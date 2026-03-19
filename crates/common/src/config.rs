@@ -74,8 +74,28 @@ pub enum StrategyType {
     Grid,
 }
 
+/// Which exchange to connect to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExchangeType {
+    Custom,
+    Binance,
+    BinanceTestnet,
+    Bybit,
+    BybitTestnet,
+}
+
+impl Default for ExchangeType {
+    fn default() -> Self {
+        Self::Custom
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExchangeConfig {
+    /// Exchange type: custom, binance, binance_testnet, bybit, bybit_testnet.
+    #[serde(default)]
+    pub exchange_type: ExchangeType,
     pub rest_url: String,
     pub ws_url: String,
     pub api_key: Option<String>,
@@ -289,6 +309,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             exchange: ExchangeConfig {
+                exchange_type: ExchangeType::Custom,
                 rest_url: "http://localhost:8080".into(),
                 ws_url: "ws://localhost:8080/ws/v1".into(),
                 api_key: None,

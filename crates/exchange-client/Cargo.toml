@@ -5,6 +5,8 @@ version.workspace = true
 
 [dependencies]
 mm-common = { workspace = true }
+mm-exchange-core = { workspace = true }
+async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }

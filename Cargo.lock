@@ -1216,6 +1216,7 @@ dependencies = [
  "mm-common",
  "mm-dashboard",
  "mm-exchange-client",
+ "mm-exchange-core",
  "mm-risk",
  "mm-strategy",
  "rust_decimal",
@@ -1281,9 +1282,11 @@ name = "mm-exchange-client"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "futures-util",
  "mm-common",
+ "mm-exchange-core",
  "reqwest",
  "rust_decimal",
  "serde",
@@ -1354,6 +1357,8 @@ dependencies = [
  "mm-common",
  "mm-dashboard",
  "mm-engine",
+ "mm-exchange-binance",
+ "mm-exchange-bybit",
  "mm-exchange-client",
  "mm-exchange-core",
  "mm-persistence",

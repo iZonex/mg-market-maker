@@ -1,15 +1,14 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use mm_common::config::{AppConfig, StrategyType};
+use mm_common::config::{AppConfig, ExchangeType, StrategyType};
 use mm_common::types::ProductSpec;
 use mm_dashboard::alerts::{AlertManager, TelegramConfig};
 use mm_dashboard::auth::{ApiUser, AuthState, Role};
 use mm_dashboard::state::DashboardState;
 use mm_dashboard::websocket::WsBroadcast;
 use mm_engine::MarketMakerEngine;
-use mm_exchange_client::rest::ExchangeRestClient;
-use mm_exchange_client::ws::ExchangeWsClient;
+use mm_exchange_core::connector::ExchangeConnector;
 use mm_persistence::checkpoint::CheckpointManager;
 use mm_strategy::{AvellanedaStoikov, GlftStrategy, GridStrategy, Strategy};
 use rust_decimal_macros::dec;
@@ -53,11 +52,15 @@ async fn main() -> Result<()> {
         info!("PAPER TRADING MODE — no real orders will be sent");
     }
 
-    // Build REST client.
-    let rest = Arc::new(ExchangeRestClient::new(&config.exchange.rest_url));
+    // Build exchange connector.
+    let connector: Arc<dyn ExchangeConnector> = create_connector(&config)?;
+    info!(
+        exchange = ?config.exchange.exchange_type,
+        "exchange connector created"
+    );
 
     // Health check.
-    match rest.health().await {
+    match connector.health_check().await {
         Ok(true) => info!("exchange health check OK"),
         Ok(false) => error!("exchange health check failed"),
         Err(e) => {
@@ -150,7 +153,7 @@ async fn main() -> Result<()> {
     for symbol in &config.symbols {
         let symbol = symbol.clone();
         let config = config.clone();
-        let rest = rest.clone();
+        let connector = connector.clone();
         let shutdown_rx = shutdown_tx.subscribe();
         let checkpoint = checkpoint.clone();
         let dashboard_state = dashboard_state.clone();
@@ -160,7 +163,7 @@ async fn main() -> Result<()> {
             if let Err(e) = run_symbol(
                 symbol.clone(),
                 config,
-                rest,
+                connector,
                 shutdown_rx,
                 checkpoint,
                 dashboard_state,
@@ -195,7 +198,7 @@ async fn main() -> Result<()> {
 async fn run_symbol(
     symbol: String,
     config: AppConfig,
-    rest: Arc<ExchangeRestClient>,
+    connector: Arc<dyn ExchangeConnector>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     _checkpoint: Arc<std::sync::Mutex<CheckpointManager>>,
     dashboard_state: DashboardState,
@@ -218,25 +221,69 @@ async fn run_symbol(
         }
     };
 
-    let ws_client = ExchangeWsClient::new(&config.exchange.ws_url);
-    let subscriptions = vec![
-        format!("orderbook.{symbol}"),
-        format!("trade.{symbol}"),
-        "orders".to_string(),
-        "fills".to_string(),
-    ];
-    let ws_rx = ws_client.connect(subscriptions).await?;
+    // Subscribe to market data via the connector.
+    let ws_rx = connector.subscribe(&[symbol.clone()]).await?;
 
     let mut engine = MarketMakerEngine::new(
         symbol,
         config,
         product,
         strategy,
-        rest,
+        connector,
         Some(dashboard_state),
         Some(alert_manager),
     );
     engine.run(ws_rx, shutdown_rx).await
+}
+
+/// Create the exchange connector based on config.
+fn create_connector(config: &AppConfig) -> Result<Arc<dyn ExchangeConnector>> {
+    let api_key = config.exchange.api_key.clone().unwrap_or_default();
+    let api_secret = config.exchange.api_secret.clone().unwrap_or_default();
+
+    match config.exchange.exchange_type {
+        ExchangeType::Custom => {
+            info!(
+                rest_url = %config.exchange.rest_url,
+                ws_url = %config.exchange.ws_url,
+                "connecting to custom exchange"
+            );
+            Ok(Arc::new(mm_exchange_client::CustomConnector::new(
+                &config.exchange.rest_url,
+                &config.exchange.ws_url,
+            )))
+        }
+        ExchangeType::Binance => {
+            info!("connecting to Binance");
+            Ok(Arc::new(mm_exchange_binance::BinanceConnector::new(
+                "https://api.binance.com",
+                "wss://stream.binance.com:9443/ws",
+                &api_key,
+                &api_secret,
+            )))
+        }
+        ExchangeType::BinanceTestnet => {
+            info!("connecting to Binance Testnet");
+            Ok(Arc::new(mm_exchange_binance::BinanceConnector::testnet(
+                &api_key,
+                &api_secret,
+            )))
+        }
+        ExchangeType::Bybit => {
+            info!("connecting to Bybit");
+            Ok(Arc::new(mm_exchange_bybit::BybitConnector::new(
+                &api_key,
+                &api_secret,
+            )))
+        }
+        ExchangeType::BybitTestnet => {
+            info!("connecting to Bybit Testnet");
+            Ok(Arc::new(mm_exchange_bybit::BybitConnector::testnet(
+                &api_key,
+                &api_secret,
+            )))
+        }
+    }
 }
 
 fn product_for_symbol(symbol: &str) -> ProductSpec {

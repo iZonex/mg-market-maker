@@ -1,5 +1,5 @@
 use mm_common::orderbook::LocalOrderBook;
-use mm_exchange_client::ws::WsEvent;
+use mm_exchange_core::events::MarketEvent;
 use tracing::debug;
 
 /// Maintains a local order book from WebSocket events.
@@ -14,11 +14,11 @@ impl BookKeeper {
         }
     }
 
-    /// Process a WebSocket event and update the local book.
+    /// Process a market event and update the local book.
     /// Returns true if the book was updated.
-    pub fn on_event(&mut self, event: &WsEvent) -> bool {
+    pub fn on_event(&mut self, event: &MarketEvent) -> bool {
         match event {
-            WsEvent::BookSnapshot {
+            MarketEvent::BookSnapshot {
                 bids,
                 asks,
                 sequence,
@@ -34,7 +34,7 @@ impl BookKeeper {
                 );
                 true
             }
-            WsEvent::BookDelta {
+            MarketEvent::BookDelta {
                 bids,
                 asks,
                 sequence,

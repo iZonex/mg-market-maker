@@ -1,10 +1,10 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Result;
-use mm_common::types::{LiveOrder, OrderId, Price, Qty, Quote, QuotePair, Side};
-use mm_common::types::{OrderType, ProductSpec, TimeInForce};
-use mm_exchange_client::rest::ExchangeRestClient;
-use mm_exchange_client::types::PlaceOrderRequest;
+use mm_common::types::{LiveOrder, OrderId, OrderType, Price, Qty, Quote, QuotePair, Side};
+use mm_common::types::{ProductSpec, TimeInForce};
+use mm_exchange_core::connector::{ExchangeConnector, NewOrder};
 use rust_decimal_macros::dec;
 use tracing::{debug, info, warn};
 
@@ -93,20 +93,19 @@ impl OrderManager {
         symbol: &str,
         desired: &[QuotePair],
         product: &ProductSpec,
-        rest: &ExchangeRestClient,
+        connector: &Arc<dyn ExchangeConnector>,
     ) -> Result<()> {
         let (to_cancel, to_place) = self.diff_orders(desired, product);
 
         // Cancel stale orders.
         for order_id in &to_cancel {
-            match rest.cancel_order(*order_id).await {
+            match connector.cancel_order(symbol, *order_id).await {
                 Ok(_) => {
                     debug!(%order_id, "cancelled stale order");
                     self.remove_order(*order_id);
                 }
                 Err(e) => {
                     warn!(%order_id, error = %e, "failed to cancel order");
-                    // Remove from tracking anyway — might already be filled.
                     self.remove_order(*order_id);
                 }
             }
@@ -114,26 +113,27 @@ impl OrderManager {
 
         // Place new orders.
         for quote in &to_place {
-            let req = PlaceOrderRequest {
+            let order = NewOrder {
                 symbol: symbol.to_string(),
                 side: quote.side,
                 order_type: OrderType::Limit,
                 price: Some(quote.price),
                 qty: quote.qty,
                 time_in_force: Some(TimeInForce::PostOnly),
+                client_order_id: None,
             };
 
-            match rest.place_order(&req).await {
-                Ok(resp) => {
+            match connector.place_order(&order).await {
+                Ok(order_id) => {
                     info!(
-                        order_id = %resp.order_id,
+                        %order_id,
                         side = ?quote.side,
                         price = %quote.price,
                         qty = %quote.qty,
                         "placed order"
                     );
                     self.track_order(LiveOrder {
-                        order_id: resp.order_id,
+                        order_id,
                         symbol: symbol.to_string(),
                         side: quote.side,
                         price: quote.price,
@@ -167,10 +167,10 @@ impl OrderManager {
     }
 
     /// Cancel all live orders (emergency or shutdown).
-    pub async fn cancel_all(&mut self, rest: &ExchangeRestClient) {
+    pub async fn cancel_all(&mut self, connector: &Arc<dyn ExchangeConnector>, symbol: &str) {
         let ids: Vec<OrderId> = self.live_orders.keys().copied().collect();
         for order_id in ids {
-            let _ = rest.cancel_order(order_id).await;
+            let _ = connector.cancel_order(symbol, order_id).await;
             self.remove_order(order_id);
         }
         info!("all orders cancelled");

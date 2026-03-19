@@ -9,8 +9,8 @@ use mm_dashboard::alerts::{AlertManager, AlertSeverity};
 use mm_dashboard::state::{
     BookDepthLevel, DashboardState, IncidentRecord, PnlSnapshot, SymbolState,
 };
-use mm_exchange_client::rest::ExchangeRestClient;
-use mm_exchange_client::ws::WsEvent;
+use mm_exchange_core::connector::ExchangeConnector;
+use mm_exchange_core::events::MarketEvent;
 use mm_risk::audit::{AuditEventType, AuditLog};
 use mm_risk::circuit_breaker::{CircuitBreaker, TripReason};
 use mm_risk::exposure::ExposureManager;
@@ -55,7 +55,7 @@ pub struct MarketMakerEngine {
     config: AppConfig,
     product: ProductSpec,
     strategy: Box<dyn Strategy>,
-    rest: Arc<ExchangeRestClient>,
+    connector: Arc<dyn ExchangeConnector>,
 
     // Core.
     book_keeper: BookKeeper,
@@ -102,7 +102,7 @@ impl MarketMakerEngine {
         config: AppConfig,
         product: ProductSpec,
         strategy: Box<dyn Strategy>,
-        rest: Arc<ExchangeRestClient>,
+        connector: Arc<dyn ExchangeConnector>,
         dashboard: Option<DashboardState>,
         alerts: Option<AlertManager>,
     ) -> Self {
@@ -169,7 +169,7 @@ impl MarketMakerEngine {
             config,
             product,
             strategy,
-            rest,
+            connector,
             cycle_start: Instant::now(),
             last_mid: dec!(0),
             tick_count: 0,
@@ -179,7 +179,7 @@ impl MarketMakerEngine {
 
     pub async fn run(
         &mut self,
-        mut ws_rx: mpsc::UnboundedReceiver<WsEvent>,
+        mut ws_rx: mpsc::UnboundedReceiver<MarketEvent>,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
         info!(symbol = %self.symbol, strategy = self.strategy.name(), "engine starting");
@@ -193,7 +193,7 @@ impl MarketMakerEngine {
         self.refresh_balances().await;
 
         // Initial orderbook snapshot via REST.
-        match self.rest.get_orderbook(&self.symbol, 25).await {
+        match self.connector.get_orderbook(&self.symbol, 25).await {
             Ok((bids, asks, seq)) => {
                 self.book_keeper.book.apply_snapshot(bids, asks, seq);
                 info!(seq, "initial book snapshot loaded");
@@ -244,7 +244,7 @@ impl MarketMakerEngine {
 
     /// Refresh balances from exchange.
     async fn refresh_balances(&mut self) {
-        if let Ok(balances) = self.rest.get_balances().await {
+        if let Ok(balances) = self.connector.get_balances().await {
             let quote_balance = balances
                 .iter()
                 .find(|b| b.asset == self.product.quote_asset)
@@ -309,7 +309,9 @@ impl MarketMakerEngine {
 
         // Kill switch L3+ → cancel all.
         if self.kill_switch.level() >= KillLevel::CancelAll {
-            self.order_manager.cancel_all(&self.rest).await;
+            self.order_manager
+                .cancel_all(&self.connector, &self.symbol)
+                .await;
             self.balance_cache.reset_reservations();
 
             // Kill switch L4 → start TWAP to flatten.
@@ -343,9 +345,9 @@ impl MarketMakerEngine {
         }
     }
 
-    fn handle_ws_event(&mut self, event: WsEvent) {
+    fn handle_ws_event(&mut self, event: MarketEvent) {
         match &event {
-            WsEvent::BookSnapshot { .. } | WsEvent::BookDelta { .. } => {
+            MarketEvent::BookSnapshot { .. } | MarketEvent::BookDelta { .. } => {
                 self.book_keeper.on_event(&event);
                 if let Some(mid) = self.book_keeper.book.mid_price() {
                     self.volatility_estimator.update(mid);
@@ -356,7 +358,7 @@ impl MarketMakerEngine {
                     self.last_mid = mid;
                 }
             }
-            WsEvent::Trade(trade) => {
+            MarketEvent::Trade { trade, .. } => {
                 self.vpin.on_trade(trade);
                 self.momentum.on_trade(trade);
 
@@ -372,7 +374,7 @@ impl MarketMakerEngine {
                     self.auto_tuner.set_toxicity(v);
                 }
             }
-            WsEvent::FillUpdate(fill) => {
+            MarketEvent::Fill { fill, .. } => {
                 info!(
                     trade_id = fill.trade_id,
                     side = ?fill.side,
@@ -381,7 +383,6 @@ impl MarketMakerEngine {
                     "FILL"
                 );
 
-                // Audit trail.
                 self.audit.order_filled(
                     &self.symbol,
                     fill.order_id,
@@ -391,14 +392,12 @@ impl MarketMakerEngine {
                     fill.is_maker,
                 );
 
-                // Core tracking.
                 self.inventory_manager.on_fill(fill);
                 self.order_manager.on_fill(fill.order_id, fill.qty);
                 self.sla_tracker.on_fill();
                 self.kill_switch.on_fill();
                 self.volume_limiter.on_trade(fill.price * fill.qty);
 
-                // Release balance reservation.
                 self.balance_cache.release(
                     fill.side,
                     fill.price,
@@ -407,22 +406,11 @@ impl MarketMakerEngine {
                     &self.product.quote_asset,
                 );
 
-                // Remove from ID map if fully filled.
-                // (order_manager already handles removal internally)
-
-                // PnL + adverse selection.
                 if let Some(mid) = self.book_keeper.book.mid_price() {
                     self.pnl_tracker.on_fill(fill, mid);
                     self.adverse_selection.on_fill(fill.price, fill.side, mid);
-
-                    // GLFT calibration: feed fill depth.
-                    let depth = (fill.price - mid).abs();
-                    // Strategy is Box<dyn Strategy>, can't downcast easily.
-                    // But the depth info is logged for future calibration.
-                    let _ = depth;
                 }
 
-                // TWAP: record fill if active.
                 if let Some(twap) = &mut self.twap {
                     twap.on_fill(fill.qty);
                     if twap.is_complete() {
@@ -431,16 +419,15 @@ impl MarketMakerEngine {
                     }
                 }
             }
-            WsEvent::OrderUpdate { data: _ } => {}
-            WsEvent::Connected => {
-                info!("WebSocket connected");
+            MarketEvent::OrderUpdate { .. } => {}
+            MarketEvent::Connected { .. } => {
+                info!("exchange connected");
                 self.audit
                     .risk_event(&self.symbol, AuditEventType::ExchangeConnected, "");
-                // Reset circuit breaker on reconnect.
                 self.circuit_breaker.reset();
             }
-            WsEvent::Disconnected => {
-                warn!("WebSocket disconnected");
+            MarketEvent::Disconnected { .. } => {
+                warn!("exchange disconnected");
                 self.audit
                     .risk_event(&self.symbol, AuditEventType::ExchangeDisconnected, "");
                 self.circuit_breaker.trip(TripReason::StaleBook);
@@ -454,7 +441,9 @@ impl MarketMakerEngine {
         // Kill switch check.
         if !self.kill_switch.allow_new_orders() {
             if self.kill_switch.level() >= KillLevel::CancelAll {
-                self.order_manager.cancel_all(&self.rest).await;
+                self.order_manager
+                    .cancel_all(&self.connector, &self.symbol)
+                    .await;
                 self.balance_cache.reset_reservations();
             }
             return Ok(());
@@ -497,7 +486,9 @@ impl MarketMakerEngine {
         }
 
         if self.circuit_breaker.is_tripped() {
-            self.order_manager.cancel_all(&self.rest).await;
+            self.order_manager
+                .cancel_all(&self.connector, &self.symbol)
+                .await;
             self.balance_cache.reset_reservations();
             return Ok(());
         }
@@ -661,7 +652,7 @@ impl MarketMakerEngine {
         self.kill_switch.on_message_sent();
 
         self.order_manager
-            .execute_diff(&self.symbol, &quotes, &self.product, &self.rest)
+            .execute_diff(&self.symbol, &quotes, &self.product, &self.connector)
             .await?;
 
         // SLA update.
@@ -794,7 +785,9 @@ impl MarketMakerEngine {
         info!(symbol = %self.symbol, "shutting down — cancelling all orders");
         self.audit
             .risk_event(&self.symbol, AuditEventType::EngineShutdown, "graceful");
-        self.order_manager.cancel_all(&self.rest).await;
+        self.order_manager
+            .cancel_all(&self.connector, &self.symbol)
+            .await;
         self.balance_cache.reset_reservations();
         self.pnl_tracker.log_summary();
         self.sla_tracker.log_summary();
