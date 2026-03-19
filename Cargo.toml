@@ -22,11 +22,11 @@ version = "0.2.0"
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
 futures-util = "0.3"
 
 # HTTP
-reqwest = { version = "0.12", features = ["json", "native-tls"] }
+reqwest = { version = "0.13", features = ["json", "native-tls"] }
 axum = { version = "0.8", features = ["json", "ws"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
@@ -43,10 +43,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Metrics
-prometheus = "0.13"
+prometheus = "0.14"
 
 # Config
-toml = "0.8"
+toml = "1.0"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
