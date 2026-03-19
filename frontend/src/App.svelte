@@ -11,15 +11,28 @@
   import Login from './lib/components/Login.svelte'
   import { createWsStore } from './lib/ws.js'
   import { createAuthStore } from './lib/auth.js'
+  import { isDemoMode, createDemoStore } from './lib/demo.js'
 
+  const demo = isDemoMode()
   const auth = createAuthStore()
-  const ws = createWsStore()
+  const ws = demo ? createDemoStore() : createWsStore()
+
+  // In demo mode, auto-login as operator.
+  if (demo && !auth.state.loggedIn) {
+    auth.state.loggedIn = true
+    auth.state.name = 'Demo Operator'
+    auth.state.role = 'operator'
+    auth.state.token = 'demo'
+  }
 </script>
 
 {#if !auth.state.loggedIn}
   <Login {auth} />
 {:else}
   <div class="app">
+    {#if demo}
+      <div class="demo-banner">DEMO MODE — simulated data</div>
+    {/if}
     <Header data={ws} {auth} />
 
     <div class="grid">
@@ -92,6 +105,11 @@
     font-size: 13px;
   }
   .app { min-height: 100vh; padding: 8px; display: flex; flex-direction: column; }
+  .demo-banner {
+    background: #d29922; color: #000; text-align: center;
+    padding: 4px; font-size: 11px; font-weight: 700;
+    letter-spacing: 1px; border-radius: 4px; margin-bottom: 4px;
+  }
   .grid {
     display: grid; grid-template-columns: 1fr 1fr 1fr;
     gap: 8px; margin-top: 8px; flex: 1;

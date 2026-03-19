@@ -215,7 +215,7 @@ impl Base64Reader {
                     }
                 })
                 .collect();
-            if vals.iter().any(|v| *v == 255) {
+            if vals.contains(&255) {
                 return None;
             }
             out.push((vals[0] << 2) | (vals.get(1).unwrap_or(&0) >> 4));
