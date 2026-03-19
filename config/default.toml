@@ -1,0 +1,79 @@
+# Market Maker Configuration
+
+symbols = ["BTCUSDT"]
+mode = "live"                   # "live" or "paper"
+dashboard_port = 9090           # HTTP dashboard (0 = disabled)
+checkpoint_path = "data/checkpoint.json"
+log_file = ""                   # Empty = stdout only; "logs/mm.log" for file
+
+# Dashboard users (or use MM_ADMIN_KEY env for default admin)
+# API keys should be in env vars in production, not here!
+#
+# [[users]]
+# id = "admin-1"
+# name = "MM Operator"
+# role = "admin"                # admin | operator | viewer
+# api_key = "set-via-env-var"
+#
+# [[users]]
+# id = "client-acme"
+# name = "Acme Token Project"
+# role = "viewer"
+# api_key = "client-key-here"
+# allowed_symbols = ["ACMEUSDT"]
+
+[exchange]
+rest_url = "http://localhost:8080"
+ws_url = "ws://localhost:8080/ws/v1"
+# api_key = "your-api-key"
+# api_secret = "your-api-secret"
+
+[market_maker]
+# Strategy: "avellaneda_stoikov", "glft", or "grid"
+strategy = "avellaneda_stoikov"
+
+# Avellaneda-Stoikov / GLFT parameters
+gamma = "0.1"           # Risk aversion (higher = wider spread)
+kappa = "1.5"           # Order arrival intensity
+sigma = "0.02"          # Default volatility (overridden by live estimate)
+time_horizon_secs = 300
+
+num_levels = 3          # Quote levels per side
+order_size = "0.001"    # Base asset per order
+refresh_interval_ms = 500
+min_spread_bps = "5"
+max_distance_bps = "100"
+
+momentum_enabled = true
+momentum_window = 200
+
+[risk]
+max_inventory = "0.1"
+max_exposure_quote = "10000"
+max_drawdown_quote = "500"
+inventory_skew_factor = "1.0"
+max_spread_bps = "500"
+stale_book_timeout_secs = 10
+
+[kill_switch]
+daily_loss_limit = "1000"
+daily_loss_warning = "500"
+max_position_value = "50000"
+max_message_rate = 100
+max_consecutive_errors = 10
+
+[sla]
+max_spread_bps = "100"
+min_depth_quote = "2000"
+min_uptime_pct = "95"
+two_sided_required = true
+max_requote_secs = 5
+min_order_rest_secs = 3
+
+[toxicity]
+vpin_bucket_size = "50000"
+vpin_num_buckets = 50
+vpin_threshold = "0.7"
+kyle_window = 100
+adverse_selection_lookback_ms = 3000
+autotune_enabled = true

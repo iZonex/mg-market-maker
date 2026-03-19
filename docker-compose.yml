@@ -1,0 +1,43 @@
+services:
+  market-maker:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config:/home/mm/config:ro
+      - mm-data:/home/mm/data
+      - mm-logs:/home/mm/logs
+    environment:
+      - RUST_LOG=info,mm_engine=debug,mm_strategy=debug
+      - MM_CONFIG=config/default.toml
+      - MM_API_KEY=${MM_API_KEY:-}
+      - MM_API_SECRET=${MM_API_SECRET:-}
+      - MM_TELEGRAM_TOKEN=${MM_TELEGRAM_TOKEN:-}
+      - MM_TELEGRAM_CHAT=${MM_TELEGRAM_CHAT:-}
+      - MM_MODE=${MM_MODE:-paper}
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+
+volumes:
+  mm-data:
+  mm-logs:
+  prom-data:
+  grafana-data:

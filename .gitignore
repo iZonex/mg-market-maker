@@ -1,0 +1,24 @@
+# Build
+/target
+
+# Secrets (NEVER commit these)
+.env
+*.key
+*.pem
+
+# Data (generated at runtime)
+data/
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Benchmark results
+target/criterion/

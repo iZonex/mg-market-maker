@@ -1,0 +1,199 @@
+use std::collections::HashMap;
+
+use anyhow::Result;
+use mm_common::types::{LiveOrder, OrderId, Price, Qty, Quote, QuotePair, Side};
+use mm_common::types::{OrderType, ProductSpec, TimeInForce};
+use mm_exchange_client::rest::ExchangeRestClient;
+use mm_exchange_client::types::PlaceOrderRequest;
+use rust_decimal_macros::dec;
+use tracing::{debug, info, warn};
+
+/// Manages live orders on the exchange.
+/// Performs order diffing: only cancels/places orders that actually changed.
+pub struct OrderManager {
+    /// Our currently live orders on the exchange, keyed by order ID.
+    live_orders: HashMap<OrderId, LiveOrder>,
+    /// Map from (side, price) to order ID for quick lookup.
+    price_index: HashMap<(Side, Price), OrderId>,
+}
+
+impl OrderManager {
+    pub fn new() -> Self {
+        Self {
+            live_orders: HashMap::new(),
+            price_index: HashMap::new(),
+        }
+    }
+
+    /// Number of live orders.
+    pub fn live_count(&self) -> usize {
+        self.live_orders.len()
+    }
+
+    /// Get all live order IDs.
+    pub fn live_order_ids(&self) -> Vec<OrderId> {
+        self.live_orders.keys().copied().collect()
+    }
+
+    /// Reconcile desired quotes with live orders.
+    /// Returns (orders_to_cancel, quotes_to_place).
+    pub fn diff_orders(
+        &self,
+        desired: &[QuotePair],
+        product: &ProductSpec,
+    ) -> (Vec<OrderId>, Vec<Quote>) {
+        let mut to_cancel = Vec::new();
+        let mut to_place = Vec::new();
+        let mut desired_prices: HashMap<(Side, Price), Qty> = HashMap::new();
+
+        // Collect all desired price levels.
+        for pair in desired {
+            if let Some(bid) = &pair.bid {
+                let price = product.round_price(bid.price);
+                desired_prices.insert((Side::Buy, price), bid.qty);
+            }
+            if let Some(ask) = &pair.ask {
+                let price = product.round_price(ask.price);
+                desired_prices.insert((Side::Sell, price), ask.qty);
+            }
+        }
+
+        // Cancel orders that are no longer desired.
+        for (&(side, price), &order_id) in &self.price_index {
+            if !desired_prices.contains_key(&(side, price)) {
+                to_cancel.push(order_id);
+            }
+        }
+
+        // Place orders at new price levels.
+        for ((side, price), qty) in &desired_prices {
+            if !self.price_index.contains_key(&(*side, *price)) {
+                to_place.push(Quote {
+                    side: *side,
+                    price: *price,
+                    qty: *qty,
+                });
+            }
+        }
+
+        (to_cancel, to_place)
+    }
+
+    /// Execute the diff: cancel stale orders, place new ones.
+    pub async fn execute_diff(
+        &mut self,
+        symbol: &str,
+        desired: &[QuotePair],
+        product: &ProductSpec,
+        rest: &ExchangeRestClient,
+    ) -> Result<()> {
+        let (to_cancel, to_place) = self.diff_orders(desired, product);
+
+        // Cancel stale orders.
+        for order_id in &to_cancel {
+            match rest.cancel_order(*order_id).await {
+                Ok(_) => {
+                    debug!(%order_id, "cancelled stale order");
+                    self.remove_order(*order_id);
+                }
+                Err(e) => {
+                    warn!(%order_id, error = %e, "failed to cancel order");
+                    // Remove from tracking anyway — might already be filled.
+                    self.remove_order(*order_id);
+                }
+            }
+        }
+
+        // Place new orders.
+        for quote in &to_place {
+            let req = PlaceOrderRequest {
+                symbol: symbol.to_string(),
+                side: quote.side,
+                order_type: OrderType::Limit,
+                price: Some(quote.price),
+                qty: quote.qty,
+                time_in_force: Some(TimeInForce::PostOnly),
+            };
+
+            match rest.place_order(&req).await {
+                Ok(resp) => {
+                    info!(
+                        order_id = %resp.order_id,
+                        side = ?quote.side,
+                        price = %quote.price,
+                        qty = %quote.qty,
+                        "placed order"
+                    );
+                    self.track_order(LiveOrder {
+                        order_id: resp.order_id,
+                        symbol: symbol.to_string(),
+                        side: quote.side,
+                        price: quote.price,
+                        qty: quote.qty,
+                        filled_qty: dec!(0),
+                        status: mm_common::types::OrderStatus::Open,
+                        created_at: chrono::Utc::now(),
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        side = ?quote.side,
+                        price = %quote.price,
+                        error = %e,
+                        "failed to place order"
+                    );
+                }
+            }
+        }
+
+        if !to_cancel.is_empty() || !to_place.is_empty() {
+            info!(
+                cancelled = to_cancel.len(),
+                placed = to_place.len(),
+                live = self.live_count(),
+                "order diff executed"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Cancel all live orders (emergency or shutdown).
+    pub async fn cancel_all(&mut self, rest: &ExchangeRestClient) {
+        let ids: Vec<OrderId> = self.live_orders.keys().copied().collect();
+        for order_id in ids {
+            let _ = rest.cancel_order(order_id).await;
+            self.remove_order(order_id);
+        }
+        info!("all orders cancelled");
+    }
+
+    fn track_order(&mut self, order: LiveOrder) {
+        self.price_index
+            .insert((order.side, order.price), order.order_id);
+        self.live_orders.insert(order.order_id, order);
+    }
+
+    fn remove_order(&mut self, order_id: OrderId) {
+        if let Some(order) = self.live_orders.remove(&order_id) {
+            self.price_index.remove(&(order.side, order.price));
+        }
+    }
+
+    /// Handle a fill event — update or remove the filled order.
+    pub fn on_fill(&mut self, order_id: OrderId, filled_qty: Qty) {
+        if let Some(order) = self.live_orders.get_mut(&order_id) {
+            order.filled_qty += filled_qty;
+            if order.filled_qty >= order.qty {
+                let id = order.order_id;
+                self.remove_order(id);
+            }
+        }
+    }
+}
+
+impl Default for OrderManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}

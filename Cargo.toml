@@ -1,0 +1,85 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/exchange-core",
+    "crates/exchange-client",
+    "crates/exchange-binance",
+    "crates/exchange-bybit",
+    "crates/strategy",
+    "crates/risk",
+    "crates/engine",
+    "crates/backtester",
+    "crates/dashboard",
+    "crates/persistence",
+    "crates/server",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+
+# HTTP
+reqwest = { version = "0.12", features = ["json", "native-tls"] }
+axum = { version = "0.8", features = ["json", "ws"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Decimal arithmetic (never f64 for money)
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+rust_decimal_macros = "1"
+
+# Logging & tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Metrics
+prometheus = "0.13"
+
+# Config
+toml = "0.8"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Errors
+anyhow = "1"
+thiserror = "2"
+
+# UUID
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Async trait
+async-trait = "0.1"
+
+# Crypto auth
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+
+# Internal crates
+mm-common = { path = "crates/common" }
+mm-exchange-core = { path = "crates/exchange-core" }
+mm-exchange-client = { path = "crates/exchange-client" }
+mm-exchange-binance = { path = "crates/exchange-binance" }
+mm-exchange-bybit = { path = "crates/exchange-bybit" }
+mm-strategy = { path = "crates/strategy" }
+mm-risk = { path = "crates/risk" }
+mm-engine = { path = "crates/engine" }
+mm-backtester = { path = "crates/backtester" }
+mm-dashboard = { path = "crates/dashboard" }
+mm-persistence = { path = "crates/persistence" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

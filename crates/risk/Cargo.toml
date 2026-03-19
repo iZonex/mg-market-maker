@@ -1,0 +1,16 @@
+[package]
+name = "mm-risk"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+mm-common = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }

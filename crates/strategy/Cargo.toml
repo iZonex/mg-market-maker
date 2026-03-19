@@ -1,0 +1,20 @@
+[package]
+name = "mm-strategy"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+mm-common = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "strategy_bench"
+harness = false

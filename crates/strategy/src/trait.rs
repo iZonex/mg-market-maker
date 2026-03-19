@@ -1,0 +1,50 @@
+use mm_common::config::MarketMakerConfig;
+use mm_common::orderbook::LocalOrderBook;
+use mm_common::types::{Price, ProductSpec, Qty, QuotePair};
+use rust_decimal::Decimal;
+
+/// Context passed to the strategy on each tick.
+pub struct StrategyContext<'a> {
+    pub book: &'a LocalOrderBook,
+    pub product: &'a ProductSpec,
+    pub config: &'a MarketMakerConfig,
+    /// Current inventory in base asset (positive = long, negative = short).
+    pub inventory: Decimal,
+    /// Estimated volatility (σ).
+    pub volatility: Decimal,
+    /// Time remaining in the horizon as a fraction [0, 1].
+    pub time_remaining: Decimal,
+    /// Recent mid price for reference.
+    pub mid_price: Price,
+}
+
+/// Trait for market-making strategies.
+pub trait Strategy: Send + Sync {
+    /// Compute the desired quotes given the current market state.
+    fn compute_quotes(&self, ctx: &StrategyContext) -> Vec<QuotePair>;
+
+    /// Name of the strategy for logging.
+    fn name(&self) -> &str;
+}
+
+/// Helper: clamp a price to [mid - max_dist, mid + max_dist].
+pub fn clamp_price(price: Price, mid: Price, max_distance: Price) -> Price {
+    let lo = mid - max_distance;
+    let hi = mid + max_distance;
+    price.max(lo).min(hi)
+}
+
+/// Convert bps to a fraction (e.g., 10 bps → 0.001).
+pub fn bps_to_frac(bps: Decimal) -> Decimal {
+    bps / Decimal::from(10_000)
+}
+
+/// Ensure a quote meets the product's min notional.
+pub fn ensure_min_qty(price: Price, min_qty: Qty, product: &ProductSpec) -> Qty {
+    let min_for_notional = if price.is_zero() {
+        min_qty
+    } else {
+        product.round_qty(product.min_notional / price) + product.lot_size
+    };
+    min_qty.max(min_for_notional)
+}
