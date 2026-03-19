@@ -111,6 +111,7 @@ async fn main() -> Result<()> {
 
     // Start dashboard.
     let dashboard_state = DashboardState::new();
+    dashboard_state.set_loans(config.loans.clone());
     let ws_broadcast = Arc::new(WsBroadcast::new(1024));
     if config.dashboard_port > 0 {
         let ds = dashboard_state.clone();
@@ -122,7 +123,10 @@ async fn main() -> Result<()> {
                 error!(error = %e, "dashboard server failed");
             }
         });
-        info!(port = config.dashboard_port, "dashboard + WebSocket + auth started");
+        info!(
+            port = config.dashboard_port,
+            "dashboard + WebSocket + auth started"
+        );
     }
 
     // Shutdown signal.

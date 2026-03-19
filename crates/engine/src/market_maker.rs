@@ -5,7 +5,9 @@ use std::time::Instant;
 use anyhow::Result;
 use mm_common::config::AppConfig;
 use mm_common::types::ProductSpec;
-use mm_dashboard::state::{DashboardState, PnlSnapshot, SymbolState};
+use mm_dashboard::state::{
+    BookDepthLevel, DashboardState, IncidentRecord, PnlSnapshot, SymbolState,
+};
 use mm_exchange_client::rest::ExchangeRestClient;
 use mm_exchange_client::ws::WsEvent;
 use mm_risk::audit::{AuditEventType, AuditLog};
@@ -82,6 +84,7 @@ pub struct MarketMakerEngine {
     // Tracking.
     sla_tracker: SlaTracker,
     pnl_tracker: PnlTracker,
+    volume_limiter: mm_risk::VolumeLimitTracker,
     dashboard: Option<DashboardState>,
 
     // Timing.
@@ -153,6 +156,10 @@ impl MarketMakerEngine {
             twap: None,
             sla_tracker: SlaTracker::new(sla_config),
             pnl_tracker: PnlTracker::new(product.maker_fee, product.taker_fee),
+            volume_limiter: mm_risk::VolumeLimitTracker::new(
+                config.risk.max_daily_volume_quote,
+                config.risk.max_hourly_volume_quote,
+            ),
             dashboard,
             symbol,
             config,
@@ -323,6 +330,10 @@ impl MarketMakerEngine {
                         AuditEventType::KillSwitchEscalated,
                         &format!("TWAP flatten started: {side:?} {}", inv.abs()),
                     );
+                    self.record_incident(
+                        "critical",
+                        &format!("Kill switch L4: TWAP flatten {side:?} {}", inv.abs()),
+                    );
                 }
             }
         }
@@ -381,6 +392,7 @@ impl MarketMakerEngine {
                 self.order_manager.on_fill(fill.order_id, fill.qty);
                 self.sla_tracker.on_fill();
                 self.kill_switch.on_fill();
+                self.volume_limiter.on_trade(fill.price * fill.qty);
 
                 // Release balance reservation.
                 self.balance_cache.release(
@@ -463,6 +475,7 @@ impl MarketMakerEngine {
                     AuditEventType::CircuitBreakerTripped,
                     "drawdown",
                 );
+                self.record_incident("high", "Circuit breaker tripped: max drawdown exceeded");
             }
             if self.exposure_manager.is_exposure_breached(
                 self.inventory_manager.inventory(),
@@ -475,6 +488,7 @@ impl MarketMakerEngine {
                     AuditEventType::CircuitBreakerTripped,
                     "exposure",
                 );
+                self.record_incident("high", "Circuit breaker tripped: max exposure exceeded");
             }
         }
 
@@ -604,6 +618,32 @@ impl MarketMakerEngine {
             }
         }
 
+        // Enforce max order size.
+        let max_size = self.config.risk.max_order_size;
+        if !max_size.is_zero() {
+            for q in quotes.iter_mut() {
+                if let Some(bid) = &mut q.bid {
+                    if bid.qty > max_size {
+                        bid.qty = self.product.round_qty(max_size);
+                    }
+                }
+                if let Some(ask) = &mut q.ask {
+                    if ask.qty > max_size {
+                        ask.qty = self.product.round_qty(max_size);
+                    }
+                }
+            }
+        }
+
+        // Enforce volume limits — cancel all new quotes if daily/hourly cap exceeded.
+        if !self.volume_limiter.can_trade(dec!(0)) {
+            warn!("volume limit reached — suppressing new quotes");
+            for q in quotes.iter_mut() {
+                q.bid = None;
+                q.ask = None;
+            }
+        }
+
         // Remove quotes with zero qty.
         for q in quotes.iter_mut() {
             if q.bid.as_ref().map(|b| b.qty.is_zero()).unwrap_or(false) {
@@ -648,6 +688,19 @@ impl MarketMakerEngine {
         self.inventory_manager.total_pnl(mid_price)
     }
 
+    /// Record an incident to the dashboard state.
+    fn record_incident(&self, severity: &str, description: &str) {
+        if let Some(ds) = &self.dashboard {
+            ds.add_incident(IncidentRecord {
+                timestamp: chrono::Utc::now(),
+                severity: severity.to_string(),
+                description: description.to_string(),
+                duration_secs: 0,
+                resolved: false,
+            });
+        }
+    }
+
     /// Push state to dashboard for HTTP API + Prometheus metrics.
     fn update_dashboard(&self) {
         let Some(ds) = &self.dashboard else { return };
@@ -682,6 +735,18 @@ impl MarketMakerEngine {
             kill_level: self.kill_switch.level() as u8,
             sla_uptime_pct: self.sla_tracker.uptime_pct(),
             regime: regime_str,
+            spread_compliance_pct: self.sla_tracker.spread_compliance_pct(),
+            book_depth_levels: [dec!(0.5), dec!(1), dec!(2), dec!(5)]
+                .iter()
+                .map(|&pct| BookDepthLevel {
+                    pct_from_mid: pct,
+                    bid_depth_quote: self.book_keeper.book.bid_depth_within_pct_quote(pct),
+                    ask_depth_quote: self.book_keeper.book.ask_depth_within_pct_quote(pct),
+                })
+                .collect(),
+            locked_in_orders_quote: self.order_manager.locked_value_quote(),
+            sla_max_spread_bps: self.sla_tracker.config().max_spread_bps,
+            sla_min_depth_quote: self.sla_tracker.config().min_depth_quote,
         });
     }
 

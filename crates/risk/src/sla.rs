@@ -44,6 +44,8 @@ pub struct SlaTracker {
     total_ticks: u64,
     /// Ticks where we were compliant.
     compliant_ticks: u64,
+    /// Ticks where spread was within limit (separate from full compliance).
+    spread_compliant_ticks: u64,
     /// Current state.
     is_quoting: bool,
     has_bid: bool,
@@ -87,6 +89,7 @@ impl SlaTracker {
             config,
             total_ticks: 0,
             compliant_ticks: 0,
+            spread_compliant_ticks: 0,
             is_quoting: false,
             has_bid: false,
             has_ask: false,
@@ -113,13 +116,15 @@ impl SlaTracker {
         }
 
         // Check spread.
-        if let Some(spread) = self.current_spread_bps {
-            if spread > self.config.max_spread_bps {
-                compliant = false;
+        let spread_ok =
+            matches!(self.current_spread_bps, Some(spread) if spread <= self.config.max_spread_bps);
+        if spread_ok {
+            self.spread_compliant_ticks += 1;
+        } else {
+            compliant = false;
+            if self.current_spread_bps.is_some() {
                 self.violations.spread_too_wide += 1;
             }
-        } else {
-            compliant = false; // No spread = not quoting.
         }
 
         // Check depth.
@@ -174,6 +179,19 @@ impl SlaTracker {
         Decimal::from(self.compliant_ticks) / Decimal::from(self.total_ticks) * dec!(100)
     }
 
+    /// Spread-only compliance percentage (% of ticks where spread was within limit).
+    pub fn spread_compliance_pct(&self) -> Decimal {
+        if self.total_ticks == 0 {
+            return dec!(100);
+        }
+        Decimal::from(self.spread_compliant_ticks) / Decimal::from(self.total_ticks) * dec!(100)
+    }
+
+    /// SLA config for reporting.
+    pub fn config(&self) -> &SlaConfig {
+        &self.config
+    }
+
     /// Is the MM currently meeting SLA?
     pub fn is_meeting_sla(&self) -> bool {
         self.uptime_pct() >= self.config.min_uptime_pct
@@ -214,5 +232,53 @@ impl SlaTracker {
                 "SLA VIOLATION"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_tracker() -> SlaTracker {
+        SlaTracker::new(SlaConfig {
+            max_spread_bps: dec!(100),
+            min_depth_quote: dec!(2000),
+            min_uptime_pct: dec!(95),
+            two_sided_required: true,
+            max_requote_secs: 5,
+            min_order_rest_secs: 3,
+        })
+    }
+
+    #[test]
+    fn test_spread_compliance_separate_from_uptime() {
+        let mut tracker = default_tracker();
+
+        // Spread within limit but depth too low → uptime fails, spread compliance passes.
+        tracker.update_quotes(true, true, Some(dec!(50)), dec!(1000), dec!(1000));
+        tracker.tick();
+
+        // Spread too wide but depth ok → both fail.
+        tracker.update_quotes(true, true, Some(dec!(150)), dec!(3000), dec!(3000));
+        tracker.tick();
+
+        // Both ok.
+        tracker.update_quotes(true, true, Some(dec!(80)), dec!(3000), dec!(3000));
+        tracker.tick();
+
+        // 3 ticks total. Spread was ok in tick 1 and 3 → spread compliance = 66.66%.
+        let spread_pct = tracker.spread_compliance_pct();
+        assert!(spread_pct > dec!(66) && spread_pct < dec!(67));
+
+        // Uptime: only tick 3 was fully compliant → 33.33%.
+        let uptime_pct = tracker.uptime_pct();
+        assert!(uptime_pct > dec!(33) && uptime_pct < dec!(34));
+    }
+
+    #[test]
+    fn test_config_accessor() {
+        let tracker = default_tracker();
+        assert_eq!(tracker.config().max_spread_bps, dec!(100));
+        assert_eq!(tracker.config().min_depth_quote, dec!(2000));
     }
 }

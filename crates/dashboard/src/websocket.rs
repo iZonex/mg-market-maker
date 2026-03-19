@@ -41,11 +41,7 @@ pub async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, dashboard, broadcast))
 }
 
-async fn handle_socket(
-    socket: WebSocket,
-    dashboard: DashboardState,
-    broadcast: Arc<WsBroadcast>,
-) {
+async fn handle_socket(socket: WebSocket, dashboard: DashboardState, broadcast: Arc<WsBroadcast>) {
     let (mut sender, mut receiver) = socket.split();
     let mut rx = broadcast.subscribe();
 

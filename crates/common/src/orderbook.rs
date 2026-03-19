@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 
 use crate::types::{Price, PriceLevel, Qty};
 
@@ -119,6 +120,37 @@ impl LocalOrderBook {
         self.asks.values().take(levels).sum()
     }
 
+    /// Bid depth within `pct` percent of mid price, in quote asset (qty * price).
+    pub fn bid_depth_within_pct_quote(&self, pct: Decimal) -> Decimal {
+        let mid = match self.mid_price() {
+            Some(m) if !m.is_zero() => m,
+            _ => return dec!(0),
+        };
+        let hundred = Decimal::from(100);
+        let lower_bound = mid * (Decimal::ONE - pct / hundred);
+        self.bids
+            .iter()
+            .rev()
+            .take_while(|(&price, _)| price >= lower_bound)
+            .map(|(price, qty)| price * qty)
+            .sum()
+    }
+
+    /// Ask depth within `pct` percent of mid price, in quote asset (qty * price).
+    pub fn ask_depth_within_pct_quote(&self, pct: Decimal) -> Decimal {
+        let mid = match self.mid_price() {
+            Some(m) if !m.is_zero() => m,
+            _ => return dec!(0),
+        };
+        let hundred = Decimal::from(100);
+        let upper_bound = mid * (Decimal::ONE + pct / hundred);
+        self.asks
+            .iter()
+            .take_while(|(&price, _)| price <= upper_bound)
+            .map(|(price, qty)| price * qty)
+            .sum()
+    }
+
     /// Book imbalance = (bid_depth - ask_depth) / (bid_depth + ask_depth).
     /// Range: -1.0 (all asks) to +1.0 (all bids).
     pub fn imbalance(&self, levels: usize) -> Option<Decimal> {
@@ -189,5 +221,49 @@ mod tests {
         let imb = book.imbalance(5).unwrap();
         // (10 - 5) / (10 + 5) = 5/15 = 0.333...
         assert!(imb > dec!(0.33) && imb < dec!(0.34));
+    }
+
+    #[test]
+    fn test_bid_depth_within_pct_quote() {
+        let mut book = LocalOrderBook::new("TEST".into());
+        // Mid = (100+102)/2 = 101. 1% of 101 = 1.01 → lower bound = 99.99.
+        // Bid at 100 (within 1%), bid at 98 (outside 1%).
+        book.apply_snapshot(
+            vec![level("100", "2.0"), level("98", "5.0")],
+            vec![level("102", "1.0")],
+            1,
+        );
+        let depth_1pct = book.bid_depth_within_pct_quote(dec!(1));
+        // Only bid at 100 is within 1% of mid (101). Depth = 100 * 2 = 200.
+        assert_eq!(depth_1pct, dec!(200));
+
+        // 5% → lower bound = 101 * 0.95 = 95.95. Both bids are within.
+        let depth_5pct = book.bid_depth_within_pct_quote(dec!(5));
+        assert_eq!(depth_5pct, dec!(200) + dec!(490)); // 100*2 + 98*5
+    }
+
+    #[test]
+    fn test_ask_depth_within_pct_quote() {
+        let mut book = LocalOrderBook::new("TEST".into());
+        // Mid = (100+102)/2 = 101. 1% of 101 = 1.01 → upper bound = 102.01.
+        book.apply_snapshot(
+            vec![level("100", "2.0")],
+            vec![level("102", "3.0"), level("105", "1.0")],
+            1,
+        );
+        let depth_1pct = book.ask_depth_within_pct_quote(dec!(1));
+        // Ask at 102 is within 1% of 101. Depth = 102 * 3 = 306.
+        assert_eq!(depth_1pct, dec!(306));
+
+        // 5% → upper bound = 101 * 1.05 = 106.05. Both asks within.
+        let depth_5pct = book.ask_depth_within_pct_quote(dec!(5));
+        assert_eq!(depth_5pct, dec!(306) + dec!(105)); // 102*3 + 105*1
+    }
+
+    #[test]
+    fn test_depth_within_pct_empty_book() {
+        let book = LocalOrderBook::new("TEST".into());
+        assert_eq!(book.bid_depth_within_pct_quote(dec!(1)), dec!(0));
+        assert_eq!(book.ask_depth_within_pct_quote(dec!(1)), dec!(0));
     }
 }

@@ -1,3 +1,5 @@
+use chrono::{DateTime, Utc};
+use mm_common::config::LoanConfig;
 use rust_decimal::Decimal;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -12,6 +14,18 @@ pub struct DashboardState {
 #[derive(Debug, Default)]
 struct StateInner {
     symbols: HashMap<String, SymbolState>,
+    loans: HashMap<String, LoanConfig>,
+    incidents: Vec<IncidentRecord>,
+}
+
+/// A recorded incident for the daily report.
+#[derive(Debug, Clone, Serialize)]
+pub struct IncidentRecord {
+    pub timestamp: DateTime<Utc>,
+    pub severity: String,
+    pub description: String,
+    pub duration_secs: u64,
+    pub resolved: bool,
 }
 
 /// Per-symbol state snapshot.
@@ -32,6 +46,24 @@ pub struct SymbolState {
     pub kill_level: u8,
     pub sla_uptime_pct: Decimal,
     pub regime: String,
+    /// Spread-only compliance (% of ticks where spread was within SLA limit).
+    pub spread_compliance_pct: Decimal,
+    /// Book depth at various percentages from mid (pct, bid_quote, ask_quote).
+    pub book_depth_levels: Vec<BookDepthLevel>,
+    /// Total value locked in open orders (quote asset).
+    pub locked_in_orders_quote: Decimal,
+    /// SLA max spread from config.
+    pub sla_max_spread_bps: Decimal,
+    /// SLA min depth from config.
+    pub sla_min_depth_quote: Decimal,
+}
+
+/// Depth at a specific percentage from mid price.
+#[derive(Debug, Clone, Serialize)]
+pub struct BookDepthLevel {
+    pub pct_from_mid: Decimal,
+    pub bid_depth_quote: Decimal,
+    pub ask_depth_quote: Decimal,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -113,6 +145,30 @@ impl DashboardState {
     pub fn get_symbol(&self, symbol: &str) -> Option<SymbolState> {
         let inner = self.inner.read().unwrap();
         inner.symbols.get(symbol).cloned()
+    }
+
+    /// Set loan configs (from AppConfig).
+    pub fn set_loans(&self, loans: HashMap<String, LoanConfig>) {
+        let mut inner = self.inner.write().unwrap();
+        inner.loans = loans;
+    }
+
+    /// Get loan config for a symbol.
+    pub fn get_loan(&self, symbol: &str) -> Option<LoanConfig> {
+        let inner = self.inner.read().unwrap();
+        inner.loans.get(symbol).cloned()
+    }
+
+    /// Record an incident.
+    pub fn add_incident(&self, incident: IncidentRecord) {
+        let mut inner = self.inner.write().unwrap();
+        inner.incidents.push(incident);
+    }
+
+    /// Get all incidents (for daily report).
+    pub fn get_incidents(&self) -> Vec<IncidentRecord> {
+        let inner = self.inner.read().unwrap();
+        inner.incidents.clone()
     }
 }
 

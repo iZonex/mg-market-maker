@@ -8,6 +8,7 @@ pub mod pnl;
 pub mod reconciliation;
 pub mod sla;
 pub mod toxicity;
+pub mod volume_limit;
 
 pub use circuit_breaker::CircuitBreaker;
 pub use exposure::ExposureManager;
@@ -16,3 +17,4 @@ pub use kill_switch::{KillLevel, KillSwitch, KillSwitchConfig};
 pub use pnl::PnlTracker;
 pub use sla::{SlaConfig, SlaTracker};
 pub use toxicity::{AdverseSelectionTracker, KyleLambda, VpinEstimator};
+pub use volume_limit::VolumeLimitTracker;

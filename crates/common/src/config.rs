@@ -1,4 +1,5 @@
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 
 /// Top-level configuration.
@@ -31,6 +32,10 @@ pub struct AppConfig {
     /// Pre-configured API users.
     #[serde(default)]
     pub users: Vec<UserConfig>,
+
+    /// Per-symbol loan configuration (keyed by symbol, e.g., "BTCUSDT").
+    #[serde(default)]
+    pub loans: std::collections::HashMap<String, LoanConfig>,
 }
 
 /// Pre-configured user for dashboard access.
@@ -147,6 +152,18 @@ pub struct RiskConfig {
 
     /// Seconds without a book update before we cancel all orders.
     pub stale_book_timeout_secs: u64,
+
+    /// Maximum single order size in base asset (0 = unlimited).
+    #[serde(default)]
+    pub max_order_size: Decimal,
+
+    /// Maximum daily trade volume in quote asset (0 = unlimited).
+    #[serde(default)]
+    pub max_daily_volume_quote: Decimal,
+
+    /// Maximum hourly trade volume in quote asset (0 = unlimited).
+    #[serde(default)]
+    pub max_hourly_volume_quote: Decimal,
 }
 
 /// Kill switch configuration.
@@ -236,6 +253,17 @@ impl Default for ToxicityConfig {
     }
 }
 
+/// Loan configuration for token loan tracking (optional).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoanConfig {
+    /// Original loan amount in base asset.
+    pub loan_amount: Decimal,
+    /// Call option strike price (if applicable).
+    pub option_strike: Option<Decimal>,
+    /// Option expiry date (ISO 8601 string, e.g., "2026-12-31").
+    pub option_expiry: Option<String>,
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -267,6 +295,9 @@ impl Default for AppConfig {
                 inventory_skew_factor: "1.0".parse().unwrap(),
                 max_spread_bps: "500".parse().unwrap(),
                 stale_book_timeout_secs: 10,
+                max_order_size: dec!(0),
+                max_daily_volume_quote: dec!(0),
+                max_hourly_volume_quote: dec!(0),
             },
             sla: SlaObligationConfig::default(),
             toxicity: ToxicityConfig::default(),
@@ -276,6 +307,7 @@ impl Default for AppConfig {
             log_file: String::new(),
             mode: "live".into(),
             users: vec![],
+            loans: std::collections::HashMap::new(),
         }
     }
 }

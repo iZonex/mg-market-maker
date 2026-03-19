@@ -1,7 +1,7 @@
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::Serialize;
@@ -87,16 +87,29 @@ async fn client_overview(State(state): State<DashboardState>) -> Json<ClientOver
             sum_uptime += s.sla_uptime_pct;
             total_pnl += s.pnl.total;
 
+            let depth_1pct = s
+                .book_depth_levels
+                .iter()
+                .find(|l| l.pct_from_mid == dec!(1))
+                .map(|l| l.bid_depth_quote + l.ask_depth_quote)
+                .unwrap_or(dec!(0));
+            let depth_2pct = s
+                .book_depth_levels
+                .iter()
+                .find(|l| l.pct_from_mid == dec!(2))
+                .map(|l| l.bid_depth_quote + l.ask_depth_quote)
+                .unwrap_or(dec!(0));
+
             SymbolOverview {
                 symbol: s.symbol.clone(),
                 exchange: "primary".to_string(),
                 avg_spread_bps: s.spread_bps,
-                spread_compliance_pct: s.sla_uptime_pct, // TODO: separate metric.
+                spread_compliance_pct: s.spread_compliance_pct,
                 uptime_pct: s.sla_uptime_pct,
-                depth_at_1pct: dec!(0), // TODO: compute from book.
-                depth_at_2pct: dec!(0),
+                depth_at_1pct: depth_1pct,
+                depth_at_2pct: depth_2pct,
                 volume_24h: vol,
-                volume_share_pct: dec!(0), // TODO: need total exchange volume.
+                volume_share_pct: dec!(100), // Single venue: we are 100% of our volume.
                 mid_price: s.mid_price,
             }
         })
@@ -146,7 +159,7 @@ async fn spread_quality(State(state): State<DashboardState>) -> Json<Vec<SpreadQ
                 symbol: s.symbol.clone(),
                 within_target_pct: s.sla_uptime_pct,
                 time_weighted_avg_bps: s.spread_bps,
-                volume_weighted_avg_bps: s.spread_bps, // TODO: tracked separately.
+                volume_weighted_avg_bps: s.spread_bps, // Approximation: no separate volume-weighted tracking yet.
                 high_vol_avg_bps: s.spread_bps * dec!(1.5),
                 normal_avg_bps: s.spread_bps,
                 current_bps: s.spread_bps,
@@ -184,38 +197,33 @@ async fn depth_report(State(state): State<DashboardState>) -> Json<Vec<DepthRepo
     Json(
         symbols
             .iter()
-            .map(|s| DepthReport {
-                symbol: s.symbol.clone(),
-                levels: vec![
-                    DepthLevel {
-                        pct_from_mid: dec!(0.5),
-                        bid_depth_quote: dec!(0), // TODO: compute from book.
-                        ask_depth_quote: dec!(0),
-                        sla_minimum: Some(dec!(10000)),
-                        compliant: false,
-                    },
-                    DepthLevel {
-                        pct_from_mid: dec!(1),
-                        bid_depth_quote: dec!(0),
-                        ask_depth_quote: dec!(0),
-                        sla_minimum: Some(dec!(50000)),
-                        compliant: false,
-                    },
-                    DepthLevel {
-                        pct_from_mid: dec!(2),
-                        bid_depth_quote: dec!(0),
-                        ask_depth_quote: dec!(0),
-                        sla_minimum: Some(dec!(100000)),
-                        compliant: false,
-                    },
-                    DepthLevel {
-                        pct_from_mid: dec!(5),
-                        bid_depth_quote: dec!(0),
-                        ask_depth_quote: dec!(0),
-                        sla_minimum: None,
-                        compliant: true,
-                    },
-                ],
+            .map(|s| {
+                let min_depth = s.sla_min_depth_quote;
+                let levels: Vec<DepthLevel> = s
+                    .book_depth_levels
+                    .iter()
+                    .map(|dl| {
+                        let sla_minimum = if dl.pct_from_mid <= dec!(2) {
+                            Some(min_depth)
+                        } else {
+                            None
+                        };
+                        let compliant = sla_minimum
+                            .map(|min| dl.bid_depth_quote >= min && dl.ask_depth_quote >= min)
+                            .unwrap_or(true);
+                        DepthLevel {
+                            pct_from_mid: dl.pct_from_mid,
+                            bid_depth_quote: dl.bid_depth_quote,
+                            ask_depth_quote: dl.ask_depth_quote,
+                            sla_minimum,
+                            compliant,
+                        }
+                    })
+                    .collect();
+                DepthReport {
+                    symbol: s.symbol.clone(),
+                    levels,
+                }
             })
             .collect(),
     )
@@ -288,16 +296,34 @@ async fn token_positions(State(state): State<DashboardState>) -> Json<Vec<TokenP
     Json(
         symbols
             .iter()
-            .map(|s| TokenPositionReport {
-                symbol: s.symbol.clone(),
-                total_token_balance: s.inventory.abs(),
-                positions: vec![ExchangePosition {
-                    exchange: "primary".to_string(),
-                    balance: s.inventory.abs(),
-                    in_orders: dec!(0), // TODO: from order manager.
-                    available: s.inventory.abs(),
-                }],
-                loan_utilization_pct: None, // TODO: from loan config.
+            .map(|s| {
+                let loan = state.get_loan(&s.symbol);
+                let balance = s.inventory.abs();
+                let in_orders = s.locked_in_orders_quote;
+                let available = if balance > in_orders {
+                    balance - in_orders
+                } else {
+                    dec!(0)
+                };
+                let utilization = loan.as_ref().and_then(|l| {
+                    if l.loan_amount.is_zero() {
+                        None
+                    } else {
+                        Some(balance / l.loan_amount * dec!(100))
+                    }
+                });
+
+                TokenPositionReport {
+                    symbol: s.symbol.clone(),
+                    total_token_balance: balance,
+                    positions: vec![ExchangePosition {
+                        exchange: "primary".to_string(),
+                        balance,
+                        in_orders,
+                        available,
+                    }],
+                    loan_utilization_pct: utilization,
+                }
             })
             .collect(),
     )
@@ -332,17 +358,37 @@ async fn loan_status(State(state): State<DashboardState>) -> Json<Vec<LoanStatus
         symbols
             .iter()
             .map(|s| {
-                // In production, loan terms come from config/database.
+                let loan = state.get_loan(&s.symbol);
+                let (loan_amount, option_strike, option_expiry) = match &loan {
+                    Some(l) => (l.loan_amount, l.option_strike, l.option_expiry.clone()),
+                    None => (dec!(0), None, None),
+                };
+                let days_to_expiry = option_expiry.as_ref().and_then(|exp| {
+                    let expiry = exp.parse::<NaiveDate>().ok()?;
+                    let today = Utc::now().date_naive();
+                    Some((expiry - today).num_days())
+                });
+                let option_itm = option_strike
+                    .map(|strike| s.mid_price > strike)
+                    .unwrap_or(false);
+                let estimated_option_value = if option_itm {
+                    option_strike
+                        .map(|strike| (s.mid_price - strike) * loan_amount)
+                        .unwrap_or(dec!(0))
+                } else {
+                    dec!(0)
+                };
+
                 LoanStatus {
                     symbol: s.symbol.clone(),
-                    loan_amount: dec!(0), // TODO: from loan config.
+                    loan_amount,
                     current_position: s.inventory.abs(),
-                    option_strike: None,
-                    option_expiry: None,
-                    days_to_expiry: None,
+                    option_strike,
+                    option_expiry,
+                    days_to_expiry,
                     current_price: s.mid_price,
-                    option_itm: false,
-                    estimated_option_value: dec!(0),
+                    option_itm,
+                    estimated_option_value,
                 }
             })
             .collect(),
@@ -373,11 +419,11 @@ struct Incident {
 }
 
 async fn daily_client_report(State(state): State<DashboardState>) -> Json<DailyClientReport> {
-    // Aggregate all sub-reports into one comprehensive daily report.
     let symbols = state.get_all();
     let n = Decimal::from(symbols.len().max(1) as u64);
 
     let mut total_vol = dec!(0);
+    let mut sum_compliance = dec!(0);
     let mut sum_uptime = dec!(0);
     let mut total_pnl = dec!(0);
 
@@ -385,20 +431,131 @@ async fn daily_client_report(State(state): State<DashboardState>) -> Json<DailyC
         .iter()
         .map(|s| {
             total_vol += s.pnl.volume;
+            sum_compliance += s.spread_compliance_pct;
             sum_uptime += s.sla_uptime_pct;
             total_pnl += s.pnl.total;
+
+            let depth_1pct = s
+                .book_depth_levels
+                .iter()
+                .find(|l| l.pct_from_mid == dec!(1))
+                .map(|l| l.bid_depth_quote + l.ask_depth_quote)
+                .unwrap_or(dec!(0));
+            let depth_2pct = s
+                .book_depth_levels
+                .iter()
+                .find(|l| l.pct_from_mid == dec!(2))
+                .map(|l| l.bid_depth_quote + l.ask_depth_quote)
+                .unwrap_or(dec!(0));
+
             SymbolOverview {
                 symbol: s.symbol.clone(),
                 exchange: "primary".to_string(),
                 avg_spread_bps: s.spread_bps,
-                spread_compliance_pct: s.sla_uptime_pct,
+                spread_compliance_pct: s.spread_compliance_pct,
                 uptime_pct: s.sla_uptime_pct,
-                depth_at_1pct: dec!(0),
-                depth_at_2pct: dec!(0),
+                depth_at_1pct: depth_1pct,
+                depth_at_2pct: depth_2pct,
                 volume_24h: s.pnl.volume,
-                volume_share_pct: dec!(0),
+                volume_share_pct: dec!(100),
                 mid_price: s.mid_price,
             }
+        })
+        .collect();
+
+    // Depth reports from book state.
+    let depth: Vec<DepthReport> = symbols
+        .iter()
+        .map(|s| {
+            let min_depth = s.sla_min_depth_quote;
+            let levels: Vec<DepthLevel> = s
+                .book_depth_levels
+                .iter()
+                .map(|dl| {
+                    let sla_minimum = if dl.pct_from_mid <= dec!(2) {
+                        Some(min_depth)
+                    } else {
+                        None
+                    };
+                    let compliant = sla_minimum
+                        .map(|min| dl.bid_depth_quote >= min && dl.ask_depth_quote >= min)
+                        .unwrap_or(true);
+                    DepthLevel {
+                        pct_from_mid: dl.pct_from_mid,
+                        bid_depth_quote: dl.bid_depth_quote,
+                        ask_depth_quote: dl.ask_depth_quote,
+                        sla_minimum,
+                        compliant,
+                    }
+                })
+                .collect();
+            DepthReport {
+                symbol: s.symbol.clone(),
+                levels,
+            }
+        })
+        .collect();
+
+    // Volume reports.
+    let volume: Vec<VolumeReport> = symbols
+        .iter()
+        .map(|s| VolumeReport {
+            symbol: s.symbol.clone(),
+            exchanges: vec![ExchangeVolume {
+                exchange: "primary".to_string(),
+                volume_24h: s.pnl.volume,
+                volume_share_pct: dec!(100),
+                num_trades: s.total_fills,
+            }],
+            total_volume_24h: s.pnl.volume,
+            maker_volume: s.pnl.volume,
+            taker_volume: dec!(0),
+        })
+        .collect();
+
+    // Token positions.
+    let token_positions: Vec<TokenPositionReport> = symbols
+        .iter()
+        .map(|s| {
+            let loan = state.get_loan(&s.symbol);
+            let balance = s.inventory.abs();
+            let in_orders = s.locked_in_orders_quote;
+            let available = if balance > in_orders {
+                balance - in_orders
+            } else {
+                dec!(0)
+            };
+            let utilization = loan.as_ref().and_then(|l| {
+                if l.loan_amount.is_zero() {
+                    None
+                } else {
+                    Some(balance / l.loan_amount * dec!(100))
+                }
+            });
+            TokenPositionReport {
+                symbol: s.symbol.clone(),
+                total_token_balance: balance,
+                positions: vec![ExchangePosition {
+                    exchange: "primary".to_string(),
+                    balance,
+                    in_orders,
+                    available,
+                }],
+                loan_utilization_pct: utilization,
+            }
+        })
+        .collect();
+
+    // Incidents from dashboard state.
+    let incidents: Vec<Incident> = state
+        .get_incidents()
+        .into_iter()
+        .map(|i| Incident {
+            timestamp: i.timestamp.to_rfc3339(),
+            severity: i.severity,
+            description: i.description,
+            duration_secs: i.duration_secs,
+            resolved: i.resolved,
         })
         .collect();
 
@@ -410,7 +567,7 @@ async fn daily_client_report(State(state): State<DashboardState>) -> Json<DailyC
             symbols: sym_overviews,
             totals: TotalOverview {
                 total_volume_24h: total_vol,
-                avg_spread_compliance_pct: sum_uptime / n,
+                avg_spread_compliance_pct: sum_compliance / n,
                 avg_uptime_pct: sum_uptime / n,
                 total_pnl,
             },
@@ -425,12 +582,12 @@ async fn daily_client_report(State(state): State<DashboardState>) -> Json<DailyC
                 high_vol_avg_bps: s.spread_bps * dec!(1.5),
                 normal_avg_bps: s.spread_bps,
                 current_bps: s.spread_bps,
-                target_bps: dec!(100),
+                target_bps: s.sla_max_spread_bps,
             })
             .collect(),
-        depth: vec![],     // TODO: populate from book.
-        volume: vec![],    // TODO: populate from tracker.
-        token_positions: vec![],
-        incidents: vec![], // TODO: from audit log.
+        depth,
+        volume,
+        token_positions,
+        incidents,
     })
 }

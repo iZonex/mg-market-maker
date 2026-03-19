@@ -269,11 +269,47 @@ impl ExchangeConnector for BinanceConnector {
     }
 
     async fn get_open_orders(&self, symbol: &str) -> anyhow::Result<Vec<LiveOrder>> {
-        let _resp = self
+        let resp = self
             .signed_get("/api/v3/openOrders", &format!("symbol={symbol}"))
             .await?;
-        // TODO: parse full response into LiveOrder vec.
-        Ok(vec![])
+        let orders = resp.as_array().cloned().unwrap_or_default();
+        Ok(orders
+            .iter()
+            .filter_map(|o| {
+                let order_id_str = o.get("clientOrderId")?.as_str()?;
+                let order_id = order_id_str.parse().ok()?;
+                let side_str = o.get("side")?.as_str()?;
+                let side = match side_str {
+                    "BUY" => Side::Buy,
+                    "SELL" => Side::Sell,
+                    _ => return None,
+                };
+                let price: Decimal = o.get("price")?.as_str()?.parse().ok()?;
+                let qty: Decimal = o.get("origQty")?.as_str()?.parse().ok()?;
+                let filled_qty: Decimal = o.get("executedQty")?.as_str()?.parse().ok()?;
+                let status_str = o.get("status")?.as_str()?;
+                let status = match status_str {
+                    "NEW" => OrderStatus::Open,
+                    "PARTIALLY_FILLED" => OrderStatus::PartiallyFilled,
+                    "FILLED" => OrderStatus::Filled,
+                    "CANCELED" | "CANCELLED" => OrderStatus::Cancelled,
+                    "REJECTED" | "EXPIRED" => OrderStatus::Rejected,
+                    _ => OrderStatus::Open,
+                };
+                let time_ms = o.get("time")?.as_i64()?;
+                let created_at = chrono::DateTime::from_timestamp_millis(time_ms)?;
+                Some(LiveOrder {
+                    order_id,
+                    symbol: symbol.to_string(),
+                    side,
+                    price,
+                    qty,
+                    filled_qty,
+                    status,
+                    created_at,
+                })
+            })
+            .collect())
     }
 
     async fn get_balances(&self) -> anyhow::Result<Vec<Balance>> {

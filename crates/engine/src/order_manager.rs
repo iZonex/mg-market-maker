@@ -35,6 +35,14 @@ impl OrderManager {
         self.live_orders.keys().copied().collect()
     }
 
+    /// Total value locked in open orders (quote asset: price * remaining_qty).
+    pub fn locked_value_quote(&self) -> Qty {
+        self.live_orders
+            .values()
+            .map(|o| o.price * (o.qty - o.filled_qty))
+            .sum()
+    }
+
     /// Reconcile desired quotes with live orders.
     /// Returns (orders_to_cancel, quotes_to_place).
     pub fn diff_orders(
@@ -195,5 +203,43 @@ impl OrderManager {
 impl Default for OrderManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn test_locked_value_quote() {
+        let mut mgr = OrderManager::new();
+
+        let o1 = LiveOrder {
+            order_id: uuid::Uuid::new_v4(),
+            symbol: "BTCUSDT".to_string(),
+            side: Side::Buy,
+            price: dec!(50000),
+            qty: dec!(0.1),
+            filled_qty: dec!(0),
+            status: mm_common::types::OrderStatus::Open,
+            created_at: chrono::Utc::now(),
+        };
+        let o2 = LiveOrder {
+            order_id: uuid::Uuid::new_v4(),
+            symbol: "BTCUSDT".to_string(),
+            side: Side::Sell,
+            price: dec!(51000),
+            qty: dec!(0.2),
+            filled_qty: dec!(0.05),
+            status: mm_common::types::OrderStatus::PartiallyFilled,
+            created_at: chrono::Utc::now(),
+        };
+
+        mgr.track_order(o1);
+        mgr.track_order(o2);
+
+        // o1: 50000 * 0.1 = 5000. o2: 51000 * (0.2 - 0.05) = 51000 * 0.15 = 7650.
+        assert_eq!(mgr.locked_value_quote(), dec!(12650));
     }
 }

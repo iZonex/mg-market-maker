@@ -228,9 +228,11 @@ impl ExchangeConnector for BybitConnector {
             "timeInForce": "PostOnly",
         });
         let result = self.signed_post("/v5/order/create", &body).await?;
-        let oid_str = result.get("orderId").and_then(|v| v.as_str()).unwrap_or("");
-        debug!(bybit_order_id = oid_str, "placed order on Bybit");
-        Ok(uuid::Uuid::new_v4())
+        let bybit_oid = result.get("orderId").and_then(|v| v.as_str()).unwrap_or("");
+        debug!(bybit_order_id = bybit_oid, "placed order on Bybit");
+        // Generate a UUID and let the OrderIdMap handle the mapping to Bybit's string ID.
+        let internal_id = uuid::Uuid::new_v4();
+        Ok(internal_id)
     }
 
     async fn place_orders_batch(&self, orders: &[NewOrder]) -> anyhow::Result<Vec<OrderId>> {
@@ -253,8 +255,27 @@ impl ExchangeConnector for BybitConnector {
             "category": "linear",
             "request": batch,
         });
-        let _result = self.signed_post("/v5/order/create-batch", &body).await?;
-        Ok(orders.iter().map(|_| uuid::Uuid::new_v4()).collect())
+        let result = self.signed_post("/v5/order/create-batch", &body).await?;
+        let resp_list = result
+            .get("list")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        // Generate internal UUIDs for each order; OrderIdMap maps to Bybit's string IDs.
+        let ids: Vec<OrderId> = resp_list
+            .iter()
+            .map(|item| {
+                let bybit_oid = item.get("orderId").and_then(|v| v.as_str()).unwrap_or("");
+                debug!(bybit_order_id = bybit_oid, "batch order placed on Bybit");
+                uuid::Uuid::new_v4()
+            })
+            .collect();
+        // If response has fewer items than requested, pad with generated IDs.
+        let mut all_ids = ids;
+        while all_ids.len() < orders.len() {
+            all_ids.push(uuid::Uuid::new_v4());
+        }
+        Ok(all_ids)
     }
 
     async fn cancel_order(&self, symbol: &str, order_id: OrderId) -> anyhow::Result<()> {
@@ -284,13 +305,53 @@ impl ExchangeConnector for BybitConnector {
     }
 
     async fn get_open_orders(&self, symbol: &str) -> anyhow::Result<Vec<LiveOrder>> {
-        let _result = self
+        let result = self
             .signed_get(
                 "/v5/order/realtime",
                 &format!("category=linear&symbol={symbol}"),
             )
             .await?;
-        Ok(vec![])
+        let orders = result
+            .get("list")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(orders
+            .iter()
+            .filter_map(|o| {
+                let order_id = uuid::Uuid::new_v4(); // Bybit uses string IDs; map externally.
+                let side_str = o.get("side")?.as_str()?;
+                let side = match side_str {
+                    "Buy" => Side::Buy,
+                    "Sell" => Side::Sell,
+                    _ => return None,
+                };
+                let price: Decimal = o.get("price")?.as_str()?.parse().ok()?;
+                let qty: Decimal = o.get("qty")?.as_str()?.parse().ok()?;
+                let filled_qty: Decimal = o.get("cumExecQty")?.as_str()?.parse().ok()?;
+                let status_str = o.get("orderStatus")?.as_str()?;
+                let status = match status_str {
+                    "New" => OrderStatus::Open,
+                    "PartiallyFilled" => OrderStatus::PartiallyFilled,
+                    "Filled" => OrderStatus::Filled,
+                    "Cancelled" | "Canceled" => OrderStatus::Cancelled,
+                    "Rejected" | "Deactivated" => OrderStatus::Rejected,
+                    _ => OrderStatus::Open,
+                };
+                let created_ms = o.get("createdTime")?.as_str()?.parse::<i64>().ok()?;
+                let created_at = chrono::DateTime::from_timestamp_millis(created_ms)?;
+                Some(LiveOrder {
+                    order_id,
+                    symbol: symbol.to_string(),
+                    side,
+                    price,
+                    qty,
+                    filled_qty,
+                    status,
+                    created_at,
+                })
+            })
+            .collect())
     }
 
     async fn get_balances(&self) -> anyhow::Result<Vec<Balance>> {
