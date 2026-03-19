@@ -1,4 +1,4 @@
-# Market Maker
+# MG Market Maker
 
 Production-grade market maker for the custom exchange at `../exchange/` with multi-venue support.
 

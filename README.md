@@ -1,8 +1,14 @@
-# Market Maker
+# MG Market Maker
 
 **Production-grade algorithmic market maker written in Rust.**
 
 High-performance, multi-venue market making engine with institutional-grade risk management, toxicity detection, and compliance features. Built for speed — Rust from the ground up, `Decimal` arithmetic everywhere (never `f64` for money).
+
+## Demo
+
+![MG Market Maker Dashboard](docs/screenshot.png)
+
+> **Try it yourself:** `cd frontend && npm install && npm run dev` → open http://localhost:3000?demo
 
 ## Features
 

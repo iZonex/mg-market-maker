@@ -9,21 +9,25 @@
   import Controls from './lib/components/Controls.svelte'
   import AlertLog from './lib/components/AlertLog.svelte'
   import Login from './lib/components/Login.svelte'
-  import { createWsStore } from './lib/ws.js'
-  import { createAuthStore } from './lib/auth.js'
-  import { isDemoMode, createDemoStore } from './lib/demo.js'
+  import { createWsStore } from './lib/ws.svelte.js'
+  import { createAuthStore } from './lib/auth.svelte.js'
+  import { isDemoMode, createDemoStore } from './lib/demo.svelte.js'
 
   const demo = isDemoMode()
   const auth = createAuthStore()
   const ws = demo ? createDemoStore() : createWsStore()
 
-  // In demo mode, auto-login as operator.
   if (demo && !auth.state.loggedIn) {
     auth.state.loggedIn = true
     auth.state.name = 'Demo Operator'
     auth.state.role = 'operator'
     auth.state.token = 'demo'
   }
+
+  // Derived values for viewer panels.
+  const sym = $derived(ws.state.symbols[0] || '')
+  const symData = $derived(ws.state.data[sym] || {})
+  const viewerPnl = $derived(symData.pnl || {})
 </script>
 
 {#if !auth.state.loggedIn}
@@ -55,13 +59,11 @@
         {:else}
           <div class="viewer-pnl">
             <h3>PnL Attribution</h3>
-            {@const sym = ws.state.symbols[0] || ''}
-            {@const pnl = ws.state.data[sym]?.pnl || {}}
-            <div class="pnl-row"><span>Spread</span><span class="pos">${parseFloat(pnl.spread || 0).toFixed(4)}</span></div>
-            <div class="pnl-row"><span>Inventory</span><span>${parseFloat(pnl.inventory || 0).toFixed(4)}</span></div>
-            <div class="pnl-row"><span>Rebates</span><span class="pos">${parseFloat(pnl.rebates || 0).toFixed(4)}</span></div>
-            <div class="pnl-row"><span>Fees</span><span class="neg">-${parseFloat(pnl.fees || 0).toFixed(4)}</span></div>
-            <div class="pnl-row total"><span>Total</span><span>${parseFloat(pnl.total || 0).toFixed(4)}</span></div>
+            <div class="pnl-row"><span>Spread</span><span class="pos">${parseFloat(viewerPnl.spread || 0).toFixed(4)}</span></div>
+            <div class="pnl-row"><span>Inventory</span><span>${parseFloat(viewerPnl.inventory || 0).toFixed(4)}</span></div>
+            <div class="pnl-row"><span>Rebates</span><span class="pos">${parseFloat(viewerPnl.rebates || 0).toFixed(4)}</span></div>
+            <div class="pnl-row"><span>Fees</span><span class="neg">-${parseFloat(viewerPnl.fees || 0).toFixed(4)}</span></div>
+            <div class="pnl-row total"><span>Total</span><span>${parseFloat(viewerPnl.total || 0).toFixed(4)}</span></div>
           </div>
         {/if}
       </div>
@@ -78,9 +80,7 @@
         {:else}
           <div class="viewer-sla">
             <h3>SLA Compliance</h3>
-            {@const sym = ws.state.symbols[0] || ''}
-            {@const d = ws.state.data[sym] || {}}
-            <div class="sla-big">{parseFloat(d.sla_uptime_pct || 0).toFixed(1)}%</div>
+            <div class="sla-big">{parseFloat(symData.sla_uptime_pct || 0).toFixed(1)}%</div>
             <div class="sla-label">Uptime</div>
           </div>
         {/if}

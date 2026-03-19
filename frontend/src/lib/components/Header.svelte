@@ -8,7 +8,10 @@
 
 <header>
   <div class="left">
-    <h1>Market Maker</h1>
+    <h1>MG Market Maker</h1>
+    {#if firstSymbol}
+      <span class="symbol-badge">{firstSymbol}</span>
+    {/if}
     <span class="status" class:online={s.connected}>
       {s.connected ? 'LIVE' : 'OFFLINE'}
     </span>
@@ -84,6 +87,11 @@
   }
   .status.online {
     background: #238636;
+  }
+  .symbol-badge {
+    padding: 2px 8px; border-radius: 4px; font-size: 12px;
+    font-weight: 700; background: #30363d; color: #58a6ff;
+    letter-spacing: 0.5px;
   }
   .metrics {
     display: flex;
