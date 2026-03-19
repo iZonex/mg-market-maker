@@ -5,6 +5,7 @@ use std::time::Instant;
 use anyhow::Result;
 use mm_common::config::AppConfig;
 use mm_common::types::ProductSpec;
+use mm_dashboard::alerts::{AlertManager, AlertSeverity};
 use mm_dashboard::state::{
     BookDepthLevel, DashboardState, IncidentRecord, PnlSnapshot, SymbolState,
 };
@@ -86,6 +87,7 @@ pub struct MarketMakerEngine {
     pnl_tracker: PnlTracker,
     volume_limiter: mm_risk::VolumeLimitTracker,
     dashboard: Option<DashboardState>,
+    alerts: Option<AlertManager>,
 
     // Timing.
     cycle_start: Instant,
@@ -102,6 +104,7 @@ impl MarketMakerEngine {
         strategy: Box<dyn Strategy>,
         rest: Arc<ExchangeRestClient>,
         dashboard: Option<DashboardState>,
+        alerts: Option<AlertManager>,
     ) -> Self {
         let tick_secs = Decimal::from(config.market_maker.refresh_interval_ms) / dec!(1000);
         let vol_est = VolatilityEstimator::new(dec!(0.94), tick_secs);
@@ -161,6 +164,7 @@ impl MarketMakerEngine {
                 config.risk.max_hourly_volume_quote,
             ),
             dashboard,
+            alerts,
             symbol,
             config,
             product,
@@ -688,7 +692,7 @@ impl MarketMakerEngine {
         self.inventory_manager.total_pnl(mid_price)
     }
 
-    /// Record an incident to the dashboard state.
+    /// Record an incident to the dashboard state and fire a Telegram alert.
     fn record_incident(&self, severity: &str, description: &str) {
         if let Some(ds) = &self.dashboard {
             ds.add_incident(IncidentRecord {
@@ -698,6 +702,19 @@ impl MarketMakerEngine {
                 duration_secs: 0,
                 resolved: false,
             });
+        }
+        if let Some(alerts) = &self.alerts {
+            let alert_severity = match severity {
+                "critical" => AlertSeverity::Critical,
+                "high" => AlertSeverity::Warning,
+                _ => AlertSeverity::Info,
+            };
+            alerts.alert(
+                alert_severity,
+                description,
+                &format!("Symbol: {}", self.symbol),
+                Some(&self.symbol),
+            );
         }
     }
 

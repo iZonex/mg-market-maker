@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "mm-backtester"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1170,7 +1170,7 @@ dependencies = [
 
 [[package]]
 name = "mm-common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "rust_decimal",
@@ -1183,7 +1183,7 @@ dependencies = [
 
 [[package]]
 name = "mm-dashboard"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1209,7 +1209,7 @@ dependencies = [
 
 [[package]]
 name = "mm-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1228,7 +1228,7 @@ dependencies = [
 
 [[package]]
 name = "mm-exchange-binance"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1253,7 +1253,7 @@ dependencies = [
 
 [[package]]
 name = "mm-exchange-bybit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1278,7 +1278,7 @@ dependencies = [
 
 [[package]]
 name = "mm-exchange-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1298,7 +1298,7 @@ dependencies = [
 
 [[package]]
 name = "mm-exchange-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1316,7 +1316,7 @@ dependencies = [
 
 [[package]]
 name = "mm-persistence"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1332,7 +1332,7 @@ dependencies = [
 
 [[package]]
 name = "mm-risk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1348,7 +1348,7 @@ dependencies = [
 
 [[package]]
 name = "mm-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "mm-common",
@@ -1373,7 +1373,7 @@ dependencies = [
 
 [[package]]
 name = "mm-strategy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "criterion",

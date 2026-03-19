@@ -3,6 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use mm_common::config::{AppConfig, StrategyType};
 use mm_common::types::ProductSpec;
+use mm_dashboard::alerts::{AlertManager, TelegramConfig};
 use mm_dashboard::auth::{ApiUser, AuthState, Role};
 use mm_dashboard::state::DashboardState;
 use mm_dashboard::websocket::WsBroadcast;
@@ -25,7 +26,7 @@ async fn main() -> Result<()> {
     // Initialize logging.
     init_logging(&config);
 
-    info!("Market Maker v0.1.0 starting...");
+    info!("Market Maker v0.2.0 starting...");
     info!(
         symbols = ?config.symbols,
         strategy = ?config.market_maker.strategy,
@@ -109,6 +110,19 @@ async fn main() -> Result<()> {
         info!(key_hint = %&default_key[..8], "default admin user created (set MM_ADMIN_KEY to customize)");
     }
 
+    // Telegram alerts.
+    let telegram_config = if config.telegram.is_configured() {
+        info!("Telegram alerts enabled");
+        Some(TelegramConfig {
+            bot_token: config.telegram.bot_token.clone(),
+            chat_id: config.telegram.chat_id.clone(),
+        })
+    } else {
+        info!("Telegram alerts disabled (set MM_TELEGRAM_TOKEN + MM_TELEGRAM_CHAT to enable)");
+        None
+    };
+    let alert_manager = AlertManager::new(telegram_config);
+
     // Start dashboard.
     let dashboard_state = DashboardState::new();
     dashboard_state.set_loans(config.loans.clone());
@@ -140,6 +154,7 @@ async fn main() -> Result<()> {
         let shutdown_rx = shutdown_tx.subscribe();
         let checkpoint = checkpoint.clone();
         let dashboard_state = dashboard_state.clone();
+        let alerts = alert_manager.clone();
 
         let handle = tokio::spawn(async move {
             if let Err(e) = run_symbol(
@@ -149,6 +164,7 @@ async fn main() -> Result<()> {
                 shutdown_rx,
                 checkpoint,
                 dashboard_state,
+                alerts,
             )
             .await
             {
@@ -183,6 +199,7 @@ async fn run_symbol(
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     _checkpoint: Arc<std::sync::Mutex<CheckpointManager>>,
     dashboard_state: DashboardState,
+    alert_manager: AlertManager,
 ) -> Result<()> {
     let product = product_for_symbol(&symbol);
 
@@ -217,6 +234,7 @@ async fn run_symbol(
         strategy,
         rest,
         Some(dashboard_state),
+        Some(alert_manager),
     );
     engine.run(ws_rx, shutdown_rx).await
 }

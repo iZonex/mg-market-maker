@@ -38,5 +38,15 @@ pub fn load_config() -> Result<AppConfig> {
         config.mode = mode;
     }
 
+    // Telegram alerts from env.
+    if let Ok(token) = std::env::var("MM_TELEGRAM_TOKEN") {
+        config.telegram.bot_token = token;
+        info!("Telegram bot token loaded from MM_TELEGRAM_TOKEN");
+    }
+    if let Ok(chat) = std::env::var("MM_TELEGRAM_CHAT") {
+        config.telegram.chat_id = chat;
+        info!("Telegram chat ID loaded from MM_TELEGRAM_CHAT");
+    }
+
     Ok(config)
 }

@@ -33,6 +33,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub users: Vec<UserConfig>,
 
+    /// Telegram alert config (populated from env vars).
+    #[serde(default)]
+    pub telegram: TelegramAlertConfig,
+
     /// Per-symbol loan configuration (keyed by symbol, e.g., "BTCUSDT").
     #[serde(default)]
     pub loans: std::collections::HashMap<String, LoanConfig>,
@@ -253,6 +257,23 @@ impl Default for ToxicityConfig {
     }
 }
 
+/// Telegram alert configuration (loaded from env vars, never config files).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TelegramAlertConfig {
+    /// Bot token (from @BotFather).
+    #[serde(default)]
+    pub bot_token: String,
+    /// Chat ID to send alerts to.
+    #[serde(default)]
+    pub chat_id: String,
+}
+
+impl TelegramAlertConfig {
+    pub fn is_configured(&self) -> bool {
+        !self.bot_token.is_empty() && !self.chat_id.is_empty()
+    }
+}
+
 /// Loan configuration for token loan tracking (optional).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoanConfig {
@@ -307,6 +328,7 @@ impl Default for AppConfig {
             log_file: String::new(),
             mode: "live".into(),
             users: vec![],
+            telegram: TelegramAlertConfig::default(),
             loans: std::collections::HashMap::new(),
         }
     }
