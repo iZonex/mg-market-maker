@@ -1,0 +1,36 @@
+name: Exchange Integration
+description: Request or track a new exchange integration
+labels: ["exchange", "enhancement"]
+body:
+  - type: input
+    id: exchange
+    attributes:
+      label: Exchange name
+      placeholder: e.g., OKX, Kraken, dYdX
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: features
+    attributes:
+      label: Required features
+      options:
+        - label: REST order placement (place / cancel / amend)
+        - label: WebSocket market data (orderbook + trades)
+        - label: WebSocket private (fills / order updates)
+        - label: Batch orders
+        - label: Authentication (HMAC / RSA / other)
+        - label: Rate limiter configuration
+        - label: Testnet support
+
+  - type: textarea
+    id: api_docs
+    attributes:
+      label: API documentation link
+      placeholder: https://docs.exchange.com/api/v1
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Any specifics about this exchange (rate limits, quirks, etc.)

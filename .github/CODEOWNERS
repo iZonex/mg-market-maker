@@ -1,0 +1,10 @@
+# Default owner for everything
+* @iZonex
+
+# Risk-critical code requires explicit review
+crates/risk/ @iZonex
+crates/engine/src/market_maker.rs @iZonex
+crates/engine/src/order_manager.rs @iZonex
+crates/exchange-binance/ @iZonex
+crates/exchange-bybit/ @iZonex
+crates/exchange-client/ @iZonex
