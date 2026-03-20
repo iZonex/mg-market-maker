@@ -43,7 +43,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Metrics
-prometheus = "0.13"
+prometheus = { version = "0.13", default-features = false }
 
 # Config
 toml = "0.8"
@@ -83,3 +83,5 @@ mm-persistence = { path = "crates/persistence" }
 lto = true
 codegen-units = 1
 strip = true
+
+# Force minimum versions to fix known vulnerabilities.

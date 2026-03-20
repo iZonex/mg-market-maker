@@ -222,7 +222,7 @@ async fn run_symbol(
     };
 
     // Subscribe to market data via the connector.
-    let ws_rx = connector.subscribe(&[symbol.clone()]).await?;
+    let ws_rx = connector.subscribe(std::slice::from_ref(&symbol)).await?;
 
     let mut engine = MarketMakerEngine::new(
         symbol,

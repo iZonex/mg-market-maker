@@ -75,20 +75,15 @@ pub enum StrategyType {
 }
 
 /// Which exchange to connect to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExchangeType {
+    #[default]
     Custom,
     Binance,
     BinanceTestnet,
     Bybit,
     BybitTestnet,
-}
-
-impl Default for ExchangeType {
-    fn default() -> Self {
-        Self::Custom
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
