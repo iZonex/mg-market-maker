@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Soft spread gate** on the quote-refresh path. New
+  `RiskConfig.max_spread_to_quote_bps: Option<Decimal>` — when
+  set, `refresh_quotes` skips quoting for a single tick if the
+  current book spread exceeds the threshold, **without**
+  tripping the circuit breaker. Covers transient wide-spread
+  events (book resync, thin-book volatility blip) where a full
+  cancel-all is overkill. The hard `max_spread_bps` circuit
+  breaker still catches sustained blowouts at a higher
+  threshold. 3 engine tests pin the semantics (None = inert,
+  wide-book = blocked without CB trip, tight-book = allowed).
+- **Multi-level weighted microprice** in
+  `mm-strategy::features::micro_price_weighted(bids, asks, depth)`.
+  Averages the per-level microprice formula
+  `(bid_px * ask_qty + ask_px * bid_qty) / (bid_qty + ask_qty)`
+  across the top `depth` levels with linearly decaying weights
+  `w(i) = depth - i`. Robust against thin inside quotes where a
+  single dusting order can skew the top-of-book microprice. 6
+  tests cover single-level parity with the plain `micro_price`,
+  symmetric books, heavy-ask asymmetry, depth clamping, empty
+  sides, and skipping zero-qty levels.
+- **`EventDeduplicator`** in `mm-backtester::deduplicator` —
+  `max_seen` watermark + bounded HashSet with periodic prune
+  at 100k entries down to the last 50k. Accepts fresh and
+  late-arriving out-of-order sequences; rejects duplicates.
+  Used by the backtester replay path so a rotated or
+  re-appended JSONL event log cannot double-fire strategy
+  callbacks. Same pattern is lined up to guard live WS
+  reconnect backlogs on Binance/Bybit. 7 tests cover fresh,
+  duplicate, out-of-order, seeded resume, interleaved stream,
+  tracked-len, and prune behaviour.
+
+### Notes
+
+- The three additions are cherry-picks from the
+  [atomic-mesh](https://github.com/Faraone-Dev/atomic-mesh)
+  research repo. The heavier pieces of that repo (C++ FFI hot
+  path, QUIC peer mesh, integer-only arithmetic) remain out of
+  scope — our design is network-bound by public WebSocket
+  RTT, so sub-microsecond strategy compute delivers no
+  end-to-end latency win, and the `Decimal`-for-money discipline
+  rules out integer-tick conversion.
+
 ## [0.3.1] - 2026-04-14
 
 Cross-compile fix release. Ships the full [0.3.0] feature set —

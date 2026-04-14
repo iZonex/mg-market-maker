@@ -210,6 +210,7 @@ mod tests {
             max_drawdown_quote: dec!(500),
             inventory_skew_factor: dec!(1),
             max_spread_bps: dec!(500),
+            max_spread_to_quote_bps: None,
             stale_book_timeout_secs: 10,
             max_order_size: dec!(0),
             max_daily_volume_quote: dec!(0),

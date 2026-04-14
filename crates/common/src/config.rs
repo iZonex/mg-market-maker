@@ -278,6 +278,18 @@ pub struct RiskConfig {
     /// If spread exceeds this (bps), pause quoting (likely manipulation).
     pub max_spread_bps: Decimal,
 
+    /// Soft spread gate. When `Some(bps)` and the current book
+    /// spread exceeds it, `refresh_quotes` skips quoting for
+    /// this tick **without** tripping the circuit breaker. Use
+    /// for transient wide-spread events (book resync, thin-book
+    /// volatility blip) where a full cancel-all is overkill —
+    /// next tick resumes quoting when the spread narrows. Set
+    /// to `None` to disable. Typical value: tighter than
+    /// `max_spread_bps` so the soft gate catches degradation
+    /// before the hard circuit breaker trips.
+    #[serde(default)]
+    pub max_spread_to_quote_bps: Option<Decimal>,
+
     /// Seconds without a book update before we cancel all orders.
     pub stale_book_timeout_secs: u64,
 
@@ -441,6 +453,7 @@ impl Default for AppConfig {
                 max_drawdown_quote: "500".parse().unwrap(),
                 inventory_skew_factor: "1.0".parse().unwrap(),
                 max_spread_bps: "500".parse().unwrap(),
+                max_spread_to_quote_bps: None,
                 stale_book_timeout_secs: 10,
                 max_order_size: dec!(0),
                 max_daily_volume_quote: dec!(0),

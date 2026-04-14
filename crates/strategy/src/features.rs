@@ -135,6 +135,58 @@ pub fn micro_price(bids: &[PriceLevel], asks: &[PriceLevel]) -> Option<Decimal> 
     Some((bid.qty * ask.price + ask.qty * bid.price) / total)
 }
 
+/// Multi-level microprice with linearly decaying depth weights.
+///
+/// For each of the top `depth` levels, the per-level microprice is
+/// `(bid_px * ask_qty + ask_px * bid_qty) / (bid_qty + ask_qty)` —
+/// the classic opposite-side-weighted fair value. The final output
+/// is the weighted average of those per-level values with weight
+/// `w(i) = depth - i` on level `i` (i.e. top-of-book matters most,
+/// deep levels contribute less).
+///
+/// A multi-level microprice is more robust than top-of-book alone
+/// when the inside quote is thin: one dusting order at the touch
+/// can't dominate the fair-value estimate. `BasisStrategy` and any
+/// alpha model that shifts reservation price around a fair value
+/// should prefer this when `depth ≥ 3`.
+///
+/// Returns `None` if either side is empty. `depth` is clamped to
+/// `min(bids.len(), asks.len())`.
+pub fn micro_price_weighted(
+    bids: &[PriceLevel],
+    asks: &[PriceLevel],
+    depth: usize,
+) -> Option<Decimal> {
+    if bids.is_empty() || asks.is_empty() {
+        return None;
+    }
+    let d = depth.min(bids.len()).min(asks.len());
+    if d == 0 {
+        return None;
+    }
+
+    let mut num = Decimal::ZERO;
+    let mut den = Decimal::ZERO;
+    for i in 0..d {
+        let bid = &bids[i];
+        let ask = &asks[i];
+        let w = Decimal::from(d - i);
+        let level_total = bid.qty + ask.qty;
+        if level_total.is_zero() {
+            continue;
+        }
+        // Accumulate numerator and denominator without
+        // computing each per-level microprice individually —
+        // algebraically identical but avoids d divisions.
+        num += (bid.qty * ask.price + ask.qty * bid.price) * w;
+        den += level_total * w;
+    }
+    if den.is_zero() {
+        return None;
+    }
+    Some(num / den)
+}
+
 // ---------------------------------------------------------------------------
 // Micro-price drift
 // ---------------------------------------------------------------------------
@@ -510,5 +562,112 @@ mod tests {
         }
         assert!(vts.short().is_some());
         assert!(vts.long().is_some());
+    }
+
+    // ---- micro_price_weighted ----
+
+    #[test]
+    fn weighted_micro_price_single_level_matches_plain_micro_price() {
+        // `depth = 1` must reduce to the classic top-of-book
+        // microprice (Cartea/Jaimungal formula).
+        let bids = vec![bid(dec!(100), dec!(10))];
+        let asks = vec![bid(dec!(101), dec!(30))];
+        let plain = micro_price(&bids, &asks).unwrap();
+        let weighted = micro_price_weighted(&bids, &asks, 1).unwrap();
+        assert_eq!(plain, dec!(100.25));
+        assert_eq!(weighted, dec!(100.25));
+    }
+
+    #[test]
+    fn weighted_micro_price_returns_none_on_empty_side() {
+        let b: Vec<PriceLevel> = Vec::new();
+        let a = vec![bid(dec!(101), dec!(1))];
+        assert!(micro_price_weighted(&b, &a, 3).is_none());
+        assert!(micro_price_weighted(&a, &b, 3).is_none());
+        assert!(micro_price_weighted(&[], &[], 3).is_none());
+    }
+
+    #[test]
+    fn weighted_micro_price_clamps_depth_to_available_levels() {
+        // Only one level on each side but caller asks for depth=5.
+        let bids = vec![bid(dec!(100), dec!(10))];
+        let asks = vec![bid(dec!(101), dec!(10))];
+        let mp = micro_price_weighted(&bids, &asks, 5).unwrap();
+        // Equal qtys → midpoint.
+        assert_eq!(mp, dec!(100.5));
+    }
+
+    /// Pinned hand-computed 3-level example. Per level the inner
+    /// microprice formula yields:
+    ///
+    ///   lvl 0: bid=100 q=10, ask=101 q=10 → mp=100.5,  total_qty=20
+    ///   lvl 1: bid=99  q=20, ask=102 q=20 → mp=100.5,  total_qty=40
+    ///   lvl 2: bid=98  q=30, ask=103 q=30 → mp=100.5,  total_qty=60
+    ///
+    /// With weights `w(i) = 3 - i` → `[3, 2, 1]`:
+    ///
+    ///   numerator   = (100.5*20)*3 + (100.5*40)*2 + (100.5*60)*1
+    ///               = 6030 + 8040 + 6030 = 20 100
+    ///   denominator = 20*3 + 40*2 + 60*1 = 60 + 80 + 60 = 200
+    ///   weighted_mp = 20 100 / 200 = 100.5
+    ///
+    /// All three levels are symmetric so the weighted value is
+    /// exactly the midpoint.
+    #[test]
+    fn weighted_micro_price_symmetric_book_equals_midpoint() {
+        let bids = vec![
+            bid(dec!(100), dec!(10)),
+            bid(dec!(99), dec!(20)),
+            bid(dec!(98), dec!(30)),
+        ];
+        let asks = vec![
+            bid(dec!(101), dec!(10)),
+            bid(dec!(102), dec!(20)),
+            bid(dec!(103), dec!(30)),
+        ];
+        let mp = micro_price_weighted(&bids, &asks, 3).unwrap();
+        assert_eq!(mp, dec!(100.5));
+    }
+
+    /// Asymmetric book — heavy asks on the inside, light bids.
+    /// Weighted microprice should be pulled toward the bid side
+    /// (fewer contrarian orders on that side) relative to the
+    /// plain midpoint `100.5`.
+    #[test]
+    fn weighted_micro_price_heavy_ask_side_leans_toward_bid() {
+        let bids = vec![
+            bid(dec!(100), dec!(1)),
+            bid(dec!(99), dec!(1)),
+            bid(dec!(98), dec!(1)),
+        ];
+        let asks = vec![
+            bid(dec!(101), dec!(9)),
+            bid(dec!(102), dec!(9)),
+            bid(dec!(103), dec!(9)),
+        ];
+        let mp = micro_price_weighted(&bids, &asks, 3).unwrap();
+        assert!(
+            mp < dec!(100.5),
+            "heavy ask → fair value should lean below midpoint, got {mp}"
+        );
+    }
+
+    #[test]
+    fn weighted_micro_price_skips_levels_with_zero_total_qty() {
+        // Level 1 is a degenerate entry with zero on both
+        // sides — the weighted average must skip it cleanly.
+        let bids = vec![
+            bid(dec!(100), dec!(10)),
+            bid(dec!(99), dec!(0)),
+            bid(dec!(98), dec!(10)),
+        ];
+        let asks = vec![
+            bid(dec!(101), dec!(10)),
+            bid(dec!(102), dec!(0)),
+            bid(dec!(103), dec!(10)),
+        ];
+        let mp = micro_price_weighted(&bids, &asks, 3).unwrap();
+        // Levels 0 and 2 only; both symmetric → midpoint.
+        assert_eq!(mp, dec!(100.5));
     }
 }
