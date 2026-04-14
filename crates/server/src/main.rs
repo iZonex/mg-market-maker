@@ -25,7 +25,10 @@ async fn main() -> Result<()> {
     // Initialize logging.
     init_logging(&config);
 
-    info!("Market Maker v0.2.0 starting...");
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "Market Maker starting..."
+    );
     info!(
         symbols = ?config.symbols,
         strategy = ?config.market_maker.strategy,

@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-04-14
+## [0.3.0] - 2026-04-14
 
 Multi-venue, multi-product market maker with cross-product basis and
 funding-arbitrage capabilities, full fast-path (WebSocket) order entry
@@ -160,7 +160,7 @@ across symbols.
 - **`ConnectorBundle { primary, hedge: Option<_>, pair: Option<_> }`**
   in `crates/engine/src/connector_bundle.rs`. `single(primary)`
   and `dual(primary, hedge, pair)` constructors. Single-connector
-  mode is byte-for-byte equivalent to the pre-0.2.0 engine.
+  mode is byte-for-byte equivalent to the previous single-connector engine.
 - **Dual-connector run loop** — new
   `MarketMakerEngine::run_with_hedge(ws_rx, hedge_rx, shutdown_rx)`
   adds a second `tokio::select!` arm reading from the hedge WS
