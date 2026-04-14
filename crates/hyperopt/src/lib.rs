@@ -36,11 +36,13 @@
 //! println!("best sharpe = {}", best.metrics.sharpe);
 //! ```
 
+pub mod de;
 mod loss;
 mod metrics;
 mod search;
 mod space;
 
+pub use de::{DeConfig, DeResult, DifferentialEvolution};
 pub use loss::{CalmarLoss, LossFn, MaxDrawdownLoss, MultiMetricLoss, SharpeLoss, SortinoLoss};
 pub use metrics::Metrics;
 pub use search::{RandomSearch, Trial};

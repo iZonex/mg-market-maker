@@ -188,6 +188,323 @@ pub fn micro_price_weighted(
 }
 
 // ---------------------------------------------------------------------------
+// Market-impact (taker cost) walker
+// ---------------------------------------------------------------------------
+
+/// Outcome of a hypothetical taker order walked against a book side.
+///
+/// All fields are expressed in the native asset denominations the
+/// `PriceLevel` entries carry, so no `Decimal`→f64 round-trip at the
+/// boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketImpact {
+    /// Volume-weighted average fill price — the price the taker
+    /// actually pays / receives once the order walks the book.
+    pub vwap: Decimal,
+    /// Base-asset quantity filled. Equals the input `target_qty`
+    /// when the book is deep enough, and is clamped to total
+    /// available qty on the side otherwise.
+    pub filled_qty: Decimal,
+    /// Notional (quote asset) actually consumed by the walk.
+    pub notional: Decimal,
+    /// Signed slippage vs `reference_price`, in basis points.
+    /// Positive = unfavourable (buy pays above reference, sell
+    /// receives below). Use this directly to size urgency or to
+    /// reject a taker that would cost more than `min_edge_bps`.
+    pub impact_bps: Decimal,
+    /// `true` when the book had less liquidity than `target_qty`
+    /// requested — callers that must fill the full size should
+    /// treat this as a reject.
+    pub partial: bool,
+}
+
+/// Walk `levels` against an incoming taker order of size
+/// `target_qty` and compute the resulting VWAP + slippage in bps
+/// versus `reference_price`.
+///
+/// `side` is the taker side:
+/// - `Side::Buy`  → walks ASK levels (pay up the book), impact is
+///   positive when VWAP > reference.
+/// - `Side::Sell` → walks BID levels (hit down the book), impact
+///   is positive when VWAP < reference.
+///
+/// Levels must already be sorted in the correct walk direction
+/// (best price first on both sides, i.e. ascending for asks,
+/// descending for bids). `LocalOrderBook::best_*` side iterators
+/// already satisfy this.
+///
+/// The classic use cases:
+/// - `XEMM::on_maker_fill` sanity-checks the hedge leg is still
+///   within `max_slippage_bps`.
+/// - `BasisStrategy` prices the cross using the real taker cost
+///   on the hedge leg instead of the touch.
+/// - `PairedUnwindExecutor` derives slice urgency from expected
+///   impact.
+///
+/// `None` is returned only when `levels` is empty. A partial walk
+/// (book thinner than `target_qty`) sets `partial = true` and
+/// reports the VWAP of whatever it could consume.
+pub fn market_impact(
+    levels: &[PriceLevel],
+    side: Side,
+    target_qty: Decimal,
+    reference_price: Decimal,
+) -> Option<MarketImpact> {
+    if levels.is_empty() || target_qty <= Decimal::ZERO {
+        return None;
+    }
+
+    let mut remaining = target_qty;
+    let mut notional = Decimal::ZERO;
+    let mut filled = Decimal::ZERO;
+
+    for level in levels {
+        if remaining <= Decimal::ZERO {
+            break;
+        }
+        let take = remaining.min(level.qty);
+        notional += take * level.price;
+        filled += take;
+        remaining -= take;
+    }
+
+    if filled <= Decimal::ZERO {
+        return None;
+    }
+
+    let vwap = notional / filled;
+    let partial = remaining > Decimal::ZERO;
+
+    // Signed slippage in bps — the sign convention makes positive
+    // always unfavourable to the taker so callers can compare the
+    // impact against a budget without a per-side case.
+    let impact_bps = if reference_price.is_zero() {
+        Decimal::ZERO
+    } else {
+        let raw = match side {
+            Side::Buy => (vwap - reference_price) / reference_price,
+            Side::Sell => (reference_price - vwap) / reference_price,
+        };
+        raw * dec!(10_000)
+    };
+
+    Some(MarketImpact {
+        vwap,
+        filled_qty: filled,
+        notional,
+        impact_bps,
+        partial,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Lead-lag path transform
+// ---------------------------------------------------------------------------
+
+/// Interleaved lead-lag encoding of a 1-D price series.
+///
+/// Given prices `[p₀, p₁, …, pₙ]`, returns
+/// `[(p₀, p₀), (p₁, p₀), (p₁, p₁), (p₂, p₁), …]`. Each pair
+/// `(lead, lag)` has the lead component one step ahead of the lag
+/// component at every other position. Downstream consumers
+/// (path-signature features, simple autocorrelation estimators)
+/// use the 2-D path to capture first-order serial dependence
+/// without having to recompute rolling windows.
+///
+/// Reference: Gyurkó, Lyons, Kontkowski, Field (2013),
+/// "Extracting information from the signature of a financial
+/// data stream", §2.
+pub fn lead_lag_transform(prices: &[Decimal]) -> Vec<(Decimal, Decimal)> {
+    if prices.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(2 * prices.len() - 1);
+    out.push((prices[0], prices[0]));
+    for i in 1..prices.len() {
+        out.push((prices[i], prices[i - 1]));
+        out.push((prices[i], prices[i]));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Hurst exponent (rescaled-range R/S method)
+// ---------------------------------------------------------------------------
+
+/// Result of a rescaled-range Hurst analysis.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HurstResult {
+    /// Estimated Hurst exponent `H ∈ (0, 1)`.
+    /// - `H < 0.5` → anti-persistent / mean-reverting
+    /// - `H ≈ 0.5` → random walk
+    /// - `H > 0.5` → persistent / trending
+    pub hurst: f64,
+    /// 95 % confidence interval `(low, high)` on `H`. Derived
+    /// from the residuals of the `log R/S` vs `log n` regression.
+    pub ci_95: (f64, f64),
+    /// `true` when the upper bound of the confidence interval
+    /// sits strictly below `0.5` — i.e. we can reject the random-
+    /// walk null at the 95 % level in favour of mean-reversion.
+    pub is_mean_reverting: bool,
+    /// Number of window sizes the estimator actually used after
+    /// filtering degenerate windows. Fewer than 3 means the
+    /// result is likely unreliable.
+    pub window_count: usize,
+}
+
+/// Estimate the Hurst exponent of a time series via the
+/// rescaled-range (R/S) method of Mandelbrot & Wallis (1969).
+///
+/// For each window size `n` in a logarithmically-spaced grid,
+/// split the series into non-overlapping windows and compute the
+/// rescaled range `R/S`:
+///
+/// ```text
+/// y_t = Σ_{k=1..t} (x_k - mean)
+/// R   = max(y_t) - min(y_t)
+/// S   = stddev(x)
+/// ```
+///
+/// Then a linear regression of `log(R/S)` on `log(n)` gives the
+/// slope `H` — the Hurst exponent. Intercept is discarded.
+///
+/// # Use inside the MM engine
+///
+/// The existing `AutoTuner::RegimeDetector` classifies regimes
+/// from price velocity + realised vol ratios. Hurst is an
+/// **orthogonal** statistical measure of persistence — combining
+/// both (velocity-based + Hurst-based) gives a stronger signal
+/// for switching between the mean-reverting and trending parameter
+/// profiles in `autotune.rs`.
+///
+/// Returns `None` when the series is too short (`< 20` samples)
+/// or degenerate (all equal).
+pub fn hurst_exponent(series: &[f64]) -> Option<HurstResult> {
+    const MIN_SAMPLES: usize = 20;
+    let n = series.len();
+    if n < MIN_SAMPLES {
+        return None;
+    }
+    let min_window = 10_usize.max(n / 100);
+    let max_window = n / 2;
+    if max_window <= min_window {
+        return None;
+    }
+
+    // Logarithmically-spaced window sizes.
+    let num_windows = 20;
+    let log_min = (min_window as f64).ln();
+    let log_max = (max_window as f64).ln();
+    let step = (log_max - log_min) / (num_windows as f64 - 1.0);
+    let mut window_sizes: Vec<usize> = (0..num_windows)
+        .map(|i| (log_min + i as f64 * step).exp() as usize)
+        .filter(|&w| w >= min_window && w <= max_window && w > 0)
+        .collect();
+    window_sizes.sort();
+    window_sizes.dedup();
+
+    let mut log_n = Vec::new();
+    let mut log_rs = Vec::new();
+    for &w in &window_sizes {
+        let chunks = n / w;
+        if chunks == 0 {
+            continue;
+        }
+        let mut rs_values = Vec::with_capacity(chunks);
+        for c in 0..chunks {
+            let start = c * w;
+            let end = start + w;
+            let window = &series[start..end];
+            let mean = window.iter().sum::<f64>() / w as f64;
+
+            // Cumulative deviations from the window mean.
+            let mut cumdev = 0.0;
+            let mut max_y = f64::NEG_INFINITY;
+            let mut min_y = f64::INFINITY;
+            for &x in window {
+                cumdev += x - mean;
+                if cumdev > max_y {
+                    max_y = cumdev;
+                }
+                if cumdev < min_y {
+                    min_y = cumdev;
+                }
+            }
+            let range = max_y - min_y;
+            let variance: f64 = window.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / w as f64;
+            let stddev = variance.sqrt();
+            if stddev > 1e-10 && range > 0.0 {
+                rs_values.push(range / stddev);
+            }
+        }
+        if rs_values.is_empty() {
+            continue;
+        }
+        let avg = rs_values.iter().sum::<f64>() / rs_values.len() as f64;
+        if avg > 0.0 {
+            log_n.push((w as f64).ln());
+            log_rs.push(avg.ln());
+        }
+    }
+
+    let window_count = log_n.len();
+    if window_count < 3 {
+        return None;
+    }
+
+    let (slope, intercept) = linear_regression_f64(&log_n, &log_rs);
+
+    // 95 % CI on the slope via residual std error.
+    let residuals: Vec<f64> = log_n
+        .iter()
+        .zip(log_rs.iter())
+        .map(|(&x, &y)| y - (slope * x + intercept))
+        .collect();
+    let rss: f64 = residuals.iter().map(|&r| r * r).sum();
+    let std_err_resid = if window_count > 2 {
+        (rss / (window_count as f64 - 2.0)).sqrt()
+    } else {
+        0.0
+    };
+    let x_mean = log_n.iter().sum::<f64>() / window_count as f64;
+    let ss_x: f64 = log_n.iter().map(|&x| (x - x_mean).powi(2)).sum();
+    let se_slope = if ss_x > 1e-15 {
+        std_err_resid / ss_x.sqrt()
+    } else {
+        0.0
+    };
+    let t_value = 1.96;
+    let ci_low = slope - t_value * se_slope;
+    let ci_high = slope + t_value * se_slope;
+
+    Some(HurstResult {
+        hurst: slope,
+        ci_95: (ci_low, ci_high),
+        is_mean_reverting: ci_high < 0.5,
+        window_count,
+    })
+}
+
+/// OLS slope + intercept `y = slope * x + intercept`. Returns
+/// `(0, mean_y)` on a degenerate `x` range so the caller does not
+/// have to special-case the all-equal input.
+fn linear_regression_f64(x: &[f64], y: &[f64]) -> (f64, f64) {
+    let n = x.len() as f64;
+    let sum_x: f64 = x.iter().sum();
+    let sum_y: f64 = y.iter().sum();
+    let sum_xx: f64 = x.iter().map(|&xi| xi * xi).sum();
+    let sum_xy: f64 = x.iter().zip(y.iter()).map(|(&xi, &yi)| xi * yi).sum();
+
+    let denom = n * sum_xx - sum_x * sum_x;
+    if denom.abs() < 1e-15 {
+        return (0.0, sum_y / n);
+    }
+    let slope = (n * sum_xy - sum_x * sum_y) / denom;
+    let intercept = (sum_y - slope * sum_x) / n;
+    (slope, intercept)
+}
+
+// ---------------------------------------------------------------------------
 // Micro-price drift
 // ---------------------------------------------------------------------------
 
@@ -669,5 +986,187 @@ mod tests {
         let mp = micro_price_weighted(&bids, &asks, 3).unwrap();
         // Levels 0 and 2 only; both symmetric → midpoint.
         assert_eq!(mp, dec!(100.5));
+    }
+
+    // ---- market_impact ----
+
+    #[test]
+    fn market_impact_returns_none_on_empty_side() {
+        assert!(market_impact(&[], Side::Buy, dec!(1), dec!(100)).is_none());
+    }
+
+    #[test]
+    fn market_impact_returns_none_on_zero_target_qty() {
+        let asks = vec![bid(dec!(100), dec!(10))];
+        assert!(market_impact(&asks, Side::Buy, dec!(0), dec!(100)).is_none());
+    }
+
+    /// Buy walk against a two-level ask book. Target qty = 5 lies
+    /// entirely inside level 0, so VWAP = level-0 price and the
+    /// impact vs reference = ((100 - 99.5) / 99.5) * 10000 ≈
+    /// 50.25 bps.
+    #[test]
+    fn market_impact_buy_fills_inside_first_level_reports_touch_slippage() {
+        let asks = vec![bid(dec!(100), dec!(10)), bid(dec!(101), dec!(10))];
+        let out = market_impact(&asks, Side::Buy, dec!(5), dec!(99.5)).unwrap();
+        assert_eq!(out.vwap, dec!(100));
+        assert_eq!(out.filled_qty, dec!(5));
+        assert_eq!(out.notional, dec!(500));
+        assert!(!out.partial);
+        // Signed: buy walks up from 99.5 to 100 → positive impact.
+        let expected_bps = dec!(0.5) / dec!(99.5) * dec!(10_000);
+        let diff = (out.impact_bps - expected_bps).abs();
+        assert!(diff < dec!(0.000001), "bps drift {diff}");
+    }
+
+    /// Buy walk that consumes level 0 entirely (5 @ 100) and
+    /// spills into level 1 (2 @ 101). VWAP = (500 + 202)/7 =
+    /// 702/7 ≈ 100.2857...
+    #[test]
+    fn market_impact_buy_walks_into_second_level() {
+        let asks = vec![bid(dec!(100), dec!(5)), bid(dec!(101), dec!(10))];
+        let out = market_impact(&asks, Side::Buy, dec!(7), dec!(100)).unwrap();
+        assert_eq!(out.filled_qty, dec!(7));
+        assert_eq!(out.notional, dec!(702));
+        // 702/7 = 100.2857142857142857142857142... —
+        // rust_decimal yields a high-precision result; compare
+        // to the closed-form.
+        let expected_vwap = dec!(702) / dec!(7);
+        assert_eq!(out.vwap, expected_vwap);
+        assert!(!out.partial);
+        // Reference = touch (100) → impact is purely the
+        // spillover cost.
+        assert!(out.impact_bps > dec!(0));
+    }
+
+    #[test]
+    fn market_impact_sell_side_flips_sign_convention() {
+        // Walking a bid book with a sell. Best bid is 99, taker
+        // receives VWAP that is the same or worse. Positive
+        // impact_bps still means "unfavourable to the taker".
+        let bids = vec![bid(dec!(99), dec!(5)), bid(dec!(98), dec!(10))];
+        let out = market_impact(&bids, Side::Sell, dec!(7), dec!(100)).unwrap();
+        assert_eq!(out.filled_qty, dec!(7));
+        // 99 * 5 + 98 * 2 = 495 + 196 = 691.
+        assert_eq!(out.notional, dec!(691));
+        // Reference = 100, VWAP < 100 → sell is leaving money
+        // on the table → impact > 0.
+        assert!(out.impact_bps > dec!(0));
+    }
+
+    #[test]
+    fn market_impact_partial_fill_flag_fires_when_book_is_thin() {
+        let asks = vec![bid(dec!(100), dec!(3))];
+        let out = market_impact(&asks, Side::Buy, dec!(10), dec!(100)).unwrap();
+        assert_eq!(out.filled_qty, dec!(3));
+        assert!(out.partial, "book had only 3 qty, partial flag must fire");
+    }
+
+    #[test]
+    fn market_impact_impact_bps_is_zero_at_reference_equal_to_vwap() {
+        let asks = vec![bid(dec!(100), dec!(10))];
+        let out = market_impact(&asks, Side::Buy, dec!(1), dec!(100)).unwrap();
+        assert_eq!(out.vwap, dec!(100));
+        assert_eq!(out.impact_bps, dec!(0));
+    }
+
+    // ---- lead_lag_transform ----
+
+    #[test]
+    fn lead_lag_empty_input_returns_empty_output() {
+        assert!(lead_lag_transform(&[]).is_empty());
+    }
+
+    #[test]
+    fn lead_lag_single_point_returns_one_pair() {
+        let out = lead_lag_transform(&[dec!(42)]);
+        assert_eq!(out, vec![(dec!(42), dec!(42))]);
+    }
+
+    /// Canonical example from Gyurkó et al. — the lead-lag
+    /// transform of `[p0, p1, p2]` is `[(p0,p0), (p1,p0), (p1,p1),
+    /// (p2,p1), (p2,p2)]`. Length is `2*n - 1` for `n > 0`.
+    #[test]
+    fn lead_lag_three_point_canonical_shape() {
+        let prices = vec![dec!(100), dec!(101), dec!(99)];
+        let out = lead_lag_transform(&prices);
+        assert_eq!(
+            out,
+            vec![
+                (dec!(100), dec!(100)),
+                (dec!(101), dec!(100)),
+                (dec!(101), dec!(101)),
+                (dec!(99), dec!(101)),
+                (dec!(99), dec!(99)),
+            ]
+        );
+        assert_eq!(out.len(), 2 * prices.len() - 1);
+    }
+
+    // ---- hurst_exponent ----
+
+    #[test]
+    fn hurst_returns_none_on_too_short_series() {
+        let series: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        assert!(hurst_exponent(&series).is_none());
+    }
+
+    #[test]
+    fn hurst_returns_none_on_constant_series() {
+        // All samples equal → std is zero for every window, no
+        // R/S values survive the filter → not enough points to
+        // regress.
+        let series = vec![100.0_f64; 200];
+        assert!(hurst_exponent(&series).is_none());
+    }
+
+    /// On iid white noise (returns of a random walk) the
+    /// theoretical Hurst exponent is `0.5`. The R/S method is
+    /// applied to the returns series — applying it directly to
+    /// the cumulative price levels would yield `H ≈ 1` instead,
+    /// because the levels themselves are non-stationary and
+    /// behave like a trend under R/S.
+    ///
+    /// With 2000 samples of Bernoulli ±1 the R/S estimator
+    /// should land comfortably within `[0.35, 0.7]` — tighter
+    /// bounds depend on seed luck.
+    #[test]
+    fn hurst_white_noise_returns_are_close_to_half() {
+        // Deterministic ±1 iid stream via xorshift64 + popcount
+        // parity. Avoids the high-bit bias of a naive LCG and
+        // sidesteps pulling in a PRNG crate for a test.
+        let n = 2000;
+        let mut returns = Vec::with_capacity(n);
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        for _ in 0..n {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let parity = state.count_ones() & 1;
+            returns.push(if parity == 0 { -1.0_f64 } else { 1.0 });
+        }
+        let r = hurst_exponent(&returns).expect("hurst on 2000 white-noise samples");
+        assert!(
+            (0.35..=0.7).contains(&r.hurst),
+            "Hurst of iid white noise should be near 0.5, got {}",
+            r.hurst
+        );
+        assert!(r.window_count >= 3);
+    }
+
+    /// On a strongly trending series (monotonic increments) the
+    /// Hurst exponent is close to 1. This test uses a pure linear
+    /// trend as the extreme case — R/S must classify it as
+    /// persistent.
+    #[test]
+    fn hurst_monotonic_trend_is_close_to_one() {
+        let series: Vec<f64> = (0..500).map(|i| i as f64).collect();
+        let r = hurst_exponent(&series).expect("hurst on trend");
+        assert!(
+            r.hurst > 0.8,
+            "Hurst of a linear trend should be near 1.0, got {}",
+            r.hurst
+        );
+        assert!(!r.is_mean_reverting);
     }
 }

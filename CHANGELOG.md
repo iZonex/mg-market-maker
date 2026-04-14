@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Differential Evolution optimiser** for the hyperopt loop
+  (`mm_hyperopt::de::DifferentialEvolution`). Ported from
+  `hft-lab-core/src/optimization.rs`. Classic DE/rand/1/bin
+  (three-vector mutation + binomial crossover + greedy
+  selection) over the existing `SearchSpace` / `LossFn`
+  traits, so operators can swap `RandomSearch` for
+  `DifferentialEvolution` without touching their backtest
+  driver. Deterministic via a seeded `ChaCha8Rng`. Logs every
+  evaluation as a `Trial` so downstream JSONL analysis stays
+  uniform. 9 tests including a Rosenbrock 2-D benchmark.
+- **Market-impact walker**
+  (`mm_strategy::features::market_impact`). Walks a book side
+  against a target qty, returns VWAP + filled qty + notional
+  + signed slippage vs a reference price (positive always
+  means unfavourable to the taker). Intended for XEMM hedge-
+  leg cost checks, basis-strategy edge calculation, and
+  paired-unwind slice urgency. 6 tests for fill inside level,
+  spillover into level 2, sell-side sign flip, partial fill
+  flag, zero slippage on reference=VWAP, and empty-side
+  guard.
+- **Lead-lag path transform**
+  (`mm_strategy::features::lead_lag_transform`). Converts a
+  1-D price series into the 2-D interleaved lead-lag pairs
+  from Gyurkó et al. (2013), consumable by downstream
+  signature / autocorrelation feature extractors. 3 tests
+  including the canonical 3-point example.
+- **Hurst exponent via rescaled-range R/S**
+  (`mm_strategy::features::hurst_exponent`). Mandelbrot &
+  Wallis (1969) R/S estimator on logarithmically-spaced
+  window sizes with a 95 % confidence interval derived from
+  residuals. Returns `HurstResult { hurst, ci_95,
+  is_mean_reverting, window_count }`. Orthogonal to the
+  existing velocity-based `RegimeDetector` in
+  `autotune.rs` — combine both for stronger regime signals
+  for parameter scaling. Pure f64, no deps. 4 tests: short
+  series guard, constant-series guard, iid white noise →
+  H ≈ 0.5, monotonic trend → H > 0.8.
 - **Soft spread gate** on the quote-refresh path. New
   `RiskConfig.max_spread_to_quote_bps: Option<Decimal>` — when
   set, `refresh_quotes` skips quoting for a single tick if the
@@ -42,14 +79,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Notes
 
-- The three additions are cherry-picks from the
+- The three spread-gate / weighted-microprice / deduplicator
+  additions are cherry-picks from the
   [atomic-mesh](https://github.com/Faraone-Dev/atomic-mesh)
-  research repo. The heavier pieces of that repo (C++ FFI hot
-  path, QUIC peer mesh, integer-only arithmetic) remain out of
-  scope — our design is network-bound by public WebSocket
-  RTT, so sub-microsecond strategy compute delivers no
-  end-to-end latency win, and the `Decimal`-for-money discipline
-  rules out integer-tick conversion.
+  research repo. The DE optimiser, market-impact walker,
+  lead-lag transform, and Hurst exponent are ports from
+  [hft-lab-core](https://github.com/ThotDjehuty/hft-lab-core)
+  (MIT). Both upstream repos are pure-research showcases; we
+  deliberately skipped their heavier pieces (C++ FFI hot path,
+  QUIC peer mesh, integer-only arithmetic, Rough Heston option
+  pricing, agent-based market simulation, geometric /
+  topological signals, proprietary mean-reversion modules)
+  because they either conflict with the `Decimal`-for-money
+  discipline, sit in a latency regime our public-WebSocket
+  transport cannot exploit, or are out of our product scope.
+  No new external dependencies introduced.
 
 ## [0.3.1] - 2026-04-14
 
