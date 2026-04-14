@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **BBW (Bollinger Band Width) accessors** on
+  `mm_indicators::BollingerValue`. New `width()` returns
+  `upper - lower`; new `width_ratio()` returns
+  `(upper - lower) / middle` as a normalised volatility-regime
+  indicator popularised by John Bollinger ("BandWidth"). Useful
+  as a fast vol-regime switch without a second volatility
+  estimator. 4 tests including a pinned monotonicity check
+  (tighter window → smaller ratio than a wider window with the
+  same mean).
+- **`bba_imbalance`** in `mm_strategy::features` — best-bid/
+  best-ask top-of-book imbalance normalised to `[-1, +1]`. A
+  one-level companion to the existing multi-level
+  `book_imbalance` / `book_imbalance_weighted`. Reacts on every
+  touch update and is the fastest cue for imminent touch
+  pressure when deeper levels are thin.
+- **`log_price_ratio`** in `mm_strategy::features` — returns
+  `100 · ln(base / follow)` as a symmetric, additively-
+  composable venue-spread / basis proxy. Rejects non-positive
+  inputs. Pinned textbook value `100 · ln(1.01) ≈ 0.995`.
+- **`ob_imbalance_multi_depth`** in `mm_strategy::features` —
+  aggregates `book_imbalance` evaluated at each of several
+  depth horizons with geometric `alpha · (1-alpha)^i` weights.
+  Robust against liquidity-distribution changes that distort
+  the existing single-depth `book_imbalance_weighted`.
+- **`WindowedTradeFlow`** in `mm_strategy::features` — a
+  rolling fixed-window snapshot of signed trade flow with
+  `log(1 + qty)` weighting. Complements the continuous-EWMA
+  `TradeFlow`: the EWMA gives you the slow trend, the window
+  gives you the fast snapshot, and the difference between the
+  two is itself a flow-acceleration signal. The log-qty weight
+  dampens whale prints so one outsized trade doesn't swamp
+  the signal.
 - **Differential Evolution optimiser** for the hyperopt loop
   (`mm_hyperopt::de::DifferentialEvolution`). Ported from
   `hft-lab-core/src/optimization.rs`. Classic DE/rand/1/bin
@@ -85,15 +117,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   research repo. The DE optimiser, market-impact walker,
   lead-lag transform, and Hurst exponent are ports from
   [hft-lab-core](https://github.com/ThotDjehuty/hft-lab-core)
-  (MIT). Both upstream repos are pure-research showcases; we
-  deliberately skipped their heavier pieces (C++ FFI hot path,
-  QUIC peer mesh, integer-only arithmetic, Rough Heston option
-  pricing, agent-based market simulation, geometric /
-  topological signals, proprietary mean-reversion modules)
+  (MIT). BBW accessors, `bba_imbalance`, `log_price_ratio`,
+  `ob_imbalance_multi_depth`, and `WindowedTradeFlow` are
+  ports from the [beatzxbt/smm](https://github.com/beatzxbt/smm)
+  Python Bybit bot. All upstream repos are research /
+  educational showcases; we deliberately skipped their heavier
+  pieces (C++ FFI hot path, QUIC peer mesh, integer-only
+  arithmetic, Rough Heston option pricing, agent-based market
+  simulation, geometric / topological signals, proprietary
+  mean-reversion modules, Python-specific OMS and WS feeds)
   because they either conflict with the `Decimal`-for-money
   discipline, sit in a latency regime our public-WebSocket
-  transport cannot exploit, or are out of our product scope.
-  No new external dependencies introduced.
+  transport cannot exploit, duplicate our existing Rust
+  infrastructure, or are out of our product scope. No new
+  external dependencies introduced.
 
 ## [0.3.1] - 2026-04-14
 

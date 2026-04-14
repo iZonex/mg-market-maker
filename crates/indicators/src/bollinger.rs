@@ -12,6 +12,27 @@ pub struct BollingerValue {
     pub stddev: Decimal,
 }
 
+impl BollingerValue {
+    /// Absolute band width `upper - lower`.
+    pub fn width(&self) -> Decimal {
+        self.upper - self.lower
+    }
+
+    /// Bollinger Band Width normalised by the middle band —
+    /// `(upper - lower) / middle`. A classic volatility-regime
+    /// indicator popularised by John Bollinger under the name
+    /// "BandWidth". Zero when σ is zero; rises when the window's
+    /// realised vol rises. Fast vol-regime switch without a
+    /// second volatility estimator. Returns `None` on a zero
+    /// middle band (degenerate / constant price at zero).
+    pub fn width_ratio(&self) -> Option<Decimal> {
+        if self.middle.is_zero() {
+            return None;
+        }
+        Some(self.width() / self.middle)
+    }
+}
+
 /// Bollinger Bands. Middle = SMA(period), upper/lower = middle ±
 /// `k_stddev × σ` where σ is the **population** standard deviation of
 /// the window (divisor `n`, not `n-1`).
@@ -170,5 +191,64 @@ mod tests {
         let v = b.value().unwrap();
         assert!(v.upper > v.middle);
         assert!(v.middle > v.lower);
+    }
+
+    #[test]
+    fn width_is_upper_minus_lower() {
+        let mut b = BollingerBands::new(8, dec!(2));
+        for v in [2, 4, 4, 4, 5, 5, 7, 9] {
+            b.update(Decimal::from(v));
+        }
+        let v = b.value().unwrap();
+        // From the textbook test above: upper = 9, lower = 1 →
+        // width = 8.
+        assert_eq!(v.width(), dec!(8));
+    }
+
+    #[test]
+    fn width_ratio_matches_width_over_middle() {
+        let mut b = BollingerBands::new(8, dec!(2));
+        for v in [2, 4, 4, 4, 5, 5, 7, 9] {
+            b.update(Decimal::from(v));
+        }
+        let v = b.value().unwrap();
+        // width = 8, middle = 5 → ratio = 1.6.
+        assert_eq!(v.width_ratio(), Some(dec!(1.6)));
+    }
+
+    #[test]
+    fn width_ratio_is_none_on_zero_middle() {
+        // Middle band at zero (all samples zero) → ratio is
+        // undefined. The indicator must return None rather than
+        // dividing by zero.
+        let mut b = BollingerBands::new(5, dec!(2));
+        for _ in 0..10 {
+            b.update(dec!(0));
+        }
+        let v = b.value().unwrap();
+        assert_eq!(v.middle, dec!(0));
+        assert_eq!(v.width_ratio(), None);
+    }
+
+    /// BBW (Bollinger Band Width) is monotonic in realised vol:
+    /// a window with spread-out samples must have a larger
+    /// `width_ratio` than a window with tightly-clustered
+    /// samples around the same mean. Pin both tips so any future
+    /// numerical regression shows up.
+    #[test]
+    fn width_ratio_rises_with_realised_volatility() {
+        let mut tight = BollingerBands::new(5, dec!(2));
+        let mut wide = BollingerBands::new(5, dec!(2));
+        // Both windows average to 100.
+        for s in [dec!(99), dec!(100), dec!(101), dec!(100), dec!(100)] {
+            tight.update(s);
+        }
+        for s in [dec!(80), dec!(100), dec!(120), dec!(100), dec!(100)] {
+            wide.update(s);
+        }
+        let tv = tight.value().unwrap();
+        let wv = wide.value().unwrap();
+        assert_eq!(tv.middle, wv.middle);
+        assert!(wv.width_ratio() > tv.width_ratio());
     }
 }

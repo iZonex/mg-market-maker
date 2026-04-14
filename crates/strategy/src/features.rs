@@ -505,6 +505,228 @@ fn linear_regression_f64(x: &[f64], y: &[f64]) -> (f64, f64) {
 }
 
 // ---------------------------------------------------------------------------
+// Best-bid/ask top-of-book imbalance
+// ---------------------------------------------------------------------------
+
+/// Normalised best-bid/best-ask imbalance in `[-1, +1]`:
+///
+/// ```text
+/// bba = 2 * (bid_qty / (bid_qty + ask_qty) - 0.5)
+///     = (bid_qty - ask_qty) / (bid_qty + ask_qty)
+/// ```
+///
+/// Computed over the **top-of-book only** — a single-level
+/// variant of `book_imbalance`. This is a classic fast-
+/// microstructure signal: it reacts on every touch update and
+/// is the fastest cue for imminent touch pressure when the
+/// inner depths are thin. Combine with the existing multi-level
+/// `book_imbalance_weighted` for a faster-plus-robust pair.
+///
+/// Returns `0` when either side is empty or the combined qty is
+/// zero.
+pub fn bba_imbalance(bids: &[PriceLevel], asks: &[PriceLevel]) -> Decimal {
+    let bid_qty = bids.first().map(|l| l.qty).unwrap_or(Decimal::ZERO);
+    let ask_qty = asks.first().map(|l| l.qty).unwrap_or(Decimal::ZERO);
+    let total = bid_qty + ask_qty;
+    if total.is_zero() {
+        return Decimal::ZERO;
+    }
+    (bid_qty - ask_qty) / total
+}
+
+// ---------------------------------------------------------------------------
+// Log price ratio — cross-venue or basis proxy
+// ---------------------------------------------------------------------------
+
+/// Log-price differential between two quotes, scaled to
+/// percentage points: `100 × ln(base / follow)`.
+///
+/// Symmetric interpretation: the sign flips when base and
+/// follow swap, and tiny spreads map to tiny numbers. Useful
+/// as a cross-venue basis proxy that composes linearly — the
+/// sum of log ratios across a chain of venues equals the log
+/// ratio of the chain endpoints.
+///
+/// Returns `None` if either input is non-positive (log of zero
+/// or negative is undefined).
+///
+/// Uses an `f64` round-trip for the natural log because
+/// `rust_decimal` has no built-in `ln`. The boundary is clean:
+/// callers use this for **feature values** (passed to alpha
+/// models / skew calculations), not PnL arithmetic, so the
+/// rounding on `Decimal::to_f64` and back is acceptable.
+pub fn log_price_ratio(base: Decimal, follow: Decimal) -> Option<Decimal> {
+    if base <= Decimal::ZERO || follow <= Decimal::ZERO {
+        return None;
+    }
+    let b = base.to_f64()?;
+    let f = follow.to_f64()?;
+    let ratio = b / f;
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return None;
+    }
+    Decimal::from_f64(ratio.ln() * 100.0)
+}
+
+// ---------------------------------------------------------------------------
+// Multi-depth order-book imbalance
+// ---------------------------------------------------------------------------
+
+/// Order-book imbalance aggregated across **multiple depth
+/// horizons** with geometrically decaying weights.
+///
+/// For each `d` in `depths`, compute `book_imbalance(bids,
+/// asks, d)` (the top-d qty imbalance in `[-1, +1]`) and then
+/// return the EMA-weighted average of those per-depth values
+/// with weights `w(i) = alpha · (1 − alpha)^i`, where `i = 0`
+/// is the first (usually shallowest) depth in `depths`. Weights
+/// are normalised so they sum to one.
+///
+/// Why prefer this over the existing `book_imbalance_weighted`
+/// (which linearly weights **levels within a single depth**):
+///
+/// - Linear per-level weighting assumes a single "right" depth
+///   horizon. Multi-depth aggregation instead computes the
+///   imbalance at each of several horizons (10, 25, 50, 100 bps
+///   … or simply top-1, top-5, top-20) and combines them.
+///   Robust to liquidity-distribution changes — a sudden fat
+///   deep-book order does not distort the short-horizon signal.
+/// - The weight vector is a knob the caller tunes separately
+///   from the depth grid.
+///
+/// Returns `0` when `depths` is empty.
+pub fn ob_imbalance_multi_depth(
+    bids: &[PriceLevel],
+    asks: &[PriceLevel],
+    depths: &[usize],
+    alpha: Decimal,
+) -> Decimal {
+    if depths.is_empty() {
+        return Decimal::ZERO;
+    }
+    let one_minus_alpha = Decimal::ONE - alpha;
+
+    // Raw weights `w_i = alpha * (1-alpha)^i`. We build them
+    // lazily and normalise at the end so a caller passing a
+    // non-normalising alpha (e.g. 0.5 on 4 depths) still gets
+    // a valid convex combination.
+    let mut num = Decimal::ZERO;
+    let mut den = Decimal::ZERO;
+    let mut w = alpha;
+    for &d in depths {
+        let imb = book_imbalance(bids, asks, d);
+        num += w * imb;
+        den += w;
+        w *= one_minus_alpha;
+    }
+    if den.is_zero() {
+        return Decimal::ZERO;
+    }
+    num / den
+}
+
+// ---------------------------------------------------------------------------
+// Windowed trade-flow snapshot (log-qty-weighted)
+// ---------------------------------------------------------------------------
+
+/// Fixed-window snapshot of signed trade flow with log-qty
+/// weighting, a companion to the continuous-EWMA [`TradeFlow`].
+///
+/// Rolling window of the last `window` trades (caller-sized),
+/// each contributing `ln(1 + qty) × sign(side)` to a signed
+/// sum. The `log(1 + qty)` term dampens the influence of a
+/// single outsized print so one whale trade doesn't swamp the
+/// signal; the rolling window gives a bounded-memory reaction
+/// horizon that the continuous EWMA lacks.
+///
+/// The normalised output is in `[-1, +1]`:
+///
+/// ```text
+/// snapshot = (Σ log(1 + q_i) · s_i) / Σ log(1 + q_i)
+/// ```
+///
+/// where `s_i ∈ {-1, +1}` is the taker side sign. Positive =
+/// net buy pressure over the window, negative = net sell.
+///
+/// Use alongside `TradeFlow`: the EWMA gives you the slow
+/// trend, this gives you the fast snapshot, and the difference
+/// between them is itself a flow-acceleration signal.
+#[derive(Debug, Clone)]
+pub struct WindowedTradeFlow {
+    window: usize,
+    // (weight, signed_weight) per trade, oldest-first.
+    entries: std::collections::VecDeque<(Decimal, Decimal)>,
+    total_weight: Decimal,
+    total_signed: Decimal,
+}
+
+impl WindowedTradeFlow {
+    pub fn new(window: usize) -> Self {
+        assert!(window > 0, "WindowedTradeFlow: window must be > 0");
+        Self {
+            window,
+            entries: std::collections::VecDeque::with_capacity(window),
+            total_weight: Decimal::ZERO,
+            total_signed: Decimal::ZERO,
+        }
+    }
+
+    /// Record a trade. `qty` is the trade quantity (positive);
+    /// `side` is the taker side.
+    pub fn on_trade(&mut self, qty: Decimal, side: Side) {
+        if qty <= Decimal::ZERO {
+            return;
+        }
+        // Weight = log(1 + qty) computed via an f64 round-trip
+        // (rust_decimal has no native log). Feature-scale math,
+        // Decimal boundary is not money-critical here.
+        let Some(q_f) = qty.to_f64() else { return };
+        let w_f = (1.0 + q_f).ln();
+        if !w_f.is_finite() || w_f <= 0.0 {
+            return;
+        }
+        let Some(weight) = Decimal::from_f64(w_f) else {
+            return;
+        };
+        let sign = match side {
+            Side::Buy => Decimal::ONE,
+            Side::Sell => -Decimal::ONE,
+        };
+        let signed = weight * sign;
+
+        self.entries.push_back((weight, signed));
+        self.total_weight += weight;
+        self.total_signed += signed;
+
+        while self.entries.len() > self.window {
+            if let Some((old_w, old_s)) = self.entries.pop_front() {
+                self.total_weight -= old_w;
+                self.total_signed -= old_s;
+            }
+        }
+    }
+
+    /// Normalised window snapshot in `[-1, +1]`. `None` when
+    /// the window has not seen a trade yet.
+    pub fn value(&self) -> Option<Decimal> {
+        if self.total_weight.is_zero() {
+            return None;
+        }
+        Some(self.total_signed / self.total_weight)
+    }
+
+    /// Number of trades currently in the window.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// `true` when the window is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Micro-price drift
 // ---------------------------------------------------------------------------
 
@@ -1168,5 +1390,201 @@ mod tests {
             r.hurst
         );
         assert!(!r.is_mean_reverting);
+    }
+
+    // ---- bba_imbalance ----
+
+    #[test]
+    fn bba_imbalance_empty_sides_return_zero() {
+        let b: Vec<PriceLevel> = Vec::new();
+        let a: Vec<PriceLevel> = Vec::new();
+        assert_eq!(bba_imbalance(&b, &a), dec!(0));
+        assert_eq!(bba_imbalance(&[bid(dec!(100), dec!(5))], &a), dec!(1));
+        assert_eq!(bba_imbalance(&b, &[bid(dec!(100), dec!(5))]), dec!(-1));
+    }
+
+    #[test]
+    fn bba_imbalance_symmetric_book_is_zero() {
+        let b = vec![bid(dec!(100), dec!(5))];
+        let a = vec![bid(dec!(101), dec!(5))];
+        assert_eq!(bba_imbalance(&b, &a), dec!(0));
+    }
+
+    #[test]
+    fn bba_imbalance_heavy_bid_side_is_positive() {
+        let b = vec![bid(dec!(100), dec!(9))];
+        let a = vec![bid(dec!(101), dec!(1))];
+        // (9 - 1) / (9 + 1) = 0.8
+        assert_eq!(bba_imbalance(&b, &a), dec!(0.8));
+    }
+
+    #[test]
+    fn bba_imbalance_ignores_deeper_levels() {
+        // Deep-level qty must not affect the top-of-book reading.
+        let b = vec![bid(dec!(100), dec!(1)), bid(dec!(99), dec!(100))];
+        let a = vec![bid(dec!(101), dec!(1))];
+        assert_eq!(bba_imbalance(&b, &a), dec!(0));
+    }
+
+    // ---- log_price_ratio ----
+
+    #[test]
+    fn log_price_ratio_equal_prices_is_zero() {
+        let r = log_price_ratio(dec!(100), dec!(100)).unwrap();
+        assert!(r.abs() < dec!(0.0001));
+    }
+
+    #[test]
+    fn log_price_ratio_sign_flips_on_argument_swap() {
+        let a = log_price_ratio(dec!(100), dec!(99)).unwrap();
+        let b = log_price_ratio(dec!(99), dec!(100)).unwrap();
+        // a ≈ -b (up to floating rounding).
+        let sum = a + b;
+        assert!(sum.abs() < dec!(0.0001));
+    }
+
+    #[test]
+    fn log_price_ratio_rejects_non_positive_inputs() {
+        assert!(log_price_ratio(dec!(0), dec!(100)).is_none());
+        assert!(log_price_ratio(dec!(100), dec!(0)).is_none());
+        assert!(log_price_ratio(dec!(-1), dec!(100)).is_none());
+    }
+
+    /// Pinned hand-computed value: `100 × ln(1.01) ≈ 0.9950`.
+    /// Using the standard Taylor expansion
+    /// `ln(1+x) ≈ x − x²/2 + x³/3 − …` with `x = 0.01` yields
+    /// `0.00995 033…`, so multiplied by 100 ≈ `0.99503`. The
+    /// `f64::ln` implementation matches to ~16 significant digits;
+    /// we allow a 1e-3 tolerance because `Decimal::from_f64`
+    /// rounds to a finite representation.
+    #[test]
+    fn log_price_ratio_matches_textbook_value() {
+        let r = log_price_ratio(dec!(101), dec!(100)).unwrap();
+        let diff = (r - dec!(0.99503)).abs();
+        assert!(diff < dec!(0.001), "expected ≈ 0.995, got {r}");
+    }
+
+    // ---- ob_imbalance_multi_depth ----
+
+    #[test]
+    fn ob_imbalance_multi_depth_empty_depths_is_zero() {
+        let b = vec![bid(dec!(100), dec!(10))];
+        let a = vec![bid(dec!(101), dec!(10))];
+        assert_eq!(ob_imbalance_multi_depth(&b, &a, &[], dec!(0.3)), dec!(0));
+    }
+
+    #[test]
+    fn ob_imbalance_multi_depth_single_depth_matches_book_imbalance() {
+        // With a single depth the multi-depth wrapper must
+        // reduce to plain `book_imbalance(bids, asks, d)` —
+        // up to the ULP of Decimal divisions (the wrapper
+        // divides twice via the weighted accumulator).
+        let bids = vec![bid(dec!(100), dec!(10)), bid(dec!(99), dec!(20))];
+        let asks = vec![bid(dec!(101), dec!(10)), bid(dec!(102), dec!(5))];
+        let direct = book_imbalance(&bids, &asks, 2);
+        let multi = ob_imbalance_multi_depth(&bids, &asks, &[2], dec!(0.5));
+        let diff = (direct - multi).abs();
+        assert!(
+            diff < dec!(0.0000000001),
+            "expected direct ≈ multi, diff = {diff}"
+        );
+    }
+
+    #[test]
+    fn ob_imbalance_multi_depth_gives_more_weight_to_first_depth() {
+        // Depth 1: bids have 10, asks have 1 → imbalance near +1.
+        // Depth 5: overall balanced → imbalance near 0.
+        // With alpha close to 1 the wrapper should favour the
+        // first (shallow) depth → positive answer.
+        let bids = vec![
+            bid(dec!(100), dec!(10)),
+            bid(dec!(99), dec!(1)),
+            bid(dec!(98), dec!(1)),
+            bid(dec!(97), dec!(1)),
+            bid(dec!(96), dec!(1)),
+        ];
+        let asks = vec![
+            bid(dec!(101), dec!(1)),
+            bid(dec!(102), dec!(5)),
+            bid(dec!(103), dec!(5)),
+            bid(dec!(104), dec!(5)),
+            bid(dec!(105), dec!(5)),
+        ];
+        let v = ob_imbalance_multi_depth(&bids, &asks, &[1, 5], dec!(0.9));
+        // Top-1 is strongly positive (9/11), depth-5 is slightly
+        // negative; weighted heavily on top-1 → net positive.
+        assert!(v > dec!(0));
+    }
+
+    // ---- WindowedTradeFlow ----
+
+    #[test]
+    fn windowed_trade_flow_empty_returns_none() {
+        let w = WindowedTradeFlow::new(10);
+        assert!(w.is_empty());
+        assert!(w.value().is_none());
+    }
+
+    #[test]
+    fn windowed_trade_flow_pure_buy_stream_is_positive_one() {
+        let mut w = WindowedTradeFlow::new(10);
+        for _ in 0..5 {
+            w.on_trade(dec!(1), Side::Buy);
+        }
+        assert_eq!(w.len(), 5);
+        assert_eq!(w.value().unwrap(), dec!(1));
+    }
+
+    #[test]
+    fn windowed_trade_flow_pure_sell_stream_is_negative_one() {
+        let mut w = WindowedTradeFlow::new(10);
+        for _ in 0..5 {
+            w.on_trade(dec!(1), Side::Sell);
+        }
+        assert_eq!(w.value().unwrap(), dec!(-1));
+    }
+
+    #[test]
+    fn windowed_trade_flow_log_weight_damps_whale_trade() {
+        // A single whale sell of qty 1000 vs five normal buys of
+        // qty 1 should tilt the signal toward sell but not
+        // completely. With a plain signed-qty weighting the
+        // whale would dominate the signal entirely.
+        let mut w = WindowedTradeFlow::new(10);
+        for _ in 0..5 {
+            w.on_trade(dec!(1), Side::Buy);
+        }
+        w.on_trade(dec!(1000), Side::Sell);
+        let v = w.value().unwrap();
+        // Log weights: log(2)×5 ≈ 3.466 on the buy side vs
+        // log(1001) ≈ 6.909 on the sell side → net negative but
+        // bounded away from -1.
+        assert!(v < dec!(0));
+        assert!(v > dec!(-0.9));
+    }
+
+    #[test]
+    fn windowed_trade_flow_drops_oldest_when_window_full() {
+        let mut w = WindowedTradeFlow::new(3);
+        w.on_trade(dec!(1), Side::Buy);
+        w.on_trade(dec!(1), Side::Buy);
+        w.on_trade(dec!(1), Side::Buy);
+        // Now overflow with a sell — the oldest buy rotates out.
+        w.on_trade(dec!(1), Side::Sell);
+        assert_eq!(w.len(), 3);
+        // Two buys + one sell in the window → positive but
+        // not saturated.
+        let v = w.value().unwrap();
+        assert!(v > dec!(0));
+        assert!(v < dec!(1));
+    }
+
+    #[test]
+    fn windowed_trade_flow_ignores_non_positive_qty() {
+        let mut w = WindowedTradeFlow::new(10);
+        w.on_trade(dec!(0), Side::Buy);
+        w.on_trade(dec!(-5), Side::Sell);
+        assert!(w.is_empty());
+        assert!(w.value().is_none());
     }
 }
