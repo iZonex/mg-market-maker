@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Queue-position-aware backtest fill model**
+  (`mm_backtester::queue_model`). Port of the canonical
+  `hftbacktest` design. New `Probability` trait with two
+  concrete implementations: `LogProbQueueFunc` (`f(x) = ln(1 + x)`)
+  and `PowerProbQueueFunc` (`f(x) = x^n`, with `n` tunable) that
+  split a qty decrease at a price level between "ahead of
+  us" and "behind us" via `f(back) / (f(back) + f(front))`.
+  Stateful `QueuePos { front_q_qty, cum_trade_qty }` tracker
+  per live maker order with `new(book_qty)`, `on_trade(qty)`,
+  `on_depth_change(prev, new, prob_model)`, and
+  `consume_fill()` — the last lifts overshoot out of the
+  tracker as filled base qty. Closes the biggest accuracy
+  gap in our backtester: the existing
+  `ProbabilisticFiller::prob_fill_on_touch` scalar
+  systematically over-reports MM PnL by 10–30 % because it
+  ignores whether the queue ahead of a maker order has
+  actually cleared. The module is standalone — callers that
+  want queue-aware fills route market events through
+  `QueuePos` alongside the existing filler. A future
+  simulator rewrite can replace the scalar coin-flip with
+  this stateful tracker. 18 tests.
+- **Latency model abstraction**
+  (`mm_backtester::latency_model`). Port of
+  `hftbacktest::backtest::models::latency`. New
+  `LatencyModel` trait with `entry(ts)` (local submission →
+  exchange matching-engine acceptance) and `response(ts)`
+  (exchange ack → local receipt) methods, plus a
+  `ConstantLatency` implementation that supports positive
+  latencies and the upstream **negative-latency-equals-
+  rejection** sign convention. Convenience constructors
+  `from_ms(entry_ms, response_ms)` and
+  `symmetric_us(us)`. The separation of entry and response
+  matters because real venues have asymmetric transport
+  (fast order path, slow ack path) and our current single
+  `latency_ms` scalar hides that. Also ships a small
+  homegrown extension `BackoffOnTrafficLatency` that scales
+  the base latency linearly with recent event rate inside a
+  rolling bucket — models the "local queue backs up under
+  load" failure mode that public-internet retail MMs hit
+  during volatility spikes. 9 tests.
 - **BBW (Bollinger Band Width) accessors** on
   `mm_indicators::BollingerValue`. New `width()` returns
   `upper - lower`; new `width_ratio()` returns
@@ -120,17 +160,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (MIT). BBW accessors, `bba_imbalance`, `log_price_ratio`,
   `ob_imbalance_multi_depth`, and `WindowedTradeFlow` are
   ports from the [beatzxbt/smm](https://github.com/beatzxbt/smm)
-  Python Bybit bot. All upstream repos are research /
-  educational showcases; we deliberately skipped their heavier
-  pieces (C++ FFI hot path, QUIC peer mesh, integer-only
-  arithmetic, Rough Heston option pricing, agent-based market
-  simulation, geometric / topological signals, proprietary
-  mean-reversion modules, Python-specific OMS and WS feeds)
-  because they either conflict with the `Decimal`-for-money
-  discipline, sit in a latency regime our public-WebSocket
-  transport cannot exploit, duplicate our existing Rust
-  infrastructure, or are out of our product scope. No new
-  external dependencies introduced.
+  Python Bybit bot. The queue-position fill model and the
+  latency model abstraction are ports from
+  [nkaz001/hftbacktest](https://github.com/nkaz001/hftbacktest)
+  (MIT) — the canonical open-source HFT backtesting library
+  for both. All upstream repos are research / educational
+  showcases; we deliberately skipped their heavier pieces
+  (C++ FFI hot path, QUIC peer mesh, integer-only arithmetic,
+  Rough Heston option pricing, agent-based market simulation,
+  geometric / topological signals, proprietary mean-reversion
+  modules, Python-specific OMS and WS feeds, L3 full-order-
+  book queue models, NPZ-backed historical latency
+  interpolation, depth fuser for multi-feed merging) because
+  they either conflict with the `Decimal`-for-money discipline,
+  sit in a latency regime our public-WebSocket transport
+  cannot exploit, duplicate our existing Rust infrastructure,
+  or are out of our product scope. No new external
+  dependencies introduced.
 
 ## [0.3.1] - 2026-04-14
 
