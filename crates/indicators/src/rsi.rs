@@ -54,8 +54,16 @@ impl Rsi {
             return;
         };
         let change = close - prev;
-        let gain = if change > Decimal::ZERO { change } else { Decimal::ZERO };
-        let loss = if change < Decimal::ZERO { -change } else { Decimal::ZERO };
+        let gain = if change > Decimal::ZERO {
+            change
+        } else {
+            Decimal::ZERO
+        };
+        let loss = if change < Decimal::ZERO {
+            -change
+        } else {
+            Decimal::ZERO
+        };
 
         self.changes_seen += 1;
         let period_dec = Decimal::from(self.period);
@@ -122,7 +130,10 @@ mod tests {
             r.update(Decimal::from(100 + i));
         }
         let v = r.value().unwrap();
-        assert!(v >= dec!(90), "expected RSI >= 90 on monotonic rise, got {v}");
+        assert!(
+            v >= dec!(90),
+            "expected RSI >= 90 on monotonic rise, got {v}"
+        );
     }
 
     #[test]
@@ -132,7 +143,10 @@ mod tests {
             r.update(Decimal::from(200 - i));
         }
         let v = r.value().unwrap();
-        assert!(v <= dec!(10), "expected RSI <= 10 on monotonic fall, got {v}");
+        assert!(
+            v <= dec!(10),
+            "expected RSI <= 10 on monotonic fall, got {v}"
+        );
     }
 
     #[test]

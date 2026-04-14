@@ -139,10 +139,7 @@ impl FundingArbExecutor {
     /// variant tells the caller whether the failure left the
     /// position flat (`TakerRejected`) or delta-exposed with a
     /// compensating reversal already attempted (`PairBreak`).
-    pub async fn enter(
-        &self,
-        signal: &FundingSignal,
-    ) -> Result<PairDispatchOutcome, PairLegError> {
+    pub async fn enter(&self, signal: &FundingSignal) -> Result<PairDispatchOutcome, PairLegError> {
         let FundingSignal::Enter {
             spot_side,
             perp_side,
@@ -306,12 +303,8 @@ fn perp_action_to_side(a: &PerpAction) -> Side {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use mm_common::types::{
-        Balance, LiveOrder, PriceLevel, ProductSpec, WalletType,
-    };
-    use mm_exchange_core::connector::{
-        VenueCapabilities, VenueId, VenueProduct,
-    };
+    use mm_common::types::{Balance, LiveOrder, PriceLevel, ProductSpec, WalletType};
+    use mm_exchange_core::connector::{VenueCapabilities, VenueId, VenueProduct};
     use mm_exchange_core::events::MarketEvent;
     use rust_decimal_macros::dec;
     use std::sync::Mutex;
@@ -396,10 +389,7 @@ mod tests {
                 _ => Ok(OrderId::new_v4()),
             }
         }
-        async fn place_orders_batch(
-            &self,
-            _orders: &[NewOrder],
-        ) -> anyhow::Result<Vec<OrderId>> {
+        async fn place_orders_batch(&self, _orders: &[NewOrder]) -> anyhow::Result<Vec<OrderId>> {
             Ok(vec![])
         }
         async fn cancel_order(&self, _symbol: &str, _order_id: OrderId) -> anyhow::Result<()> {

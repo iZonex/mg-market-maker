@@ -133,7 +133,10 @@ mod tests {
 
     #[test]
     fn max_drawdown_loss_is_positive_number() {
-        assert_eq!(MaxDrawdownLoss.evaluate(&m(0.0, 0.0, 0.0, 200.0, 0.0)), 200.0);
+        assert_eq!(
+            MaxDrawdownLoss.evaluate(&m(0.0, 0.0, 0.0, 200.0, 0.0)),
+            200.0
+        );
     }
 
     #[test]
@@ -149,7 +152,10 @@ mod tests {
         let better = m(2.0, 2.0, 1.5, 100.0, 500.0);
         assert!(SharpeLoss.evaluate(&better) < SharpeLoss.evaluate(&worse));
         assert!(MaxDrawdownLoss.evaluate(&better) < MaxDrawdownLoss.evaluate(&worse));
-        assert!(MultiMetricLoss::default().evaluate(&better) < MultiMetricLoss::default().evaluate(&worse));
+        assert!(
+            MultiMetricLoss::default().evaluate(&better)
+                < MultiMetricLoss::default().evaluate(&worse)
+        );
     }
 
     /// Property: sorting trials by `loss` (ascending) must match the

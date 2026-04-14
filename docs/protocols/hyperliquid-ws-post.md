@@ -1,6 +1,6 @@
 # HyperLiquid WebSocket `post` method
 
-**Status:** target for implementation — Sprint 3
+**Status:** implemented — `crates/exchange/hyperliquid/src/ws_post.rs`
 **Canonical spec:** <https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket>
 
 ## Purpose
@@ -179,20 +179,16 @@ HL returns errors as strings in `response.payload` when `response.type == "error
 - Vault address: if set, the same 20-byte address used in REST signing flows through unchanged here.
 - `nonce` must be monotonically increasing per address across **all** paths (REST and WS). Use a single counter (`chrono::Utc::now().timestamp_millis() as u64`) and guarantee monotonicity across paths — two parallel posts with the same millisecond timestamp are rejected.
 
-## Fix our existing bug
-
-`HyperLiquidConnector::capabilities()` currently sets `supports_ws_trading: false`. **This is wrong.** The capability should be `true` as part of Sprint 3.
-
 ## Sample fixtures
 
-To be captured during Sprint 1 against testnet:
+To be captured against live testnet:
 - `fixtures/hyperliquid/post_order_success.json`
 - `fixtures/hyperliquid/post_order_reject_insufficient.json`
 - `fixtures/hyperliquid/post_info_open_orders.json`
 - `fixtures/hyperliquid/post_cancel_by_cloid.json`
 - `fixtures/hyperliquid/post_error_bad_signature.json`
 
-## Open items (verify in Sprint 1)
+## Open items to verify against testnet
 
 - ⚠ Exact rate limit bucket for posts vs REST — are they summed or separate?
 - ⚠ Socket idle timeout (probe empirically on testnet).

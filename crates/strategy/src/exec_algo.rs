@@ -47,7 +47,10 @@ pub struct ExecContext {
 #[derive(Debug, Clone)]
 pub enum ExecAction {
     /// Place a new child order with the given quote.
-    Place { client_order_id: OrderId, quote: Quote },
+    Place {
+        client_order_id: OrderId,
+        quote: Quote,
+    },
     /// Cancel a previously-placed child order.
     Cancel { client_order_id: OrderId },
     /// Nothing to do on this tick.
@@ -211,7 +214,10 @@ impl VwapAlgo {
         let normalised: Vec<Decimal> = if total > Decimal::ZERO {
             config.volume_profile.iter().map(|w| *w / total).collect()
         } else {
-            vec![Decimal::ONE / Decimal::from(config.volume_profile.len()); config.volume_profile.len()]
+            vec![
+                Decimal::ONE / Decimal::from(config.volume_profile.len());
+                config.volume_profile.len()
+            ]
         };
         Self {
             config,
@@ -274,8 +280,7 @@ impl ExecAlgorithm for VwapAlgo {
     }
 
     fn is_finished(&self) -> bool {
-        self.slices_sent >= self.config.volume_profile.len()
-            && self.filled >= self.config.total_qty
+        self.slices_sent >= self.config.volume_profile.len() && self.filled >= self.config.total_qty
     }
 }
 

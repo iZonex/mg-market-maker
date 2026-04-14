@@ -745,10 +745,7 @@ mod tests {
     /// constructor.
     #[test]
     fn product_matches_constructor() {
-        assert_eq!(
-            BybitConnector::spot("k", "s").product(),
-            VenueProduct::Spot
-        );
+        assert_eq!(BybitConnector::spot("k", "s").product(), VenueProduct::Spot);
         assert_eq!(
             BybitConnector::linear("k", "s").product(),
             VenueProduct::LinearPerp
@@ -791,7 +788,10 @@ mod tests {
     /// and tests keep working without changes.
     #[test]
     fn legacy_constructors_map_to_linear() {
-        assert_eq!(BybitConnector::new("k", "s").category, BybitCategory::Linear);
+        assert_eq!(
+            BybitConnector::new("k", "s").category,
+            BybitCategory::Linear
+        );
         assert_eq!(
             BybitConnector::testnet("k", "s").category,
             BybitCategory::Linear

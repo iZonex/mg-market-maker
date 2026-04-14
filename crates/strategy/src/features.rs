@@ -28,8 +28,8 @@
 //! guarantee.)
 
 use mm_common::types::{PriceLevel, Side};
-use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 // ---------------------------------------------------------------------------
@@ -421,10 +421,7 @@ mod tests {
         let empty: Vec<PriceLevel> = Vec::new();
         assert_eq!(book_imbalance(&b, &empty, 5), dec!(1));
         assert_eq!(book_imbalance(&empty, &b, 5), dec!(-1));
-        assert_eq!(
-            book_imbalance(&b, &[bid(dec!(101), dec!(10))], 5),
-            dec!(0)
-        );
+        assert_eq!(book_imbalance(&b, &[bid(dec!(101), dec!(10))], 5), dec!(0));
     }
 
     /// Linear-decay weighting with `weight = k - i`. Pinned hand-

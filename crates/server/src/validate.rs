@@ -94,10 +94,15 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
         if config.exchange.ws_url.is_empty() {
             errors.push("exchange.ws_url is required".to_string());
         }
-    } else if config.exchange.api_secret.as_deref().unwrap_or("").is_empty() {
+    } else if config
+        .exchange
+        .api_secret
+        .as_deref()
+        .unwrap_or("")
+        .is_empty()
+    {
         errors.push(
-            "HyperLiquid requires MM_API_SECRET to be set to a hex-encoded private key"
-                .to_string(),
+            "HyperLiquid requires MM_API_SECRET to be set to a hex-encoded private key".to_string(),
         );
     }
 
@@ -151,9 +156,7 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
                         );
                     }
                     if fa.min_rate_annual_pct <= dec!(0) {
-                        errors.push(
-                            "funding_arb.min_rate_annual_pct must be > 0".to_string(),
-                        );
+                        errors.push("funding_arb.min_rate_annual_pct must be > 0".to_string());
                     }
                     if fa.max_position <= dec!(0) {
                         errors.push("funding_arb.max_position must be > 0".to_string());
@@ -241,7 +244,10 @@ mod tests {
         cfg.market_maker.strategy = StrategyType::Basis;
         cfg.hedge = None;
         let err = validate_config(&cfg).unwrap_err().to_string();
-        assert!(err.contains("strategy=basis requires a [hedge] section"), "{err}");
+        assert!(
+            err.contains("strategy=basis requires a [hedge] section"),
+            "{err}"
+        );
     }
 
     #[test]

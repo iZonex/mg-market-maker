@@ -41,7 +41,10 @@ pub struct ProtectionsConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProtectionStatus {
     Clear,
-    Locked { reason: String, until: Option<Instant> },
+    Locked {
+        reason: String,
+        until: Option<Instant>,
+    },
 }
 
 impl ProtectionStatus {
@@ -420,8 +423,12 @@ mod tests {
         let mut p = Protections::new(cfg_all());
         let t0 = Instant::now();
         p.record_stop("BTCUSDT", t0);
-        assert!(p.is_locked("BTCUSDT", t0 + Duration::from_secs(5)).is_locked());
-        assert!(!p.is_locked("ETHUSDT", t0 + Duration::from_secs(5)).is_locked());
+        assert!(p
+            .is_locked("BTCUSDT", t0 + Duration::from_secs(5))
+            .is_locked());
+        assert!(!p
+            .is_locked("ETHUSDT", t0 + Duration::from_secs(5))
+            .is_locked());
     }
 
     #[test]
@@ -429,7 +436,9 @@ mod tests {
         let mut p = Protections::new(cfg_all());
         let t0 = Instant::now();
         p.record_stop("BTCUSDT", t0);
-        assert!(p.is_locked("BTCUSDT", t0 + Duration::from_secs(5)).is_locked());
+        assert!(p
+            .is_locked("BTCUSDT", t0 + Duration::from_secs(5))
+            .is_locked());
         // After 30s cooldown + a margin, clear.
         let t_later = t0 + Duration::from_secs(31);
         // stoploss guard only triggers at 3 stops, so we have just 1 — cooldown should be the only active lock.
@@ -476,11 +485,7 @@ mod tests {
         let t0 = Instant::now();
         // Need at least 5 trades with negative rolling sum.
         for i in 0..5 {
-            p.record_trade_pnl(
-                "BTCUSDT",
-                dec!(-10),
-                t0 + Duration::from_secs(i * 60),
-            );
+            p.record_trade_pnl("BTCUSDT", dec!(-10), t0 + Duration::from_secs(i * 60));
         }
         assert!(p
             .is_locked("BTCUSDT", t0 + Duration::from_secs(301))
@@ -493,11 +498,7 @@ mod tests {
         let t0 = Instant::now();
         // 4 trades, all losing — below min_trades=5, so no lock.
         for i in 0..4 {
-            p.record_trade_pnl(
-                "BTCUSDT",
-                dec!(-10),
-                t0 + Duration::from_secs(i * 60),
-            );
+            p.record_trade_pnl("BTCUSDT", dec!(-10), t0 + Duration::from_secs(i * 60));
         }
         assert!(!p
             .is_locked("BTCUSDT", t0 + Duration::from_secs(241))

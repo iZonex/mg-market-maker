@@ -64,9 +64,9 @@ impl WireFormat for BinanceWsWire {
                 result: Ok(result),
             })
         } else {
-            let err = v.get("error").cloned().unwrap_or_else(|| {
-                json!({"code": status, "msg": v.get("status").cloned().unwrap_or(Value::Null)})
-            });
+            let err = v.get("error").cloned().unwrap_or_else(
+                || json!({"code": status, "msg": v.get("status").cloned().unwrap_or(Value::Null)}),
+            );
             Ok(Frame::Response {
                 id,
                 result: Err(err),
@@ -128,11 +128,7 @@ impl BinanceWsTrader {
     }
 
     /// Cancel by client order id (stable across REST and WS paths).
-    pub async fn cancel_order(
-        &self,
-        symbol: &str,
-        orig_client_order_id: &str,
-    ) -> Result<Value> {
+    pub async fn cancel_order(&self, symbol: &str, orig_client_order_id: &str) -> Result<Value> {
         let mut params: BTreeMap<String, String> = BTreeMap::new();
         params.insert("symbol".into(), symbol.into());
         params.insert("origClientOrderId".into(), orig_client_order_id.into());

@@ -1,6 +1,6 @@
 # OKX V5 WebSocket Private (trade)
 
-**Status:** reference only — no OKX connector yet, future epic
+**Status:** reference only — no OKX connector yet
 **Canonical spec:** <https://www.okx.com/docs-v5/en/#overview-websocket>
 
 ## Purpose

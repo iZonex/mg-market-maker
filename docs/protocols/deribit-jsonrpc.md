@@ -1,6 +1,6 @@
 # Deribit JSON-RPC 2.0 over WebSocket
 
-**Status:** reference only — no Deribit connector yet, future epic
+**Status:** reference only — no Deribit connector yet
 **Canonical spec:** <https://docs.deribit.com/>
 
 ## Purpose

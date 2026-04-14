@@ -271,7 +271,7 @@ Contributions welcome! Please:
 
 ## Research notes
 
-- [`docs/research/spot-mm-specifics.md`](docs/research/spot-mm-specifics.md) — 15 canonical sections on how spot MM differs from perp MM (fees, settlement, wallet topology, listen keys, liquidity profile, …). Required reading before touching the spot + cross-product epic.
+- [`docs/research/spot-mm-specifics.md`](docs/research/spot-mm-specifics.md) — 15 canonical sections on how spot MM differs from perp MM (fees, settlement, wallet topology, listen keys, liquidity profile, …). Required reading before touching spot or cross-product code.
 
 ## Unique Advantages Over Alternatives
 

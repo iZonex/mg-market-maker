@@ -123,11 +123,7 @@ impl WsRpcClient {
     }
 
     /// Send a request and await its response.
-    pub async fn send_request(
-        &self,
-        method: &str,
-        params: Value,
-    ) -> Result<Value, WsRpcError> {
+    pub async fn send_request(&self, method: &str, params: Value) -> Result<Value, WsRpcError> {
         let (reply, rx) = oneshot::channel();
         self.cmd_tx
             .send(Command::Request {
@@ -325,10 +321,7 @@ async fn sleep_or_shutdown(
     }
 }
 
-async fn fail_pending(
-    pending: &Arc<Mutex<HashMap<u64, Pending>>>,
-    err_template: WsRpcError,
-) {
+async fn fail_pending(pending: &Arc<Mutex<HashMap<u64, Pending>>>, err_template: WsRpcError) {
     let mut map = pending.lock().await;
     for (_, p) in map.drain() {
         let _ = p.reply.send(Err(clone_err(&err_template)));

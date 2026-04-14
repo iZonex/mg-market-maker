@@ -112,11 +112,7 @@ mod tests {
         ];
         for (i, v) in input.iter().enumerate() {
             e.update(*v);
-            assert_eq!(
-                e.value_raw().unwrap(),
-                expected[i],
-                "step {i} mismatch"
-            );
+            assert_eq!(e.value_raw().unwrap(), expected[i], "step {i} mismatch");
         }
     }
 

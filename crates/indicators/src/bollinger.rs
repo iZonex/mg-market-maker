@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
-use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::Decimal;
 
 /// One snapshot of a Bollinger Bands indicator.
 #[derive(Debug, Clone, PartialEq)]

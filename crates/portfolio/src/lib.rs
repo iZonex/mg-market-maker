@@ -42,8 +42,8 @@ impl Position {
     pub fn apply_fill(&mut self, fill_qty: Decimal, fill_price: Decimal) {
         let new_qty = self.qty + fill_qty;
 
-        let same_sign = !self.qty.is_zero()
-            && ((self.qty > Decimal::ZERO) == (fill_qty > Decimal::ZERO));
+        let same_sign =
+            !self.qty.is_zero() && ((self.qty > Decimal::ZERO) == (fill_qty > Decimal::ZERO));
 
         if self.qty.is_zero() || same_sign {
             // Opening or increasing the position → recompute
@@ -250,7 +250,7 @@ mod tests {
     fn short_then_cover_realises_positive_pnl_on_drop() {
         let mut p = Position::default();
         p.apply_fill(dec!(-2), dec!(100)); // short 2 at 100
-        p.apply_fill(dec!(1), dec!(80));   // cover 1 at 80 → +20
+        p.apply_fill(dec!(1), dec!(80)); // cover 1 at 80 → +20
         assert_eq!(p.qty, dec!(-1));
         assert_eq!(p.realised_pnl_native, dec!(20));
     }

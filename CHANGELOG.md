@@ -363,14 +363,6 @@ across symbols.
     but never dispatch.
 
 #### Documentation
-- **`docs/epics/protocols-coverage.md`** — six-sprint epic driving
-  the fast-protocol work with per-sprint DoD.
-- **`docs/epics/competitor-gap-analysis.md`** — research comparing
-  the project against Hummingbot, NautilusTrader, and Freqtrade;
-  source of the P0 / P1 / P2 prioritisation.
-- **`docs/epics/spot-and-cross-product.md`** — ten-task epic
-  covering venue completeness and cross-product strategies with
-  per-task architecture decisions and DoD.
 - **`docs/research/spot-mm-specifics.md`** — 15-section canonical
   reference on how spot MM differs from perp MM (fees, settlement,
   wallet topology, listen keys, liquidity profile, …).
@@ -378,6 +370,9 @@ across symbols.
   (Binance WS API, Binance FIX, Bybit WS Trade, Bybit FIX,
   HyperLiquid WS post, OKX WS Trade, Deribit JSON-RPC) plus a
   single-page comparison matrix.
+- **`docs/deployment.md`** operator guide covering fast-path
+  order entry, capability audit harness, and the remaining
+  operator follow-ups.
 - **`CLAUDE.md`** updated with the new crate layout and the "one
   abstraction, many adapters" architectural rule.
 
@@ -432,8 +427,8 @@ across symbols.
 - **FIX 4.4 session engine** covers the subset of FIX our target
   venues need (Logon, Heartbeat, TestRequest, ResendRequest,
   SequenceReset, Logout, gap detection). It is not tested against
-  a FIX conformance suite — that graduates in a future epic when
-  the first FIX venue comes online.
+  a FIX conformance suite — conformance validation is deferred
+  until the first FIX venue comes online.
 - **HyperLiquid `supports_ws_trading`** was originally declared
   `false` during initial implementation; fixed to `true` once
   `HlWsTrader` was wired.

@@ -186,8 +186,7 @@ impl PairedUnwindExecutor {
 
     /// `true` when **both** legs have hit their target.
     pub fn is_complete(&self) -> bool {
-        self.executed_primary >= self.target_primary
-            && self.executed_hedge >= self.target_hedge
+        self.executed_primary >= self.target_primary && self.executed_hedge >= self.target_hedge
     }
 
     /// Residual delta still open, expressed in primary base
@@ -456,7 +455,7 @@ mod tests {
     fn progress_averages_both_legs() {
         let mut exec = mk(pair_1to1(), Side::Buy, Side::Sell, dec!(0.1), 5);
         exec.on_primary_fill(dec!(0.05)); // 50 %
-        exec.on_hedge_fill(dec!(0.025));  // 25 %
+        exec.on_hedge_fill(dec!(0.025)); // 25 %
         assert_eq!(exec.progress(), dec!(0.375));
     }
 

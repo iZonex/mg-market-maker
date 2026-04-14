@@ -33,9 +33,7 @@ pub static ORDER_ENTRY_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
         "mm_order_entry_duration_seconds",
         "Round-trip latency of place_order calls, by venue and transport path",
         &["venue", "path", "method"],
-        vec![
-            0.0005, 0.001, 0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.200, 0.500, 1.0, 2.0, 5.0
-        ]
+        vec![0.0005, 0.001, 0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.200, 0.500, 1.0, 2.0, 5.0]
     )
     .unwrap()
 });

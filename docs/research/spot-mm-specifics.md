@@ -2,18 +2,18 @@
 
 **Status:** canonical reference
 **Created:** 2026-04-14
-**Consumers:** `docs/epics/spot-and-cross-product.md` Sprints B–J
 
-This document is **required reading** before touching any code in the
-spot-and-cross-product epic. Spot MM and perp MM look identical at
-30,000 ft — you quote both sides, capture spread, manage inventory.
-Every assumption underneath that surface is different. Read all 15
-sections before writing Sprint B's `VenueProduct` enum.
+This document is **required reading** before touching any spot or
+cross-product code. Spot MM and perp MM look identical at 30,000 ft
+— you quote both sides, capture spread, manage inventory. Every
+assumption underneath that surface is different. Read all 15
+sections before modifying connectors, risk guards, or strategies
+that touch spot symbols.
 
-Where a section has a direct code implication it is called out at the
-bottom of the section with the exact file path and line number.
-Implementers should grep for that line before starting the matching
-sprint so they know what the existing code assumes.
+Where a section has a direct code implication it is called out at
+the bottom of the section with the exact file path. Grep for that
+path before changing the matching subsystem so you know what the
+existing code assumes.
 
 ---
 
@@ -47,14 +47,13 @@ filled lot as pure rebate income, before any spread capture. That's
 ### Implication for our code
 - `PnlTracker` at `crates/risk/src/pnl.rs` holds a single `maker_fee`
   + `taker_fee` pair. Correct for single-product engines but the
-  aggregated dashboard must track rebate income **separately per
+  aggregated dashboard tracks rebate income **separately per
   product type** so the operator can see whether spot rebates or perp
   spread capture is actually paying the rent.
-- Sprint I (Portfolio wiring) adds product-tagged PnL rollups via
-  `mm-portfolio` — when a `Portfolio` instance is wired to the
-  engine, rebates per product become a Prometheus gauge
-  (`mm_portfolio_rebate_income_usdt{product}`) in addition to the
-  existing `mm_pnl_rebates`.
+- `mm-portfolio` exposes per-product PnL rollups. When a `Portfolio`
+  instance is wired to the engine, rebates become a Prometheus gauge
+  (`mm_portfolio_realised_pnl{currency}`) in addition to the existing
+  per-symbol `mm_pnl_rebates`.
 
 ---
 
@@ -81,14 +80,10 @@ Our engine derives inventory from `InventoryManager::on_fill` at
 `crates/risk/src/inventory.rs`. On perp this matches the `positions`
 API. On spot we must **also** reconcile against `get_balances`
 because the wallet is the ground truth — if we miss a `Fill` event,
-the wallet still moved and the next reconciliation cycle will catch
-the drift. Sprint I wires this via the existing
-`reconciliation.rs` module which already has the reconcile logic —
-it just isn't called today.
-
-**Code fix required:** `market_maker.rs` reconciliation loop
-currently only logs. It must actually call `get_balances` and
-compare on spot. Sprint I addresses this.
+the wallet still moved and the next reconciliation cycle catches the
+drift. The engine's reconciliation loop in
+`crates/engine/src/market_maker.rs::reconcile` calls
+`refresh_balances` on every cycle for exactly this reason.
 
 ---
 
@@ -115,11 +110,6 @@ from perp:
   liquidated out of a long position — you just hold until you decide
   to sell.
 
-Sprint B's audit pass should update the doc comments on each kill
-level to say what they mean per product type. No behavioural change
-in Sprint B — documentation only. Sprint J revisits L4 for paired
-positions.
-
 ---
 
 ## 4. Delta-neutrality is not free on spot
@@ -142,15 +132,14 @@ you want to pay for it with a better entry price.
 ### Implication for our code
 `inventory_skew.rs` already applies quadratic skew on the quote side
 based on `net_inventory`. On spot this is the **only** tool — there
-is no "just hedge it" escape hatch unless a paired connector exists
-(Sprint G+H).
+is no "just hedge it" escape hatch unless a paired connector exists.
 
 The `cross_exchange` and `xemm` strategies assume venue-A / venue-B
 parity: **both legs trade the same product type**. Venue-A spot
 against venue-B spot is fine (two spot books, same asset). Venue-A
 spot against venue-B perp is a **basis trade** — different math,
-different risk profile, different unwind rules. Sprint H's
-`BasisStrategy` and `FundingArbExecutor` are the first paths that
+different risk profile, different unwind rules. `BasisStrategy` and
+`FundingArbExecutor` in `crates/strategy/` are the code paths that
 handle this correctly.
 
 ---
@@ -179,21 +168,12 @@ UI. This matters for our `balance_cache` because a spot buy that
 lands in the spot wallet does not make the futures wallet richer.
 
 ### Implication for our code
-`Balance` at `crates/common/src/types.rs:122` has no wallet tag.
-`BalanceCache::update_from_exchange` at
-`crates/engine/src/balance_cache.rs:38` conflates any `Balance`
-returned by any connector into one bucket keyed by asset symbol
-string.
-
-**Bug today:** if we run spot BTCUSDT and USDⓈ-M BTCUSDT on the same
-engine, both connectors report "BTC" balances from different wallets
-and the second one **overwrites** the first in the cache. The engine
-will use whichever was last updated, which is wrong for both
-products.
-
-**Sprint B fix:** add `WalletType` tag on `Balance`, make
-`BalanceCache` key on `(asset, WalletType)`. This is AD-2 in the
-epic.
+`Balance` at `crates/common/src/types.rs` carries a `wallet:
+WalletType` field. `BalanceCache` keys on `(asset, WalletType)` so
+running spot BTCUSDT and USDⓈ-M BTCUSDT on the same engine does not
+silently overwrite one wallet's balance with the other. The
+regression test `wallet_types_do_not_collide` in
+`crates/engine/src/balance_cache.rs` pins this invariant.
 
 ---
 
@@ -218,28 +198,23 @@ epic.
   distinct from the perp "trigger order" concept.
 
 ### Implication for our code
-`NewOrder` at `crates/exchange/core/src/connector.rs:38` is a
-minimal struct — no `reduce_only`, no `position_side`, no
-`iceberg_qty`. **That's the right minimum.** Keep it that way.
+`NewOrder` at `crates/exchange/core/src/connector.rs` is a minimal
+struct — no `reduce_only`, no `position_side`, no `iceberg_qty`.
+**That's the right minimum.** Keep it that way.
 
-Product-specific extras live in a new `ProductParams` enum that can
-be passed alongside `NewOrder` when the product needs it. Sprint B
-adds this as an optional field on `NewOrder` so spot orders never
-need to construct it. Avoid a kitchen-sink struct — if only one
-product needs a field, it goes in the per-product param enum, not
-the shared order struct.
+Product-specific extras should live in a per-product param enum
+passed alongside `NewOrder` when the product needs it. Avoid a
+kitchen-sink struct — if only one product needs a field, it goes in
+the per-product param enum, not the shared order struct.
 
 ---
 
-## 7. Listen keys / user data streams (Binance-specific gap)
+## 7. Listen keys / user data streams (Binance-specific)
 
-### The bug we have today
 Binance spot delivers **execution reports and balance updates** over
 a listen-key WebSocket obtained from `POST /api/v3/userDataStream`.
-Our connector at `crates/exchange/binance/src/connector.rs:147` only
-subscribes to the public `depth` and `trade` streams.
-
-The engine never sees spot fills that arrive via:
+Without this stream, the engine never sees spot fills that arrive
+via:
 - Manual intervention from the trader
 - An RFQ product or OTC deal
 - A non-WS-API fallback REST submission from our own engine (when
@@ -248,28 +223,26 @@ The engine never sees spot fills that arrive via:
 
 The WS-API trader at `ws_trade.rs` delivers responses to its own
 `place_order` requests — that's a request/response envelope, not a
-user-data stream. If we place an order via REST fallback, the fill
-never flows through the engine.
+user-data stream. If an order is placed via REST fallback, the fill
+never flows through the engine unless the user-data stream is
+running.
 
-### Same issue on futures
 USDⓈ-M futures has the same pattern but with different paths:
 `POST /fapi/v1/listenKey` and
-`wss://fstream.binance.com/ws/<listenKey>`. When Sprint D lands
-the futures connector, it must wire a user-data stream too — or it
-has the same silent-fill bug.
+`wss://fstream.binance.com/ws/<listenKey>`.
 
-### Sprint F fix
-- Own listen-key lifecycle (obtain via POST, keepalive every 30
-  minutes via PUT, close via DELETE on shutdown, re-obtain on
-  expiry after 60 minutes).
-- Open the user-data WS to
-  `wss://stream.binance.com:9443/ws/<key>` (spot) or
-  `wss://fstream.binance.com/ws/<key>` (futures).
-- Parse `executionReport` → `MarketEvent::Fill` (map client order
-  id back to UUID via `OrderIdMap`).
-- Parse `outboundAccountPosition` / `ACCOUNT_UPDATE` →
-  `MarketEvent::BalanceUpdate` (new variant added in Sprint F).
-- Reconnect + re-obtain listen key on drop or expiry.
+### Implication for our code
+`crates/exchange/binance/src/user_stream.rs` owns the listen-key
+lifecycle for both spot and USDⓈ-M futures:
+- Obtain via POST.
+- Keepalive every 30 minutes via PUT.
+- Close via DELETE on shutdown.
+- Re-obtain on expiry after 60 minutes.
+
+The module parses `executionReport` → `MarketEvent::Fill` (mapping
+the client order id back to a UUID via `OrderIdMap`) and
+`outboundAccountPosition` / `ACCOUNT_UPDATE` → `MarketEvent::BalanceUpdate`.
+Reconnects automatically on drop or expiry.
 
 ---
 
@@ -283,14 +256,14 @@ rate-limit buckets**:
 - Futures orders: per-sub-account quota, usually 300/10s
 
 Our `RateLimiter` at `crates/exchange/core/src/rate_limiter.rs` is
-per-connector. If spot and futures each hold their own connector
-instance (which is our design — Sprint D ships a separate
-`BinanceFuturesConnector` struct) the buckets are correctly
-independent.
+per-connector. Spot and futures each hold their own connector
+instance — `BinanceConnector` and `BinanceFuturesConnector` are two
+separate structs in `crates/exchange/binance/` — so the buckets are
+correctly independent.
 
-If we ever multiplex both products through a single connector, the
-connector would need two limiters. We explicitly avoid that by
-keeping connectors per-product.
+We explicitly avoid multiplexing both products through a single
+connector; that would require two limiters in one place and is harder
+to reason about.
 
 ---
 
@@ -307,13 +280,14 @@ keeping connectors per-product.
 ### Implication
 The engine uses `ProductSpec.symbol` as the venue-native identifier.
 That is already the right choice — we never try to normalise across
-venues inside the engine. Sprint B's `VenueProduct` enum lets the
-connector disambiguate spot vs perp **within** a venue.
+venues inside the engine. The `VenueProduct` enum in
+`mm-exchange-core::connector` lets the connector disambiguate spot
+vs perp **within** a venue.
 
-`InstrumentPair` from Sprint G pairs a spot symbol on venue-A with a
-futures symbol on venue-B **without** assuming they're the same
-string. That future-proofs us against Kraken-style renames and OKX's
-suffix convention.
+`InstrumentPair` in `mm-common::types` pairs a spot symbol on
+venue-A with a futures symbol on venue-B **without** assuming they're
+the same string. That future-proofs us against Kraken-style renames
+and OKX's suffix convention.
 
 ---
 
@@ -329,12 +303,12 @@ propagates to spot 100–150ms later.
 - Spot quotes can afford **tighter `min_spread_bps`** during quiet
   regimes because rebates are richer.
 - Spot reservation price should be **skewed toward the perp mid**
-  during trending regimes — that's what `BasisStrategy` does in
-  Sprint H.
+  during trending regimes — that's what `BasisStrategy` in
+  `crates/strategy/src/basis.rs` does via its `shift` parameter.
 - Spot VPIN and toxicity scores lag perp VPIN. A trader who is toxic
   on perps will usually trade spot a beat later. Our existing
   `toxicity` module updates per-venue independently; cross-product
-  toxicity is an open research question not in this epic's scope.
+  toxicity remains an open research question.
 
 ---
 
@@ -350,14 +324,11 @@ capture** at top VIP tier. The MM business on spot is primarily a
 rebate business, not a spread business, once you're above VIP 7.
 
 ### Implication for our code
-- `PnlAttribution::rebate_income` already tracks this in
-  `crates/risk/src/pnl.rs` but the dashboard currently rolls it into
-  `total_pnl`.
-- Sprint I emits rebates as a separate Prometheus gauge so the
-  operator can see the rebate rate directly
-  (`mm_pnl_rebates{symbol}` is already in `dashboard/metrics.rs`
-  from the protocol-coverage epic — no new metric needed, just make
-  sure the engine actually populates it on spot fills).
+- `PnlAttribution::rebate_income` in `crates/risk/src/pnl.rs` tracks
+  rebate income as a separate line item.
+- `mm_pnl_rebates{symbol}` in `dashboard/metrics.rs` exposes it as
+  a Prometheus gauge so the operator can see the rebate rate
+  directly without having to subtract `total_pnl − spread_pnl`.
 
 ---
 
@@ -373,23 +344,21 @@ The `ExchangeConnector` trait stays perp-agnostic. Margin mode is a
 config knob on the futures connector, never exposed in the shared
 trait. Anyone writing a spot-only strategy never sees it.
 
-Sprint D's `BinanceFuturesConnector::new` takes a
-`position_mode: PositionMode` parameter with options
-`OneWay | Hedge`. Default is `OneWay`. `Hedge` mode unlocks the
-ability to hold long and short simultaneously on the same symbol,
-which matters for certain basis strategies but is explicitly out of
-scope for this epic's `BasisStrategy` — we use one-way mode and
-pair legs across instruments, not within.
+`BinanceFuturesConnector` currently defaults to one-way position
+mode. Hedge mode (holding long and short simultaneously on the same
+symbol) is intentionally not wired — basis strategies pair legs
+across instruments, not within, so one-way is sufficient.
 
 ---
 
 ## 13. Withdrawal / deposit flows
 
-Out of scope for this epic. Flagged because a spot inventory manager
-eventually has to rebalance wallets across venues (or even across
-chain layers). A pure quote-maker's job stops at the venue boundary.
+Out of scope for the quote-maker engine. Flagged because a spot
+inventory manager eventually has to rebalance wallets across venues
+(or even across chain layers). A pure quote-maker's job stops at
+the venue boundary.
 
-Implementation notes for future epics:
+Implementation notes for future work:
 - Binance: `POST /sapi/v1/capital/withdraw/apply`
 - HL: on-chain signed withdrawal transaction
 - Bybit: `POST /v5/asset/withdraw/create`
@@ -413,10 +382,8 @@ Our engine already assigns unique cloids via
 each place_order goes out with a fresh client id. But if we ever
 implement a cross-exchange strategy where both legs are routed
 through the same API key on the same venue, the **venue will reject
-the second leg** with `-2021`.
-
-Not a code change today. Document this in `cross_exchange.rs` doc
-comments in Sprint B so the next strategy author knows.
+the second leg** with `-2021`. The `cross_exchange` and `xemm`
+strategies assume distinct API credentials per leg for this reason.
 
 Regulatory note: tax-lot accounting for spot (FIFO vs LIFO vs
 weighted-average for gains reporting) is a compliance concern, not
@@ -437,17 +404,9 @@ before trading in a US-taxable entity.
 | Kraken | $10 | $20 |
 
 `ProductSpec.min_notional` already handles this per-symbol via the
-existing `meets_min_notional` method at `common/src/types.rs:146`.
+existing `meets_min_notional` method at
+`crates/common/src/types.rs`.
 
 The venue-level dust handling (automatic conversion to BNB/USDT
 after you accumulate a position below the minimum) is a post-trade
-concern and out of scope for this epic.
-
----
-
-## Cross-referenced from
-
-- `docs/epics/spot-and-cross-product.md` — reading order: this doc
-  first, then the epic.
-- `docs/epics/protocols-coverage.md` — completed predecessor.
-- `README.md` Research section — one link.
+concern and not handled by the engine.

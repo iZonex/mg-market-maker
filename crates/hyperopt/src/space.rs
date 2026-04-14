@@ -15,10 +15,7 @@ pub enum Param {
     IntUniform { name: String, min: i64, max: i64 },
     /// Categorical choice from a fixed set. The chosen value's index
     /// is stored as `f64`; the caller maps it back.
-    Choice {
-        name: String,
-        values: Vec<f64>,
-    },
+    Choice { name: String, values: Vec<f64> },
 }
 
 impl Param {

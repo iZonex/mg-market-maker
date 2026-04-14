@@ -148,7 +148,10 @@ async fn start_mock(ctl: MockCtl) -> MockServer {
         }
     });
 
-    MockServer { url, _handle: handle }
+    MockServer {
+        url,
+        _handle: handle,
+    }
 }
 
 fn test_config(url: String, timeout_ms: u64) -> WsRpcConfig {
@@ -229,13 +232,9 @@ async fn push_messages_fire_the_callback() {
     let server = start_mock(ctl).await;
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let client = WsRpcClient::spawn(
-        test_config(server.url.clone(), 2000),
-        TestWire,
-        move |v| {
-            let _ = tx.send(v);
-        },
-    );
+    let client = WsRpcClient::spawn(test_config(server.url.clone(), 2000), TestWire, move |v| {
+        let _ = tx.send(v);
+    });
     wait_connected(&client).await;
 
     // Poke a request so the client definitely pulls at least one frame
@@ -246,7 +245,10 @@ async fn push_messages_fire_the_callback() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(push.get("push").and_then(|p| p.as_str()), Some("market-tick"));
+    assert_eq!(
+        push.get("push").and_then(|p| p.as_str()),
+        Some("market-tick")
+    );
 }
 
 #[tokio::test]
@@ -361,7 +363,9 @@ async fn unknown_response_id_is_ignored_gracefully() {
         let (mut tx, mut rx) = ws.split();
         // Send a bogus response first.
         let _ = tx
-            .send(Message::Text(r#"{"id":99999,"result":{"ignored":true}}"#.to_string()))
+            .send(Message::Text(
+                r#"{"id":99999,"result":{"ignored":true}}"#.to_string(),
+            ))
             .await;
         // Then echo real requests.
         while let Some(Ok(msg)) = rx.next().await {

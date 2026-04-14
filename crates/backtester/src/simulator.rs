@@ -75,7 +75,7 @@ impl Simulator {
                             volatility: sigma,
                             time_remaining: dec!(1),
                             mid_price: mid,
-            ref_price: None,
+                            ref_price: None,
                         };
 
                         let quotes = strategy.compute_quotes(&ctx);

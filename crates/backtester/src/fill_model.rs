@@ -153,7 +153,7 @@ impl ProbabilisticFiller {
         if slip_roll < self.config.prob_slippage {
             let adjust = quote.price * self.config.slippage_bps / dec!(10000);
             match quote.side {
-                Side::Buy => fill_price += adjust, // bad for the buyer
+                Side::Buy => fill_price += adjust,  // bad for the buyer
                 Side::Sell => fill_price -= adjust, // bad for the seller
             }
         }

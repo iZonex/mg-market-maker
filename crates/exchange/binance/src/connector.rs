@@ -54,7 +54,7 @@ impl BinanceConnector {
                 // report `false` so a capability-driven router never
                 // picks Binance for a FIX route.
                 supports_fix: false,
-                max_order_rate: 300, // per 10s.
+                max_order_rate: 300,          // per 10s.
                 supports_funding_rate: false, // spot has no funding
             },
             ws_trader: None,
@@ -237,7 +237,9 @@ impl ExchangeConnector for BinanceConnector {
     async fn place_order(&self, order: &NewOrder) -> anyhow::Result<OrderId> {
         let side_buy = matches!(order.side, Side::Buy);
         let tif_str = match order.time_in_force {
-            Some(TimeInForce::Gtc) | Some(TimeInForce::PostOnly) | Some(TimeInForce::Gtd)
+            Some(TimeInForce::Gtc)
+            | Some(TimeInForce::PostOnly)
+            | Some(TimeInForce::Gtd)
             | None => "GTC",
             Some(TimeInForce::Ioc) => "IOC",
             Some(TimeInForce::Fok) => "FOK",

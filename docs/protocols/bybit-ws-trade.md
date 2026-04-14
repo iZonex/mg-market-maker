@@ -1,6 +1,6 @@
 # Bybit V5 WebSocket Trade API
 
-**Status:** target for implementation — Sprint 3
+**Status:** adapter scaffold (`crates/exchange/bybit/src/ws_trade.rs`); not yet routed through `BybitConnector::place_order` pending live-testnet auth verification
 **Canonical spec:** <https://bybit-exchange.github.io/docs/v5/websocket/trade/guideline>
 
 ## Purpose
@@ -178,7 +178,7 @@ Current-window usage comes back in response headers `X-Bapi-Limit` / `X-Bapi-Lim
 
 ## Sample fixtures
 
-To be captured during Sprint 1 against testnet:
+To be captured against live testnet:
 - `fixtures/bybit/auth_success.json`
 - `fixtures/bybit/auth_reject_bad_sig.json`
 - `fixtures/bybit/order_create_success.json`
@@ -186,7 +186,7 @@ To be captured during Sprint 1 against testnet:
 - `fixtures/bybit/order_create_batch_mixed.json`
 - `fixtures/bybit/rate_limit_exceeded.json`
 
-## Open items (verify in Sprint 1)
+## Open items to verify against testnet
 
 - ⚠ Confirm current category-specific rate limits — they've changed between V5 revisions.
 - ⚠ Exact behaviour when the same `reqId` is sent twice in one session — reject or echo previous response?

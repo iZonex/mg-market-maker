@@ -39,9 +39,7 @@ pub struct HlOrder {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum HlOrderTif {
-    Limit {
-        limit: HlLimit,
-    },
+    Limit { limit: HlLimit },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -187,7 +185,9 @@ mod tests {
             p: "42000".into(),
             s: "0.01".into(),
             r: false,
-            t: HlOrderTif::Limit { limit: HlLimit::alo() },
+            t: HlOrderTif::Limit {
+                limit: HlLimit::alo(),
+            },
             c: cloid.map(|s| s.to_string()),
         }
     }

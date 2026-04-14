@@ -45,9 +45,7 @@ impl Atr {
                 (prev_atr * Decimal::from(self.samples_seen - 1) + tr)
                     / Decimal::from(self.samples_seen)
             }
-            Some(prev_atr) => {
-                (prev_atr * Decimal::from(self.period - 1) + tr) / period_dec
-            }
+            Some(prev_atr) => (prev_atr * Decimal::from(self.period - 1) + tr) / period_dec,
         });
         self.prev_close = Some(close);
     }
@@ -89,8 +87,8 @@ mod tests {
     fn gap_up_extends_true_range() {
         let mut a = Atr::new(2);
         a.update(dec!(100), dec!(90), dec!(95)); // TR1 = 10
-        // Gap up — close was 95, next candle is [110, 105].
-        // TR2 = max(110-105, |110-95|, |105-95|) = max(5, 15, 10) = 15.
+                                                 // Gap up — close was 95, next candle is [110, 105].
+                                                 // TR2 = max(110-105, |110-95|, |105-95|) = max(5, 15, 10) = 15.
         a.update(dec!(110), dec!(105), dec!(108));
         let v = a.value().unwrap();
         // Simple average of [10, 15] = 12.5.

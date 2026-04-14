@@ -1,6 +1,6 @@
 # Binance FIX 4.4 (spot, beta)
 
-**Status:** target for Sprint 4 (session engine), Sprint 3 unblocks the codec layer
+**Status:** codec + session engine live in `crates/protocols/fix`; Binance FIX venue adapter not yet wired (access is gated, institutional tier)
 **Canonical spec:** <https://developers.binance.com/docs/binance-spot-api-docs/fix-api>
 
 ## Purpose
@@ -108,7 +108,7 @@ Business rejects via ExecutionReport with `OrdStatus(39)=8 (Rejected)` + `OrdRej
 - CheckSum is `sum(all_bytes) mod 256`, **3-digit zero-padded**, over every byte up to (not including) the `10=` field.
 - Price and quantity fields are strings; no locale-specific decimal separators.
 - `TransactTime(60)` and `SendingTime(52)` in UTCTimestamp format `YYYYMMDD-HH:MM:SS.sss` — our codec accepts this as a `&str` to keep it deterministic.
-- Binance requires `MsgSeqNum` on every outbound — the session layer (Sprint 4) owns this.
+- Binance requires `MsgSeqNum` on every outbound — the session layer in `crates/protocols/fix::session` owns this.
 - No drop-copy merging: if you want to receive fills via FIX, connect a separate DC session — OE does not include fill reports.
 
 ## Testing approach
@@ -127,7 +127,7 @@ To be produced for tests (not captured live since FIX access is gated):
 - `fixtures/binance/fix/execution_report_fill.txt`
 - `fixtures/binance/fix/order_cancel_reject.txt`
 
-## Open items (verify in Sprint 1)
+## Open items to verify against testnet
 
 - ⚠ Exact Ed25519 signing payload for Logon (tag 95/96 content).
 - ⚠ Current tag numbers for Binance-custom MessageHandling / ResponseMode (25035/25036 are placeholders).

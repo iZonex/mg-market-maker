@@ -159,10 +159,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
         VenueProduct::LinearPerp
     }
 
-    async fn get_funding_rate(
-        &self,
-        symbol: &str,
-    ) -> Result<FundingRate, FundingRateError> {
+    async fn get_funding_rate(&self, symbol: &str) -> Result<FundingRate, FundingRateError> {
         // `/fapi/v1/premiumIndex` returns current mark price,
         // funding rate, and next funding time for the symbol.
         self.rate_limiter.acquire(1).await;
@@ -180,20 +177,16 @@ impl ExchangeConnector for BinanceFuturesConnector {
         let rate_str = body
             .get("lastFundingRate")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                FundingRateError::Other(anyhow::anyhow!("missing lastFundingRate"))
-            })?;
+            .ok_or_else(|| FundingRateError::Other(anyhow::anyhow!("missing lastFundingRate")))?;
         let rate: Decimal = rate_str
             .parse()
             .map_err(|e| FundingRateError::Other(anyhow::anyhow!("bad rate: {e}")))?;
         let next_ms = body
             .get("nextFundingTime")
             .and_then(|v| v.as_i64())
-            .ok_or_else(|| {
-                FundingRateError::Other(anyhow::anyhow!("missing nextFundingTime"))
-            })?;
-        let next_funding_time = chrono::DateTime::from_timestamp_millis(next_ms)
-            .ok_or_else(|| {
+            .ok_or_else(|| FundingRateError::Other(anyhow::anyhow!("missing nextFundingTime")))?;
+        let next_funding_time =
+            chrono::DateTime::from_timestamp_millis(next_ms).ok_or_else(|| {
                 FundingRateError::Other(anyhow::anyhow!("bad nextFundingTime: {next_ms}"))
             })?;
 
@@ -310,7 +303,10 @@ impl ExchangeConnector for BinanceFuturesConnector {
         let resp: Value = self.client.get(&url).send().await?.json().await?;
         let bids = super::connector::parse_levels(resp.get("bids"))?;
         let asks = super::connector::parse_levels(resp.get("asks"))?;
-        let seq = resp.get("lastUpdateId").and_then(|v| v.as_u64()).unwrap_or(0);
+        let seq = resp
+            .get("lastUpdateId")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         Ok((bids, asks, seq))
     }
 
@@ -380,7 +376,11 @@ impl ExchangeConnector for BinanceFuturesConnector {
         let mut batch: Vec<Value> = Vec::with_capacity(orders.len());
         let mut uuids: Vec<OrderId> = Vec::with_capacity(orders.len());
         for o in orders {
-            let side = if matches!(o.side, Side::Buy) { "BUY" } else { "SELL" };
+            let side = if matches!(o.side, Side::Buy) {
+                "BUY"
+            } else {
+                "SELL"
+            };
             let ord_type = match o.order_type {
                 OrderType::Limit => "LIMIT",
                 OrderType::Market => "MARKET",
@@ -427,11 +427,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
         Ok(())
     }
 
-    async fn cancel_orders_batch(
-        &self,
-        symbol: &str,
-        order_ids: &[OrderId],
-    ) -> anyhow::Result<()> {
+    async fn cancel_orders_batch(&self, symbol: &str, order_ids: &[OrderId]) -> anyhow::Result<()> {
         for oid in order_ids {
             let _ = self.cancel_order(symbol, *oid).await;
         }
@@ -440,7 +436,8 @@ impl ExchangeConnector for BinanceFuturesConnector {
 
     async fn cancel_all_orders(&self, symbol: &str) -> anyhow::Result<()> {
         let params = format!("symbol={symbol}");
-        self.signed_delete("/fapi/v1/allOpenOrders", &params).await?;
+        self.signed_delete("/fapi/v1/allOpenOrders", &params)
+            .await?;
         Ok(())
     }
 
@@ -520,7 +517,11 @@ impl ExchangeConnector for BinanceFuturesConnector {
         self.rate_limiter.acquire(1).await;
         let url = format!("{}/fapi/v1/exchangeInfo", self.base_url);
         let resp: Value = self.client.get(&url).send().await?.json().await?;
-        let symbols = resp.get("symbols").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let symbols = resp
+            .get("symbols")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
         let sym = symbols
             .iter()
             .find(|s| s.get("symbol").and_then(|v| v.as_str()) == Some(symbol))

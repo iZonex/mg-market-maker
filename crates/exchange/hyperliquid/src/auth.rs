@@ -26,13 +26,13 @@ pub struct PrivateKey {
 impl PrivateKey {
     /// Parse a hex-encoded 32-byte private key. `0x` prefix is optional.
     pub fn from_hex(hex_str: &str) -> Result<Self> {
-        let trimmed = hex_str.trim().trim_start_matches("0x").trim_start_matches("0X");
+        let trimmed = hex_str
+            .trim()
+            .trim_start_matches("0x")
+            .trim_start_matches("0X");
         let bytes = hex::decode(trimmed).context("invalid hex private key")?;
         if bytes.len() != 32 {
-            return Err(anyhow!(
-                "private key must be 32 bytes, got {}",
-                bytes.len()
-            ));
+            return Err(anyhow!("private key must be 32 bytes, got {}", bytes.len()));
         }
         let signing_key =
             SigningKey::from_slice(&bytes).context("invalid secp256k1 private key")?;

@@ -77,9 +77,11 @@ impl<L: LossFn> RandomSearch<L> {
 
     /// Lowest-loss trial seen so far, or `None` before any reports.
     pub fn best_trial(&self) -> Option<&Trial> {
-        self.trials
-            .iter()
-            .min_by(|a, b| a.loss.partial_cmp(&b.loss).unwrap_or(std::cmp::Ordering::Equal))
+        self.trials.iter().min_by(|a, b| {
+            a.loss
+                .partial_cmp(&b.loss)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     }
 
     /// Save the full trial log as newline-delimited JSON. One trial

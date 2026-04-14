@@ -291,8 +291,7 @@ impl HyperLiquidConnector {
         }
 
         let resp = self.info_post(json!({ "type": "meta" })).await?;
-        let meta: HlMeta =
-            serde_json::from_value(resp).context("HL meta parse")?;
+        let meta: HlMeta = serde_json::from_value(resp).context("HL meta parse")?;
         let mut map = self.asset_map.write().await;
         let mut rev = self.asset_index_to_name.write().await;
         for (idx, asset) in meta.universe.iter().enumerate() {
@@ -442,10 +441,7 @@ impl ExchangeConnector for HyperLiquidConnector {
         }
     }
 
-    async fn subscribe(
-        &self,
-        symbols: &[String],
-    ) -> Result<mpsc::UnboundedReceiver<MarketEvent>> {
+    async fn subscribe(&self, symbols: &[String]) -> Result<mpsc::UnboundedReceiver<MarketEvent>> {
         let (tx, rx) = mpsc::unbounded_channel();
         let url = self.ws_url.clone();
         let coins: Vec<String> = symbols.to_vec();
@@ -480,10 +476,18 @@ impl ExchangeConnector for HyperLiquidConnector {
                                 "method": "subscribe",
                                 "subscription": { "type": "trades", "coin": coin }
                             });
-                            if write.send(Message::Text(sub_book.to_string())).await.is_err() {
+                            if write
+                                .send(Message::Text(sub_book.to_string()))
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
-                            if write.send(Message::Text(sub_trades.to_string())).await.is_err() {
+                            if write
+                                .send(Message::Text(sub_trades.to_string()))
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                         }
@@ -685,7 +689,10 @@ impl ExchangeConnector for HyperLiquidConnector {
                     continue;
                 }
                 if let Some(oid) = o.get("oid").and_then(|v| v.as_u64()) {
-                    cancels.push(HlCancel { a: asset.index, o: oid });
+                    cancels.push(HlCancel {
+                        a: asset.index,
+                        o: oid,
+                    });
                 }
             }
         }
@@ -765,8 +772,7 @@ impl ExchangeConnector for HyperLiquidConnector {
                 .iter()
                 .filter_map(|b| {
                     let asset = b.get("coin")?.as_str()?.to_string();
-                    let total: Decimal =
-                        b.get("total").and_then(|v| v.as_str())?.parse().ok()?;
+                    let total: Decimal = b.get("total").and_then(|v| v.as_str())?.parse().ok()?;
                     let hold: Decimal = b
                         .get("hold")
                         .and_then(|v| v.as_str())
@@ -860,7 +866,11 @@ fn parse_hl_event(v: &Value) -> Vec<MarketEvent> {
     match channel {
         "l2Book" => {
             let Some(d) = data else { return Vec::new() };
-            let symbol = d.get("coin").and_then(|c| c.as_str()).unwrap_or("").to_string();
+            let symbol = d
+                .get("coin")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
             let time = d.get("time").and_then(|t| t.as_u64()).unwrap_or(0);
             let Some(levels) = d.get("levels").and_then(|l| l.as_array()) else {
                 return Vec::new();
@@ -892,8 +902,8 @@ fn parse_hl_event(v: &Value) -> Vec<MarketEvent> {
                     };
                     let tid = t.get("tid").and_then(|v| v.as_u64()).unwrap_or(0);
                     let time_ms = t.get("time").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let timestamp =
-                        chrono::DateTime::from_timestamp_millis(time_ms).unwrap_or_else(chrono::Utc::now);
+                    let timestamp = chrono::DateTime::from_timestamp_millis(time_ms)
+                        .unwrap_or_else(chrono::Utc::now);
                     Some(MarketEvent::Trade {
                         venue,
                         trade: mm_common::types::Trade {
@@ -925,8 +935,8 @@ fn parse_hl_event(v: &Value) -> Vec<MarketEvent> {
                     };
                     let tid = f.get("tid").and_then(|v| v.as_u64()).unwrap_or(0);
                     let time_ms = f.get("time").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let timestamp =
-                        chrono::DateTime::from_timestamp_millis(time_ms).unwrap_or_else(chrono::Utc::now);
+                    let timestamp = chrono::DateTime::from_timestamp_millis(time_ms)
+                        .unwrap_or_else(chrono::Utc::now);
                     let order_id = f
                         .get("cloid")
                         .and_then(|v| v.as_str())
@@ -1091,7 +1101,10 @@ mod tests {
             caps.supports_ws_trading,
             "HL declares WS trading — the WS post adapter must exist"
         );
-        assert!(!caps.supports_amend, "HL has no native amend (cancel+place)");
+        assert!(
+            !caps.supports_amend,
+            "HL has no native amend (cancel+place)"
+        );
         assert!(!caps.supports_fix, "HL has no FIX gateway");
         // Type-level confirmation that the adapter actually exists:
         let _: fn() = || {

@@ -83,7 +83,10 @@ impl TelegramControl {
 
 async fn poll_loop(config: TelegramConfig, tx: mpsc::UnboundedSender<TelegramCommand>) {
     let client = reqwest::Client::new();
-    let url = format!("https://api.telegram.org/bot{}/getUpdates", config.bot_token);
+    let url = format!(
+        "https://api.telegram.org/bot{}/getUpdates",
+        config.bot_token
+    );
     let mut offset: i64 = 0;
 
     // Telegram returns stale updates after a cold start — prime the

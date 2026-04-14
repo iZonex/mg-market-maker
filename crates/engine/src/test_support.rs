@@ -5,15 +5,12 @@
 //! leak into the public API of `mm-exchange-core`.
 
 #![cfg(test)]
-
 #![allow(dead_code)]
 
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use mm_common::types::{
-    Balance, LiveOrder, OrderId, PriceLevel, ProductSpec, WalletType,
-};
+use mm_common::types::{Balance, LiveOrder, OrderId, PriceLevel, ProductSpec, WalletType};
 use mm_exchange_core::connector::{
     ExchangeConnector, NewOrder, VenueCapabilities, VenueId, VenueProduct,
 };
@@ -143,4 +140,3 @@ impl ExchangeConnector for MockConnector {
         Ok(true)
     }
 }
-

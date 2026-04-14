@@ -89,10 +89,9 @@ cargo build --release
 ## Fast protocol paths
 
 Binance, Bybit, and HyperLiquid each expose a low-latency WebSocket
-path for order entry in addition to REST. The protocol-coverage epic
-(see `docs/epics/protocols-coverage.md`) wires these paths with REST as
-a transparent fallback so a WS disconnect degrades to REST without
-surfacing an error to the engine.
+path for order entry in addition to REST. The connector layer wires
+these paths with REST as a transparent fallback, so a WS disconnect
+degrades to REST without surfacing an error to the engine.
 
 ### Per-venue status
 
@@ -131,9 +130,9 @@ HyperLiquid uses a wallet private key, not an HMAC secret. Set
 optional). `MM_API_KEY` is ignored for HyperLiquid — the Ethereum
 address is derived from the private key.
 
-## Operator next steps (deferred from the protocol-coverage epic)
+## Operator follow-ups
 
-Three items were intentionally left open because they require live
+Three items are intentionally left open because they require live
 testnet credentials that were unavailable during implementation.
 Close them in order once credentials are provisioned.
 

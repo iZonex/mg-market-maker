@@ -1,6 +1,6 @@
 # Binance WebSocket API (spot + USDⓈ-M futures)
 
-**Status:** target for implementation — Sprint 3
+**Status:** implemented — `crates/exchange/binance/src/ws_trade.rs`
 **Canonical spec:** <https://developers.binance.com/docs/binance-spot-api-docs/web-socket-api/general-api-information>
 
 ## Purpose
@@ -174,14 +174,14 @@ Shared budget with REST:
 
 ## Sample fixtures
 
-To be captured during Sprint 1 against testnet:
+To be captured against live testnet:
 - `fixtures/binance/logon_response.json`
 - `fixtures/binance/order_place_success.json`
 - `fixtures/binance/order_place_reject_filter.json`
 - `fixtures/binance/order_cancel_unknown.json`
 - `fixtures/binance/rate_limit_exceeded.json`
 
-## Open items (verify in Sprint 1)
+## Open items to verify against testnet
 
 - ⚠ Exact Ed25519 signature canonicalisation — re-read spec section "Encoding and signing for Ed25519".
 - ⚠ Confirm that `newClientOrderId` accepts 32-char hex (our UUID→hex form).

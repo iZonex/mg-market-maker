@@ -52,7 +52,7 @@ fn make_config() -> MarketMakerConfig {
         strategy: StrategyType::AvellanedaStoikov,
         momentum_enabled: false,
         momentum_window: 200,
-            basis_shift: dec!(0.5),
+        basis_shift: dec!(0.5),
     }
 }
 
@@ -73,7 +73,7 @@ fn bench_avellaneda(c: &mut Criterion) {
                 volatility: dec!(0.02),
                 time_remaining: dec!(0.8),
                 mid_price: mid,
-            ref_price: None,
+                ref_price: None,
             };
             black_box(strategy.compute_quotes(&ctx))
         })
@@ -97,7 +97,7 @@ fn bench_glft(c: &mut Criterion) {
                 volatility: dec!(0.02),
                 time_remaining: dec!(0.8),
                 mid_price: mid,
-            ref_price: None,
+                ref_price: None,
             };
             black_box(strategy.compute_quotes(&ctx))
         })
@@ -121,7 +121,7 @@ fn bench_grid(c: &mut Criterion) {
                 volatility: dec!(0.02),
                 time_remaining: dec!(0.8),
                 mid_price: mid,
-            ref_price: None,
+                ref_price: None,
             };
             black_box(strategy.compute_quotes(&ctx))
         })

@@ -61,9 +61,7 @@ use crate::funding_arb::{FundingArbExecutor, PairDispatchOutcome, PairLegError};
 #[derive(Debug, Clone)]
 pub enum DriverEvent {
     /// Successful atomic pair entry.
-    Entered {
-        outcome: PairDispatchOutcome,
-    },
+    Entered { outcome: PairDispatchOutcome },
     /// Successful atomic pair exit.
     Exited {
         outcome: PairDispatchOutcome,
@@ -143,8 +141,7 @@ impl FundingArbDriver {
         config: FundingArbDriverConfig,
         sink: Arc<dyn DriverEventSink>,
     ) -> Self {
-        let executor =
-            FundingArbExecutor::new(primary.clone(), hedge.clone(), pair.clone());
+        let executor = FundingArbExecutor::new(primary.clone(), hedge.clone(), pair.clone());
         let engine = FundingArbEngine::new(&pair.primary_symbol, config.engine.clone());
         Self {
             executor,
@@ -188,7 +185,11 @@ impl FundingArbDriver {
 
         match signal {
             FundingSignal::Hold => DriverEvent::Hold,
-            FundingSignal::Enter { ref spot_side, ref perp_side, size } => {
+            FundingSignal::Enter {
+                ref spot_side,
+                ref perp_side,
+                size,
+            } => {
                 let spot_side_mm = match spot_side {
                     mm_persistence::funding::SpotAction::Buy => Side::Buy,
                     mm_persistence::funding::SpotAction::Sell => Side::Sell,
@@ -202,7 +203,11 @@ impl FundingArbDriver {
                         // Record entry in the decision-core state
                         // so later Exit signals see an open
                         // position.
-                        let spot_qty = if outcome.spot_side == Side::Buy { size } else { -size };
+                        let spot_qty = if outcome.spot_side == Side::Buy {
+                            size
+                        } else {
+                            -size
+                        };
                         let perp_qty = if outcome.perp_side == Side::Buy {
                             size * self.pair.multiplier
                         } else {
@@ -220,9 +225,15 @@ impl FundingArbDriver {
                     Err(PairLegError::TakerRejected { reason }) => {
                         DriverEvent::TakerRejected { reason }
                     }
-                    Err(PairLegError::PairBreak { reason, compensated }) => {
+                    Err(PairLegError::PairBreak {
+                        reason,
+                        compensated,
+                    }) => {
                         error!(%reason, %compensated, "driver observed pair break");
-                        DriverEvent::PairBreak { reason, compensated }
+                        DriverEvent::PairBreak {
+                            reason,
+                            compensated,
+                        }
                     }
                 }
             }
@@ -242,7 +253,10 @@ impl FundingArbDriver {
                     Err(PairLegError::TakerRejected { reason: taker_err }) => {
                         DriverEvent::TakerRejected { reason: taker_err }
                     }
-                    Err(PairLegError::PairBreak { reason: break_err, compensated }) => {
+                    Err(PairLegError::PairBreak {
+                        reason: break_err,
+                        compensated,
+                    }) => {
                         error!(%break_err, %compensated, "driver observed pair break on exit");
                         DriverEvent::PairBreak {
                             reason: break_err,
@@ -321,10 +335,16 @@ impl FundingArbDriver {
     }
 
     async fn sample_mids(&self) -> Option<(Decimal, Decimal)> {
-        let (primary_bids, primary_asks, _) =
-            self.primary.get_orderbook(&self.pair.primary_symbol, 1).await.ok()?;
-        let (hedge_bids, hedge_asks, _) =
-            self.hedge.get_orderbook(&self.pair.hedge_symbol, 1).await.ok()?;
+        let (primary_bids, primary_asks, _) = self
+            .primary
+            .get_orderbook(&self.pair.primary_symbol, 1)
+            .await
+            .ok()?;
+        let (hedge_bids, hedge_asks, _) = self
+            .hedge
+            .get_orderbook(&self.pair.hedge_symbol, 1)
+            .await
+            .ok()?;
         let primary_mid = mid_of(&primary_bids, &primary_asks)?;
         let hedge_mid = mid_of(&hedge_bids, &hedge_asks)?;
         Some((primary_mid, hedge_mid))
@@ -420,10 +440,7 @@ mod tests {
         fn product(&self) -> VenueProduct {
             self.product
         }
-        async fn get_funding_rate(
-            &self,
-            _symbol: &str,
-        ) -> Result<FundingRate, FundingRateError> {
+        async fn get_funding_rate(&self, _symbol: &str) -> Result<FundingRate, FundingRateError> {
             match *self.funding.lock().unwrap() {
                 Some(rate) => Ok(FundingRate {
                     rate,
@@ -539,7 +556,11 @@ mod tests {
         primary_mid: Decimal,
         hedge_mid: Decimal,
     ) -> (Arc<MockVenue>, Arc<MockVenue>, FundingArbDriver) {
-        let primary = Arc::new(MockVenue::new(VenueId::Binance, VenueProduct::Spot, primary_mid));
+        let primary = Arc::new(MockVenue::new(
+            VenueId::Binance,
+            VenueProduct::Spot,
+            primary_mid,
+        ));
         let hedge = Arc::new(MockVenue::new(
             VenueId::Binance,
             VenueProduct::LinearPerp,
@@ -654,7 +675,11 @@ mod tests {
 
     #[tokio::test]
     async fn run_loop_halts_on_uncompensated_pair_break() {
-        let primary = Arc::new(MockVenue::new(VenueId::Binance, VenueProduct::Spot, dec!(50_000)));
+        let primary = Arc::new(MockVenue::new(
+            VenueId::Binance,
+            VenueProduct::Spot,
+            dec!(50_000),
+        ));
         let hedge = Arc::new(MockVenue::new(
             VenueId::Binance,
             VenueProduct::LinearPerp,
@@ -717,8 +742,14 @@ mod tests {
 
         // Step 1: Enter.
         let ev = driver.tick_once().await;
-        assert!(matches!(ev, DriverEvent::Entered { .. }), "expected Entered, got {ev:?}");
-        assert!(driver.open_sides.is_some(), "driver tracks an open position");
+        assert!(
+            matches!(ev, DriverEvent::Entered { .. }),
+            "expected Entered, got {ev:?}"
+        );
+        assert!(
+            driver.open_sides.is_some(),
+            "driver tracks an open position"
+        );
         // Engine decision-core state reflects the new position.
         let state = driver.state();
         assert_eq!(state.spot_position, dec!(0.1), "long 0.1 spot");
@@ -742,7 +773,10 @@ mod tests {
         // is above the 2 % hold floor inside FundingArbEngine.)
         hedge.set_funding(dec!(0.0001));
         let ev = driver.tick_once().await;
-        assert!(matches!(ev, DriverEvent::Hold), "hold while open, got {ev:?}");
+        assert!(
+            matches!(ev, DriverEvent::Hold),
+            "hold while open, got {ev:?}"
+        );
 
         // Step 3: Basis blows out past max_basis_bps=200.
         // 52_000 / 50_000 = +400 bps basis → Exit.
@@ -773,4 +807,3 @@ mod tests {
         assert_eq!(hedge.placed.lock().unwrap().len(), 2);
     }
 }
-

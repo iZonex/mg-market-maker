@@ -1,6 +1,6 @@
 # Fast Protocol Comparison Matrix
 
-Single-page source of truth for what protocols our venues expose, our implementation status, and expected latency. Update after Sprint 5 benchmarks.
+Single-page source of truth for what protocols our venues expose, our implementation status, and expected latency. Update as benchmark results land.
 
 ## Implementation status
 
@@ -13,13 +13,13 @@ Single-page source of truth for what protocols our venues expose, our implementa
 | HyperLiquid | ✅ live | ✅ wired with REST fallback (WS post) | — | — | WS live |
 | OKX | ❌ no connector | — | — | — | not started |
 | Deribit | ❌ no connector | — | — | — | not started |
-| dYdX v4 | ❌ no connector (gRPC/protobuf, own epic) | — | — | — | not started |
+| dYdX v4 | ❌ no connector (gRPC/protobuf, separate effort) | — | — | — | not started |
 
 Legend: ✅ wired + tested  ·  🧩 scaffold (code exists, not routed)  ·  ⏳ planned  ·  ❌ not started
 
 ## Latency estimates (pre-benchmark)
 
-Typical end-to-end `place_order` round-trip from our colo-adjacent infra (educated guess until Sprint 5 fills in measured numbers):
+Typical end-to-end `place_order` round-trip from our colo-adjacent infra (educated guess until benchmarks land):
 
 | Path | Latency | Notes |
 |---|---|---|
@@ -28,16 +28,16 @@ Typical end-to-end `place_order` round-trip from our colo-adjacent infra (educat
 | FIX 4.4 | 1–8 ms | Binary-ish, no JSON parse, sequence-numbered |
 | Binance SBE binary | 1–3 ms | Only once SBE decoder exists |
 
-Numbers here are placeholders. Sprint 5 replaces with p50/p90/p99 from the benchmark harness.
+Numbers here are placeholders until the benchmark harness fills in measured p50/p90/p99 values.
 
 ## Protocol families
 
 | Family | Venues | Shared abstraction |
 |---|---|---|
-| Request/response JSON over persistent WS with `id` correlation | Binance, Bybit, HyperLiquid, OKX | `crates/protocols/ws_rpc` (Sprint 2) |
+| Request/response JSON over persistent WS with `id` correlation | Binance, Bybit, HyperLiquid, OKX | `crates/protocols/ws_rpc` |
 | JSON-RPC 2.0 over WS | Deribit, Derive | Can reuse `ws_rpc` with a JSON-RPC `WireFormat` |
-| FIX 4.4 over TLS TCP | Binance, Bybit, Deribit (alt), OKX (alt) | `crates/protocols/fix` + session engine (Sprint 4) |
-| gRPC + Cosmos SDK protobuf | dYdX v4 | Separate epic |
+| FIX 4.4 over TLS TCP | Binance, Bybit, Deribit (alt), OKX (alt) | `crates/protocols/fix` + session engine |
+| gRPC + Cosmos SDK protobuf | dYdX v4 | Separate effort |
 | Binance SBE | Binance only | Out of scope |
 
 ## Rate limits (order-entry relevant)
@@ -54,44 +54,47 @@ Numbers here are placeholders. Sprint 5 replaces with p50/p90/p99 from the bench
 | OKX spot | ~60/s per sub-account | — | Per-sub-account |
 | Deribit (MM Tier 1) | ~100/s | — | Per client_id |
 
-## Capability flags (target end-state)
+## Capability flags (current state)
 
-After Sprint 3 completes, `VenueCapabilities` for each venue should read:
+`VenueCapabilities` currently read:
 
 ```rust
-// Binance
+// Binance spot
 VenueCapabilities {
     max_batch_size: 5,
     supports_amend: true,
-    supports_ws_trading: true,  // wired in Sprint 3
-    supports_fix: true,          // wired in Sprint 4
-    max_order_rate: 300,         // per 10s
+    supports_ws_trading: true,   // BinanceConnector + ws_trade.rs
+    supports_fix: false,          // codec + session engine ready; venue adapter pending
+    max_order_rate: 300,          // per 10s
+    supports_funding_rate: false,
 }
 
-// Bybit
+// Bybit linear
 VenueCapabilities {
     max_batch_size: 20,
     supports_amend: true,
-    supports_ws_trading: true,   // wired in Sprint 3
-    supports_fix: false,          // Sprint 4 (beta / institutional)
-    max_order_rate: 600,         // per 5s
+    supports_ws_trading: false,   // adapter scaffold exists; pending live-testnet auth verification
+    supports_fix: false,           // access gated (institutional tier)
+    max_order_rate: 600,          // per 5s
+    supports_funding_rate: true,
 }
 
-// HyperLiquid
+// HyperLiquid perp
 VenueCapabilities {
     max_batch_size: 20,
-    supports_amend: false,       // native modify not exposed in v1
-    supports_ws_trading: true,   // FIX capability bug — to be fixed in Sprint 3
+    supports_amend: false,        // native modify not exposed in v1
+    supports_ws_trading: true,    // HyperLiquidConnector + ws_post.rs
     supports_fix: false,
     max_order_rate: 100,
+    supports_funding_rate: true,
 }
 ```
 
-Sprint 5 audit pass verifies these match the implementation.
+Each venue's `capabilities_match_implementation` unit test pins these flags to the actual adapter types, so declared capabilities cannot drift from code.
 
 ## Benchmark placeholders
 
-To be filled at Sprint 5:
+To be filled from the benchmark harness:
 
 | Path | p50 (ms) | p90 (ms) | p99 (ms) |
 |---|---|---|---|

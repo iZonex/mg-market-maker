@@ -133,5 +133,4 @@ wired — covered by a capability-audit test in each exchange crate.
 
 Venue-specific documentation lives in `docs/protocols/` — one file per
 protocol with endpoint, auth scheme, rate limits, error codes, and
-reconnect semantics. See `docs/epics/protocols-coverage.md` for the
-epic driving this structure.
+reconnect semantics.

@@ -20,8 +20,8 @@ use mm_risk::pnl::PnlTracker;
 use mm_risk::sla::{SlaConfig, SlaTracker};
 use mm_risk::toxicity::{AdverseSelectionTracker, KyleLambda, VpinEstimator};
 use mm_strategy::autotune::AutoTuner;
-use mm_strategy::inventory_skew::AdvancedInventoryManager;
 use mm_strategy::funding_arb_driver::{DriverEvent, FundingArbDriver};
+use mm_strategy::inventory_skew::AdvancedInventoryManager;
 use mm_strategy::momentum::MomentumSignals;
 use mm_strategy::paired_unwind::PairedUnwindExecutor;
 use mm_strategy::r#trait::{Strategy, StrategyContext};
@@ -176,7 +176,10 @@ impl MarketMakerEngine {
             config.toxicity.vpin_num_buckets,
         );
 
-        let hedge_book = connectors.pair.as_ref().map(|pair| BookKeeper::new(&pair.hedge_symbol));
+        let hedge_book = connectors
+            .pair
+            .as_ref()
+            .map(|pair| BookKeeper::new(&pair.hedge_symbol));
         let hedge_order_manager = connectors.hedge.as_ref().map(|_| OrderManager::new());
         Self {
             book_keeper: BookKeeper::new(&symbol),
@@ -285,7 +288,12 @@ impl MarketMakerEngine {
         self.refresh_balances().await;
 
         // Initial orderbook snapshot via REST.
-        match self.connectors.primary.get_orderbook(&self.symbol, 25).await {
+        match self
+            .connectors
+            .primary
+            .get_orderbook(&self.symbol, 25)
+            .await
+        {
             Ok((bids, asks, seq)) => {
                 self.book_keeper.book.apply_snapshot(bids, asks, seq);
                 info!(seq, "initial book snapshot loaded");
@@ -294,9 +302,10 @@ impl MarketMakerEngine {
         }
 
         // Initial hedge orderbook snapshot.
-        if let (Some(hedge), Some(pair)) =
-            (self.connectors.hedge.as_ref(), self.connectors.pair.as_ref())
-        {
+        if let (Some(hedge), Some(pair)) = (
+            self.connectors.hedge.as_ref(),
+            self.connectors.pair.as_ref(),
+        ) {
             match hedge.get_orderbook(&pair.hedge_symbol, 25).await {
                 Ok((bids, asks, seq)) => {
                     if let Some(hb) = self.hedge_book.as_mut() {
@@ -394,21 +403,18 @@ impl MarketMakerEngine {
                 );
             }
             DriverEvent::Exited { reason, .. } => {
-                self.audit.risk_event(
-                    &self.symbol,
-                    AuditEventType::PairDispatchExited,
-                    &reason,
-                );
+                self.audit
+                    .risk_event(&self.symbol, AuditEventType::PairDispatchExited, &reason);
             }
             DriverEvent::TakerRejected { reason } => {
-                self.audit.risk_event(
-                    &self.symbol,
-                    AuditEventType::PairTakerRejected,
-                    &reason,
-                );
+                self.audit
+                    .risk_event(&self.symbol, AuditEventType::PairTakerRejected, &reason);
                 warn!(%reason, "funding arb taker leg rejected — position stayed flat");
             }
-            DriverEvent::PairBreak { reason, compensated } => {
+            DriverEvent::PairBreak {
+                reason,
+                compensated,
+            } => {
                 self.audit.risk_event(
                     &self.symbol,
                     AuditEventType::PairBreak,
@@ -480,9 +486,7 @@ impl MarketMakerEngine {
                 // Portfolio gets the hedge fill with the hedge
                 // symbol so per-asset tracking remains symmetric
                 // across the two legs of a pair.
-                if let (Some(pf), Some(pair)) =
-                    (&self.portfolio, self.connectors.pair.as_ref())
-                {
+                if let (Some(pf), Some(pair)) = (&self.portfolio, self.connectors.pair.as_ref()) {
                     if let Ok(mut pf) = pf.lock() {
                         pf.on_fill(&pair.hedge_symbol, signed_qty, fill.price);
                     }
@@ -576,10 +580,7 @@ impl MarketMakerEngine {
             // `OrderManager` so cancel-all + fill tracking
             // stay per-venue.
             if let Some(unwind) = self.paired_unwind.as_mut() {
-                if let Some(hedge_mid) = self
-                    .hedge_book
-                    .as_ref()
-                    .and_then(|hb| hb.book.mid_price())
+                if let Some(hedge_mid) = self.hedge_book.as_ref().and_then(|hb| hb.book.mid_price())
                 {
                     let slice = unwind.next_slice(mid, hedge_mid);
                     if let Some(p) = &slice.primary {
@@ -963,10 +964,7 @@ impl MarketMakerEngine {
         tuned.order_size = eff_size;
         tuned.min_spread_bps = eff_spread;
 
-        let ref_price = self
-            .hedge_book
-            .as_ref()
-            .and_then(|hb| hb.book.mid_price());
+        let ref_price = self.hedge_book.as_ref().and_then(|hb| hb.book.mid_price());
 
         let ctx = StrategyContext {
             book: &self.book_keeper.book,
@@ -1070,7 +1068,12 @@ impl MarketMakerEngine {
         self.kill_switch.on_message_sent();
 
         self.order_manager
-            .execute_diff(&self.symbol, &quotes, &self.product, &self.connectors.primary)
+            .execute_diff(
+                &self.symbol,
+                &quotes,
+                &self.product,
+                &self.connectors.primary,
+            )
             .await?;
 
         // SLA update.
@@ -1310,7 +1313,10 @@ mod dual_connector_tests {
     #[test]
     fn dual_bundle_creates_hedge_book() {
         let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
-        let hedge = Arc::new(MockConnector::new(VenueId::HyperLiquid, VenueProduct::LinearPerp));
+        let hedge = Arc::new(MockConnector::new(
+            VenueId::HyperLiquid,
+            VenueProduct::LinearPerp,
+        ));
         let bundle = ConnectorBundle::dual(primary, hedge, sample_pair());
         let engine = MarketMakerEngine::new(
             "BTCUSDT".to_string(),
@@ -1329,7 +1335,10 @@ mod dual_connector_tests {
     #[test]
     fn handle_hedge_event_routes_book_updates_to_hedge_book() {
         let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
-        let hedge = Arc::new(MockConnector::new(VenueId::HyperLiquid, VenueProduct::LinearPerp));
+        let hedge = Arc::new(MockConnector::new(
+            VenueId::HyperLiquid,
+            VenueProduct::LinearPerp,
+        ));
         let bundle = ConnectorBundle::dual(primary, hedge, sample_pair());
         let mut engine = MarketMakerEngine::new(
             "BTCUSDT".to_string(),
@@ -1343,7 +1352,12 @@ mod dual_connector_tests {
 
         // Primary gets a spot quote around 50 000. Hedge gets a
         // perp quote around 50 100 — a +10 bps basis.
-        engine.handle_ws_event(snapshot("BTCUSDT", VenueId::Binance, dec!(49_999), dec!(50_001)));
+        engine.handle_ws_event(snapshot(
+            "BTCUSDT",
+            VenueId::Binance,
+            dec!(49_999),
+            dec!(50_001),
+        ));
         engine.handle_hedge_event(snapshot(
             "BTC",
             VenueId::HyperLiquid,
@@ -1392,7 +1406,10 @@ mod dual_connector_tests {
         // of side effects) so we inspect the intermediate
         // expression the production code uses.
         let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
-        let hedge = Arc::new(MockConnector::new(VenueId::HyperLiquid, VenueProduct::LinearPerp));
+        let hedge = Arc::new(MockConnector::new(
+            VenueId::HyperLiquid,
+            VenueProduct::LinearPerp,
+        ));
         let bundle = ConnectorBundle::dual(primary, hedge, sample_pair());
         let mut engine = MarketMakerEngine::new(
             "BTCUSDT".to_string(),
@@ -1489,12 +1506,7 @@ mod portfolio_tests {
         );
         assert!(engine.portfolio.is_none());
         // Fill should NOT panic when portfolio is absent.
-        engine.handle_ws_event(fill_event(
-            "BTCUSDT",
-            Side::Buy,
-            dec!(0.1),
-            dec!(50_000),
-        ));
+        engine.handle_ws_event(fill_event("BTCUSDT", Side::Buy, dec!(0.1), dec!(50_000)));
     }
 
     #[test]
@@ -1502,12 +1514,7 @@ mod portfolio_tests {
         let portfolio = Arc::new(Mutex::new(Portfolio::new("USDT")));
         let mut engine = build_engine("BTCUSDT", portfolio.clone());
 
-        engine.handle_ws_event(fill_event(
-            "BTCUSDT",
-            Side::Buy,
-            dec!(0.1),
-            dec!(50_000),
-        ));
+        engine.handle_ws_event(fill_event("BTCUSDT", Side::Buy, dec!(0.1), dec!(50_000)));
 
         let snap = portfolio.lock().unwrap().snapshot();
         let btc = snap.per_asset.get("BTCUSDT").expect("BTCUSDT entry");
@@ -1541,18 +1548,8 @@ mod portfolio_tests {
         let mut btc_engine = build_engine("BTCUSDT", portfolio.clone());
         let mut eth_engine = build_engine("ETHUSDT", portfolio.clone());
 
-        btc_engine.handle_ws_event(fill_event(
-            "BTCUSDT",
-            Side::Buy,
-            dec!(0.1),
-            dec!(50_000),
-        ));
-        eth_engine.handle_ws_event(fill_event(
-            "ETHUSDT",
-            Side::Buy,
-            dec!(1),
-            dec!(3_000),
-        ));
+        btc_engine.handle_ws_event(fill_event("BTCUSDT", Side::Buy, dec!(0.1), dec!(50_000)));
+        eth_engine.handle_ws_event(fill_event("ETHUSDT", Side::Buy, dec!(1), dec!(3_000)));
 
         let snap = portfolio.lock().unwrap().snapshot();
         assert_eq!(snap.per_asset.len(), 2, "both symbols tracked");
@@ -1569,12 +1566,7 @@ mod portfolio_tests {
         // that contract.
         let portfolio = Arc::new(Mutex::new(Portfolio::new("USDT")));
         let mut engine = build_engine("BTCUSDT", portfolio.clone());
-        engine.handle_ws_event(fill_event(
-            "BTCUSDT",
-            Side::Buy,
-            dec!(0.01),
-            dec!(50_000),
-        ));
+        engine.handle_ws_event(fill_event("BTCUSDT", Side::Buy, dec!(0.01), dec!(50_000)));
         let snap = portfolio.lock().unwrap().snapshot();
         assert_eq!(snap.reporting_currency, "USDT");
     }
@@ -1885,7 +1877,11 @@ mod paired_unwind_tests {
         let snap = portfolio.lock().unwrap().snapshot();
         assert!(snap.per_asset.contains_key("BTC-PERP"));
         let hedge_entry = snap.per_asset.get("BTC-PERP").unwrap();
-        assert_eq!(hedge_entry.qty, dec!(0.02), "hedge buy fill = long position");
+        assert_eq!(
+            hedge_entry.qty,
+            dec!(0.02),
+            "hedge buy fill = long position"
+        );
         // paired_unwind tracked the fill → progress > 0.
         let unwind = engine.paired_unwind.as_ref().expect("unwind still active");
         // 0.02 filled out of 0.1 target on hedge, primary still at 0
@@ -1970,7 +1966,10 @@ mod paired_unwind_tests {
         });
 
         // Executor cleared itself on the final on_hedge_fill.
-        assert!(engine.paired_unwind.is_none(), "unwind cleared on completion");
+        assert!(
+            engine.paired_unwind.is_none(),
+            "unwind cleared on completion"
+        );
     }
 }
 
@@ -2135,4 +2134,3 @@ mod driver_event_tests {
         assert_eq!(state.net_delta, dec!(0), "delta-neutral");
     }
 }
-

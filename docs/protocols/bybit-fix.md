@@ -1,6 +1,6 @@
 # Bybit FIX 4.4 (institutional)
 
-**Status:** target for Sprint 4; access gated
+**Status:** codec + session engine live in `crates/protocols/fix`; Bybit FIX venue adapter not yet wired (access gated, institutional tier)
 **Canonical spec:** <https://bybit-exchange.github.io/docs/v5/fix>
 
 ## Purpose

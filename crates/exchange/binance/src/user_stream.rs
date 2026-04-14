@@ -146,7 +146,10 @@ pub fn start(config: UserStreamConfig, tx: mpsc::UnboundedSender<MarketEvent>) -
     UserDataStream
 }
 
-async fn run(config: UserStreamConfig, tx: mpsc::UnboundedSender<MarketEvent>) -> anyhow::Result<()> {
+async fn run(
+    config: UserStreamConfig,
+    tx: mpsc::UnboundedSender<MarketEvent>,
+) -> anyhow::Result<()> {
     let client = Client::new();
     loop {
         let listen_key = match obtain_listen_key(&client, &config).await {
@@ -197,7 +200,11 @@ async fn obtain_listen_key(client: &Client, config: &UserStreamConfig) -> anyhow
     Ok(key.to_string())
 }
 
-fn spawn_keepalive(client: Client, config: UserStreamConfig, key: String) -> tokio::task::JoinHandle<()> {
+fn spawn_keepalive(
+    client: Client,
+    config: UserStreamConfig,
+    key: String,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30 * 60));
         interval.tick().await; // fire once immediately after 30min, not at t=0
@@ -570,10 +577,7 @@ mod tests {
             UserStreamProduct::UsdMarginedFutures.wallet(),
             WalletType::UsdMarginedFutures
         );
-        assert_eq!(
-            UserStreamProduct::Spot.venue_product(),
-            VenueProduct::Spot
-        );
+        assert_eq!(UserStreamProduct::Spot.venue_product(), VenueProduct::Spot);
         assert_eq!(
             UserStreamProduct::UsdMarginedFutures.venue_product(),
             VenueProduct::LinearPerp

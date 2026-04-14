@@ -338,10 +338,8 @@ mod tests {
             dec!(50_000),
             Some(dec!(50_150)),
         ));
-        let all_empty = quotes
-            .iter()
-            .all(|q| q.bid.is_none() && q.ask.is_none())
-            || quotes.is_empty();
+        let all_empty =
+            quotes.iter().all(|q| q.bid.is_none() && q.ask.is_none()) || quotes.is_empty();
         assert!(
             all_empty,
             "basis > threshold must produce no actionable quotes"
@@ -397,9 +395,8 @@ mod tests {
             dec!(50_000),
             Some(dec!(50_500)),
         ));
-        let quotes_without_perp = strategy.compute_quotes(&ctx(
-            &book, &product, &config, dec!(50_000), None,
-        ));
+        let quotes_without_perp =
+            strategy.compute_quotes(&ctx(&book, &product, &config, dec!(50_000), None));
         assert_eq!(
             quotes_with_perp[0].bid.as_ref().unwrap().price,
             quotes_without_perp[0].bid.as_ref().unwrap().price

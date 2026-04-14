@@ -18,9 +18,7 @@ use mm_protocols_ws_rpc::{Frame, WireFormat, WsRpcClient, WsRpcConfig};
 use serde_json::{json, Value};
 
 use crate::auth::{sign_l1_action, PrivateKey};
-use crate::types::{
-    HlCancelByCloid, HlCancelByCloidAction, HlOrder, HlOrderAction,
-};
+use crate::types::{HlCancelByCloid, HlCancelByCloidAction, HlOrder, HlOrderAction};
 
 /// Wire format for HL WS `method=post` envelopes.
 pub struct HlPostWire;
@@ -144,11 +142,7 @@ impl HlWsTrader {
     }
 
     /// Cancel a batch of orders by cloid on the same asset.
-    pub async fn cancel_batch_by_cloid(
-        &self,
-        asset: u32,
-        cloids: Vec<String>,
-    ) -> Result<Value> {
+    pub async fn cancel_batch_by_cloid(&self, asset: u32, cloids: Vec<String>) -> Result<Value> {
         let cancels = cloids
             .into_iter()
             .map(|cloid| HlCancelByCloid { asset, cloid })
@@ -216,7 +210,9 @@ mod tests {
         match frame {
             Frame::Response { id, result: Ok(v) } => {
                 assert_eq!(id, 42);
-                let oid = v.pointer("/data/statuses/0/resting/oid").and_then(|v| v.as_u64());
+                let oid = v
+                    .pointer("/data/statuses/0/resting/oid")
+                    .and_then(|v| v.as_u64());
                 assert_eq!(oid, Some(12345));
             }
             _ => panic!("expected Response::Ok"),
@@ -279,6 +275,12 @@ mod tests {
             }
         }"#;
         let frame = HlPostWire.decode_frame(frame).unwrap();
-        assert!(matches!(frame, Frame::Response { id: 1, result: Err(_) }));
+        assert!(matches!(
+            frame,
+            Frame::Response {
+                id: 1,
+                result: Err(_)
+            }
+        ));
     }
 }

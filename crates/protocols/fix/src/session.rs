@@ -451,7 +451,11 @@ mod tests {
         let mut s = mk_session();
         let t0 = Instant::now();
         let _ = s.start_logon(t0, T);
-        let _ = s.on_message(decode(&Message::logon(30).encode("VENUE", "CLIENT", 1, T)), t0, T);
+        let _ = s.on_message(
+            decode(&Message::logon(30).encode("VENUE", "CLIENT", 1, T)),
+            t0,
+            T,
+        );
 
         let mut tr = Message::test_request("ABC");
         // Mutate MsgSeqNum via internal fields: encode then decode with

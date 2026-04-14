@@ -162,10 +162,7 @@ pub trait ExchangeConnector: Send + Sync {
     /// Current funding rate for a perp symbol. Spot connectors
     /// return `Err(FundingRateError::NotSupported)` (this is the
     /// default impl).
-    async fn get_funding_rate(
-        &self,
-        _symbol: &str,
-    ) -> Result<FundingRate, FundingRateError> {
+    async fn get_funding_rate(&self, _symbol: &str) -> Result<FundingRate, FundingRateError> {
         Err(FundingRateError::NotSupported)
     }
 

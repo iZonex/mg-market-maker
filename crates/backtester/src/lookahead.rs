@@ -118,11 +118,7 @@ where
 
 /// Convenience wrapper for `Vec<V>` equality checks where `V` is
 /// numeric and a tiny rounding tolerance is acceptable.
-pub fn check_lookahead_approx<E, F>(
-    events: &[E],
-    run: F,
-    tolerance: f64,
-) -> LookaheadReport<f64>
+pub fn check_lookahead_approx<E, F>(events: &[E], run: F, tolerance: f64) -> LookaheadReport<f64>
 where
     F: Fn(&[E]) -> Vec<f64>,
 {
@@ -201,7 +197,11 @@ mod tests {
     fn clean_sma_has_no_leak() {
         let prices = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
         let report = check_lookahead_approx(&prices, clean_sma, 1e-12);
-        assert!(report.is_clean(), "clean SMA flagged as leaky: {:?}", report.leaks);
+        assert!(
+            report.is_clean(),
+            "clean SMA flagged as leaky: {:?}",
+            report.leaks
+        );
     }
 
     #[test]

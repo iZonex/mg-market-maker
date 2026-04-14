@@ -222,7 +222,11 @@ mod tests {
         let mut e = exec(dec!(50), dec!(0));
         let d = e.on_maker_fill(Side::Buy, dec!(1), dec!(100), dec!(100.5), dec!(100.6));
         match d {
-            XemmDecision::Hedge { side, qty, expected_price } => {
+            XemmDecision::Hedge {
+                side,
+                qty,
+                expected_price,
+            } => {
                 assert_eq!(side, Side::Sell);
                 assert_eq!(qty, dec!(1));
                 assert_eq!(expected_price, dec!(100.5));
@@ -236,7 +240,11 @@ mod tests {
         let mut e = exec(dec!(50), dec!(0));
         let d = e.on_maker_fill(Side::Sell, dec!(2), dec!(100), dec!(99.5), dec!(99.6));
         match d {
-            XemmDecision::Hedge { side, expected_price, qty } => {
+            XemmDecision::Hedge {
+                side,
+                expected_price,
+                qty,
+            } => {
                 assert_eq!(side, Side::Buy);
                 assert_eq!(expected_price, dec!(99.6));
                 assert_eq!(qty, dec!(2));

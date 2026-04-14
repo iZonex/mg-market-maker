@@ -115,13 +115,7 @@ impl Message {
     /// `sending_time` as a pre-formatted UTCTimestamp string
     /// (`YYYYMMDD-HH:MM:SS.sss`). Keeping the timestamp out of the codec
     /// means the output is deterministic for tests.
-    pub fn encode(
-        &self,
-        sender: &str,
-        target: &str,
-        seq: u64,
-        sending_time: &str,
-    ) -> Vec<u8> {
+    pub fn encode(&self, sender: &str, target: &str, seq: u64, sending_time: &str) -> Vec<u8> {
         // Body: MsgType first, then mandatory session headers, then custom
         // fields. We skip any caller-set session tags so the session layer
         // retains ownership of them.
@@ -173,7 +167,10 @@ impl Message {
         // Checksum is always the last field.
         let last = fields.last().ok_or_else(|| anyhow!("empty FIX message"))?;
         if last.0 != tags::CHECKSUM {
-            bail!("FIX: CheckSum (10) must be the last field, found {}", last.0);
+            bail!(
+                "FIX: CheckSum (10) must be the last field, found {}",
+                last.0
+            );
         }
         let expected: u32 = last
             .1
