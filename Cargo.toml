@@ -28,11 +28,11 @@ version = "0.3.0"
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 
 # HTTP
-reqwest = { version = "0.12", features = ["json", "native-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 axum = { version = "0.8", features = ["json", "ws"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
