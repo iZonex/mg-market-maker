@@ -9,11 +9,13 @@ mm-exchange-client = { workspace = true }
 mm-exchange-core = { workspace = true }
 mm-exchange-binance = { workspace = true }
 mm-exchange-bybit = { workspace = true }
+mm-exchange-hyperliquid = { workspace = true }
 mm-strategy = { workspace = true }
 mm-risk = { workspace = true }
 mm-engine = { workspace = true }
 mm-dashboard = { workspace = true }
 mm-persistence = { workspace = true }
+mm-portfolio = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -16,6 +16,10 @@ pub struct StrategyContext<'a> {
     pub time_remaining: Decimal,
     /// Recent mid price for reference.
     pub mid_price: Price,
+    /// Mid price on the hedge leg (basis-aware strategies shift
+    /// reservation price toward this). `None` in single-connector
+    /// mode or before the hedge book has seen its first update.
+    pub ref_price: Option<Price>,
 }
 
 /// Trait for market-making strategies.

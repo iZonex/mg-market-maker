@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use mm_common::config::LoanConfig;
+use mm_portfolio::PortfolioSnapshot;
 use rust_decimal::Decimal;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -16,6 +17,12 @@ struct StateInner {
     symbols: HashMap<String, SymbolState>,
     loans: HashMap<String, LoanConfig>,
     incidents: Vec<IncidentRecord>,
+    /// Last-seen portfolio snapshot, aggregated across all
+    /// symbols/engines. `None` when the operator runs without
+    /// `mm-portfolio` wired — in that case the dashboard still
+    /// shows per-symbol PnL from `PnlTracker` but the unified
+    /// multi-currency view is unavailable.
+    portfolio: Option<PortfolioSnapshot>,
 }
 
 /// A recorded incident for the daily report.
@@ -169,6 +176,35 @@ impl DashboardState {
     pub fn get_incidents(&self) -> Vec<IncidentRecord> {
         let inner = self.inner.read().unwrap();
         inner.incidents.clone()
+    }
+
+    /// Publish a portfolio snapshot + its Prometheus gauges.
+    /// The engine calls this every summary tick with a snapshot
+    /// taken under the shared portfolio mutex.
+    pub fn update_portfolio(&self, snap: PortfolioSnapshot) {
+        crate::metrics::PORTFOLIO_TOTAL_EQUITY
+            .with_label_values(&[&snap.reporting_currency])
+            .set(decimal_to_f64(snap.total_equity));
+        crate::metrics::PORTFOLIO_REALISED_PNL
+            .with_label_values(&[&snap.reporting_currency])
+            .set(decimal_to_f64(snap.total_realised_pnl));
+        crate::metrics::PORTFOLIO_UNREALISED_PNL
+            .with_label_values(&[&snap.reporting_currency])
+            .set(decimal_to_f64(snap.total_unrealised_pnl));
+        for (symbol, asset) in &snap.per_asset {
+            crate::metrics::PORTFOLIO_ASSET_QTY
+                .with_label_values(&[symbol])
+                .set(decimal_to_f64(asset.qty));
+            crate::metrics::PORTFOLIO_ASSET_UNREALISED
+                .with_label_values(&[symbol])
+                .set(decimal_to_f64(asset.unrealised_pnl_reporting));
+        }
+        self.inner.write().unwrap().portfolio = Some(snap);
+    }
+
+    /// Read the last-published portfolio snapshot.
+    pub fn get_portfolio(&self) -> Option<PortfolioSnapshot> {
+        self.inner.read().unwrap().portfolio.clone()
     }
 }
 

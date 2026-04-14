@@ -1,0 +1,9 @@
+[package]
+name = "mm-indicators"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+serde = { workspace = true }

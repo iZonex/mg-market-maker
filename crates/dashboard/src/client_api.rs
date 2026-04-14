@@ -16,12 +16,24 @@ use crate::state::DashboardState;
 ///   GET /api/v1/sla                — SLA compliance report
 ///   GET /api/v1/fills/recent       — recent fills
 ///   GET /api/v1/report/daily       — daily performance report (JSON)
+///   GET /api/v1/portfolio          — unified multi-currency portfolio snapshot
 pub fn client_routes() -> Router<DashboardState> {
     Router::new()
         .route("/api/v1/positions", get(get_positions))
         .route("/api/v1/pnl", get(get_pnl))
         .route("/api/v1/sla", get(get_sla))
         .route("/api/v1/report/daily", get(get_daily_report))
+        .route("/api/v1/portfolio", get(get_portfolio))
+}
+
+/// Unified multi-currency portfolio snapshot in the reporting
+/// currency. Returns `null` when `mm-portfolio` is not wired
+/// (operator did not call `MarketMakerEngine::with_portfolio`)
+/// or before the first summary tick has pushed a snapshot.
+async fn get_portfolio(
+    State(state): State<DashboardState>,
+) -> Json<Option<mm_portfolio::PortfolioSnapshot>> {
+    Json(state.get_portfolio())
 }
 
 /// Position per symbol.

@@ -252,6 +252,22 @@ impl FundingArbEngine {
         self.state.perp_position = dec!(0);
         self.state.net_delta = dec!(0);
     }
+
+    /// Incrementally adjust the spot leg's position from a real
+    /// exchange fill. Keeps `FundingArbState` in sync with the
+    /// live OMS rather than relying on the ideal `on_entry`
+    /// amount written at dispatch time. Caller passes a signed
+    /// qty (positive = buy, negative = sell).
+    pub fn apply_spot_fill(&mut self, signed_qty: Decimal) {
+        self.state.spot_position += signed_qty;
+        self.state.net_delta = self.state.spot_position + self.state.perp_position;
+    }
+
+    /// Same as [`apply_spot_fill`] for the perp leg.
+    pub fn apply_perp_fill(&mut self, signed_qty: Decimal) {
+        self.state.perp_position += signed_qty;
+        self.state.net_delta = self.state.spot_position + self.state.perp_position;
+    }
 }
 
 #[cfg(test)]

@@ -73,6 +73,21 @@ pub enum AuditEventType {
     // Strategy.
     StrategyQuoteRefresh,
     RegimeChange,
+
+    // Cross-product pair dispatch (funding arb / basis trade).
+    /// Atomic pair dispatch succeeded — both legs placed.
+    PairDispatchEntered,
+    /// Atomic pair dispatch exited cleanly — both legs reversed.
+    PairDispatchExited,
+    /// Taker leg rejected before any position committed. Safe,
+    /// no exposure.
+    PairTakerRejected,
+    /// Maker leg rejected after taker leg filled. The executor
+    /// fires a compensating market reversal; `detail` says
+    /// whether the compensation itself succeeded. An
+    /// uncompensated break is the cue to escalate the kill
+    /// switch to L2 StopNewOrders.
+    PairBreak,
 }
 
 impl AuditLog {

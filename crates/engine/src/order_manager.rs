@@ -166,6 +166,66 @@ impl OrderManager {
         Ok(())
     }
 
+    /// Place a single unwind slice on the venue without going
+    /// through the diff machinery. Used by kill-switch L4
+    /// executors (`TwapExecutor`, `PairedUnwindExecutor`) where
+    /// each tick emits a fresh IOC-ish slice that either fills
+    /// immediately or gets cleaned up on shutdown.
+    ///
+    /// The order is placed as a limit with `TimeInForce::Ioc`
+    /// so a non-crossing slice evaporates on the venue side
+    /// instead of resting and interfering with future slices.
+    /// Tracked in `live_orders` so `cancel_all` + fill routing
+    /// still work.
+    pub async fn execute_unwind_slice(
+        &mut self,
+        symbol: &str,
+        quote: &Quote,
+        product: &ProductSpec,
+        connector: &Arc<dyn ExchangeConnector>,
+    ) -> Result<()> {
+        let price = product.round_price(quote.price);
+        let qty = product.round_qty(quote.qty);
+        if qty.is_zero() {
+            return Ok(());
+        }
+        let order = NewOrder {
+            symbol: symbol.to_string(),
+            side: quote.side,
+            order_type: OrderType::Limit,
+            price: Some(price),
+            qty,
+            time_in_force: Some(TimeInForce::Ioc),
+            client_order_id: None,
+        };
+        match connector.place_order(&order).await {
+            Ok(order_id) => {
+                info!(
+                    %order_id,
+                    side = ?quote.side,
+                    %price,
+                    %qty,
+                    "placed unwind slice"
+                );
+                self.track_order(LiveOrder {
+                    order_id,
+                    symbol: symbol.to_string(),
+                    side: quote.side,
+                    price,
+                    qty,
+                    filled_qty: dec!(0),
+                    status: mm_common::types::OrderStatus::Open,
+                    created_at: chrono::Utc::now(),
+                });
+                Ok(())
+            }
+            Err(e) => {
+                warn!(error = %e, "unwind slice placement failed");
+                Err(e)
+            }
+        }
+    }
+
     /// Cancel all live orders (emergency or shutdown).
     pub async fn cancel_all(&mut self, connector: &Arc<dyn ExchangeConnector>, symbol: &str) {
         let ids: Vec<OrderId> = self.live_orders.keys().copied().collect();

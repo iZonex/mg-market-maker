@@ -26,3 +26,6 @@ frontend/dist/
 
 # Benchmark results
 target/criterion/
+
+docs/epics/
+docs/audits/

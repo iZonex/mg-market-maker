@@ -1,6 +1,13 @@
 use once_cell::sync::Lazy;
 use prometheus::{register_gauge_vec, register_int_counter_vec, GaugeVec, IntCounterVec};
 
+// Connector-level metrics live in `mm-exchange-core::metrics` so venue
+// adapters can observe them without pulling in the dashboard crate.
+// The `/metrics` endpoint scrapes the process-global registry so the
+// timeseries still shows up here even though the Lazy lives in a
+// different crate.
+pub use mm_exchange_core::metrics::ORDER_ENTRY_LATENCY;
+
 // Prometheus metrics for the market maker.
 
 // PnL
@@ -101,6 +108,48 @@ pub static REGIME: Lazy<GaugeVec> = Lazy::new(|| {
     .unwrap()
 });
 
+// Portfolio — unified view across all symbols in the reporting currency.
+pub static PORTFOLIO_TOTAL_EQUITY: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_portfolio_total_equity",
+        "Portfolio total equity (realised + unrealised) in reporting currency",
+        &["currency"]
+    )
+    .unwrap()
+});
+pub static PORTFOLIO_REALISED_PNL: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_portfolio_realised_pnl",
+        "Portfolio realised PnL in reporting currency",
+        &["currency"]
+    )
+    .unwrap()
+});
+pub static PORTFOLIO_UNREALISED_PNL: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_portfolio_unrealised_pnl",
+        "Portfolio unrealised (mark-to-market) PnL in reporting currency",
+        &["currency"]
+    )
+    .unwrap()
+});
+pub static PORTFOLIO_ASSET_QTY: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_portfolio_asset_qty",
+        "Portfolio per-asset position quantity (signed)",
+        &["symbol"]
+    )
+    .unwrap()
+});
+pub static PORTFOLIO_ASSET_UNREALISED: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_portfolio_asset_unrealised_reporting",
+        "Portfolio per-asset unrealised PnL in reporting currency",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
 /// Initialize all metrics (call once at startup).
 pub fn init() {
     // Force lazy initialization.
@@ -121,4 +170,10 @@ pub fn init() {
     let _ = &*KILL_SWITCH_LEVEL;
     let _ = &*SLA_UPTIME;
     let _ = &*REGIME;
+    let _ = &*PORTFOLIO_TOTAL_EQUITY;
+    let _ = &*PORTFOLIO_REALISED_PNL;
+    let _ = &*PORTFOLIO_UNREALISED_PNL;
+    let _ = &*PORTFOLIO_ASSET_QTY;
+    let _ = &*PORTFOLIO_ASSET_UNREALISED;
+    let _ = &*ORDER_ENTRY_LATENCY;
 }

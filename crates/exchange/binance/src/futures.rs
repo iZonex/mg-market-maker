@@ -1,0 +1,640 @@
+//! Binance USDⓈ-M futures connector.
+//!
+//! Parallel struct to [`BinanceConnector`](crate::connector::BinanceConnector)
+//! that targets `/fapi/v1/*` instead of `/api/v3/*`. Reuses `auth.rs`
+//! because the HMAC-SHA256 signing scheme is identical between spot
+//! and futures; only the URLs and the endpoint shapes differ.
+//!
+//! Scope:
+//!
+//! - USDⓈ-margined perps (`BTCUSDT`, `ETHUSDT`, …)
+//! - REST order entry, open-orders, balances, exchange info
+//! - Native batch orders via `/fapi/v1/batchOrders`
+//! - Funding rate read via `/fapi/v1/premiumIndex`
+//! - Public depth + trade WebSocket streams on `fstream.binance.com`
+//! - One-way position mode (hedge mode deferred until needed)
+//!
+//! Out of scope for Sprint D:
+//!
+//! - WS API order entry (separate `BinanceFuturesWsTrader` adapter)
+//! - Listen-key user data stream (Sprint F closes this gap for
+//!   both spot and futures)
+//! - COIN-M futures (`/dapi/v1/*` — different base URL, separate
+//!   epic when needed)
+
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use mm_common::types::*;
+use mm_exchange_core::connector::*;
+use mm_exchange_core::events::MarketEvent;
+use mm_exchange_core::metrics::ORDER_ENTRY_LATENCY;
+use mm_exchange_core::rate_limiter::RateLimiter;
+use reqwest::Client;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+use serde_json::Value;
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
+
+use crate::auth;
+
+/// Binance USDⓈ-M futures connector.
+pub struct BinanceFuturesConnector {
+    client: Client,
+    base_url: String,
+    ws_url: String,
+    api_key: String,
+    api_secret: String,
+    rate_limiter: RateLimiter,
+    capabilities: VenueCapabilities,
+}
+
+impl BinanceFuturesConnector {
+    pub fn new(api_key: &str, api_secret: &str) -> Self {
+        Self::with_urls(
+            "https://fapi.binance.com",
+            "wss://fstream.binance.com/ws",
+            api_key,
+            api_secret,
+        )
+    }
+
+    pub fn testnet(api_key: &str, api_secret: &str) -> Self {
+        Self::with_urls(
+            "https://testnet.binancefuture.com",
+            "wss://stream.binancefuture.com/ws",
+            api_key,
+            api_secret,
+        )
+    }
+
+    fn with_urls(base_url: &str, ws_url: &str, api_key: &str, api_secret: &str) -> Self {
+        Self {
+            client: Client::new(),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            ws_url: ws_url.to_string(),
+            api_key: api_key.to_string(),
+            api_secret: api_secret.to_string(),
+            // Binance USDⓈ-M: 2400 weight / min, 80% budget.
+            rate_limiter: RateLimiter::new(2400, Duration::from_secs(60), 0.8),
+            capabilities: VenueCapabilities {
+                max_batch_size: 5,
+                supports_amend: true,
+                supports_ws_trading: false, // adapter + listen-key in later sprints
+                supports_fix: false,
+                max_order_rate: 300,
+                supports_funding_rate: true,
+            },
+        }
+    }
+
+    async fn signed_get(&self, path: &str, params: &str) -> anyhow::Result<Value> {
+        self.rate_limiter.acquire(1).await;
+        let query = auth::signed_query(&self.api_secret, params);
+        let url = format!("{}{path}?{query}", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: Value = resp.json().await?;
+        if !status.is_success() {
+            anyhow::bail!("Binance futures API error {status}: {body}");
+        }
+        Ok(body)
+    }
+
+    async fn signed_post(&self, path: &str, params: &str) -> anyhow::Result<Value> {
+        self.rate_limiter.acquire(1).await;
+        let query = auth::signed_query(&self.api_secret, params);
+        let url = format!("{}{path}?{query}", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: Value = resp.json().await?;
+        if !status.is_success() {
+            anyhow::bail!("Binance futures API error {status}: {body}");
+        }
+        Ok(body)
+    }
+
+    async fn signed_delete(&self, path: &str, params: &str) -> anyhow::Result<Value> {
+        self.rate_limiter.acquire(1).await;
+        let query = auth::signed_query(&self.api_secret, params);
+        let url = format!("{}{path}?{query}", self.base_url);
+        let resp = self
+            .client
+            .delete(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: Value = resp.json().await?;
+        if !status.is_success() {
+            anyhow::bail!("Binance futures API error {status}: {body}");
+        }
+        Ok(body)
+    }
+}
+
+#[async_trait]
+impl ExchangeConnector for BinanceFuturesConnector {
+    fn venue_id(&self) -> VenueId {
+        VenueId::Binance
+    }
+
+    fn capabilities(&self) -> &VenueCapabilities {
+        &self.capabilities
+    }
+
+    fn product(&self) -> VenueProduct {
+        // USDⓈ-M perpetual futures.
+        VenueProduct::LinearPerp
+    }
+
+    async fn get_funding_rate(
+        &self,
+        symbol: &str,
+    ) -> Result<FundingRate, FundingRateError> {
+        // `/fapi/v1/premiumIndex` returns current mark price,
+        // funding rate, and next funding time for the symbol.
+        self.rate_limiter.acquire(1).await;
+        let url = format!("{}/fapi/v1/premiumIndex?symbol={symbol}", self.base_url);
+        let body: Value = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| FundingRateError::Other(anyhow::anyhow!(e)))?
+            .json()
+            .await
+            .map_err(|e| FundingRateError::Other(anyhow::anyhow!(e)))?;
+
+        let rate_str = body
+            .get("lastFundingRate")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                FundingRateError::Other(anyhow::anyhow!("missing lastFundingRate"))
+            })?;
+        let rate: Decimal = rate_str
+            .parse()
+            .map_err(|e| FundingRateError::Other(anyhow::anyhow!("bad rate: {e}")))?;
+        let next_ms = body
+            .get("nextFundingTime")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| {
+                FundingRateError::Other(anyhow::anyhow!("missing nextFundingTime"))
+            })?;
+        let next_funding_time = chrono::DateTime::from_timestamp_millis(next_ms)
+            .ok_or_else(|| {
+                FundingRateError::Other(anyhow::anyhow!("bad nextFundingTime: {next_ms}"))
+            })?;
+
+        Ok(FundingRate {
+            rate,
+            next_funding_time,
+            // Binance USDⓈ-M funding cadence is 8h on most symbols.
+            // Exceptions exist (1h or 4h on a handful of contracts);
+            // the authoritative value is in the `/fapi/v1/fundingInfo`
+            // endpoint, which we read lazily only if the downstream
+            // strategy asks for it. For now, report the common case.
+            interval: Duration::from_secs(8 * 3600),
+        })
+    }
+
+    async fn subscribe(
+        &self,
+        symbols: &[String],
+    ) -> anyhow::Result<mpsc::UnboundedReceiver<MarketEvent>> {
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        // Depth20 + trade per symbol, combined stream.
+        let streams: Vec<String> = symbols
+            .iter()
+            .flat_map(|s| {
+                let lower = s.to_lowercase();
+                vec![format!("{lower}@depth20@100ms"), format!("{lower}@trade")]
+            })
+            .collect();
+        let stream_param = streams.join("/");
+        // Combined-stream endpoint pattern:
+        //   wss://fstream.binance.com/stream?streams=<s1>/<s2>/…
+        let host = self
+            .ws_url
+            .trim_end_matches("/ws")
+            .trim_end_matches("/stream");
+        let url = format!("{host}/stream?streams={stream_param}");
+
+        info!(url = %url, "subscribing to Binance futures streams");
+
+        tokio::spawn(async move {
+            use futures_util::StreamExt;
+            use tokio_tungstenite::connect_async;
+
+            loop {
+                match connect_async(&url).await {
+                    Ok((ws, _)) => {
+                        let _ = tx.send(MarketEvent::Connected {
+                            venue: VenueId::Binance,
+                        });
+                        let (_, mut read) = ws.split();
+                        while let Some(Ok(msg)) = read.next().await {
+                            if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+                                if let Ok(v) = serde_json::from_str::<Value>(&text.to_string()) {
+                                    let stream = v.get("stream").and_then(|s| s.as_str());
+                                    let data = v.get("data");
+                                    if let (Some(stream), Some(data)) = (stream, data) {
+                                        if let Some(evt) =
+                                            super::connector::parse_binance_event(stream, data)
+                                        {
+                                            // Parser tags events with
+                                            // VenueId::Binance regardless of
+                                            // product — that's fine because
+                                            // the engine routes on symbol.
+                                            if tx.send(evt).is_err() {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let _ = tx.send(MarketEvent::Disconnected {
+                            venue: VenueId::Binance,
+                        });
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Binance futures WS connect failed");
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+
+        Ok(rx)
+    }
+
+    async fn get_orderbook(
+        &self,
+        symbol: &str,
+        depth: u32,
+    ) -> anyhow::Result<(Vec<PriceLevel>, Vec<PriceLevel>, u64)> {
+        self.rate_limiter.acquire(5).await;
+        // Futures accepts 5, 10, 20, 50, 100, 500, 1000 — clamp.
+        let clamped = if depth <= 5 {
+            5
+        } else if depth <= 10 {
+            10
+        } else if depth <= 20 {
+            20
+        } else if depth <= 50 {
+            50
+        } else if depth <= 100 {
+            100
+        } else if depth <= 500 {
+            500
+        } else {
+            1000
+        };
+        let url = format!(
+            "{}/fapi/v1/depth?symbol={}&limit={}",
+            self.base_url, symbol, clamped
+        );
+        let resp: Value = self.client.get(&url).send().await?.json().await?;
+        let bids = super::connector::parse_levels(resp.get("bids"))?;
+        let asks = super::connector::parse_levels(resp.get("asks"))?;
+        let seq = resp.get("lastUpdateId").and_then(|v| v.as_u64()).unwrap_or(0);
+        Ok((bids, asks, seq))
+    }
+
+    async fn place_order(&self, order: &NewOrder) -> anyhow::Result<OrderId> {
+        let side = match order.side {
+            Side::Buy => "BUY",
+            Side::Sell => "SELL",
+        };
+        let order_type = match order.order_type {
+            OrderType::Limit => "LIMIT",
+            OrderType::Market => "MARKET",
+        };
+        let mut params = format!(
+            "symbol={}&side={}&type={}&quantity={}",
+            order.symbol, side, order_type, order.qty
+        );
+        if let Some(price) = &order.price {
+            params.push_str(&format!("&price={price}"));
+        }
+        if order.order_type == OrderType::Limit {
+            let tif = match order.time_in_force {
+                Some(TimeInForce::Gtc) | Some(TimeInForce::Gtd) | None => "GTC",
+                Some(TimeInForce::PostOnly) => "GTX", // Binance futures post-only
+                Some(TimeInForce::Ioc) => "IOC",
+                Some(TimeInForce::Fok) => "FOK",
+                Some(TimeInForce::Day) => "GTC",
+            };
+            params.push_str(&format!("&timeInForce={tif}"));
+        }
+        let cloid = order
+            .client_order_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        params.push_str(&format!("&newClientOrderId={cloid}"));
+
+        let t0 = Instant::now();
+        let rest_result = self.signed_post("/fapi/v1/order", &params).await;
+        ORDER_ENTRY_LATENCY
+            .with_label_values(&["binance_futures", "rest", "place_order"])
+            .observe(t0.elapsed().as_secs_f64());
+        let resp = rest_result?;
+
+        let binance_id = resp.get("orderId").and_then(|v| v.as_u64()).unwrap_or(0);
+        let internal = uuid::Uuid::new_v4();
+        debug!(%internal, binance_id, "placed order on Binance futures");
+        Ok(internal)
+    }
+
+    async fn place_orders_batch(&self, orders: &[NewOrder]) -> anyhow::Result<Vec<OrderId>> {
+        // Native `/fapi/v1/batchOrders` supports up to 5 orders per
+        // request. For larger batches the caller must chunk. We ship
+        // up to 5 here and let the engine's diff layer handle
+        // anything bigger.
+        if orders.is_empty() {
+            return Ok(Vec::new());
+        }
+        if orders.len() > 5 {
+            // Fall back to per-order placement. Still returns the
+            // full list of UUIDs in order.
+            let mut ids = Vec::with_capacity(orders.len());
+            for o in orders {
+                ids.push(self.place_order(o).await?);
+            }
+            return Ok(ids);
+        }
+
+        let mut batch: Vec<Value> = Vec::with_capacity(orders.len());
+        let mut uuids: Vec<OrderId> = Vec::with_capacity(orders.len());
+        for o in orders {
+            let side = if matches!(o.side, Side::Buy) { "BUY" } else { "SELL" };
+            let ord_type = match o.order_type {
+                OrderType::Limit => "LIMIT",
+                OrderType::Market => "MARKET",
+            };
+            let tif = match o.time_in_force {
+                Some(TimeInForce::Gtc) | Some(TimeInForce::Gtd) | None => "GTC",
+                Some(TimeInForce::PostOnly) => "GTX",
+                Some(TimeInForce::Ioc) => "IOC",
+                Some(TimeInForce::Fok) => "FOK",
+                Some(TimeInForce::Day) => "GTC",
+            };
+            let uuid = uuid::Uuid::new_v4();
+            uuids.push(uuid);
+            let mut entry = serde_json::json!({
+                "symbol": o.symbol,
+                "side": side,
+                "type": ord_type,
+                "quantity": o.qty.to_string(),
+                "newClientOrderId": uuid.to_string(),
+            });
+            if o.order_type == OrderType::Limit {
+                entry["timeInForce"] = Value::String(tif.into());
+                if let Some(p) = o.price {
+                    entry["price"] = Value::String(p.to_string());
+                }
+            }
+            batch.push(entry);
+        }
+        let orders_json = serde_json::to_string(&batch)?;
+        // Binance wants the batch as a URL-encoded JSON string in the
+        // `batchOrders` query param.
+        let params = format!("batchOrders={}", urlencoding::encode(&orders_json));
+        let t0 = Instant::now();
+        let _resp = self.signed_post("/fapi/v1/batchOrders", &params).await?;
+        ORDER_ENTRY_LATENCY
+            .with_label_values(&["binance_futures", "rest", "place_orders_batch"])
+            .observe(t0.elapsed().as_secs_f64());
+        Ok(uuids)
+    }
+
+    async fn cancel_order(&self, symbol: &str, order_id: OrderId) -> anyhow::Result<()> {
+        let params = format!("symbol={symbol}&origClientOrderId={order_id}");
+        self.signed_delete("/fapi/v1/order", &params).await?;
+        Ok(())
+    }
+
+    async fn cancel_orders_batch(
+        &self,
+        symbol: &str,
+        order_ids: &[OrderId],
+    ) -> anyhow::Result<()> {
+        for oid in order_ids {
+            let _ = self.cancel_order(symbol, *oid).await;
+        }
+        Ok(())
+    }
+
+    async fn cancel_all_orders(&self, symbol: &str) -> anyhow::Result<()> {
+        let params = format!("symbol={symbol}");
+        self.signed_delete("/fapi/v1/allOpenOrders", &params).await?;
+        Ok(())
+    }
+
+    async fn get_open_orders(&self, symbol: &str) -> anyhow::Result<Vec<LiveOrder>> {
+        let resp = self
+            .signed_get("/fapi/v1/openOrders", &format!("symbol={symbol}"))
+            .await?;
+        let arr = resp.as_array().cloned().unwrap_or_default();
+        Ok(arr
+            .iter()
+            .filter_map(|o| {
+                let order_id_str = o.get("clientOrderId")?.as_str()?;
+                let order_id = order_id_str.parse().ok()?;
+                let side = match o.get("side")?.as_str()? {
+                    "BUY" => Side::Buy,
+                    "SELL" => Side::Sell,
+                    _ => return None,
+                };
+                let price: Decimal = o.get("price")?.as_str()?.parse().ok()?;
+                let qty: Decimal = o.get("origQty")?.as_str()?.parse().ok()?;
+                let filled_qty: Decimal = o.get("executedQty")?.as_str()?.parse().ok()?;
+                let status = match o.get("status")?.as_str()? {
+                    "NEW" => OrderStatus::Open,
+                    "PARTIALLY_FILLED" => OrderStatus::PartiallyFilled,
+                    "FILLED" => OrderStatus::Filled,
+                    "CANCELED" | "CANCELLED" => OrderStatus::Cancelled,
+                    "REJECTED" | "EXPIRED" => OrderStatus::Rejected,
+                    _ => OrderStatus::Open,
+                };
+                let time_ms = o.get("time")?.as_i64()?;
+                let created_at = chrono::DateTime::from_timestamp_millis(time_ms)?;
+                Some(LiveOrder {
+                    order_id,
+                    symbol: symbol.to_string(),
+                    side,
+                    price,
+                    qty,
+                    filled_qty,
+                    status,
+                    created_at,
+                })
+            })
+            .collect())
+    }
+
+    async fn get_balances(&self) -> anyhow::Result<Vec<Balance>> {
+        // `/fapi/v2/balance` — newer balance endpoint with asset-level
+        // rollup. Returns `[{accountAlias, asset, balance, …}]`.
+        let resp = self.signed_get("/fapi/v2/balance", "").await?;
+        let arr = resp.as_array().cloned().unwrap_or_default();
+        Ok(arr
+            .iter()
+            .filter_map(|b| {
+                let asset = b.get("asset")?.as_str()?.to_string();
+                let total: Decimal = b.get("balance")?.as_str()?.parse().ok()?;
+                // `crossUnPnl` is the margin tied up; approximate
+                // `locked` with `max(0, total - available)`.
+                let available: Decimal = b
+                    .get("availableBalance")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(total);
+                let locked = (total - available).max(Decimal::ZERO);
+                Some(Balance {
+                    asset,
+                    wallet: WalletType::UsdMarginedFutures,
+                    total,
+                    locked,
+                    available,
+                })
+            })
+            .filter(|b| b.total > dec!(0))
+            .collect())
+    }
+
+    async fn get_product_spec(&self, symbol: &str) -> anyhow::Result<ProductSpec> {
+        self.rate_limiter.acquire(1).await;
+        let url = format!("{}/fapi/v1/exchangeInfo", self.base_url);
+        let resp: Value = self.client.get(&url).send().await?.json().await?;
+        let symbols = resp.get("symbols").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let sym = symbols
+            .iter()
+            .find(|s| s.get("symbol").and_then(|v| v.as_str()) == Some(symbol))
+            .ok_or_else(|| anyhow::anyhow!("symbol not found: {symbol}"))?;
+        let base = sym
+            .get("baseAsset")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let quote = sym
+            .get("quoteAsset")
+            .and_then(|v| v.as_str())
+            .unwrap_or("USDT")
+            .to_string();
+
+        let filters = sym
+            .get("filters")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut tick_size = dec!(0.01);
+        let mut lot_size = dec!(0.001);
+        let mut min_notional = dec!(5);
+        for f in &filters {
+            match f.get("filterType").and_then(|v| v.as_str()) {
+                Some("PRICE_FILTER") => {
+                    if let Some(ts) = f.get("tickSize").and_then(|v| v.as_str()) {
+                        tick_size = ts.parse().unwrap_or(tick_size);
+                    }
+                }
+                Some("LOT_SIZE") => {
+                    if let Some(ss) = f.get("stepSize").and_then(|v| v.as_str()) {
+                        lot_size = ss.parse().unwrap_or(lot_size);
+                    }
+                }
+                Some("MIN_NOTIONAL") => {
+                    if let Some(mn) = f.get("notional").and_then(|v| v.as_str()) {
+                        min_notional = mn.parse().unwrap_or(min_notional);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(ProductSpec {
+            symbol: symbol.to_string(),
+            base_asset: base,
+            quote_asset: quote,
+            tick_size,
+            lot_size,
+            min_notional,
+            // Binance futures default tier: 0.02% maker / 0.05% taker.
+            maker_fee: dec!(0.0002),
+            taker_fee: dec!(0.0005),
+        })
+    }
+
+    async fn health_check(&self) -> anyhow::Result<bool> {
+        let url = format!("{}/fapi/v1/ping", self.base_url);
+        let resp = self.client.get(&url).send().await?;
+        Ok(resp.status().is_success())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn product_is_linear_perp() {
+        let c = BinanceFuturesConnector::testnet("k", "s");
+        assert_eq!(c.product(), VenueProduct::LinearPerp);
+    }
+
+    #[test]
+    fn capabilities_claim_funding_rate_support() {
+        let c = BinanceFuturesConnector::testnet("k", "s");
+        assert!(c.capabilities().supports_funding_rate);
+        assert!(c.capabilities().supports_amend);
+        assert!(!c.capabilities().supports_ws_trading);
+        assert!(!c.capabilities().supports_fix);
+    }
+
+    #[test]
+    fn testnet_uses_testnet_urls() {
+        let c = BinanceFuturesConnector::testnet("k", "s");
+        assert!(c.base_url.contains("binancefuture.com"));
+        assert!(c.ws_url.contains("binancefuture.com"));
+    }
+
+    #[test]
+    fn mainnet_uses_fapi_urls() {
+        let c = BinanceFuturesConnector::new("k", "s");
+        assert!(c.base_url.contains("fapi.binance.com"));
+        assert!(c.ws_url.contains("fstream.binance.com"));
+    }
+
+    /// Default impl of `get_funding_rate` lives in the trait; we
+    /// override it. The override returns `Err(Other)` when the venue
+    /// is unreachable (tested on a non-routable URL) rather than
+    /// falling through to `NotSupported`.
+    #[tokio::test]
+    async fn get_funding_rate_returns_other_not_notsupported_on_network_fail() {
+        let c = BinanceFuturesConnector::with_urls(
+            "http://127.0.0.1:1", // unreachable
+            "ws://127.0.0.1:1",
+            "k",
+            "s",
+        );
+        let err = c.get_funding_rate("BTCUSDT").await.unwrap_err();
+        match err {
+            FundingRateError::NotSupported => {
+                panic!("futures connector must NOT report NotSupported")
+            }
+            FundingRateError::Other(_) => {}
+        }
+    }
+}

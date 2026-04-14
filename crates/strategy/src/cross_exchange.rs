@@ -171,6 +171,7 @@ mod tests {
             strategy: StrategyType::AvellanedaStoikov,
             momentum_enabled: false,
             momentum_window: 200,
+            basis_shift: dec!(0.5),
         };
         let mut book = LocalOrderBook::new("BTCUSDT".into());
         book.apply_snapshot(
@@ -197,6 +198,7 @@ mod tests {
             volatility: dec!(0.02),
             time_remaining: dec!(1),
             mid_price: book.mid_price().unwrap(),
+            ref_price: None,
         };
 
         let quotes = strategy.compute_quotes(&ctx);

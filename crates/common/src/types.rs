@@ -34,10 +34,18 @@ pub enum OrderType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TimeInForce {
+    /// Good-Till-Cancelled.
     Gtc,
+    /// Immediate-Or-Cancel.
     Ioc,
+    /// Fill-Or-Kill.
     Fok,
+    /// Post-only — reject if the order would cross the book.
     PostOnly,
+    /// Day order — expires at session close.
+    Day,
+    /// Good-Till-Date. Caller tracks the expiry separately.
+    Gtd,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,10 +117,45 @@ pub struct PriceLevel {
     pub qty: Qty,
 }
 
+/// Which sub-account / wallet this balance belongs to.
+///
+/// On every major venue, `spot`, `margin`, USDⓈ-M futures, COIN-M
+/// futures, options, and a dedicated funding wallet are separate
+/// sub-accounts with independent balances. The API paths differ
+/// (see `docs/research/spot-mm-specifics.md` §5 "Wallet topology").
+///
+/// Balances from different wallets MUST NOT be conflated by the
+/// `BalanceCache`: a spot BTC balance of 1.0 and a futures BTC
+/// balance of 0.5 are two different piles of asset, not `max(1.0,
+/// 0.5)`. `BalanceCache` is keyed on `(asset, WalletType)` for
+/// exactly this reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WalletType {
+    /// Plain spot wallet — holds the asset directly.
+    Spot,
+    /// USDⓈ-margined futures wallet (Binance USDⓈ-M, Bybit linear,
+    /// HyperLiquid perps — anything settled in USDT / USDC).
+    UsdMarginedFutures,
+    /// COIN-margined futures wallet (Binance COIN-M, Bybit inverse).
+    CoinMarginedFutures,
+    /// Cross/isolated margin spot-with-borrow wallet.
+    Margin,
+    /// Binance "funding" wallet used for on-chain deposits/withdrawals.
+    Funding,
+    /// Bybit V5 Unified Trading Account that consolidates spot +
+    /// linear + options under one collateral pool.
+    Unified,
+}
+
 /// Snapshot of balances from the exchange.
+///
+/// Always carry a `wallet` tag so two connectors reporting the
+/// "same" asset from different sub-accounts do not overwrite each
+/// other in the `BalanceCache`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Balance {
     pub asset: String,
+    pub wallet: WalletType,
     pub total: Decimal,
     pub locked: Decimal,
     pub available: Decimal,
@@ -146,4 +189,32 @@ impl ProductSpec {
     pub fn meets_min_notional(&self, price: Price, qty: Qty) -> bool {
         price * qty >= self.min_notional
     }
+}
+
+/// A pair of instruments on two venues traded together as one
+/// logical position.
+///
+/// Used by cross-product strategies like basis trade and funding
+/// arbitrage: the engine quotes one leg (typically spot) and hedges
+/// on the other (typically a perp or futures). The two symbols need
+/// not be the same string — Binance spot `BTCUSDT` paired with
+/// HyperLiquid perp `BTC` is one `InstrumentPair`.
+///
+/// `multiplier` is the contract-size multiplier on the futures/perp
+/// leg: 1 spot BTC ≈ `multiplier` contracts. For linear perps with
+/// 1:1 sizing this is `dec!(1)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstrumentPair {
+    /// Symbol on the primary (usually spot) venue.
+    pub primary_symbol: String,
+    /// Symbol on the hedge (usually perp/futures) venue.
+    pub hedge_symbol: String,
+    /// Contract multiplier: qty_hedge = qty_primary * multiplier.
+    pub multiplier: Decimal,
+    /// Funding interval on the hedge leg (None on spot-spot pairs).
+    #[serde(default)]
+    pub funding_interval_secs: Option<u64>,
+    /// Basis threshold in bps — strategies widen quotes / defer
+    /// entries when |basis| exceeds this.
+    pub basis_threshold_bps: Decimal,
 }

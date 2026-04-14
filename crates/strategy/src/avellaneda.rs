@@ -171,6 +171,7 @@ mod tests {
             strategy: mm_common::config::StrategyType::AvellanedaStoikov,
             momentum_enabled: false,
             momentum_window: 200,
+            basis_shift: dec!(0.5),
         }
     }
 
@@ -200,6 +201,7 @@ mod tests {
             volatility: dec!(0.02),
             time_remaining: dec!(1),
             mid_price: mid,
+            ref_price: None,
         };
 
         let strategy = AvellanedaStoikov;
@@ -244,6 +246,7 @@ mod tests {
             volatility: dec!(0.02),
             time_remaining: dec!(1),
             mid_price: mid,
+            ref_price: None,
         };
 
         let strategy = AvellanedaStoikov;

@@ -40,6 +40,91 @@ pub struct AppConfig {
     /// Per-symbol loan configuration (keyed by symbol, e.g., "BTCUSDT").
     #[serde(default)]
     pub loans: std::collections::HashMap<String, LoanConfig>,
+
+    /// Optional hedge connector for cross-product strategies.
+    ///
+    /// When set, the engine builds a `ConnectorBundle` with both
+    /// primary and hedge connectors and maintains a second
+    /// `BookKeeper` for the hedge leg. Cross-product strategies
+    /// (`BasisStrategy`, `FundingArbExecutor`) consume the hedge
+    /// book via `StrategyContext.ref_price`.
+    #[serde(default)]
+    pub hedge: Option<HedgeConfig>,
+
+    /// Funding-arb driver config. Required when
+    /// `StrategyType::FundingArb` is selected; ignored otherwise.
+    #[serde(default)]
+    pub funding_arb: Option<FundingArbCfg>,
+}
+
+/// Serializable shape of `FundingArbDriverConfig` — same fields,
+/// plus flat TOML-friendly representations of the nested
+/// `FundingArbConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FundingArbCfg {
+    /// Driver tick interval in seconds. Default 60 s.
+    #[serde(default = "default_funding_tick_secs")]
+    pub tick_interval_secs: u64,
+    /// Minimum annualised funding rate (%) required to open a
+    /// position. Default 10.
+    #[serde(default = "default_min_rate_apr")]
+    pub min_rate_annual_pct: Decimal,
+    /// Maximum position size in base asset per pair. Default 0.1.
+    #[serde(default = "default_max_position")]
+    pub max_position: Decimal,
+    /// Maximum basis deviation (bps) before forcing exit.
+    #[serde(default = "default_max_basis")]
+    pub max_basis_bps: Decimal,
+    /// Enable the driver. Safety default is `false` so a
+    /// stray config section does not unexpectedly start
+    /// trading cross-product.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+fn default_funding_tick_secs() -> u64 {
+    60
+}
+fn default_min_rate_apr() -> Decimal {
+    dec!(10)
+}
+fn default_max_position() -> Decimal {
+    dec!(0.1)
+}
+fn default_max_basis() -> Decimal {
+    dec!(50)
+}
+
+/// Hedge-leg exchange + instrument pair config.
+///
+/// The hedge exchange config mirrors `ExchangeConfig`; the
+/// `pair` describes how the primary symbol relates to the hedge
+/// symbol. Strategies that do not need a hedge leg leave this
+/// unset and the engine runs in single-connector mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HedgeConfig {
+    pub exchange: ExchangeConfig,
+    pub pair: HedgePairConfig,
+}
+
+/// Serializable flavour of `InstrumentPair` for TOML config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HedgePairConfig {
+    pub primary_symbol: String,
+    pub hedge_symbol: String,
+    #[serde(default = "default_multiplier")]
+    pub multiplier: Decimal,
+    #[serde(default)]
+    pub funding_interval_secs: Option<u64>,
+    #[serde(default = "default_basis_threshold_bps")]
+    pub basis_threshold_bps: Decimal,
+}
+
+fn default_multiplier() -> Decimal {
+    dec!(1)
+}
+fn default_basis_threshold_bps() -> Decimal {
+    dec!(20)
 }
 
 /// Pre-configured user for dashboard access.
@@ -72,6 +157,18 @@ pub enum StrategyType {
     AvellanedaStoikov,
     Glft,
     Grid,
+    /// Basis-aware quoting for cross-product MM. Requires
+    /// `AppConfig.hedge` to be set so the engine can build a
+    /// `ConnectorBundle` with the hedge-leg price reference.
+    /// See `BasisStrategy` and `docs/research/spot-mm-specifics.md` §10.
+    Basis,
+    /// Funding-rate arbitrage driver. Runs a `BasisStrategy`
+    /// for the primary quoting leg AND spins up a
+    /// `FundingArbDriver` that periodically samples the hedge
+    /// venue's funding rate + both mids and dispatches
+    /// atomic-pair entries/exits via `FundingArbExecutor`.
+    /// Requires `AppConfig.hedge` and `funding_arb` sections.
+    FundingArb,
 }
 
 /// Which exchange to connect to.
@@ -84,6 +181,8 @@ pub enum ExchangeType {
     BinanceTestnet,
     Bybit,
     BybitTestnet,
+    HyperLiquid,
+    HyperLiquidTestnet,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +238,16 @@ pub struct MarketMakerConfig {
     /// Momentum signal window size (number of recent trades).
     #[serde(default = "default_momentum_window")]
     pub momentum_window: usize,
+
+    /// `BasisStrategy` reservation-price shift toward the hedge
+    /// mid, in `[0, 1]`. Default 0.5. Ignored when strategy is
+    /// not `Basis`.
+    #[serde(default = "default_basis_shift")]
+    pub basis_shift: Decimal,
+}
+
+fn default_basis_shift() -> Decimal {
+    dec!(0.5)
 }
 
 fn default_strategy() -> StrategyType {
@@ -323,6 +432,7 @@ impl Default for AppConfig {
                 strategy: StrategyType::AvellanedaStoikov,
                 momentum_enabled: true,
                 momentum_window: 200,
+                basis_shift: dec!(0.5),
             },
             kill_switch: KillSwitchCfg::default(),
             risk: RiskConfig {
@@ -346,6 +456,20 @@ impl Default for AppConfig {
             users: vec![],
             telegram: TelegramAlertConfig::default(),
             loans: std::collections::HashMap::new(),
+            hedge: None,
+            funding_arb: None,
+        }
+    }
+}
+
+impl From<HedgePairConfig> for crate::types::InstrumentPair {
+    fn from(c: HedgePairConfig) -> Self {
+        Self {
+            primary_symbol: c.primary_symbol,
+            hedge_symbol: c.hedge_symbol,
+            multiplier: c.multiplier,
+            funding_interval_secs: c.funding_interval_secs,
+            basis_threshold_bps: c.basis_threshold_bps,
         }
     }
 }

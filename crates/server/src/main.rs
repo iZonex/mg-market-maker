@@ -10,7 +10,7 @@ use mm_dashboard::websocket::WsBroadcast;
 use mm_engine::MarketMakerEngine;
 use mm_exchange_core::connector::ExchangeConnector;
 use mm_persistence::checkpoint::CheckpointManager;
-use mm_strategy::{AvellanedaStoikov, GlftStrategy, GridStrategy, Strategy};
+use mm_strategy::{AvellanedaStoikov, BasisStrategy, GlftStrategy, GridStrategy, Strategy};
 use rust_decimal_macros::dec;
 use tracing::{error, info, warn};
 
@@ -150,6 +150,12 @@ async fn main() -> Result<()> {
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let mut handles = Vec::new();
 
+    // Shared multi-currency portfolio across all per-symbol
+    // engines. Reporting currency = USDT by default; override
+    // per-symbol FX factors inside individual strategies if you
+    // quote in a different quote asset.
+    let portfolio = Arc::new(std::sync::Mutex::new(mm_portfolio::Portfolio::new("USDT")));
+
     for symbol in &config.symbols {
         let symbol = symbol.clone();
         let config = config.clone();
@@ -158,6 +164,7 @@ async fn main() -> Result<()> {
         let checkpoint = checkpoint.clone();
         let dashboard_state = dashboard_state.clone();
         let alerts = alert_manager.clone();
+        let portfolio = portfolio.clone();
 
         let handle = tokio::spawn(async move {
             if let Err(e) = run_symbol(
@@ -168,6 +175,7 @@ async fn main() -> Result<()> {
                 checkpoint,
                 dashboard_state,
                 alerts,
+                portfolio,
             )
             .await
             {
@@ -195,6 +203,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_symbol(
     symbol: String,
     config: AppConfig,
@@ -203,6 +212,7 @@ async fn run_symbol(
     _checkpoint: Arc<std::sync::Mutex<CheckpointManager>>,
     dashboard_state: DashboardState,
     alert_manager: AlertManager,
+    portfolio: Arc<std::sync::Mutex<mm_portfolio::Portfolio>>,
 ) -> Result<()> {
     let product = product_for_symbol(&symbol);
 
@@ -219,21 +229,139 @@ async fn run_symbol(
             info!(symbol = %symbol, "using Grid strategy");
             Box::new(GridStrategy)
         }
+        StrategyType::Basis | StrategyType::FundingArb => {
+            let shift = config.market_maker.basis_shift;
+            let max_basis_bps = config
+                .hedge
+                .as_ref()
+                .map(|h| h.pair.basis_threshold_bps)
+                .unwrap_or(dec!(50));
+            info!(
+                symbol = %symbol,
+                %shift,
+                %max_basis_bps,
+                kind = ?config.market_maker.strategy,
+                "using Basis strategy (quoting leg) — requires hedge connector"
+            );
+            Box::new(BasisStrategy::new(shift, max_basis_bps))
+        }
     };
 
     // Subscribe to market data via the connector.
     let ws_rx = connector.subscribe(std::slice::from_ref(&symbol)).await?;
 
-    let mut engine = MarketMakerEngine::new(
+    // Build the connector bundle: single-connector by default,
+    // dual when `config.hedge` is set (basis / funding-arb modes).
+    let (bundle, hedge_rx) = if let Some(hedge_cfg) = config.hedge.clone() {
+        let hedge_conn = create_hedge_connector(&hedge_cfg.exchange)?;
+        let hedge_symbol = hedge_cfg.pair.hedge_symbol.clone();
+        let hedge_rx = hedge_conn
+            .subscribe(std::slice::from_ref(&hedge_symbol))
+            .await?;
+        let pair = mm_common::types::InstrumentPair::from(hedge_cfg.pair);
+        info!(
+            primary = %symbol,
+            hedge = %pair.hedge_symbol,
+            "dual-connector bundle with hedge leg"
+        );
+        (
+            mm_engine::ConnectorBundle::dual(connector, hedge_conn, pair),
+            Some(hedge_rx),
+        )
+    } else {
+        (mm_engine::ConnectorBundle::single(connector), None)
+    };
+
+    // If the operator selected FundingArb, build the driver
+    // from the `funding_arb` config section and inject it into
+    // the engine. The engine's run loop picks up the periodic
+    // tick + event routing.
+    let funding_arb_wiring = if matches!(config.market_maker.strategy, StrategyType::FundingArb) {
+        let cfg = config.funding_arb.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "strategy=funding_arb requires [funding_arb] section in config"
+            )
+        })?;
+        if !cfg.enabled {
+            warn!("funding_arb.enabled=false — driver wired but signals disabled");
+        }
+        let hedge_conn = bundle.hedge.clone().ok_or_else(|| {
+            anyhow::anyhow!("strategy=funding_arb requires a hedge connector")
+        })?;
+        let pair = bundle.pair.clone().ok_or_else(|| {
+            anyhow::anyhow!("strategy=funding_arb requires an instrument pair")
+        })?;
+        let driver = mm_strategy::FundingArbDriver::new(
+            bundle.primary.clone(),
+            hedge_conn,
+            pair,
+            mm_strategy::FundingArbDriverConfig {
+                tick_interval: std::time::Duration::from_secs(cfg.tick_interval_secs),
+                engine: mm_persistence::funding::FundingArbConfig {
+                    min_rate_annual_pct: cfg.min_rate_annual_pct,
+                    max_position: cfg.max_position,
+                    max_basis_bps: cfg.max_basis_bps,
+                    enabled: cfg.enabled,
+                },
+            },
+            Arc::new(mm_strategy::NullSink),
+        );
+        Some((driver, std::time::Duration::from_secs(cfg.tick_interval_secs)))
+    } else {
+        None
+    };
+
+    let engine_builder = MarketMakerEngine::new(
         symbol,
         config,
         product,
         strategy,
-        connector,
+        bundle,
         Some(dashboard_state),
         Some(alert_manager),
-    );
-    engine.run(ws_rx, shutdown_rx).await
+    )
+    .with_portfolio(portfolio);
+
+    let mut engine = match funding_arb_wiring {
+        Some((driver, tick)) => engine_builder.with_funding_arb_driver(driver, tick),
+        None => engine_builder,
+    };
+    engine.run_with_hedge(ws_rx, hedge_rx, shutdown_rx).await
+}
+
+/// Build a hedge-leg connector from its `ExchangeConfig`. Kept
+/// separate from `create_connector` so the primary and hedge
+/// paths can evolve independently — cross-venue basis trades
+/// (Binance spot vs HyperLiquid perps) will land here.
+fn create_hedge_connector(cfg: &mm_common::config::ExchangeConfig) -> Result<Arc<dyn ExchangeConnector>> {
+    let api_key = cfg.api_key.clone().unwrap_or_default();
+    let api_secret = cfg.api_secret.clone().unwrap_or_default();
+
+    match cfg.exchange_type {
+        ExchangeType::Custom => Ok(Arc::new(mm_exchange_client::CustomConnector::new(
+            &cfg.rest_url,
+            &cfg.ws_url,
+        ))),
+        ExchangeType::Binance | ExchangeType::BinanceTestnet => {
+            // Hedge-leg connector defaults to Binance USDⓈ-M
+            // futures — the spot connector is already the
+            // typical primary. Sprint I hooks this up via a
+            // product-aware selector.
+            Ok(Arc::new(mm_exchange_binance::BinanceFuturesConnector::new(
+                &api_key,
+                &api_secret,
+            )))
+        }
+        ExchangeType::Bybit | ExchangeType::BybitTestnet => Ok(Arc::new(
+            mm_exchange_bybit::BybitConnector::linear(&api_key, &api_secret),
+        )),
+        ExchangeType::HyperLiquid => Ok(Arc::new(
+            mm_exchange_hyperliquid::HyperLiquidConnector::new(&api_secret)?,
+        )),
+        ExchangeType::HyperLiquidTestnet => Ok(Arc::new(
+            mm_exchange_hyperliquid::HyperLiquidConnector::testnet(&api_secret)?,
+        )),
+    }
 }
 
 /// Create the exchange connector based on config.
@@ -282,6 +410,20 @@ fn create_connector(config: &AppConfig) -> Result<Arc<dyn ExchangeConnector>> {
                 &api_key,
                 &api_secret,
             )))
+        }
+        ExchangeType::HyperLiquid => {
+            info!("connecting to HyperLiquid");
+            // For HL: api_secret holds the hex-encoded wallet private key.
+            // api_key is unused — the address is derived from the private key.
+            Ok(Arc::new(mm_exchange_hyperliquid::HyperLiquidConnector::new(
+                &api_secret,
+            )?))
+        }
+        ExchangeType::HyperLiquidTestnet => {
+            info!("connecting to HyperLiquid Testnet");
+            Ok(Arc::new(
+                mm_exchange_hyperliquid::HyperLiquidConnector::testnet(&api_secret)?,
+            ))
         }
     }
 }

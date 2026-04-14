@@ -1,0 +1,13 @@
+[package]
+name = "mm-protocols-ws-rpc"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

@@ -2,10 +2,16 @@
 resolver = "2"
 members = [
     "crates/common",
-    "crates/exchange-core",
-    "crates/exchange-client",
-    "crates/exchange-binance",
-    "crates/exchange-bybit",
+    "crates/exchange/core",
+    "crates/exchange/client",
+    "crates/exchange/binance",
+    "crates/exchange/bybit",
+    "crates/exchange/hyperliquid",
+    "crates/protocols/fix",
+    "crates/protocols/ws_rpc",
+    "crates/hyperopt",
+    "crates/indicators",
+    "crates/portfolio",
     "crates/strategy",
     "crates/risk",
     "crates/engine",
@@ -66,12 +72,23 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 
+# HyperLiquid signing (EIP-712 over secp256k1)
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha3 = "0.10"
+rmp-serde = "1"
+
 # Internal crates
 mm-common = { path = "crates/common" }
-mm-exchange-core = { path = "crates/exchange-core" }
-mm-exchange-client = { path = "crates/exchange-client" }
-mm-exchange-binance = { path = "crates/exchange-binance" }
-mm-exchange-bybit = { path = "crates/exchange-bybit" }
+mm-exchange-core = { path = "crates/exchange/core" }
+mm-exchange-client = { path = "crates/exchange/client" }
+mm-exchange-binance = { path = "crates/exchange/binance" }
+mm-exchange-bybit = { path = "crates/exchange/bybit" }
+mm-exchange-hyperliquid = { path = "crates/exchange/hyperliquid" }
+mm-protocols-fix = { path = "crates/protocols/fix" }
+mm-protocols-ws-rpc = { path = "crates/protocols/ws_rpc" }
+mm-hyperopt = { path = "crates/hyperopt" }
+mm-indicators = { path = "crates/indicators" }
+mm-portfolio = { path = "crates/portfolio" }
 mm-strategy = { path = "crates/strategy" }
 mm-risk = { path = "crates/risk" }
 mm-engine = { path = "crates/engine" }

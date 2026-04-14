@@ -5,12 +5,18 @@ version.workspace = true
 
 [dependencies]
 mm-common = { workspace = true }
+mm-exchange-core = { workspace = true }
+mm-persistence = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.5"

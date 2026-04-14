@@ -75,6 +75,7 @@ impl Simulator {
                             volatility: sigma,
                             time_remaining: dec!(1),
                             mid_price: mid,
+            ref_price: None,
                         };
 
                         let quotes = strategy.compute_quotes(&ctx);
@@ -218,6 +219,7 @@ mod tests {
             strategy: StrategyType::AvellanedaStoikov,
             momentum_enabled: false,
             momentum_window: 200,
+            basis_shift: dec!(0.5),
         };
         let product = ProductSpec {
             symbol: "BTCUSDT".into(),

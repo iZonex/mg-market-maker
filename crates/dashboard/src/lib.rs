@@ -5,4 +5,7 @@ pub mod client_portal;
 pub mod metrics;
 pub mod server;
 pub mod state;
+pub mod telegram_control;
 pub mod websocket;
+
+pub use telegram_control::{TelegramCommand, TelegramControl};

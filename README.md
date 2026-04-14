@@ -17,16 +17,23 @@ High-performance, multi-venue market making engine with institutional-grade risk
 - **GLFT** (Guéant-Lehalle-Fernandez-Tapia) — with live order flow calibration
 - **Grid** — symmetric grid quoting around mid
 - **Cross-Exchange** — make on venue A, hedge on venue B
+- **xemm Executor** — dedicated cross-exchange MM with hedge-leg tracking and slippage-band reject
 - **TWAP** — time-weighted execution for inventory unwinding
+- **ExecAlgorithm Framework** — plug-in trait with shipped TWAP / VWAP / POV / Iceberg implementations
 - **Momentum Alpha** — book imbalance + trade flow + micro-price shifts reservation price
+- **Microstructure Features** — pure numerical feature extractors (top-k book imbalance, trade-flow EWMA, micro-price drift, vol term structure) feeding future predictors
+- **Technical Indicators** — SMA, EMA, RSI, ATR, Bollinger Bands (pure sync, Decimal-based, lookahead-safe)
 
 ### Risk Management
 - **5-Level Kill Switch** — widen → stop → cancel → flatten (TWAP) → disconnect
+- **Protections Stack** — StoplossGuard / CooldownPeriod / MaxDrawdownPause (equity-peak mode) / LowProfitPairs — per-pair lockouts below the kill switch granularity
 - **Circuit Breaker** — stale book, wide spread, max drawdown, max exposure
 - **VPIN** — Volume-Synchronized Probability of Informed Trading (toxicity)
 - **Kyle's Lambda** — price impact estimation
 - **Adverse Selection Tracker** — monitors post-fill price movement
 - **Inventory Limits** — quadratic skew + dynamic sizing + urgency unwinding
+- **DCA / Position-Adjustment Planner** — splits any `current → target` delta into scheduled slices (flat / linear / accelerated curves) with correct reduce-only tagging
+- **Client-Side Order Emulator** — emulated stops / stop-limit / trailing stops / OCO brackets / GTD expiry for venues that lack native support (HyperLiquid, etc.)
 - **Balance Pre-Check** — reservation system prevents over-submitting orders
 
 ### Auto-Tuning
@@ -36,29 +43,41 @@ High-performance, multi-venue market making engine with institutional-grade risk
 
 ### Exchange Connectivity
 - **Custom Exchange** — full REST + WebSocket connector
-- **Binance** — spot + futures, HMAC auth, combined WS streams
-- **Bybit** — V5 API, batch orders (20), amend support
+- **Binance** — **spot + USDⓈ-M futures** connectors (separate `BinanceConnector` / `BinanceFuturesConnector`), HMAC auth, listen-key user-data stream (spot + futures), combined public WS streams, **WebSocket API order entry** with REST fallback, native `fapi/v1/batchOrders`, `get_funding_rate` via `/fapi/v1/premiumIndex`
+- **Bybit** — V5 API **parameterised on category** (`::spot()` / `::linear()` / `::inverse()` + testnet variants), batch orders (20), amend support, per-category WS URL, **WebSocket Trade adapter**
+- **HyperLiquid** — **perps + spot** (same connector via `is_spot` flag; spot path queries `spotMeta` with `@N` asset indices), hand-rolled EIP-712 signing (secp256k1), **WS post order entry** with REST fallback
 - **Exchange Connector Trait** — add new exchanges by implementing one trait
 - **Unified Order Book** — aggregate liquidity across venues
 - **Smart Order Router** — routes by effective price (including fees)
 - **Rate Limiter** — token-bucket with safety buffer per venue
 - **429 Retry** — exponential backoff with Retry-After header support
 
+### Professional MM Protocols (`crates/protocols/*`)
+- **Generic WS-RPC** — one id-correlated request/response abstraction powering Binance WS API, Bybit WS Trade, and HyperLiquid WS post. Reconnect + re-auth + request timeout + push routing, all in one place.
+- **FIX 4.4 codec** — standalone message encoder/decoder with deterministic encode, auto-computed `BodyLength` + `CheckSum`, message constructors for Logon / Heartbeat / TestRequest / NewOrderSingle / OrderCancelRequest.
+- **FIX 4.4 session engine** — pure synchronous state machine (Disconnected → LogonSent → LoggedIn → LogoutSent) with heartbeat watchdog, gap-detection ResendRequest, SequenceReset handling, and a pluggable `SeqNumStore` trait for persistence.
+- **Capability audit** — per-venue tests pin `VenueCapabilities::supports_ws_trading`/`supports_fix` to actual adapter presence: declared capabilities cannot drift from code.
+- **Fast-path observability** — `mm_order_entry_duration_seconds` Prometheus histogram labelled by `(venue, path, method)` for side-by-side REST vs WS latency in Grafana.
+
 ### Compliance & Audit
 - **Audit Trail** — append-only JSONL log of all actions (MiCA compliant, 5-year retention)
 - **SLA Tracking** — uptime, spread, depth, two-sided quoting obligations
 - **Order + Balance Reconciliation** — periodic comparison vs exchange state
 - **PnL Attribution** — spread capture / inventory / rebates / fees breakdown
+- **Multi-Currency Portfolio** — aggregate positions and PnL across symbols with different quote currencies (BTCUSDT + ETHBTC + …) into a single reporting currency
 
 ### Monitoring & Alerting
 - **HTTP Dashboard** — `/api/status`, `/api/v1/positions`, `/api/v1/pnl`, `/api/v1/sla`, `/api/v1/report/daily`
-- **Prometheus Metrics** — 27 gauges/counters (PnL, inventory, spread, VPIN, kill level, regime, etc.)
+- **Prometheus Metrics** — 28 gauges/counters/histograms (PnL, inventory, spread, VPIN, kill level, regime, order-entry latency by path, etc.)
 - **Telegram Alerts** — 3-level severity with dedup (Info / Warning / Critical)
+- **Telegram Control (two-way)** — `/status`, `/stop`, `/pause SYMBOL`, `/resume SYMBOL`, `/force_exit SYMBOL` with strict chat-id filter
 - **Grafana** — pre-configured via docker-compose
 
 ### Backtesting & Paper Trading
 - **Backtester** — replay recorded events through strategies with simulated fills
-- **Fill Models** — PriceCross (optimistic) or QueuePosition (probabilistic)
+- **Fill Models** — PriceCross, QueuePosition, and a full `ProbabilisticFiller` with configurable fill probability, slippage, and latency (seeded `ChaCha8Rng` for reproducibility)
+- **Lookahead-Bias Detector** — generic `check_lookahead` primitive catches silent data leaks in indicators and signal constructors
+- **Hyperopt** — random-search parameter optimiser with Sharpe / Sortino / Calmar / MaxDD / MultiMetric loss functions; trial log persists to JSONL
 - **Paper Trading** — live market data, simulated fills, no real orders
 - **Event Recorder** — record live data to JSONL for later replay
 
@@ -250,6 +269,10 @@ Contributions welcome! Please:
 4. Ensure `cargo clippy` passes with zero warnings
 5. Open a PR
 
+## Research notes
+
+- [`docs/research/spot-mm-specifics.md`](docs/research/spot-mm-specifics.md) — 15 canonical sections on how spot MM differs from perp MM (fees, settlement, wallet topology, listen keys, liquidity profile, …). Required reading before touching the spot + cross-product epic.
+
 ## Unique Advantages Over Alternatives
 
 | Feature | market-maker | Hummingbot | Freqtrade | NautilusTrader |
@@ -264,3 +287,20 @@ Contributions welcome! Please:
 | **PnL Attribution** | Yes | No | No | No |
 | **Balance Pre-Check** | Yes | No | No | No |
 | **Reconciliation** | Yes | No | No | No |
+| **HyperLiquid (EIP-712)** | Yes | Partial | No | No |
+| **WS Order Entry** (fast path) | Yes (B / Byb / HL) | Partial | No | Partial |
+| **FIX 4.4 session engine** | Yes | No | No | Partial |
+| **Shared protocol layer** (one abstraction, many adapters) | Yes | No | No | No |
+| **Capability audit tests** | Yes | No | No | No |
+| **Order-entry latency histogram** (REST vs WS) | Yes | No | No | No |
+| **Protections stack** (StoplossGuard / CooldownPeriod / LowProfitPairs) | Yes | No | Yes | No |
+| **Hyperopt loop** (Sharpe / Sortino / Calmar / MaxDD / MultiMetric) | Yes | No | Yes | No |
+| **Lookahead-bias detector** | Yes | No | Yes | No |
+| **Probabilistic FillModel** (prob_fill_on_touch / slippage / latency) | Yes | No | No | Yes |
+| **Client-side order emulator** (stops / trailing / OCO / GTD) | Yes | Partial | No | Yes |
+| **ExecAlgorithm framework** (TWAP / VWAP / POV / Iceberg) | Yes | Partial (V2 executors) | No | Yes |
+| **Microstructure feature extractors** (no training, no PyTorch) | Yes | No | No | No |
+| **Multi-currency portfolio** (per-asset FX factors) | Yes | Partial | No | Yes |
+| **Cross-product basis / funding arb** (spot + perp on one engine) | Yes | No | No | Partial |
+| **Paired unwind on L4 kill switch** (delta-neutral flatten) | Yes | No | No | No |
+| **Telegram two-way control** | Yes | Yes | Yes | No |

@@ -10,6 +10,7 @@ mm-exchange-core = { workspace = true }
 mm-strategy = { workspace = true }
 mm-risk = { workspace = true }
 mm-dashboard = { workspace = true }
+mm-portfolio = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
@@ -18,3 +19,6 @@ rust_decimal_macros = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }

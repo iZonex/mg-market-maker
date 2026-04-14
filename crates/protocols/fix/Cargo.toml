@@ -1,0 +1,7 @@
+[package]
+name = "mm-protocols-fix"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }

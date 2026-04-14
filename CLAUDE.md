@@ -4,53 +4,75 @@ Production-grade market maker for the custom exchange at `../exchange/` with mul
 
 ## Stats
 
-**12 crates, 67 files, ~10K lines Rust, 51 tests**
+**18 crates, 121 files, ~29.7K lines Rust, 384 tests**
 
 ## Architecture
 
 ```
-server/              Entry point, config validation, secrets from env, file logging
-engine/              Main event loop — ALL subsystems wired:
-  ├── market_maker   Book → Strategy → Risk → Order diff → Exchange
-  ├── order_manager  Cancel/place with order diffing
-  ├── book_keeper    Local orderbook from WS
-  ├── order_id_map   UUID ↔ exchange native ID mapping
-  └── balance_cache  Pre-check + reservation before placing
-common/              Types (Decimal, never f64), config, orderbook
-exchange-core/       ExchangeConnector trait, unified book, SOR, rate limiter
-exchange-client/     Custom exchange REST+WS + retry with 429 backoff
-exchange-binance/    Binance spot/futures (HMAC, batch, combined WS)
-exchange-bybit/      Bybit V5 (batch 20, amend, HMAC)
-strategy/            Strategies + signals:
-  ├── avellaneda     Avellaneda-Stoikov optimal MM
-  ├── glft           Guéant-Lehalle-Fernandez-Tapia with calibration
-  ├── grid           Symmetric grid quoting
-  ├── momentum       Alpha signals (book imbalance, trade flow, micro-price)
-  ├── twap           Time-weighted execution for inventory unwinding
-  ├── autotune       Regime detection + toxicity-based parameter adjustment
-  ├── inventory_skew Quadratic skew, dynamic sizing, urgency unwinding
-  └── volatility     EWMA realized vol estimator
-risk/                Risk management:
-  ├── kill_switch    5-level emergency (widen→stop→cancel→flatten→disconnect)
-  ├── circuit_breaker Stale book, wide spread detection
-  ├── inventory      Position tracking, PnL, limits
-  ├── exposure       Drawdown tracking
-  ├── toxicity       VPIN, Kyle's Lambda, adverse selection
-  ├── sla            Exchange obligation compliance tracking
-  ├── pnl            Attribution (spread/inventory/rebates/fees)
-  ├── audit          Append-only JSONL audit trail (MiCA compliant)
-  └── reconciliation Order + balance reconciliation vs exchange
-dashboard/           HTTP dashboard:
-  ├── server         /health, /api/status, /metrics, /api/v1/*
-  ├── metrics        27 Prometheus gauges/counters
-  ├── alerts         Telegram bot + 3-level severity + dedup
-  ├── client_api     /positions, /pnl, /sla, /report/daily
-  └── state          Shared state updated from engine
-backtester/          Backtesting + paper trading:
-  ├── simulator      Replay events → strategy → simulated fills
-  ├── paper          Real-time paper trading with fill simulation
-  ├── data           JSONL event recorder/loader
-  └── report         Performance report with PnL attribution
+server/                Entry point, config validation, secrets from env, file logging
+engine/                Main event loop — ALL subsystems wired:
+  ├── market_maker     Book → Strategy → Risk → Order diff → Exchange
+  ├── order_manager    Cancel/place with order diffing
+  ├── book_keeper      Local orderbook from WS
+  ├── order_id_map     UUID ↔ exchange native ID mapping
+  └── balance_cache    Pre-check + reservation before placing
+common/                Types (Decimal, never f64), config, orderbook
+exchange/              Venue adapters (one abstraction, many connectors):
+  ├── core/            ExchangeConnector trait, unified book, SOR, rate limiter
+  ├── client/          Custom exchange REST+WS + retry with 429 backoff
+  ├── binance/         Binance spot/futures — REST + WS API (HMAC)
+  ├── bybit/           Bybit V5 — REST + WS Trade (HMAC, batch 20, amend)
+  └── hyperliquid/     HyperLiquid perp DEX — REST + WS post (EIP-712 / k256)
+protocols/             Shared wire/transport layers:
+  ├── fix/             FIX 4.4 message codec + session engine
+  └── ws_rpc/          Generic id-correlated WS request/response client
+indicators/            Technical indicators (SMA, EMA, RSI, ATR, Bollinger)
+portfolio/             Multi-currency position tracker + PnL aggregation
+hyperopt/              Random-search hyperparameter optimiser + loss functions
+strategy/              Strategies + signals + execution:
+  ├── avellaneda       Avellaneda-Stoikov optimal MM
+  ├── glft             Guéant-Lehalle-Fernandez-Tapia with calibration
+  ├── grid             Symmetric grid quoting
+  ├── cross_exchange   Make on venue A, hedge on venue B
+  ├── xemm             Dedicated cross-exchange executor with slippage band
+  ├── basis            Basis-shifted reservation price (spot + ref_price)
+  ├── funding_arb      Atomic pair dispatcher (market-take hedge, maker-post primary)
+  ├── funding_arb_driver Periodic FundingArbEngine loop + DriverEventSink
+  ├── paired_unwind    L4 kill-switch flatten for paired basis/funding positions
+  ├── exec_algo        ExecAlgorithm trait + TWAP/VWAP/POV/Iceberg impls
+  ├── features         Microstructure feature extractors (imbalance, trade flow, …)
+  ├── momentum         Alpha signals (book imbalance, trade flow, micro-price)
+  ├── twap             Time-weighted execution for single-leg inventory unwinding
+  ├── autotune         Regime detection + toxicity-based parameter adjustment
+  ├── inventory_skew   Quadratic skew, dynamic sizing, urgency unwinding
+  └── volatility       EWMA realized vol estimator
+risk/                  Risk management:
+  ├── kill_switch      5-level emergency (widen→stop→cancel→flatten→disconnect)
+  ├── protections      StoplossGuard / CooldownPeriod / MaxDrawdown / LowProfitPairs
+  ├── circuit_breaker  Stale book, wide spread detection
+  ├── dca              Position-adjustment planner (flat/linear/accelerated)
+  ├── order_emulator   Client-side stops/trailing/OCO/GTD emulation
+  ├── inventory        Position tracking, PnL, limits
+  ├── exposure         Drawdown tracking
+  ├── toxicity         VPIN, Kyle's Lambda, adverse selection
+  ├── sla              Exchange obligation compliance tracking
+  ├── pnl              Attribution (spread/inventory/rebates/fees)
+  ├── audit            Append-only JSONL audit trail (MiCA compliant)
+  └── reconciliation   Order + balance reconciliation vs exchange
+dashboard/             HTTP dashboard:
+  ├── server           /health, /api/status, /metrics, /api/v1/*
+  ├── metrics          28 Prometheus gauges/counters/histograms
+  ├── alerts           Telegram bot + 3-level severity + dedup
+  ├── telegram_control Two-way Telegram (/status, /stop, /pause, /force_exit)
+  ├── client_api       /positions, /pnl, /sla, /report/daily
+  └── state            Shared state updated from engine
+backtester/            Backtesting + paper trading:
+  ├── simulator        Replay events → strategy → simulated fills
+  ├── fill_model       Probabilistic fill model with latency + slippage
+  ├── lookahead        Generic lookahead-bias detector (O(N²) prefix check)
+  ├── paper            Real-time paper trading with fill simulation
+  ├── data             JSONL event recorder/loader
+  └── report           Performance report with PnL attribution
 persistence/         State management:
   ├── checkpoint     Atomic JSON checkpoint with auto-flush
   └── funding        Funding rate arbitrage engine
@@ -60,7 +82,8 @@ persistence/         State management:
 
 ```bash
 cargo build                    # build all
-cargo test                     # 51 tests
+cargo test                     # 384 tests
+cargo clippy --all-targets -- -D warnings
 cargo run -p mm-server         # run live
 MM_MODE=paper cargo run -p mm-server   # paper trading
 RUST_LOG=debug cargo run -p mm-server  # debug logging
@@ -92,3 +115,23 @@ Secrets via environment (NEVER in config files):
 - TWAP executor for kill switch L4 (flatten all)
 - Dashboard state pushed every 30s to Prometheus + HTTP API
 - Graceful shutdown: Ctrl+C → cancel all → final reports → checkpoint flush
+
+## Protocol architecture rule
+
+**One abstraction, many adapters.** When two venues share a transport
+pattern (id-correlated WebSocket request/response, FIX 4.4 session,
+JSON-RPC 2.0), the pattern lives once in `crates/protocols/*`. Venue
+crates under `crates/exchange/*` provide thin adapters that map the
+shared abstraction onto the venue's specific request/response shape,
+error codes, and auth scheme.
+
+WS order entry for Binance, Bybit, and HyperLiquid all sit on top of
+`crates/protocols/ws_rpc`. FIX 4.4 for any future venue sits on top of
+`crates/protocols/fix`. `VenueCapabilities::supports_ws_trading` and
+`supports_fix` flags are never set unless the code path is actually
+wired — covered by a capability-audit test in each exchange crate.
+
+Venue-specific documentation lives in `docs/protocols/` — one file per
+protocol with endpoint, auth scheme, rate limits, error codes, and
+reconnect semantics. See `docs/epics/protocols-coverage.md` for the
+epic driving this structure.

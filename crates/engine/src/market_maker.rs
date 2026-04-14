@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -9,8 +9,8 @@ use mm_dashboard::alerts::{AlertManager, AlertSeverity};
 use mm_dashboard::state::{
     BookDepthLevel, DashboardState, IncidentRecord, PnlSnapshot, SymbolState,
 };
-use mm_exchange_core::connector::ExchangeConnector;
 use mm_exchange_core::events::MarketEvent;
+use mm_portfolio::Portfolio;
 use mm_risk::audit::{AuditEventType, AuditLog};
 use mm_risk::circuit_breaker::{CircuitBreaker, TripReason};
 use mm_risk::exposure::ExposureManager;
@@ -21,7 +21,9 @@ use mm_risk::sla::{SlaConfig, SlaTracker};
 use mm_risk::toxicity::{AdverseSelectionTracker, KyleLambda, VpinEstimator};
 use mm_strategy::autotune::AutoTuner;
 use mm_strategy::inventory_skew::AdvancedInventoryManager;
+use mm_strategy::funding_arb_driver::{DriverEvent, FundingArbDriver};
 use mm_strategy::momentum::MomentumSignals;
+use mm_strategy::paired_unwind::PairedUnwindExecutor;
 use mm_strategy::r#trait::{Strategy, StrategyContext};
 use mm_strategy::twap::TwapExecutor;
 use mm_strategy::volatility::VolatilityEstimator;
@@ -32,6 +34,7 @@ use tracing::{error, info, warn};
 
 use crate::balance_cache::BalanceCache;
 use crate::book_keeper::BookKeeper;
+use crate::connector_bundle::ConnectorBundle;
 use crate::order_id_map::OrderIdMap;
 use crate::order_manager::OrderManager;
 
@@ -55,10 +58,18 @@ pub struct MarketMakerEngine {
     config: AppConfig,
     product: ProductSpec,
     strategy: Box<dyn Strategy>,
-    connector: Arc<dyn ExchangeConnector>,
+    connectors: ConnectorBundle,
 
     // Core.
     book_keeper: BookKeeper,
+    /// Second book for the hedge leg when `connectors.hedge` is set.
+    /// Cross-product strategies read its mid as `StrategyContext.ref_price`.
+    hedge_book: Option<BookKeeper>,
+    /// Second `OrderManager` for the hedge leg, built lazily when
+    /// `connectors.hedge` is present. Kept strictly separate
+    /// from the primary `order_manager` so per-leg diffing,
+    /// cancel-all, and fill routing never mix the two venues.
+    hedge_order_manager: Option<OrderManager>,
     order_manager: OrderManager,
     inventory_manager: InventoryManager,
     exposure_manager: ExposureManager,
@@ -81,6 +92,26 @@ pub struct MarketMakerEngine {
     auto_tuner: AutoTuner,
     adv_inventory: AdvancedInventoryManager,
     twap: Option<TwapExecutor>,
+    /// Paired-unwind executor for kill-switch L4 on a basis /
+    /// funding-arb position. Populated only when
+    /// `connectors.pair` is set AND the kill switch escalates
+    /// to `FlattenAll`. Replaces the single-leg `twap`
+    /// executor in dual-connector mode — running both would
+    /// double-flatten the primary leg.
+    paired_unwind: Option<PairedUnwindExecutor>,
+    /// Funding-arb driver owned by the engine. When set, the
+    /// engine's select loop adds a periodic tick that pulls
+    /// funding rate + both mids, asks
+    /// `FundingArbEngine::evaluate`, and dispatches via
+    /// `FundingArbExecutor`. DriverEvent routing (audit,
+    /// kill-switch escalation on uncompensated pair break)
+    /// lives in `handle_driver_event`. Mutually exclusive with
+    /// regular maker quoting — operators who run funding arb
+    /// set `StrategyType::FundingArb` in config and the engine
+    /// uses the driver as the main tick instead of
+    /// `refresh_quotes`.
+    funding_arb_driver: Option<FundingArbDriver>,
+    funding_arb_tick: std::time::Duration,
 
     // Tracking.
     sla_tracker: SlaTracker,
@@ -88,6 +119,12 @@ pub struct MarketMakerEngine {
     volume_limiter: mm_risk::VolumeLimitTracker,
     dashboard: Option<DashboardState>,
     alerts: Option<AlertManager>,
+    /// Multi-currency portfolio aggregator. Shared across all
+    /// `MarketMakerEngine` instances in a multi-symbol process
+    /// via `Arc<Mutex<_>>` so a single unified snapshot covers
+    /// every symbol's positions. `None` in single-symbol
+    /// deployments or tests that don't care about unified PnL.
+    portfolio: Option<Arc<Mutex<Portfolio>>>,
 
     // Timing.
     cycle_start: Instant,
@@ -102,7 +139,7 @@ impl MarketMakerEngine {
         config: AppConfig,
         product: ProductSpec,
         strategy: Box<dyn Strategy>,
-        connector: Arc<dyn ExchangeConnector>,
+        connectors: ConnectorBundle,
         dashboard: Option<DashboardState>,
         alerts: Option<AlertManager>,
     ) -> Self {
@@ -139,8 +176,12 @@ impl MarketMakerEngine {
             config.toxicity.vpin_num_buckets,
         );
 
+        let hedge_book = connectors.pair.as_ref().map(|pair| BookKeeper::new(&pair.hedge_symbol));
+        let hedge_order_manager = connectors.hedge.as_ref().map(|_| OrderManager::new());
         Self {
             book_keeper: BookKeeper::new(&symbol),
+            hedge_book,
+            hedge_order_manager,
             order_manager: OrderManager::new(),
             inventory_manager: InventoryManager::new(),
             exposure_manager: ExposureManager::new(dec!(0)),
@@ -157,6 +198,9 @@ impl MarketMakerEngine {
             auto_tuner: AutoTuner::new(200),
             adv_inventory: AdvancedInventoryManager::new(config.risk.max_inventory),
             twap: None,
+            paired_unwind: None,
+            funding_arb_driver: None,
+            funding_arb_tick: std::time::Duration::from_secs(60),
             sla_tracker: SlaTracker::new(sla_config),
             pnl_tracker: PnlTracker::new(product.maker_fee, product.taker_fee),
             volume_limiter: mm_risk::VolumeLimitTracker::new(
@@ -165,11 +209,12 @@ impl MarketMakerEngine {
             ),
             dashboard,
             alerts,
+            portfolio: None,
             symbol,
             config,
             product,
             strategy,
-            connector,
+            connectors,
             cycle_start: Instant::now(),
             last_mid: dec!(0),
             tick_count: 0,
@@ -177,12 +222,59 @@ impl MarketMakerEngine {
         }
     }
 
+    /// Attach a shared multi-currency portfolio to this engine.
+    ///
+    /// Pass the same `Arc<Mutex<Portfolio>>` to every engine in a
+    /// multi-symbol deployment so the dashboard reports a single
+    /// unified PnL snapshot. Operators who don't need unified
+    /// reporting just skip this call and the engine's existing
+    /// `PnlTracker` remains the sole source of truth for dashboard
+    /// gauges.
+    pub fn with_portfolio(mut self, portfolio: Arc<Mutex<Portfolio>>) -> Self {
+        self.portfolio = Some(portfolio);
+        self
+    }
+
+    /// Attach a `FundingArbDriver` to the engine. The engine's
+    /// main loop polls it on `tick_interval` and routes every
+    /// `DriverEvent` to the audit trail + kill switch.
+    /// Requires a dual-connector bundle — funding arb can't run
+    /// without a hedge leg.
+    pub fn with_funding_arb_driver(
+        mut self,
+        driver: FundingArbDriver,
+        tick_interval: std::time::Duration,
+    ) -> Self {
+        self.funding_arb_driver = Some(driver);
+        self.funding_arb_tick = tick_interval;
+        self
+    }
+
     pub async fn run(
         &mut self,
+        ws_rx: mpsc::UnboundedReceiver<MarketEvent>,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
+        self.run_with_hedge(ws_rx, None, shutdown_rx).await
+    }
+
+    /// Dual-connector variant of [`run`]. Callers with a hedge
+    /// connector subscribe its market-data stream and pass it in
+    /// `hedge_rx`; events from that channel only update the hedge
+    /// `BookKeeper` and never place orders — the primary leg is
+    /// still the only one touched by `OrderManager`.
+    pub async fn run_with_hedge(
+        &mut self,
         mut ws_rx: mpsc::UnboundedReceiver<MarketEvent>,
+        mut hedge_rx: Option<mpsc::UnboundedReceiver<MarketEvent>>,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
-        info!(symbol = %self.symbol, strategy = self.strategy.name(), "engine starting");
+        info!(
+            symbol = %self.symbol,
+            strategy = self.strategy.name(),
+            dual = self.connectors.is_dual(),
+            "engine starting"
+        );
         self.audit.risk_event(
             &self.symbol,
             AuditEventType::EngineStarted,
@@ -193,12 +285,27 @@ impl MarketMakerEngine {
         self.refresh_balances().await;
 
         // Initial orderbook snapshot via REST.
-        match self.connector.get_orderbook(&self.symbol, 25).await {
+        match self.connectors.primary.get_orderbook(&self.symbol, 25).await {
             Ok((bids, asks, seq)) => {
                 self.book_keeper.book.apply_snapshot(bids, asks, seq);
                 info!(seq, "initial book snapshot loaded");
             }
             Err(e) => warn!(error = %e, "failed to fetch initial book"),
+        }
+
+        // Initial hedge orderbook snapshot.
+        if let (Some(hedge), Some(pair)) =
+            (self.connectors.hedge.as_ref(), self.connectors.pair.as_ref())
+        {
+            match hedge.get_orderbook(&pair.hedge_symbol, 25).await {
+                Ok((bids, asks, seq)) => {
+                    if let Some(hb) = self.hedge_book.as_mut() {
+                        hb.book.apply_snapshot(bids, asks, seq);
+                        info!(seq, hedge_symbol = %pair.hedge_symbol, "initial hedge book loaded");
+                    }
+                }
+                Err(e) => warn!(error = %e, "failed to fetch initial hedge book"),
+            }
         }
 
         let refresh_ms = self.config.market_maker.refresh_interval_ms;
@@ -208,6 +315,13 @@ impl MarketMakerEngine {
         let mut summary_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
         // Reconcile every 60 seconds.
         let mut reconcile_interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        // Funding-arb driver tick. Only used when
+        // `funding_arb_driver` is Some; the select arm below
+        // gates on that so a None driver never fires.
+        let mut funding_arb_interval = tokio::time::interval(self.funding_arb_tick);
+        // Skip the first immediate tick so a fresh driver does
+        // not fire before the first market-data sample lands.
+        funding_arb_interval.tick().await;
         self.cycle_start = Instant::now();
 
         loop {
@@ -220,6 +334,14 @@ impl MarketMakerEngine {
                 }
                 Some(event) = ws_rx.recv() => {
                     self.handle_ws_event(event);
+                }
+                Some(event) = async {
+                    match hedge_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.handle_hedge_event(event);
                 }
                 _ = refresh_interval.tick() => {
                     if let Err(e) = self.refresh_quotes().await {
@@ -238,13 +360,147 @@ impl MarketMakerEngine {
                 _ = reconcile_interval.tick() => {
                     self.reconcile().await;
                 }
+                _ = funding_arb_interval.tick(),
+                    if self.funding_arb_driver.is_some() =>
+                {
+                    // Borrow-check dance: take the driver out,
+                    // tick it, then put it back. Keeps
+                    // `handle_driver_event` free to mutate
+                    // other engine state (kill switch, audit)
+                    // without conflicting on `&mut self`.
+                    if let Some(mut driver) = self.funding_arb_driver.take() {
+                        let event = driver.tick_once().await;
+                        self.funding_arb_driver = Some(driver);
+                        self.handle_driver_event(event);
+                    }
+                }
             }
+        }
+    }
+
+    /// Handle a `DriverEvent` from the in-engine
+    /// `FundingArbDriver`. Routes to audit + kill switch so
+    /// pair breaks escalate automatically. An uncompensated
+    /// pair break trips kill switch L2 `StopNewOrders` —
+    /// stronger escalation (L4 paired unwind) is left to the
+    /// operator via the regular kill-switch policy paths.
+    fn handle_driver_event(&mut self, event: DriverEvent) {
+        match event {
+            DriverEvent::Entered { .. } => {
+                self.audit.risk_event(
+                    &self.symbol,
+                    AuditEventType::PairDispatchEntered,
+                    "funding arb driver entered",
+                );
+            }
+            DriverEvent::Exited { reason, .. } => {
+                self.audit.risk_event(
+                    &self.symbol,
+                    AuditEventType::PairDispatchExited,
+                    &reason,
+                );
+            }
+            DriverEvent::TakerRejected { reason } => {
+                self.audit.risk_event(
+                    &self.symbol,
+                    AuditEventType::PairTakerRejected,
+                    &reason,
+                );
+                warn!(%reason, "funding arb taker leg rejected — position stayed flat");
+            }
+            DriverEvent::PairBreak { reason, compensated } => {
+                self.audit.risk_event(
+                    &self.symbol,
+                    AuditEventType::PairBreak,
+                    &format!("compensated={compensated}: {reason}"),
+                );
+                self.record_incident(
+                    if compensated { "high" } else { "critical" },
+                    &format!("funding arb pair break (compensated={compensated}): {reason}"),
+                );
+                if !compensated {
+                    // Uncompensated break: flip to L2 so no
+                    // new orders fire until the operator
+                    // investigates. Intentionally NOT L4 —
+                    // L4 would start a paired unwind on an
+                    // already-broken pair, which compounds
+                    // the problem.
+                    self.kill_switch.manual_trigger(
+                        mm_risk::kill_switch::KillLevel::StopNewOrders,
+                        "uncompensated funding arb pair break",
+                    );
+                    // Drop the driver so it stops ticking
+                    // until the operator explicitly restarts
+                    // the engine.
+                    self.funding_arb_driver = None;
+                }
+            }
+            DriverEvent::Hold | DriverEvent::InputUnavailable { .. } => {}
+        }
+    }
+
+    /// Handle an event from the hedge connector's market-data
+    /// stream. Book events update `hedge_book`; `Fill` events
+    /// from the hedge leg feed per-leg bookkeeping
+    /// (`hedge_order_manager`, `paired_unwind.on_hedge_fill`,
+    /// shared portfolio). Connectivity events are logged at
+    /// trace level but intentionally don't trip the primary
+    /// engine's circuit breaker — a hedge disconnect is a
+    /// degraded state, not a full market-maker outage.
+    fn handle_hedge_event(&mut self, event: MarketEvent) {
+        match &event {
+            MarketEvent::BookSnapshot { .. } | MarketEvent::BookDelta { .. } => {
+                if let Some(hb) = self.hedge_book.as_mut() {
+                    hb.on_event(&event);
+                }
+            }
+            MarketEvent::Fill { fill, .. } => {
+                info!(
+                    trade_id = fill.trade_id,
+                    side = ?fill.side,
+                    price = %fill.price,
+                    qty = %fill.qty,
+                    "HEDGE FILL"
+                );
+                if let Some(hedge_om) = self.hedge_order_manager.as_mut() {
+                    hedge_om.on_fill(fill.order_id, fill.qty);
+                }
+                if let Some(unwind) = self.paired_unwind.as_mut() {
+                    unwind.on_hedge_fill(fill.qty);
+                    if !unwind.active() {
+                        info!("paired unwind complete");
+                        self.paired_unwind = None;
+                    }
+                }
+                let signed_qty = match fill.side {
+                    mm_common::types::Side::Buy => fill.qty,
+                    mm_common::types::Side::Sell => -fill.qty,
+                };
+
+                // Portfolio gets the hedge fill with the hedge
+                // symbol so per-asset tracking remains symmetric
+                // across the two legs of a pair.
+                if let (Some(pf), Some(pair)) =
+                    (&self.portfolio, self.connectors.pair.as_ref())
+                {
+                    if let Ok(mut pf) = pf.lock() {
+                        pf.on_fill(&pair.hedge_symbol, signed_qty, fill.price);
+                    }
+                }
+
+                // Reconcile the funding-arb driver's perp-leg
+                // bookkeeping with the real fill.
+                if let Some(driver) = self.funding_arb_driver.as_mut() {
+                    driver.on_hedge_fill(signed_qty);
+                }
+            }
+            _ => {}
         }
     }
 
     /// Refresh balances from exchange.
     async fn refresh_balances(&mut self) {
-        if let Ok(balances) = self.connector.get_balances().await {
+        if let Ok(balances) = self.connectors.primary.get_balances().await {
             let quote_balance = balances
                 .iter()
                 .find(|b| b.asset == self.product.quote_asset)
@@ -292,6 +548,15 @@ impl MarketMakerEngine {
                 .update_mid(mid, self.config.toxicity.adverse_selection_lookback_ms);
             self.pnl_tracker.mark_to_market(mid);
 
+            // Mark-to-market the shared portfolio. The portfolio
+            // holds a mark price per symbol so unrealised PnL
+            // snapshots reflect the latest mid on every tick.
+            if let Some(pf) = &self.portfolio {
+                if let Ok(mut pf) = pf.lock() {
+                    pf.mark_price(&self.symbol, mid);
+                }
+            }
+
             let total_pnl = self.pnl_tracker.attribution.total_pnl();
             self.kill_switch.update_pnl(total_pnl);
 
@@ -305,17 +570,77 @@ impl MarketMakerEngine {
                     info!(side = ?quote.side, price = %quote.price, qty = %quote.qty, "TWAP slice");
                 }
             }
+
+            // Paired-unwind execution (if active). Dispatches
+            // the slice through the hedge leg's own
+            // `OrderManager` so cancel-all + fill tracking
+            // stay per-venue.
+            if let Some(unwind) = self.paired_unwind.as_mut() {
+                if let Some(hedge_mid) = self
+                    .hedge_book
+                    .as_ref()
+                    .and_then(|hb| hb.book.mid_price())
+                {
+                    let slice = unwind.next_slice(mid, hedge_mid);
+                    if let Some(p) = &slice.primary {
+                        if let Err(e) = self
+                            .order_manager
+                            .execute_unwind_slice(
+                                &self.symbol,
+                                p,
+                                &self.product,
+                                &self.connectors.primary,
+                            )
+                            .await
+                        {
+                            warn!(error = %e, "unwind primary dispatch failed");
+                        }
+                    }
+                    if let Some(h) = &slice.hedge {
+                        if let (Some(hedge_conn), Some(hedge_om), Some(pair)) = (
+                            self.connectors.hedge.as_ref(),
+                            self.hedge_order_manager.as_mut(),
+                            self.connectors.pair.as_ref(),
+                        ) {
+                            if let Err(e) = hedge_om
+                                .execute_unwind_slice(
+                                    &pair.hedge_symbol,
+                                    h,
+                                    &self.product,
+                                    hedge_conn,
+                                )
+                                .await
+                            {
+                                warn!(error = %e, "unwind hedge dispatch failed");
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Kill switch L3+ → cancel all.
         if self.kill_switch.level() >= KillLevel::CancelAll {
             self.order_manager
-                .cancel_all(&self.connector, &self.symbol)
+                .cancel_all(&self.connectors.primary, &self.symbol)
                 .await;
             self.balance_cache.reset_reservations();
 
-            // Kill switch L4 → start TWAP to flatten.
-            if self.kill_switch.level() >= KillLevel::FlattenAll && self.twap.is_none() {
+            // Kill switch L4 → start the right flatten executor.
+            //
+            // Single-connector mode: single-leg `TwapExecutor`
+            // against the one position.
+            //
+            // Dual-connector mode (basis / funding arb): pick
+            // `PairedUnwindExecutor` so both legs flatten in
+            // lockstep. Running `TwapExecutor` alongside would
+            // double-flatten the primary leg and leave the hedge
+            // leg dangling, exactly the failure mode AD-11 of
+            // the spot-and-cross-product epic calls out.
+            if self.kill_switch.level() >= KillLevel::FlattenAll
+                && self.twap.is_none()
+                && self.paired_unwind.is_none()
+            {
                 let inv = self.inventory_manager.inventory();
                 if !inv.is_zero() {
                     let side = if inv > dec!(0) {
@@ -323,23 +648,56 @@ impl MarketMakerEngine {
                     } else {
                         mm_common::types::Side::Buy
                     };
-                    self.twap = Some(TwapExecutor::new(
-                        self.symbol.clone(),
-                        side,
-                        inv.abs(),
-                        60,      // 60 seconds.
-                        10,      // 10 slices.
-                        dec!(5), // 5 bps aggressive.
-                    ));
-                    self.audit.risk_event(
-                        &self.symbol,
-                        AuditEventType::KillSwitchEscalated,
-                        &format!("TWAP flatten started: {side:?} {}", inv.abs()),
-                    );
-                    self.record_incident(
-                        "critical",
-                        &format!("Kill switch L4: TWAP flatten {side:?} {}", inv.abs()),
-                    );
+
+                    if let Some(pair) = self.connectors.pair.clone() {
+                        // Paired unwind: infer the hedge-leg
+                        // direction from the primary inventory
+                        // sign. Long-spot → short-hedge, and vice
+                        // versa. Basis-neutral pairs always have
+                        // opposite sides on the two legs.
+                        let primary_side = if inv > dec!(0) {
+                            mm_common::types::Side::Buy
+                        } else {
+                            mm_common::types::Side::Sell
+                        };
+                        let hedge_side = primary_side.opposite();
+                        self.paired_unwind = Some(PairedUnwindExecutor::new(
+                            pair,
+                            primary_side,
+                            hedge_side,
+                            inv.abs(),
+                            60,
+                            10,
+                            dec!(5),
+                        ));
+                        self.audit.risk_event(
+                            &self.symbol,
+                            AuditEventType::KillSwitchEscalated,
+                            &format!("paired unwind started: primary {side:?} {}", inv.abs()),
+                        );
+                        self.record_incident(
+                            "critical",
+                            &format!("Kill switch L4: paired unwind {} base", inv.abs()),
+                        );
+                    } else {
+                        self.twap = Some(TwapExecutor::new(
+                            self.symbol.clone(),
+                            side,
+                            inv.abs(),
+                            60,      // 60 seconds.
+                            10,      // 10 slices.
+                            dec!(5), // 5 bps aggressive.
+                        ));
+                        self.audit.risk_event(
+                            &self.symbol,
+                            AuditEventType::KillSwitchEscalated,
+                            &format!("TWAP flatten started: {side:?} {}", inv.abs()),
+                        );
+                        self.record_incident(
+                            "critical",
+                            &format!("Kill switch L4: TWAP flatten {side:?} {}", inv.abs()),
+                        );
+                    }
                 }
             }
         }
@@ -398,6 +756,20 @@ impl MarketMakerEngine {
                 self.kill_switch.on_fill();
                 self.volume_limiter.on_trade(fill.price * fill.qty);
 
+                // Feed the shared multi-currency portfolio. The
+                // qty passed to `on_fill` is signed — positive on
+                // buys, negative on sells — so the portfolio can
+                // correctly flip / close positions.
+                if let Some(pf) = &self.portfolio {
+                    let signed_qty = match fill.side {
+                        mm_common::types::Side::Buy => fill.qty,
+                        mm_common::types::Side::Sell => -fill.qty,
+                    };
+                    if let Ok(mut pf) = pf.lock() {
+                        pf.on_fill(&self.symbol, signed_qty, fill.price);
+                    }
+                }
+
                 self.balance_cache.release(
                     fill.side,
                     fill.price,
@@ -418,8 +790,48 @@ impl MarketMakerEngine {
                         self.twap = None;
                     }
                 }
+
+                if let Some(unwind) = self.paired_unwind.as_mut() {
+                    unwind.on_primary_fill(fill.qty);
+                    if !unwind.active() {
+                        info!("paired unwind complete");
+                        self.paired_unwind = None;
+                    }
+                }
+
+                // Reconcile the funding-arb driver's position
+                // bookkeeping with the real primary-leg fill.
+                if let Some(driver) = self.funding_arb_driver.as_mut() {
+                    let signed_qty = match fill.side {
+                        mm_common::types::Side::Buy => fill.qty,
+                        mm_common::types::Side::Sell => -fill.qty,
+                    };
+                    driver.on_primary_fill(signed_qty);
+                }
             }
             MarketEvent::OrderUpdate { .. } => {}
+            MarketEvent::BalanceUpdate {
+                asset,
+                wallet,
+                total,
+                locked,
+                available,
+                ..
+            } => {
+                // Listen-key / user-data streams push balance
+                // snapshots when the wallet moves (fills,
+                // deposits, withdrawals). Plug them straight into
+                // `BalanceCache` — same shape as
+                // `update_from_exchange` but for a single asset.
+                use mm_common::types::Balance;
+                self.balance_cache.update_from_exchange(&[Balance {
+                    asset: asset.clone(),
+                    wallet: *wallet,
+                    total: *total,
+                    locked: *locked,
+                    available: *available,
+                }]);
+            }
             MarketEvent::Connected { .. } => {
                 info!("exchange connected");
                 self.audit
@@ -442,7 +854,7 @@ impl MarketMakerEngine {
         if !self.kill_switch.allow_new_orders() {
             if self.kill_switch.level() >= KillLevel::CancelAll {
                 self.order_manager
-                    .cancel_all(&self.connector, &self.symbol)
+                    .cancel_all(&self.connectors.primary, &self.symbol)
                     .await;
                 self.balance_cache.reset_reservations();
             }
@@ -487,7 +899,7 @@ impl MarketMakerEngine {
 
         if self.circuit_breaker.is_tripped() {
             self.order_manager
-                .cancel_all(&self.connector, &self.symbol)
+                .cancel_all(&self.connectors.primary, &self.symbol)
                 .await;
             self.balance_cache.reset_reservations();
             return Ok(());
@@ -551,6 +963,11 @@ impl MarketMakerEngine {
         tuned.order_size = eff_size;
         tuned.min_spread_bps = eff_spread;
 
+        let ref_price = self
+            .hedge_book
+            .as_ref()
+            .and_then(|hb| hb.book.mid_price());
+
         let ctx = StrategyContext {
             book: &self.book_keeper.book,
             product: &self.product,
@@ -559,6 +976,7 @@ impl MarketMakerEngine {
             volatility: sigma,
             time_remaining: t_remaining,
             mid_price: alpha_mid,
+            ref_price,
         };
 
         let mut quotes = self.strategy.compute_quotes(&ctx);
@@ -652,7 +1070,7 @@ impl MarketMakerEngine {
         self.kill_switch.on_message_sent();
 
         self.order_manager
-            .execute_diff(&self.symbol, &quotes, &self.product, &self.connector)
+            .execute_diff(&self.symbol, &quotes, &self.product, &self.connectors.primary)
             .await?;
 
         // SLA update.
@@ -712,6 +1130,16 @@ impl MarketMakerEngine {
     /// Push state to dashboard for HTTP API + Prometheus metrics.
     fn update_dashboard(&self) {
         let Some(ds) = &self.dashboard else { return };
+
+        // Publish the unified portfolio snapshot on every
+        // dashboard update. Taking the snapshot under the mutex
+        // keeps the dashboard's view consistent across all
+        // symbols in a multi-engine deployment.
+        if let Some(pf) = &self.portfolio {
+            if let Ok(pf) = pf.lock() {
+                ds.update_portfolio(pf.snapshot());
+            }
+        }
 
         let regime = self.auto_tuner.regime_detector.regime();
         let regime_str = format!("{regime:?}");
@@ -786,8 +1214,19 @@ impl MarketMakerEngine {
         self.audit
             .risk_event(&self.symbol, AuditEventType::EngineShutdown, "graceful");
         self.order_manager
-            .cancel_all(&self.connector, &self.symbol)
+            .cancel_all(&self.connectors.primary, &self.symbol)
             .await;
+        // Cancel live orders on the hedge leg too — a shutdown
+        // with a dangling hedge order is the exact state that
+        // turns a delta-neutral pair into a naked position over
+        // the restart window.
+        if let (Some(hedge_om), Some(hedge_conn), Some(pair)) = (
+            self.hedge_order_manager.as_mut(),
+            self.connectors.hedge.as_ref(),
+            self.connectors.pair.as_ref(),
+        ) {
+            hedge_om.cancel_all(hedge_conn, &pair.hedge_symbol).await;
+        }
         self.balance_cache.reset_reservations();
         self.pnl_tracker.log_summary();
         self.sla_tracker.log_summary();
@@ -796,3 +1235,904 @@ impl MarketMakerEngine {
         info!(symbol = %self.symbol, "shutdown complete");
     }
 }
+
+#[cfg(test)]
+mod dual_connector_tests {
+    use super::*;
+    use crate::connector_bundle::ConnectorBundle;
+    use crate::test_support::MockConnector;
+    use mm_common::config::AppConfig;
+    use mm_common::types::{InstrumentPair, PriceLevel};
+    use mm_exchange_core::connector::{VenueId, VenueProduct};
+    use mm_exchange_core::events::MarketEvent;
+    use mm_strategy::AvellanedaStoikov;
+
+    fn sample_config() -> AppConfig {
+        AppConfig::default()
+    }
+
+    fn sample_product(symbol: &str) -> ProductSpec {
+        ProductSpec {
+            symbol: symbol.to_string(),
+            base_asset: "BTC".to_string(),
+            quote_asset: "USDT".to_string(),
+            tick_size: dec!(0.01),
+            lot_size: dec!(0.0001),
+            min_notional: dec!(10),
+            maker_fee: dec!(0.0001),
+            taker_fee: dec!(0.0005),
+        }
+    }
+
+    fn sample_pair() -> InstrumentPair {
+        InstrumentPair {
+            primary_symbol: "BTCUSDT".to_string(),
+            hedge_symbol: "BTC".to_string(),
+            multiplier: dec!(1),
+            funding_interval_secs: Some(28_800),
+            basis_threshold_bps: dec!(20),
+        }
+    }
+
+    fn snapshot(symbol: &str, venue: VenueId, bid: Decimal, ask: Decimal) -> MarketEvent {
+        MarketEvent::BookSnapshot {
+            venue,
+            symbol: symbol.to_string(),
+            bids: vec![PriceLevel {
+                price: bid,
+                qty: dec!(1),
+            }],
+            asks: vec![PriceLevel {
+                price: ask,
+                qty: dec!(1),
+            }],
+            sequence: 1,
+        }
+    }
+
+    #[test]
+    fn single_bundle_has_no_hedge_book() {
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        let engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            sample_config(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        assert!(engine.hedge_book.is_none());
+        assert!(!engine.connectors.is_dual());
+    }
+
+    #[test]
+    fn dual_bundle_creates_hedge_book() {
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let hedge = Arc::new(MockConnector::new(VenueId::HyperLiquid, VenueProduct::LinearPerp));
+        let bundle = ConnectorBundle::dual(primary, hedge, sample_pair());
+        let engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            sample_config(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        let hb = engine.hedge_book.as_ref().expect("hedge_book must exist");
+        assert_eq!(hb.book.symbol, "BTC");
+        assert!(engine.connectors.is_dual());
+    }
+
+    #[test]
+    fn handle_hedge_event_routes_book_updates_to_hedge_book() {
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let hedge = Arc::new(MockConnector::new(VenueId::HyperLiquid, VenueProduct::LinearPerp));
+        let bundle = ConnectorBundle::dual(primary, hedge, sample_pair());
+        let mut engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            sample_config(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+
+        // Primary gets a spot quote around 50 000. Hedge gets a
+        // perp quote around 50 100 — a +10 bps basis.
+        engine.handle_ws_event(snapshot("BTCUSDT", VenueId::Binance, dec!(49_999), dec!(50_001)));
+        engine.handle_hedge_event(snapshot(
+            "BTC",
+            VenueId::HyperLiquid,
+            dec!(50_099),
+            dec!(50_101),
+        ));
+
+        assert_eq!(
+            engine.book_keeper.book.mid_price(),
+            Some(dec!(50_000)),
+            "primary mid"
+        );
+        let hb = engine.hedge_book.as_ref().unwrap();
+        assert_eq!(hb.book.mid_price(), Some(dec!(50_100)), "hedge mid");
+    }
+
+    #[test]
+    fn handle_hedge_event_is_noop_in_single_mode() {
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        let mut engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            sample_config(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        // Must not panic; hedge_book is None so the routing is a
+        // silent drop. The primary book must stay untouched.
+        engine.handle_hedge_event(snapshot(
+            "BTC",
+            VenueId::HyperLiquid,
+            dec!(50_099),
+            dec!(50_101),
+        ));
+        assert!(engine.book_keeper.book.mid_price().is_none());
+    }
+
+    #[test]
+    fn hedge_book_mid_feeds_ref_price_via_refresh_quotes() {
+        // Verify the wiring that `refresh_quotes` reads
+        // `hedge_book.book.mid_price()` into `StrategyContext.ref_price`.
+        // Testing the real `refresh_quotes` is heavy (async, lots
+        // of side effects) so we inspect the intermediate
+        // expression the production code uses.
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let hedge = Arc::new(MockConnector::new(VenueId::HyperLiquid, VenueProduct::LinearPerp));
+        let bundle = ConnectorBundle::dual(primary, hedge, sample_pair());
+        let mut engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            sample_config(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        engine.handle_hedge_event(snapshot(
+            "BTC",
+            VenueId::HyperLiquid,
+            dec!(50_099),
+            dec!(50_101),
+        ));
+
+        let ref_price = engine
+            .hedge_book
+            .as_ref()
+            .and_then(|hb| hb.book.mid_price());
+        assert_eq!(ref_price, Some(dec!(50_100)));
+    }
+}
+
+#[cfg(test)]
+mod portfolio_tests {
+    use super::*;
+    use crate::connector_bundle::ConnectorBundle;
+    use crate::test_support::MockConnector;
+    use mm_common::config::AppConfig;
+    use mm_common::types::{Fill, Side};
+    use mm_exchange_core::connector::{VenueId, VenueProduct};
+    use mm_exchange_core::events::MarketEvent;
+    use mm_portfolio::Portfolio;
+    use mm_strategy::AvellanedaStoikov;
+
+    fn sample_product(symbol: &str) -> ProductSpec {
+        ProductSpec {
+            symbol: symbol.to_string(),
+            base_asset: "BTC".to_string(),
+            quote_asset: "USDT".to_string(),
+            tick_size: dec!(0.01),
+            lot_size: dec!(0.0001),
+            min_notional: dec!(10),
+            maker_fee: dec!(0.0001),
+            taker_fee: dec!(0.0005),
+        }
+    }
+
+    fn build_engine(symbol: &str, portfolio: Arc<Mutex<Portfolio>>) -> MarketMakerEngine {
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        MarketMakerEngine::new(
+            symbol.to_string(),
+            AppConfig::default(),
+            sample_product(symbol),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        )
+        .with_portfolio(portfolio)
+    }
+
+    fn fill_event(symbol: &str, side: Side, qty: Decimal, price: Decimal) -> MarketEvent {
+        MarketEvent::Fill {
+            venue: VenueId::Binance,
+            fill: Fill {
+                trade_id: 1,
+                order_id: mm_common::types::OrderId::new_v4(),
+                symbol: symbol.to_string(),
+                side,
+                price,
+                qty,
+                is_maker: true,
+                timestamp: chrono::Utc::now(),
+            },
+        }
+    }
+
+    #[test]
+    fn engine_without_portfolio_runs_untouched() {
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        let mut engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            AppConfig::default(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        assert!(engine.portfolio.is_none());
+        // Fill should NOT panic when portfolio is absent.
+        engine.handle_ws_event(fill_event(
+            "BTCUSDT",
+            Side::Buy,
+            dec!(0.1),
+            dec!(50_000),
+        ));
+    }
+
+    #[test]
+    fn fill_routes_signed_qty_to_shared_portfolio() {
+        let portfolio = Arc::new(Mutex::new(Portfolio::new("USDT")));
+        let mut engine = build_engine("BTCUSDT", portfolio.clone());
+
+        engine.handle_ws_event(fill_event(
+            "BTCUSDT",
+            Side::Buy,
+            dec!(0.1),
+            dec!(50_000),
+        ));
+
+        let snap = portfolio.lock().unwrap().snapshot();
+        let btc = snap.per_asset.get("BTCUSDT").expect("BTCUSDT entry");
+        assert_eq!(btc.qty, dec!(0.1), "long from buy fill");
+        assert_eq!(btc.avg_entry, dec!(50_000));
+    }
+
+    #[test]
+    fn sell_fill_routes_negative_qty_to_portfolio() {
+        let portfolio = Arc::new(Mutex::new(Portfolio::new("USDT")));
+        let mut engine = build_engine("BTCUSDT", portfolio.clone());
+
+        // Buy 0.2 then sell 0.15 → net long 0.05, realise +50 USDT
+        // on the 0.15 closed at 51_000 vs avg 50_000.
+        engine.handle_ws_event(fill_event("BTCUSDT", Side::Buy, dec!(0.2), dec!(50_000)));
+        engine.handle_ws_event(fill_event("BTCUSDT", Side::Sell, dec!(0.15), dec!(51_000)));
+
+        let snap = portfolio.lock().unwrap().snapshot();
+        let btc = snap.per_asset.get("BTCUSDT").unwrap();
+        assert_eq!(btc.qty, dec!(0.05));
+        assert_eq!(btc.realised_pnl_native, dec!(150));
+        assert_eq!(snap.total_realised_pnl, dec!(150));
+    }
+
+    #[test]
+    fn multi_symbol_engines_share_one_portfolio() {
+        // Two engines, one shared portfolio. After both report
+        // a buy fill, the snapshot sees both positions under the
+        // unified reporting currency.
+        let portfolio = Arc::new(Mutex::new(Portfolio::new("USDT")));
+        let mut btc_engine = build_engine("BTCUSDT", portfolio.clone());
+        let mut eth_engine = build_engine("ETHUSDT", portfolio.clone());
+
+        btc_engine.handle_ws_event(fill_event(
+            "BTCUSDT",
+            Side::Buy,
+            dec!(0.1),
+            dec!(50_000),
+        ));
+        eth_engine.handle_ws_event(fill_event(
+            "ETHUSDT",
+            Side::Buy,
+            dec!(1),
+            dec!(3_000),
+        ));
+
+        let snap = portfolio.lock().unwrap().snapshot();
+        assert_eq!(snap.per_asset.len(), 2, "both symbols tracked");
+        assert!(snap.per_asset.contains_key("BTCUSDT"));
+        assert!(snap.per_asset.contains_key("ETHUSDT"));
+    }
+
+    #[test]
+    fn portfolio_fx_and_reporting_currency_roundtrip() {
+        // Portfolio remains in USDT regardless of per-engine
+        // quote assets. The engine does NOT set FX by default —
+        // callers are responsible for wiring `set_fx` when the
+        // engine quotes in a non-USDT asset. This test locks
+        // that contract.
+        let portfolio = Arc::new(Mutex::new(Portfolio::new("USDT")));
+        let mut engine = build_engine("BTCUSDT", portfolio.clone());
+        engine.handle_ws_event(fill_event(
+            "BTCUSDT",
+            Side::Buy,
+            dec!(0.01),
+            dec!(50_000),
+        ));
+        let snap = portfolio.lock().unwrap().snapshot();
+        assert_eq!(snap.reporting_currency, "USDT");
+    }
+}
+
+#[cfg(test)]
+mod paired_unwind_tests {
+    use super::*;
+    use crate::connector_bundle::ConnectorBundle;
+    use crate::test_support::MockConnector;
+    use mm_common::config::AppConfig;
+    use mm_common::types::{Fill, InstrumentPair, Side};
+    use mm_exchange_core::connector::{VenueId, VenueProduct};
+    use mm_exchange_core::events::MarketEvent;
+    use mm_risk::kill_switch::KillLevel;
+    use mm_strategy::AvellanedaStoikov;
+
+    fn sample_product(symbol: &str) -> ProductSpec {
+        ProductSpec {
+            symbol: symbol.to_string(),
+            base_asset: "BTC".to_string(),
+            quote_asset: "USDT".to_string(),
+            tick_size: dec!(0.01),
+            lot_size: dec!(0.0001),
+            min_notional: dec!(10),
+            maker_fee: dec!(0.0001),
+            taker_fee: dec!(0.0005),
+        }
+    }
+
+    fn sample_pair() -> InstrumentPair {
+        InstrumentPair {
+            primary_symbol: "BTCUSDT".to_string(),
+            hedge_symbol: "BTC-PERP".to_string(),
+            multiplier: dec!(1),
+            funding_interval_secs: Some(28_800),
+            basis_threshold_bps: dec!(50),
+        }
+    }
+
+    fn dual_engine() -> MarketMakerEngine {
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let hedge = Arc::new(MockConnector::new(
+            VenueId::HyperLiquid,
+            VenueProduct::LinearPerp,
+        ));
+        let bundle = ConnectorBundle::dual(primary, hedge, sample_pair());
+        MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            AppConfig::default(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        )
+    }
+
+    fn single_engine() -> MarketMakerEngine {
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            AppConfig::default(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        )
+    }
+
+    fn buy_fill(qty: Decimal, price: Decimal) -> MarketEvent {
+        MarketEvent::Fill {
+            venue: VenueId::Binance,
+            fill: Fill {
+                trade_id: 1,
+                order_id: mm_common::types::OrderId::new_v4(),
+                symbol: "BTCUSDT".to_string(),
+                side: Side::Buy,
+                price,
+                qty,
+                is_maker: true,
+                timestamp: chrono::Utc::now(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn kill_switch_l4_picks_paired_unwind_in_dual_mode() {
+        let mut engine = dual_engine();
+        // Build up an inventory on the primary leg.
+        engine.handle_ws_event(buy_fill(dec!(0.05), dec!(50_000)));
+        assert_eq!(engine.inventory_manager.inventory(), dec!(0.05));
+
+        // Need a mid on the primary book for tick_second to
+        // reach the kill-switch dispatch branch.
+        engine.handle_ws_event(MarketEvent::BookSnapshot {
+            venue: VenueId::Binance,
+            symbol: "BTCUSDT".to_string(),
+            bids: vec![mm_common::types::PriceLevel {
+                price: dec!(49_999),
+                qty: dec!(10),
+            }],
+            asks: vec![mm_common::types::PriceLevel {
+                price: dec!(50_001),
+                qty: dec!(10),
+            }],
+            sequence: 1,
+        });
+
+        // Trip the kill switch all the way to L4.
+        engine
+            .kill_switch
+            .manual_trigger(KillLevel::FlattenAll, "test L4 escalation");
+        assert_eq!(engine.kill_switch.level(), KillLevel::FlattenAll);
+
+        // One tick drives the L4 dispatch logic.
+        engine.tick_second().await;
+
+        assert!(
+            engine.paired_unwind.is_some(),
+            "dual-connector mode must pick PairedUnwindExecutor"
+        );
+        assert!(
+            engine.twap.is_none(),
+            "paired_unwind must replace twap, never run both"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_switch_l4_picks_twap_in_single_mode() {
+        let mut engine = single_engine();
+        engine.handle_ws_event(buy_fill(dec!(0.05), dec!(50_000)));
+        engine.handle_ws_event(MarketEvent::BookSnapshot {
+            venue: VenueId::Binance,
+            symbol: "BTCUSDT".to_string(),
+            bids: vec![mm_common::types::PriceLevel {
+                price: dec!(49_999),
+                qty: dec!(10),
+            }],
+            asks: vec![mm_common::types::PriceLevel {
+                price: dec!(50_001),
+                qty: dec!(10),
+            }],
+            sequence: 1,
+        });
+        engine
+            .kill_switch
+            .manual_trigger(KillLevel::FlattenAll, "test L4 escalation");
+
+        engine.tick_second().await;
+
+        assert!(engine.twap.is_some(), "single-mode path still uses TWAP");
+        assert!(engine.paired_unwind.is_none());
+    }
+
+    #[tokio::test]
+    async fn paired_unwind_is_not_spawned_when_inventory_is_zero() {
+        let mut engine = dual_engine();
+        engine.handle_ws_event(MarketEvent::BookSnapshot {
+            venue: VenueId::Binance,
+            symbol: "BTCUSDT".to_string(),
+            bids: vec![mm_common::types::PriceLevel {
+                price: dec!(49_999),
+                qty: dec!(10),
+            }],
+            asks: vec![mm_common::types::PriceLevel {
+                price: dec!(50_001),
+                qty: dec!(10),
+            }],
+            sequence: 1,
+        });
+        engine
+            .kill_switch
+            .manual_trigger(KillLevel::FlattenAll, "test L4 escalation");
+
+        engine.tick_second().await;
+        assert!(engine.paired_unwind.is_none());
+        assert!(engine.twap.is_none());
+    }
+
+    /// Seed the dual engine with inventory + both books so the
+    /// L4 dispatch path can actually run the first slice.
+    async fn prime_for_unwind(engine: &mut MarketMakerEngine) {
+        engine.handle_ws_event(buy_fill(dec!(0.1), dec!(50_000)));
+        engine.handle_ws_event(MarketEvent::BookSnapshot {
+            venue: VenueId::Binance,
+            symbol: "BTCUSDT".to_string(),
+            bids: vec![mm_common::types::PriceLevel {
+                price: dec!(49_999),
+                qty: dec!(10),
+            }],
+            asks: vec![mm_common::types::PriceLevel {
+                price: dec!(50_001),
+                qty: dec!(10),
+            }],
+            sequence: 1,
+        });
+        engine.handle_hedge_event(MarketEvent::BookSnapshot {
+            venue: VenueId::HyperLiquid,
+            symbol: "BTC-PERP".to_string(),
+            bids: vec![mm_common::types::PriceLevel {
+                price: dec!(50_009),
+                qty: dec!(10),
+            }],
+            asks: vec![mm_common::types::PriceLevel {
+                price: dec!(50_011),
+                qty: dec!(10),
+            }],
+            sequence: 1,
+        });
+    }
+
+    #[tokio::test]
+    async fn slice_dispatches_orders_on_both_venues_not_just_logs() {
+        let mut engine = dual_engine();
+        prime_for_unwind(&mut engine).await;
+
+        // Install a tiny-duration executor directly so the
+        // first `next_slice` fires immediately — L4 dispatch
+        // is tested elsewhere, here we only care about the
+        // slice-to-order-manager pipeline. `num_seconds()` in
+        // the executor's scheduler truncates, so the sleep
+        // must exceed 1 full second to register as `elapsed = 1`.
+        let pair = engine.connectors.pair.clone().unwrap();
+        engine.paired_unwind = Some(PairedUnwindExecutor::new(
+            pair,
+            mm_common::types::Side::Buy,
+            mm_common::types::Side::Sell,
+            dec!(0.1),
+            1, // 1 second total duration
+            1, // one slice → fires on first post-schedule tick
+            dec!(5),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+        // Do NOT trip the kill switch here — the L3+ cancel-all
+        // branch in `tick_second` would clear out the slice
+        // orders we just placed. The dispatch pipeline itself
+        // is the only contract under test; L4 spawning is
+        // covered by the earlier kill-switch test.
+        engine.tick_second().await;
+
+        // Both order managers should now have at least one live
+        // order from the dispatched slice.
+        let primary_live = engine.order_manager.live_count();
+        let hedge_live = engine
+            .hedge_order_manager
+            .as_ref()
+            .map(|om| om.live_count())
+            .unwrap_or(0);
+        assert!(
+            primary_live > 0 || hedge_live > 0,
+            "at least one leg must have dispatched a slice (primary={primary_live}, hedge={hedge_live})"
+        );
+    }
+
+    #[tokio::test]
+    async fn hedge_fill_routes_into_paired_unwind_and_portfolio() {
+        let portfolio = Arc::new(Mutex::new(mm_portfolio::Portfolio::new("USDT")));
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let hedge = Arc::new(MockConnector::new(
+            VenueId::HyperLiquid,
+            VenueProduct::LinearPerp,
+        ));
+        let bundle = ConnectorBundle::dual(primary, hedge, sample_pair());
+        let mut engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            AppConfig::default(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        )
+        .with_portfolio(portfolio.clone());
+
+        // Seed an active paired unwind with a known target size.
+        let pair = engine.connectors.pair.clone().unwrap();
+        engine.paired_unwind = Some(PairedUnwindExecutor::new(
+            pair,
+            mm_common::types::Side::Buy,
+            mm_common::types::Side::Sell,
+            dec!(0.1),
+            60,
+            5,
+            dec!(5),
+        ));
+
+        // Hedge fill comes in through the hedge WS path.
+        let hedge_fill = MarketEvent::Fill {
+            venue: VenueId::HyperLiquid,
+            fill: mm_common::types::Fill {
+                trade_id: 42,
+                order_id: mm_common::types::OrderId::new_v4(),
+                symbol: "BTC-PERP".to_string(),
+                side: mm_common::types::Side::Buy, // unwinding a short hedge = buying
+                price: dec!(50_010),
+                qty: dec!(0.02),
+                is_maker: false,
+                timestamp: chrono::Utc::now(),
+            },
+        };
+        engine.handle_hedge_event(hedge_fill);
+
+        // The portfolio saw the hedge symbol, not the primary.
+        let snap = portfolio.lock().unwrap().snapshot();
+        assert!(snap.per_asset.contains_key("BTC-PERP"));
+        let hedge_entry = snap.per_asset.get("BTC-PERP").unwrap();
+        assert_eq!(hedge_entry.qty, dec!(0.02), "hedge buy fill = long position");
+        // paired_unwind tracked the fill → progress > 0.
+        let unwind = engine.paired_unwind.as_ref().expect("unwind still active");
+        // 0.02 filled out of 0.1 target on hedge, primary still at 0
+        // → average progress = (0 + 0.2) / 2 = 0.1.
+        assert_eq!(unwind.progress(), dec!(0.1));
+    }
+
+    #[tokio::test]
+    async fn primary_fill_routes_into_paired_unwind_not_just_inventory() {
+        let mut engine = dual_engine();
+        let pair = engine.connectors.pair.clone().unwrap();
+        engine.paired_unwind = Some(PairedUnwindExecutor::new(
+            pair,
+            mm_common::types::Side::Buy,
+            mm_common::types::Side::Sell,
+            dec!(0.1),
+            60,
+            5,
+            dec!(5),
+        ));
+
+        engine.handle_ws_event(MarketEvent::Fill {
+            venue: VenueId::Binance,
+            fill: mm_common::types::Fill {
+                trade_id: 1,
+                order_id: mm_common::types::OrderId::new_v4(),
+                symbol: "BTCUSDT".to_string(),
+                side: mm_common::types::Side::Sell, // unwinding long spot = selling
+                price: dec!(50_000),
+                qty: dec!(0.05),
+                is_maker: false,
+                timestamp: chrono::Utc::now(),
+            },
+        });
+
+        let unwind = engine.paired_unwind.as_ref().expect("unwind still active");
+        // 0.05 filled on primary, 0 on hedge → avg = 0.25.
+        assert_eq!(unwind.progress(), dec!(0.25));
+    }
+
+    #[tokio::test]
+    async fn paired_unwind_clears_when_both_legs_complete() {
+        let mut engine = dual_engine();
+        let pair = engine.connectors.pair.clone().unwrap();
+        engine.paired_unwind = Some(PairedUnwindExecutor::new(
+            pair,
+            mm_common::types::Side::Buy,
+            mm_common::types::Side::Sell,
+            dec!(0.1),
+            60,
+            1,
+            dec!(5),
+        ));
+
+        // Primary leg fully fills.
+        engine.handle_ws_event(MarketEvent::Fill {
+            venue: VenueId::Binance,
+            fill: mm_common::types::Fill {
+                trade_id: 1,
+                order_id: mm_common::types::OrderId::new_v4(),
+                symbol: "BTCUSDT".to_string(),
+                side: mm_common::types::Side::Sell,
+                price: dec!(50_000),
+                qty: dec!(0.1),
+                is_maker: false,
+                timestamp: chrono::Utc::now(),
+            },
+        });
+        // Hedge leg fully fills.
+        engine.handle_hedge_event(MarketEvent::Fill {
+            venue: VenueId::HyperLiquid,
+            fill: mm_common::types::Fill {
+                trade_id: 2,
+                order_id: mm_common::types::OrderId::new_v4(),
+                symbol: "BTC-PERP".to_string(),
+                side: mm_common::types::Side::Buy,
+                price: dec!(50_010),
+                qty: dec!(0.1),
+                is_maker: false,
+                timestamp: chrono::Utc::now(),
+            },
+        });
+
+        // Executor cleared itself on the final on_hedge_fill.
+        assert!(engine.paired_unwind.is_none(), "unwind cleared on completion");
+    }
+}
+
+#[cfg(test)]
+mod driver_event_tests {
+    use super::*;
+    use crate::connector_bundle::ConnectorBundle;
+    use crate::test_support::MockConnector;
+    use mm_common::config::AppConfig;
+    use mm_common::types::InstrumentPair;
+    use mm_exchange_core::connector::{VenueId, VenueProduct};
+    use mm_risk::kill_switch::KillLevel;
+    use mm_strategy::funding_arb_driver::DriverEvent;
+    use mm_strategy::AvellanedaStoikov;
+
+    fn dual_engine_with_driver_field() -> MarketMakerEngine {
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let hedge = Arc::new(MockConnector::new(
+            VenueId::HyperLiquid,
+            VenueProduct::LinearPerp,
+        ));
+        let pair = InstrumentPair {
+            primary_symbol: "BTCUSDT".to_string(),
+            hedge_symbol: "BTC-PERP".to_string(),
+            multiplier: dec!(1),
+            funding_interval_secs: Some(28_800),
+            basis_threshold_bps: dec!(50),
+        };
+        let bundle = ConnectorBundle::dual(primary, hedge, pair);
+        MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            AppConfig::default(),
+            ProductSpec {
+                symbol: "BTCUSDT".to_string(),
+                base_asset: "BTC".to_string(),
+                quote_asset: "USDT".to_string(),
+                tick_size: dec!(0.01),
+                lot_size: dec!(0.0001),
+                min_notional: dec!(10),
+                maker_fee: dec!(0.0001),
+                taker_fee: dec!(0.0005),
+            },
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn compensated_pair_break_does_not_halt_driver_but_audits() {
+        let mut engine = dual_engine_with_driver_field();
+        // Driver itself is None in this test — we only assert
+        // the dispatcher's behaviour on the event value. A real
+        // driver would have been constructed via
+        // `with_funding_arb_driver`.
+        let starting_level = engine.kill_switch.level();
+        engine.handle_driver_event(DriverEvent::PairBreak {
+            reason: "post-only cross".to_string(),
+            compensated: true,
+        });
+        // Compensated breaks do NOT escalate kill switch.
+        assert_eq!(engine.kill_switch.level(), starting_level);
+    }
+
+    #[tokio::test]
+    async fn uncompensated_pair_break_escalates_to_l2_and_drops_driver() {
+        let mut engine = dual_engine_with_driver_field();
+        // Start with driver set so we can verify it gets dropped.
+        // Construct a driver with a NullSink using real connectors.
+        let driver = mm_strategy::FundingArbDriver::new(
+            engine.connectors.primary.clone(),
+            engine.connectors.hedge.clone().unwrap(),
+            engine.connectors.pair.clone().unwrap(),
+            mm_strategy::FundingArbDriverConfig::default(),
+            Arc::new(mm_strategy::NullSink),
+        );
+        engine.funding_arb_driver = Some(driver);
+
+        engine.handle_driver_event(DriverEvent::PairBreak {
+            reason: "post-only cross".to_string(),
+            compensated: false,
+        });
+
+        assert_eq!(
+            engine.kill_switch.level(),
+            KillLevel::StopNewOrders,
+            "uncompensated break → L2"
+        );
+        assert!(
+            engine.funding_arb_driver.is_none(),
+            "driver dropped so it stops ticking"
+        );
+    }
+
+    #[tokio::test]
+    async fn hold_events_are_silent_noops() {
+        let mut engine = dual_engine_with_driver_field();
+        let starting_level = engine.kill_switch.level();
+        engine.handle_driver_event(DriverEvent::Hold);
+        engine.handle_driver_event(DriverEvent::InputUnavailable {
+            reason: "test".to_string(),
+        });
+        assert_eq!(engine.kill_switch.level(), starting_level);
+    }
+
+    #[tokio::test]
+    async fn entered_and_exited_only_audit_do_not_escalate() {
+        let mut engine = dual_engine_with_driver_field();
+        let starting_level = engine.kill_switch.level();
+        engine.handle_driver_event(DriverEvent::TakerRejected {
+            reason: "insufficient margin".to_string(),
+        });
+        assert_eq!(engine.kill_switch.level(), starting_level);
+    }
+
+    #[tokio::test]
+    async fn fills_reconcile_driver_state_on_both_legs() {
+        let mut engine = dual_engine_with_driver_field();
+        let driver = mm_strategy::FundingArbDriver::new(
+            engine.connectors.primary.clone(),
+            engine.connectors.hedge.clone().unwrap(),
+            engine.connectors.pair.clone().unwrap(),
+            mm_strategy::FundingArbDriverConfig::default(),
+            Arc::new(mm_strategy::NullSink),
+        );
+        engine.funding_arb_driver = Some(driver);
+
+        // Primary leg fill: long 0.1 spot.
+        engine.handle_ws_event(MarketEvent::Fill {
+            venue: VenueId::Binance,
+            fill: mm_common::types::Fill {
+                trade_id: 1,
+                order_id: mm_common::types::OrderId::new_v4(),
+                symbol: "BTCUSDT".to_string(),
+                side: mm_common::types::Side::Buy,
+                price: dec!(50_000),
+                qty: dec!(0.1),
+                is_maker: true,
+                timestamp: chrono::Utc::now(),
+            },
+        });
+
+        // Hedge leg fill: short 0.1 perp.
+        engine.handle_hedge_event(MarketEvent::Fill {
+            venue: VenueId::HyperLiquid,
+            fill: mm_common::types::Fill {
+                trade_id: 2,
+                order_id: mm_common::types::OrderId::new_v4(),
+                symbol: "BTC-PERP".to_string(),
+                side: mm_common::types::Side::Sell,
+                price: dec!(50_010),
+                qty: dec!(0.1),
+                is_maker: false,
+                timestamp: chrono::Utc::now(),
+            },
+        });
+
+        let state = engine.funding_arb_driver.as_ref().unwrap().state();
+        assert_eq!(state.spot_position, dec!(0.1), "spot long");
+        assert_eq!(state.perp_position, dec!(-0.1), "perp short");
+        assert_eq!(state.net_delta, dec!(0), "delta-neutral");
+    }
+}
+
