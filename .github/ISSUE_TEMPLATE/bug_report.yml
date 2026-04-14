@@ -76,7 +76,7 @@ body:
     attributes:
       label: Version
       description: Output of `git describe --tags` or version tag
-      placeholder: v0.3.0
+      placeholder: v0.3.1
 
   - type: dropdown
     id: mode

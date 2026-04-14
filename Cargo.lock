@@ -1188,7 +1188,7 @@ dependencies = [
 
 [[package]]
 name = "mm-backtester"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1208,7 +1208,7 @@ dependencies = [
 
 [[package]]
 name = "mm-common"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "rust_decimal",
@@ -1221,7 +1221,7 @@ dependencies = [
 
 [[package]]
 name = "mm-dashboard"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1249,7 +1249,7 @@ dependencies = [
 
 [[package]]
 name = "mm-engine"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1271,7 +1271,7 @@ dependencies = [
 
 [[package]]
 name = "mm-exchange-binance"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1298,7 +1298,7 @@ dependencies = [
 
 [[package]]
 name = "mm-exchange-bybit"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1324,7 +1324,7 @@ dependencies = [
 
 [[package]]
 name = "mm-exchange-client"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1346,7 +1346,7 @@ dependencies = [
 
 [[package]]
 name = "mm-exchange-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1366,7 +1366,7 @@ dependencies = [
 
 [[package]]
 name = "mm-exchange-hyperliquid"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1393,7 +1393,7 @@ dependencies = [
 
 [[package]]
 name = "mm-hyperopt"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "rand 0.8.5",
@@ -1405,7 +1405,7 @@ dependencies = [
 
 [[package]]
 name = "mm-indicators"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "rust_decimal",
  "rust_decimal_macros",
@@ -1414,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "mm-persistence"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1430,7 +1430,7 @@ dependencies = [
 
 [[package]]
 name = "mm-portfolio"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "mm-common",
  "rust_decimal",
@@ -1440,14 +1440,14 @@ dependencies = [
 
 [[package]]
 name = "mm-protocols-fix"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "mm-protocols-ws-rpc"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -1460,7 +1460,7 @@ dependencies = [
 
 [[package]]
 name = "mm-risk"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1476,7 +1476,7 @@ dependencies = [
 
 [[package]]
 name = "mm-server"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "mm-common",
@@ -1506,7 +1506,7 @@ dependencies = [
 
 [[package]]
 name = "mm-strategy"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",

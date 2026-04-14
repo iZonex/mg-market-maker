@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-04-14
+
+Cross-compile fix release. Ships the full [0.3.0] feature set —
+the previous tag's `release.yml` workflow failed to produce
+`aarch64-unknown-linux-gnu` artifacts because `openssl-sys`
+cannot be cross-compiled without a target sysroot. 0.3.1 is
+the first release with working artifacts on every target in the
+matrix.
+
+### Fixed
+
+- `reqwest` and `tokio-tungstenite` workspace dependencies
+  dropped their default `native-tls` feature in favour of
+  `rustls-tls-webpki-roots`. This removes `openssl`,
+  `openssl-sys`, `openssl-macros`, `openssl-probe`,
+  `native-tls`, and `hyper-tls` from the dependency tree
+  entirely. `rustls` is pure Rust (ring + webpki), so
+  cross-compile to `aarch64-unknown-linux-gnu` no longer needs
+  a libssl-dev sysroot on the runner. The code surface is
+  unchanged — `reqwest::Client::new()` and
+  `tokio_tungstenite::connect_async` keep the same signatures.
+
 ## [0.3.0] - 2026-04-14
 
 Multi-venue, multi-product market maker with cross-product basis and
