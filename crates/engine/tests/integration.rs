@@ -49,6 +49,8 @@ fn test_config() -> MarketMakerConfig {
         otr_enabled: true,
         hma_enabled: true,
         hma_window: 9,
+        momentum_ofi_enabled: false,
+        momentum_learned_microprice_path: None,
         user_stream_enabled: true,
         inventory_drift_tolerance: dec!(0.0001),
         inventory_drift_auto_correct: false,

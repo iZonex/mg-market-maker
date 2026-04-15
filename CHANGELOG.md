@@ -9,6 +9,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Epic D stage-3 — engine-side OFI + learned-MP
+  auto-attach** (Apr 2026). Closes the second deferral
+  the Epic D stage-1 closure note tracked: "OFI and
+  learned-MP consumers are wired into `MomentumSignals`
+  as opt-in builder knobs but the engine's default
+  `MomentumSignals::new(...).with_hma(...)` construction
+  does not yet attach them — operators enable per config
+  in stage-2." Stage-3 ships the config knobs and the
+  engine wiring.
+  - **Two new `MarketMakerConfig` knobs** in
+    `mm-common::config`:
+    - `momentum_ofi_enabled: bool` (default `false`) —
+      when `true`, the engine attaches a fresh
+      `OfiTracker` via `MomentumSignals::with_ofi()`
+      and feeds every L1 book event through it via
+      `on_l1_snapshot`.
+    - `momentum_learned_microprice_path: Option<String>`
+      (default `None`) — when `Some(path)`, the engine
+      loads a finalized `LearnedMicroprice` TOML file
+      via `LearnedMicroprice::from_toml(path)` (the
+      offline CLI fit binary from Track 2) and attaches
+      it via `with_learned_microprice(model)`. **Load
+      failure logs a warning and continues without the
+      signal — never panics.**
+    Both knobs use `#[serde(default)]` for backward
+    compat; operators who didn't add them to existing
+    config files see byte-identical wave-1 behaviour.
+  - **Engine `MomentumSignals` construction** in
+    `MarketMakerEngine::new` now reads both knobs and
+    conditionally attaches the optional signals after
+    the existing `with_hma` call.
+  - **Engine `handle_ws_event` L1 feed**: the book-
+    event branch now calls
+    `momentum.on_l1_snapshot(bid_px, bid_qty, ask_px,
+    ask_qty)` after the existing `momentum.on_mid` call,
+    reading the freshly-applied snapshot directly from
+    `book_keeper.book`. The call is a no-op when
+    `with_ofi()` was not called at construction time.
+  - **3 new engine integration tests** in
+    `signal_wave_2_integration`:
+    - `momentum_ofi_disabled_keeps_ewma_unset` — pin
+      the default-off path
+    - `momentum_ofi_enabled_populates_ewma_from_book_events`
+      — pin the default-on path with growing-bid-depth
+      snapshots
+    - `momentum_learned_microprice_missing_path_does_not_panic`
+      — pin the load-failure recovery
+  - **All 7 test fixtures** updated with the new field
+    defaults (engine integration tests, strategy bench,
+    avellaneda, glft, basis, cross_exchange, simulator).
+  - **Workspace stats**: 1011 → **1014 tests** (+3),
+    workspace clippy `-D warnings` clean, workspace fmt
+    clean. Zero new dependencies.
+
 - **Epic D stage-3 — per-side ρ end-to-end wiring** (Apr 2026).
   Closes the deferral that Epic D stage-2 Track 2 documented:
   per-side asymmetric `ρ_b` / `ρ_a` for the Cartea closed-form

@@ -285,6 +285,30 @@ pub struct MarketMakerConfig {
     #[serde(default = "default_hma_window")]
     pub hma_window: usize,
 
+    /// Epic D stage-3 — enable the Cont-Kukanov-Stoikov
+    /// L1 Order Flow Imbalance signal as a fifth alpha
+    /// component on the engine's `MomentumSignals`. When
+    /// `true`, the engine attaches an `OfiTracker` via
+    /// `MomentumSignals::with_ofi()` and feeds top-of-book
+    /// snapshots into it on every book event. Default
+    /// `false` for backward-compat with operators who tuned
+    /// the wave-1 alpha weights.
+    #[serde(default)]
+    pub momentum_ofi_enabled: bool,
+
+    /// Epic D stage-3 — optional path to a finalized
+    /// `LearnedMicroprice` TOML file (produced by the
+    /// `mm-learned-microprice-fit` offline CLI binary).
+    /// When `Some`, the engine loads the model at startup
+    /// and attaches it via
+    /// `MomentumSignals::with_learned_microprice(model)`.
+    /// On load failure the engine logs a warning and
+    /// continues without the learned microprice signal —
+    /// it never panics on a missing or malformed file.
+    /// Default `None`.
+    #[serde(default)]
+    pub momentum_learned_microprice_path: Option<String>,
+
     /// Enable the Binance listen-key user-data stream. When
     /// `true` (the default), the server spawns a background
     /// task that opens a signed WebSocket against
@@ -741,6 +765,8 @@ impl Default for AppConfig {
                 otr_enabled: true,
                 hma_enabled: true,
                 hma_window: 9,
+                momentum_ofi_enabled: false,
+                momentum_learned_microprice_path: None,
                 user_stream_enabled: true,
                 inventory_drift_tolerance: dec!(0.0001),
                 inventory_drift_auto_correct: false,

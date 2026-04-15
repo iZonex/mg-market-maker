@@ -451,6 +451,41 @@ impl MarketMakerEngine {
                 if config.market_maker.hma_enabled {
                     ms = ms.with_hma(config.market_maker.hma_window);
                 }
+                // Epic D stage-3 — engine-side auto-attach of
+                // OFI + learned-microprice signals. Both default
+                // to off (`momentum_ofi_enabled = false`,
+                // `momentum_learned_microprice_path = None`) so
+                // operators who tuned the wave-1 alpha weights
+                // see byte-identical behaviour. Flipping
+                // `momentum_ofi_enabled = true` attaches a fresh
+                // `OfiTracker`; `handle_ws_event` then feeds it
+                // every L1 snapshot via `on_l1_snapshot`. A
+                // `Some(path)` on `momentum_learned_microprice_path`
+                // loads the offline-fitted model via
+                // `LearnedMicroprice::from_toml` and attaches it.
+                // Load failure logs a warning and continues
+                // without the signal — never panics.
+                if config.market_maker.momentum_ofi_enabled {
+                    ms = ms.with_ofi();
+                    info!("MomentumSignals: OFI signal attached (Epic D stage-3)");
+                }
+                if let Some(path) = &config.market_maker.momentum_learned_microprice_path {
+                    match mm_strategy::learned_microprice::LearnedMicroprice::from_toml(
+                        std::path::Path::new(path),
+                    ) {
+                        Ok(model) => {
+                            ms = ms.with_learned_microprice(model);
+                            info!(path = %path, "MomentumSignals: learned microprice model loaded");
+                        }
+                        Err(e) => {
+                            warn!(
+                                path = %path,
+                                error = %e,
+                                "failed to load learned microprice — continuing without it"
+                            );
+                        }
+                    }
+                }
                 ms
             },
             auto_tuner: AutoTuner::new(200),
@@ -1577,6 +1612,19 @@ impl MarketMakerEngine {
                     // slope information.
                     self.momentum.on_mid(mid);
                     self.last_mid = mid;
+                }
+                // Epic D stage-3 — feed the L1 top-of-book
+                // into the momentum OFI tracker. No-op when
+                // `with_ofi` was not called at construction
+                // time. Reads the book directly so the OFI
+                // observation lines up with the freshly
+                // applied snapshot/delta.
+                let book = &self.book_keeper.book;
+                if let (Some(bid_px), Some(ask_px)) = (book.best_bid(), book.best_ask()) {
+                    let bid_qty = book.bids.get(&bid_px).copied().unwrap_or_default();
+                    let ask_qty = book.asks.get(&ask_px).copied().unwrap_or_default();
+                    self.momentum
+                        .on_l1_snapshot(bid_px, bid_qty, ask_px, ask_qty);
                 }
                 // Feed the current book into the Market
                 // Resilience detector so it can track spread /
@@ -4064,6 +4112,7 @@ mod signal_wave_2_integration {
     use crate::connector_bundle::ConnectorBundle;
     use crate::test_support::MockConnector;
     use mm_common::config::AppConfig;
+    use mm_common::PriceLevel;
     use mm_exchange_core::connector::{VenueId, VenueProduct};
     use mm_strategy::avellaneda::AvellanedaStoikov;
     use mm_strategy::cartea_spread;
@@ -4199,6 +4248,128 @@ mod signal_wave_2_integration {
             narrow_spread <= neutral_spread,
             "informed flow should narrow or match: narrow={narrow_spread}, neutral={neutral_spread}"
         );
+    }
+
+    // ----- Epic D stage-3 — engine-side OFI auto-attach -----
+
+    /// When `momentum_ofi_enabled = false`, the engine
+    /// constructs a plain `MomentumSignals` and never feeds
+    /// the OFI tracker. This is the wave-1 default path.
+    #[test]
+    fn momentum_ofi_disabled_keeps_ewma_unset() {
+        let mut cfg = AppConfig::default();
+        cfg.market_maker.momentum_ofi_enabled = false;
+        let primary = Arc::new(MockConnector::new(VenueId::Bybit, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        let mut engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            cfg,
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        // Drive a few book events.
+        for n in 0..5 {
+            engine.handle_ws_event(MarketEvent::BookSnapshot {
+                venue: VenueId::Bybit,
+                symbol: "BTCUSDT".to_string(),
+                bids: vec![PriceLevel {
+                    price: dec!(50_000) + Decimal::from(n),
+                    qty: dec!(10),
+                }],
+                asks: vec![PriceLevel {
+                    price: dec!(50_001) + Decimal::from(n),
+                    qty: dec!(10),
+                }],
+                sequence: n as u64 + 1,
+            });
+        }
+        // OFI EWMA stays unset because the tracker was never
+        // attached.
+        assert!(engine.momentum.ofi_ewma().is_none());
+    }
+
+    /// When `momentum_ofi_enabled = true`, the engine attaches
+    /// the OfiTracker via `with_ofi()` and feeds every L1
+    /// book event via `on_l1_snapshot`. The EWMA populates
+    /// after the second snapshot.
+    #[test]
+    fn momentum_ofi_enabled_populates_ewma_from_book_events() {
+        let mut cfg = AppConfig::default();
+        cfg.market_maker.momentum_ofi_enabled = true;
+        let primary = Arc::new(MockConnector::new(VenueId::Bybit, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        let mut engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            cfg,
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        // First snapshot seeds the OfiTracker; second snapshot
+        // produces the first observation. Use a deterministic
+        // bid-side widening so EWMA goes positive.
+        engine.handle_ws_event(MarketEvent::BookSnapshot {
+            venue: VenueId::Bybit,
+            symbol: "BTCUSDT".to_string(),
+            bids: vec![PriceLevel {
+                price: dec!(50_000),
+                qty: dec!(10),
+            }],
+            asks: vec![PriceLevel {
+                price: dec!(50_001),
+                qty: dec!(10),
+            }],
+            sequence: 1,
+        });
+        engine.handle_ws_event(MarketEvent::BookSnapshot {
+            venue: VenueId::Bybit,
+            symbol: "BTCUSDT".to_string(),
+            bids: vec![PriceLevel {
+                price: dec!(50_000),
+                qty: dec!(20),
+            }],
+            asks: vec![PriceLevel {
+                price: dec!(50_001),
+                qty: dec!(10),
+            }],
+            sequence: 2,
+        });
+        let ewma = engine.momentum.ofi_ewma();
+        assert!(ewma.is_some(), "EWMA should be populated after 2 snapshots");
+        let v = ewma.unwrap();
+        assert!(
+            v > dec!(0),
+            "growing bid depth should produce positive OFI, got {v}"
+        );
+    }
+
+    /// `momentum_learned_microprice_path` set to a missing
+    /// path logs a warning and continues without the signal —
+    /// must NOT panic. This is the operator-visible
+    /// failure-mode pin.
+    #[test]
+    fn momentum_learned_microprice_missing_path_does_not_panic() {
+        let mut cfg = AppConfig::default();
+        cfg.market_maker.momentum_learned_microprice_path =
+            Some("/nonexistent/path/to/lmp.toml".to_string());
+        let primary = Arc::new(MockConnector::new(VenueId::Bybit, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        let _engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            cfg,
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        // Construction completed without panic — the
+        // load-failure path logged a warning and continued.
     }
 }
 
