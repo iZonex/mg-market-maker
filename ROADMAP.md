@@ -11,6 +11,296 @@ analysis later.
 
 ---
 
+## Production crypto MM SOTA gap epics (2026-04-15 research pass)
+
+Six new epics surfaced by the desk-research pass against
+publicly-known production prop desks (Wintermute, GSR, Jump,
+Flow Traders, Cumberland, Flowdesk, Keyrock, B2C2, Hummingbot
+ecosystem). Full source citations and per-axis gap matrices
+live in `docs/research/production-mm-state-of-the-art.md`.
+
+The previous `production-spot-MM gap closure` epic (now CLOSED
+as v0.4.0) closed eight P0/P1/P2 items that were pure
+operational hardening on top of the v0.2.0 spot+cross-product
+foundation. This new cluster is structurally different: each
+epic adds either a new strategy family, a new aggregation
+layer, or a new execution coordinator. Most depend on
+primitives we *already have* — the gap is the missing
+coordinator on top, not missing infrastructure underneath.
+
+The recommended sequencing is **C → A → B → D → E → F**
+because (a) Epic C unlocks the per-strategy PnL view that
+Epic B's stat-arb depends on, (b) Epic A's SOR is the cleanest
+single execution win and unlocks both XEMM and triangular arb,
+(c) Epic B is the biggest *strategy-variety* gap and pays for
+itself the fastest in $/eng-week, (d) D / E / F are
+incrementally additive once A-C land.
+
+### Epic A — Cross-venue Smart Order Router (P1, ~1 month)
+
+**Why.** Every venue connector is built (Binance spot+futures,
+Bybit spot/linear/inverse, HL spot+perp, custom) and every
+primitive a router needs (live fee tiers from P1.2, queue
+model from v0.4.0, balance cache per venue, rate limiters)
+is in place — but no coordinator decides where to route a
+given fill. This is the single biggest leverage gap in the
+codebase.
+
+**Scope.** New `mm-engine::sor` module. Given a desired
+quantity on one side, solve a small linear program that
+minimizes
+`Σ(taker_fee · taker_qty_i + queue_wait_cost · maker_qty_i)`
+subject to per-venue rate limits, per-venue margin
+availability, and a target completion time. Start with a
+greedy version and move to a real LP solver later.
+
+**Effort.** 3-4 weeks.
+
+**Pre-conditions.** None — all primitives already exist.
+
+**Unlocks.** Triangular arb (Epic B sub-item), cleaner XEMM,
+proper cross-venue basis dispatch, multi-venue stat-arb leg
+execution.
+
+### Epic B — Stat-arb / cointegrated pairs strategy (P1, ~1 month)
+
+**Why.** Cointegrated-pair stat-arb is the single largest
+strategy family every production prop desk runs that we
+structurally lack. Hummingbot ships a screening UI for it,
+GSR publishes research on BTC/ETH and stablecoin pairs as
+their bread-and-butter trade. Our `BasisStrategy` covers
+*one* form (same-asset cash-vs-future basis) but not the
+general cointegrated-pair case where the two legs are
+different assets.
+
+**Scope.** New `mm-strategy::stat_arb` crate module:
+- Johansen cointegration test for pair selection on a rolling
+  30-day window from the backtester event data
+- Kalman filter for adaptive hedge ratio so the ratio adapts
+  to regime change
+- Z-score entry/exit on the residual
+- Reuse the existing `ExecAlgorithm` (TWAP/VWAP/POV) for leg
+  execution
+- First three pairs: BTC/ETH, ETH/SOL, USDC/USDT triangle
+
+**Effort.** 3-4 weeks.
+
+**Pre-conditions.** Per-strategy PnL attribution (Epic C
+delivers this) so the stat-arb book has its own PnL view
+and is not commingled with the MM books.
+
+### Epic C — Portfolio-level risk view ✅ CLOSED stage-1 (Apr 2026)
+
+**Status.** All 5 stage-1 sub-components shipped over 4
+one-week sprints (C-1 planning/study, C-2 per-factor delta
++ per-strategy labeling + stress scaffolding, C-3 hedge
+optimizer + VaR guard, C-4 stress runner + CLI + docs).
+Full breakdown in CHANGELOG `[Unreleased]` and in
+`docs/sprints/epic-c-portfolio-risk-view.md`.
+
+**Stage-2 follow-ups (tracked as next epic):**
+
+- Real historical Tardis replay for the five scenarios
+  (v1 uses deterministic synthetic shock profiles)
+- Cross-beta hedging (off-diagonal β from rolling
+  regression) in the hedge optimizer
+- Off-diagonal factor covariance estimation
+- LP solver (`good_lp` / `clarabel`) for the constrained
+  LASSO variant of the hedge optimization
+- EWMA variance in the VaR guard for faster regime
+  adaptation
+- Historical-simulation VaR as a cross-check against the
+  parametric Gaussian formula
+- CVaR / expected-shortfall alongside VaR
+- Full-engine stress integration test — Sprint C-4 runs
+  the stress path through the synthetic runner only; the
+  full `MarketMakerEngine` end-to-end drive is deferred
+
+---
+
+### Epic C — Portfolio-level risk view (P1, ~3 weeks) — ORIGINAL SCOPE
+
+**Why.** Risk guards are per-strategy, per-symbol, and
+per-asset-class (P2.1), but there is no *portfolio* level.
+The aggregation layer that turns "eight strategies quoting
+on three venues in four assets" into one coherent risk view
+does not exist. This is what unlocks risk-parity capital
+allocation, cross-asset hedge optimization, and a credible
+institutional risk story.
+
+**Scope.**
+- **Per-factor delta aggregation.** Extend `Portfolio` to
+  aggregate exposure per **base asset** (BTC-delta, ETH-delta,
+  SOL-delta, stablecoin-delta) instead of just total PnL.
+  New Prometheus gauges `mm_portfolio_delta{asset=BTC}` etc.
+- **Cross-asset hedge optimizer** (Cartea-Jaimungal ch.6
+  closed form). Takes the full portfolio exposure vector,
+  emits the optimal hedge basket (BTC spot vs perp, ETH spot
+  vs perp, USDC↔USDT FX leg) to minimize portfolio variance
+  subject to funding cost.
+- **Per-strategy VaR limit.** `mm-risk::var_guard` computes
+  rolling 24h PnL variance per strategy, sets a 95%-VaR
+  ceiling from config, on breach pushes a soft-throttle
+  signal into the autotune channel exactly like Market
+  Resilience does today.
+- **Stress replay library.** Curate event JSONL snapshots
+  for the five canonical crypto crashes (2020 covid, 2021
+  China ban, 2022 LUNA, 2022 FTX, 2023 USDC depeg) from
+  Tardis historical data. New
+  `cargo run -p mm-backtester --bin mm-stress-test --
+  --scenario=ftx --config=config.toml` runs the current
+  strategy config against a scenario and emits a
+  standardized report (max DD, time-to-recovery, inventory
+  peak, kill-switch trips, SLA breaches).
+
+**Effort.** 2-3 weeks.
+
+**Pre-conditions.** Per-strategy PnL attribution (still
+deferred from the v0.2.0 epic — this is one of the dangling
+ends).
+
+**Unlocks.** Institutional risk story, USDC↔USDT micro-hedge
+(P1.4 stage-2), options MM when that epic gets picked up.
+
+### Epic D — Signal sophistication wave 2 (P1, ~1 month)
+
+**Why.** The microstructure stack ships ~20 features but
+several of the highest-cited production-MM signals are still
+missing or only have a weaker proxy. Each one is small to
+build and most have a pure-function shape that drops into the
+existing `MomentumSignals` autotune path with no plumbing.
+
+**Scope.**
+- **OFI on the book event path** (Cont-Kukanov-Stoikov 2014).
+  Add `OrderFlowImbalance` in `mm-strategy::features`. Sums
+  signed changes in best-bid / best-ask sizes event-by-event,
+  normalizes by depth. Wire as a fifth alpha component in
+  `MomentumSignals` alongside book imbalance, trade flow,
+  micro-price, HMA. Probably the single highest-ROI signal
+  upgrade we can make. Effort: 3-5 days.
+- **Learned microprice G-function** (Stoikov 2017 §3).
+  Replace `micro_price_weighted` with a per-symbol learned
+  lookup table over (imbalance decile × spread decile).
+  Training runs offline in the backtester against recorded
+  event JSONL; production path loads the table at startup
+  and refreshes nightly. Effort: 1 week.
+- **BVC trade classification** (Easley-Lopez de Prado 2012).
+  Cheap port for the venues that don't expose `isBuyerMaker`
+  reliably. Effort: 1-2 days.
+- **Cartea adverse-selection closed form** in
+  Avellaneda reservation. Currently we use VPIN /
+  Kyle's Lambda to widen spread; the production form is the
+  closed-form additive term in Cartea-Jaimungal ch.10.
+  Effort: 3-5 days.
+
+**Effort.** 3-5 weeks total.
+
+**Pre-conditions.** None.
+
+### Epic E — Execution infra polish (P2, ~2 weeks)
+
+**Why.** Three small wins that improve tail latency and add a
+new venue path. None of these is in the kernel-bypass cost
+bracket — that one is correctly deferred.
+
+**Scope.**
+- **Batch order entry on create + cancel paths.**
+  `OrderManager::execute_diff` already groups by venue; the
+  dispatch just needs to accumulate same-side creates into
+  one `batch_create_orders` call per venue. Bybit V5 + HL get
+  full benefit (up to 20 orders/msg), Binance futures gets
+  5× coalescing. Effort: 3 days.
+- **io_uring runtime for the WS read path.** Move tokio's
+  worker threads to `tokio-uring` for the hot WS read loop.
+  Public benchmarks measure 20-40% tail-latency improvement
+  on 1000-msg/s feeds. Effort: 1-2 weeks for code +
+  rustls validation.
+- **NUMA / IRQ / RT-kernel / hugepages deployment guide** in
+  `docs/deployment.md` plus a validated systemd unit
+  template. This is a deployment story, not a code change,
+  but it is the highest-ROI piece because most operators do
+  not know any of this. Effort: 2-3 days.
+- **Coinbase Prime FIX 4.4 wiring** on top of the existing
+  FIX 4.4 codec we already have in `crates/protocols/fix/`.
+  No venue currently uses it. Coinbase Prime FIX is the
+  cleanest latency path to Coinbase for institutional
+  counterparties. Effort: 2 weeks.
+
+**Effort.** ~2 weeks for the first three; +2 weeks for
+Coinbase Prime FIX.
+
+**Pre-conditions.** None.
+
+### Epic F — Defensive strategy layer (P2, ~3 weeks)
+
+**Why.** Three additive defensive features that improve
+adverse-selection performance without touching the alpha
+stack. All three are small, independent, and low-risk.
+
+**Scope.**
+- **Lead-lag guard.** New `mm-risk::lead_lag_guard` module.
+  Subscribe to a "leader venue" mid feed (usually Binance
+  Futures for same-asset pairs per the Makarov-Schoar paper),
+  compute the return on a 100-500ms window, and when
+  `|return| > N·σ`, push a soft-widen signal into the
+  quoter's autotune path. The defensive form of latency arb
+  — we cannot race HFTs but we can retreat before they hit
+  us. Effort: 1 week.
+- **News / sentiment retreat state machine.** Background
+  task subscribes to a news feed (Kaiko, Laevitas, or just
+  a Telegram/Twitter scraper for crypto-priority headlines)
+  with a regex priority list. On a high-priority headline,
+  flips a `news_retreat` flag that the quoter consults to
+  widen or pull. Wintermute publicly discusses this as a
+  first-class control. Effort: 1-2 weeks.
+- **Listing sniper / probation onboard** (P2.3 stage-2).
+  Background task parses each venue's "new listing"
+  announcement schedule, spawns a dedicated engine for the
+  new symbol a few seconds after the first trade, runs in
+  probation mode (wide spreads, small size) for the first
+  ~24h to capture the opening liquidity premium. P2.3
+  stage-1 shipped halt + drift detection; this is the
+  auto-onboard half. Effort: 2 weeks.
+
+**Effort.** 2-3 weeks.
+
+**Pre-conditions.** Cross-venue connector bundle (already in
+place since v0.2.0 Sprint G).
+
+### Epic-level summary
+
+| Epic | Priority | Effort | Depends on | Unlocks |
+|------|---------|--------|------------|---------|
+| A — Cross-venue SOR | P1 | ~1 mo | none | XEMM, triangular arb, basis dispatch |
+| B — Stat-arb pairs | P1 | ~1 mo | Epic C (per-strat PnL) | new strategy family |
+| C — Portfolio risk view | P1 | ~3 wk | per-strat PnL | risk parity, FX hedge, options |
+| D — Signal wave 2 | P1 | ~1 mo | none | tighter spreads on liquid pairs |
+| E — Execution polish | P2 | ~2 wk | none | tail latency, Coinbase Prime |
+| F — Defensive layer | P2 | ~3 wk | cross-venue bundle | adverse-selection survival |
+
+**Total epic effort:** ~14-18 weeks if run sequentially, ~10
+weeks with two engineers parallelizing on independent epics
+(A+D, then B+C, then E+F).
+
+### Explicit out-of-scope from this research pass
+
+- **Options market making** — 1-quarter+ epic when a Deribit
+  or OKX options connector lands. Tracked as future epic only.
+- **Kernel bypass (DPDK, Solarflare Onload, Aquila)** — not
+  ROI-positive at our public-WS / sub-$500M-day volume
+  regime. Deferred until that volume threshold.
+- **L3 queue position via per-order feeds** — surfaced in
+  Axis 1 of the research doc but requires a Tardis
+  subscription for the per-order channel; tracked as a
+  follow-up to Epic D rather than as its own epic.
+- **Real RL policy inference** — the existing
+  `RL-driven γ / spread policy` section below stands. The
+  closed-form `InventoryGammaPolicy` from v0.4.0 captures
+  ~80% of the value at ~0.1% of the cost per the original
+  ISAC analysis.
+
+---
+
 ## Production-spot-MM gap closure epic (2026-04-15 research pass)
 
 **Why it is here, not in-flight.** The 10-sprint spot-and-cross-

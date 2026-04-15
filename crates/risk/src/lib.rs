@@ -3,6 +3,7 @@ pub mod borrow;
 pub mod circuit_breaker;
 pub mod dca;
 pub mod exposure;
+pub mod hedge_optimizer;
 pub mod inventory;
 pub mod inventory_drift;
 pub mod kill_switch;
@@ -14,6 +15,7 @@ pub mod protections;
 pub mod reconciliation;
 pub mod sla;
 pub mod toxicity;
+pub mod var_guard;
 pub mod volume_limit;
 
 pub use circuit_breaker::CircuitBreaker;

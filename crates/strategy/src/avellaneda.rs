@@ -200,6 +200,9 @@ mod tests {
             borrow_buffer_base: dec!(0),
             pair_lifecycle_enabled: true,
             pair_lifecycle_refresh_secs: 300,
+            var_guard_enabled: false,
+            var_guard_limit_95: None,
+            var_guard_limit_99: None,
             cross_venue_basis_max_staleness_ms: 1500,
         }
     }

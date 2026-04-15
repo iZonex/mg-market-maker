@@ -139,6 +139,21 @@ pub enum AuditEventType {
     /// flip. Surfaced separately so the audit trail records
     /// exactly what moved.
     PairLifecycleMinNotionalChanged,
+
+    // Epic C — Portfolio-level risk view.
+    /// Hedge optimizer produced a non-empty basket. `detail`
+    /// carries the basket summary (symbols + signed qty).
+    /// Emitted on every refresh tick where the optimizer
+    /// recommends a non-trivial hedge — operators can
+    /// reconstruct the hedge path from the audit trail alone.
+    HedgeBasketRecommended,
+    /// Per-strategy VaR guard dropped the throttle below 1.0
+    /// for a strategy class. `detail` carries the strategy
+    /// class + the new throttle multiplier. Emitted only on
+    /// throttle **transitions** so the audit log isn't
+    /// spammed on every refresh tick while the throttle is
+    /// stable.
+    VarGuardThrottleApplied,
 }
 
 impl AuditLog {

@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 
 /// A single asset position with weighted-average cost basis.
@@ -91,6 +92,15 @@ pub struct PortfolioSnapshot {
     pub total_realised_pnl: Decimal,
     pub total_unrealised_pnl: Decimal,
     pub per_asset: HashMap<String, AssetSnapshot>,
+    /// Per-factor (base / quote asset) delta roll-up, seeded
+    /// from the registered symbol→(base, quote) map. Epic C
+    /// sub-component #1.
+    #[serde(default)]
+    pub per_factor: Vec<(String, Decimal)>,
+    /// Per-strategy realised PnL in the reporting currency,
+    /// keyed by `Strategy::name()`. Epic C sub-component #2.
+    #[serde(default)]
+    pub per_strategy: Vec<(String, Decimal)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +125,26 @@ pub struct Portfolio {
     /// → N units of the reporting currency. For USDT-quoted pairs
     /// where the reporting currency is USDT this stays `1`.
     fx_to_reporting: HashMap<String, Decimal>,
+    /// Symbol → (base asset, quote asset) map seeded by
+    /// `register_symbol`. Used by [`Self::factor_delta`] and
+    /// [`Self::factors`] (P2.3 Epic C sub-component #1) to
+    /// aggregate per-base-asset exposure across symbols. A
+    /// symbol with no registration contributes nothing to the
+    /// factor view (best-effort — the old per-symbol snapshot
+    /// path still works for unregistered symbols).
+    symbol_assets: HashMap<String, (String, String)>,
+    /// Per-strategy-class PnL accumulator (Epic C #2). Keys
+    /// are owned `String`s because `Strategy::name()` returns
+    /// `&str` not `&'static str`. Allocation only happens on
+    /// the first fill of a new strategy class — subsequent
+    /// fills on the same class re-hash and reuse the existing
+    /// entry.
+    per_strategy_pnl: HashMap<String, Decimal>,
+    /// Dust threshold for the factor iterator. Factors with
+    /// absolute delta below this are pruned from the
+    /// [`Self::factors`] output so the dashboard doesn't show
+    /// micro-residuals from fee rounding.
+    dust_threshold: Decimal,
 }
 
 impl Portfolio {
@@ -124,14 +154,60 @@ impl Portfolio {
             positions: HashMap::new(),
             marks_native: HashMap::new(),
             fx_to_reporting: HashMap::new(),
+            symbol_assets: HashMap::new(),
+            per_strategy_pnl: HashMap::new(),
+            dust_threshold: dec!(0.00000001),
         }
     }
 
+    /// Seed the per-factor aggregation with the (base, quote)
+    /// asset decomposition for a symbol. Engine calls this once
+    /// at startup from its `ProductSpec`. Idempotent — re-seeding
+    /// with the same tuple is a no-op; re-seeding with a different
+    /// tuple overwrites.
+    ///
+    /// Without this call a symbol still participates in PnL
+    /// aggregation (via the old `per_asset` snapshot path) but
+    /// contributes **nothing** to `factor_delta` / `factors`
+    /// because the aggregator doesn't know which factor the
+    /// symbol's base leg belongs to.
+    pub fn register_symbol(&mut self, symbol: &str, base: &str, quote: &str) {
+        self.symbol_assets
+            .insert(symbol.to_string(), (base.to_string(), quote.to_string()));
+    }
+
     /// Record a fill. `symbol` is the instrument identifier (e.g.
-    /// `BTCUSDT`). `qty` is signed.
-    pub fn on_fill(&mut self, symbol: &str, qty: Decimal, price: Decimal) {
+    /// `BTCUSDT`). `qty` is signed. `strategy_class` is the
+    /// tag from `Strategy::name()` that tells the portfolio
+    /// which strategy-level bucket the PnL belongs to (Epic C
+    /// #2). Pass `"unclassified"` from test code or legacy
+    /// call sites that do not know the strategy.
+    pub fn on_fill(&mut self, symbol: &str, qty: Decimal, price: Decimal, strategy_class: &str) {
         let pos = self.positions.entry(symbol.to_string()).or_default();
+        let prior_realised = pos.realised_pnl_native;
         pos.apply_fill(qty, price);
+        // Strategy-class attribution only tracks the *realised*
+        // PnL delta from this fill — unrealised MTM is still
+        // reported per-symbol via `snapshot()`. For pure
+        // opening fills the realised delta is zero and the
+        // strategy-class bucket sees nothing; for closing fills
+        // the delta equals the realised PnL on the overlap.
+        let realised_delta = pos.realised_pnl_native - prior_realised;
+        if !realised_delta.is_zero() {
+            // Apply FX to the strategy PnL the same way the
+            // snapshot path does — realised PnL is in the
+            // symbol's native quote currency, we report in the
+            // reporting currency.
+            let fx = self
+                .fx_to_reporting
+                .get(symbol)
+                .copied()
+                .unwrap_or(Decimal::ONE);
+            *self
+                .per_strategy_pnl
+                .entry(strategy_class.to_string())
+                .or_insert(Decimal::ZERO) += realised_delta * fx;
+        }
     }
 
     /// Update the current mark price for a symbol, in its own native
@@ -193,11 +269,99 @@ impl Portfolio {
             total_realised_pnl: total_realised,
             total_unrealised_pnl: total_unrealised,
             per_asset,
+            per_factor: self.factors(),
+            per_strategy: self.per_strategy_sorted(),
         }
     }
 
     pub fn positions(&self) -> &HashMap<String, Position> {
         &self.positions
+    }
+
+    /// Per-factor delta for the named base / quote asset. Sums
+    /// contributions from every registered symbol:
+    ///
+    /// - A symbol whose **base asset** is `asset` contributes
+    ///   `+qty` (a long BTCUSDT contributes +BTC).
+    /// - A symbol whose **quote asset** is `asset` contributes
+    ///   `-qty · mark_native` (a long ETHBTC implicitly sells
+    ///   BTC equal to the notional of the ETH leg, so it
+    ///   contributes a negative BTC delta proportional to the
+    ///   ETH mark).
+    ///
+    /// Symbols without a prior `register_symbol` call are
+    /// silently skipped — the aggregator only sees registered
+    /// symbols.
+    pub fn factor_delta(&self, asset: &str) -> Decimal {
+        let mut total = Decimal::ZERO;
+        for (symbol, pos) in &self.positions {
+            let Some((base, quote)) = self.symbol_assets.get(symbol) else {
+                continue;
+            };
+            if base == asset {
+                total += pos.qty;
+            }
+            if quote == asset {
+                let mark = self
+                    .marks_native
+                    .get(symbol)
+                    .copied()
+                    .unwrap_or(pos.avg_entry);
+                total -= pos.qty * mark;
+            }
+        }
+        total
+    }
+
+    /// Iterator-style access to every non-dust factor delta.
+    /// Returns a vector of `(asset, delta)` pairs pruned by the
+    /// `dust_threshold`. Used by the dashboard daily report so
+    /// operators see an honest per-factor view instead of
+    /// noise-level residuals.
+    pub fn factors(&self) -> Vec<(String, Decimal)> {
+        // Collect the distinct set of base + quote assets across
+        // registered symbols.
+        let mut assets: Vec<String> = Vec::new();
+        for (base, quote) in self.symbol_assets.values() {
+            if !assets.iter().any(|a| a == base) {
+                assets.push(base.clone());
+            }
+            if !assets.iter().any(|a| a == quote) {
+                assets.push(quote.clone());
+            }
+        }
+        let mut out = Vec::new();
+        for asset in assets {
+            let delta = self.factor_delta(&asset);
+            if delta.abs() >= self.dust_threshold {
+                out.push((asset, delta));
+            }
+        }
+        // Deterministic order for the daily report.
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Read-only view of the per-strategy PnL accumulator.
+    /// Returns strategy-class tag → realised PnL (in the
+    /// reporting currency) since engine start. Keys are
+    /// whatever `Strategy::name()` implementations return,
+    /// plus the literal `"unclassified"` bucket used by
+    /// legacy and test call sites.
+    pub fn per_strategy_pnl(&self) -> &HashMap<String, Decimal> {
+        &self.per_strategy_pnl
+    }
+
+    /// Iterator-style access to the per-strategy PnL, sorted by
+    /// strategy class for deterministic daily-report output.
+    pub fn per_strategy_sorted(&self) -> Vec<(String, Decimal)> {
+        let mut v: Vec<(String, Decimal)> = self
+            .per_strategy_pnl
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
     }
 }
 
@@ -298,14 +462,16 @@ mod tests {
         assert_eq!(p.realised_pnl_native, dec!(25));
     }
 
+    const UNCLASSIFIED: &str = "unclassified";
+
     #[test]
     fn portfolio_aggregates_multiple_symbols_in_reporting_currency() {
         let mut pf = Portfolio::new("USDT");
         // BTCUSDT: buy 0.1 at 50000, mark at 55000.
-        pf.on_fill("BTCUSDT", dec!(0.1), dec!(50000));
+        pf.on_fill("BTCUSDT", dec!(0.1), dec!(50000), UNCLASSIFIED);
         pf.mark_price("BTCUSDT", dec!(55000));
         // ETHBTC: buy 1 at 0.05 (BTC-quoted). Mark at 0.055.
-        pf.on_fill("ETHBTC", dec!(1), dec!(0.05));
+        pf.on_fill("ETHBTC", dec!(1), dec!(0.05), UNCLASSIFIED);
         pf.mark_price("ETHBTC", dec!(0.055));
         pf.set_fx("ETHBTC", dec!(55000)); // 1 BTC = 55000 USDT at mark
 
@@ -320,7 +486,7 @@ mod tests {
     #[test]
     fn fx_default_is_one() {
         let mut pf = Portfolio::new("USDT");
-        pf.on_fill("BTCUSDT", dec!(1), dec!(100));
+        pf.on_fill("BTCUSDT", dec!(1), dec!(100), UNCLASSIFIED);
         pf.mark_price("BTCUSDT", dec!(110));
         let snap = pf.snapshot();
         // (110 - 100) * 1 = 10 USDT.
@@ -330,13 +496,245 @@ mod tests {
     #[test]
     fn total_equity_is_realised_plus_unrealised() {
         let mut pf = Portfolio::new("USDT");
-        pf.on_fill("BTCUSDT", dec!(2), dec!(100));
-        pf.on_fill("BTCUSDT", dec!(-1), dec!(110)); // realise +10
+        pf.on_fill("BTCUSDT", dec!(2), dec!(100), UNCLASSIFIED);
+        pf.on_fill("BTCUSDT", dec!(-1), dec!(110), UNCLASSIFIED); // realise +10
         pf.mark_price("BTCUSDT", dec!(120));
         let snap = pf.snapshot();
         // Realised 10, unrealised (120 - 100) * 1 = 20.
         assert_eq!(snap.total_realised_pnl, dec!(10));
         assert_eq!(snap.total_unrealised_pnl, dec!(20));
         assert_eq!(snap.total_equity, dec!(30));
+    }
+
+    // ---- Epic C sub-component #1: per-factor delta tests ----
+
+    /// Single USDT-quoted long contributes +qty to the base
+    /// factor and a negative USDT number to the quote factor
+    /// (the implicit short of the reporting currency). The
+    /// reporting currency side is reported for completeness —
+    /// operators can filter it client-side.
+    #[test]
+    fn factor_delta_single_usdt_quoted_long() {
+        let mut pf = Portfolio::new("USDT");
+        pf.register_symbol("BTCUSDT", "BTC", "USDT");
+        pf.on_fill("BTCUSDT", dec!(0.5), dec!(50000), UNCLASSIFIED);
+        pf.mark_price("BTCUSDT", dec!(50000));
+        assert_eq!(pf.factor_delta("BTC"), dec!(0.5));
+        // Quote leg: long 0.5 BTC at 50000 sells 25_000 USDT.
+        assert_eq!(pf.factor_delta("USDT"), dec!(-25000));
+    }
+
+    /// Two BTC-contributing symbols (BTCUSDT long + ETHBTC long)
+    /// must aggregate additively. ETHBTC long contributes
+    /// +ETH to the ETH factor AND a negative BTC contribution
+    /// (-qty · mark) to the BTC factor because the ETHBTC
+    /// quote leg is an implicit BTC short.
+    #[test]
+    fn factor_delta_cross_quote_aggregates_correctly() {
+        let mut pf = Portfolio::new("USDT");
+        pf.register_symbol("BTCUSDT", "BTC", "USDT");
+        pf.register_symbol("ETHBTC", "ETH", "BTC");
+        pf.on_fill("BTCUSDT", dec!(1), dec!(50000), UNCLASSIFIED);
+        pf.on_fill("ETHBTC", dec!(10), dec!(0.05), UNCLASSIFIED);
+        pf.mark_price("BTCUSDT", dec!(50000));
+        pf.mark_price("ETHBTC", dec!(0.05));
+        // ETH factor = +10 from the ETHBTC base leg.
+        assert_eq!(pf.factor_delta("ETH"), dec!(10));
+        // BTC factor = +1 from BTCUSDT base leg, and -0.5 from
+        // the ETHBTC quote leg (10 ETH × 0.05 BTC/ETH = 0.5 BTC
+        // implicitly sold). Net = +0.5.
+        assert_eq!(pf.factor_delta("BTC"), dec!(0.5));
+    }
+
+    /// `factors()` iterator returns every distinct factor from
+    /// the registered symbols, skips dust, and sorts
+    /// deterministically by asset name.
+    #[test]
+    fn factors_iterator_is_sorted_and_dust_pruned() {
+        let mut pf = Portfolio::new("USDT");
+        pf.register_symbol("BTCUSDT", "BTC", "USDT");
+        pf.register_symbol("ETHUSDT", "ETH", "USDT");
+        pf.on_fill("BTCUSDT", dec!(0.5), dec!(50000), UNCLASSIFIED);
+        pf.on_fill("ETHUSDT", dec!(2), dec!(3000), UNCLASSIFIED);
+        pf.mark_price("BTCUSDT", dec!(50000));
+        pf.mark_price("ETHUSDT", dec!(3000));
+        let factors = pf.factors();
+        // Deterministic alphabetical order.
+        let keys: Vec<String> = factors.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(keys, vec!["BTC", "ETH", "USDT"]);
+        assert_eq!(factors[0], ("BTC".to_string(), dec!(0.5)));
+        assert_eq!(factors[1], ("ETH".to_string(), dec!(2)));
+        // USDT = -(0.5 × 50000 + 2 × 3000) = -31_000
+        assert_eq!(factors[2], ("USDT".to_string(), dec!(-31000)));
+    }
+
+    /// Unregistered symbols are silently skipped by the
+    /// per-factor aggregator. The old per-symbol PnL path
+    /// still works for them via `snapshot()` — the factor
+    /// view just doesn't see them.
+    #[test]
+    fn factor_delta_ignores_unregistered_symbols() {
+        let mut pf = Portfolio::new("USDT");
+        // Register BTCUSDT but NOT ETHUSDT.
+        pf.register_symbol("BTCUSDT", "BTC", "USDT");
+        pf.on_fill("BTCUSDT", dec!(0.5), dec!(50000), UNCLASSIFIED);
+        pf.on_fill("ETHUSDT", dec!(2), dec!(3000), UNCLASSIFIED); // unregistered
+        pf.mark_price("BTCUSDT", dec!(50000));
+        pf.mark_price("ETHUSDT", dec!(3000));
+        assert_eq!(pf.factor_delta("BTC"), dec!(0.5));
+        // ETH factor gets nothing — ETHUSDT was never registered.
+        assert_eq!(pf.factor_delta("ETH"), dec!(0));
+        // USDT factor only reflects BTCUSDT, not ETHUSDT.
+        assert_eq!(pf.factor_delta("USDT"), dec!(-25000));
+    }
+
+    /// `register_symbol` is idempotent: calling it twice with
+    /// the same tuple is a no-op, calling it with a new tuple
+    /// overwrites. Catches the regression where a late
+    /// re-registration would double-count a factor.
+    #[test]
+    fn register_symbol_is_idempotent_and_overwrites() {
+        let mut pf = Portfolio::new("USDT");
+        pf.register_symbol("BTCUSDT", "BTC", "USDT");
+        pf.register_symbol("BTCUSDT", "BTC", "USDT"); // idempotent
+        pf.on_fill("BTCUSDT", dec!(1), dec!(50000), UNCLASSIFIED);
+        assert_eq!(pf.factor_delta("BTC"), dec!(1));
+
+        // Now overwrite with a different classification — the
+        // contributions flip immediately.
+        pf.register_symbol("BTCUSDT", "BTC2", "USDT");
+        assert_eq!(pf.factor_delta("BTC"), dec!(0));
+        assert_eq!(pf.factor_delta("BTC2"), dec!(1));
+    }
+
+    /// Signed cancellation: long BTCUSDT on venue A + short
+    /// BTCUSDT on venue B nets to zero BTC-delta. Modelled as
+    /// two separate symbols that both resolve to the BTC
+    /// factor.
+    #[test]
+    fn factor_delta_signed_cancellation_across_venues() {
+        let mut pf = Portfolio::new("USDT");
+        // "BINANCE:BTCUSDT" and "BYBIT:BTCUSDT" — distinct
+        // symbol strings, both map to BTC/USDT factors.
+        pf.register_symbol("BINANCE:BTCUSDT", "BTC", "USDT");
+        pf.register_symbol("BYBIT:BTCUSDT", "BTC", "USDT");
+        pf.on_fill("BINANCE:BTCUSDT", dec!(1), dec!(50000), UNCLASSIFIED);
+        pf.on_fill("BYBIT:BTCUSDT", dec!(-1), dec!(50000), UNCLASSIFIED);
+        pf.mark_price("BINANCE:BTCUSDT", dec!(50000));
+        pf.mark_price("BYBIT:BTCUSDT", dec!(50000));
+        assert_eq!(pf.factor_delta("BTC"), dec!(0));
+    }
+
+    /// Dust threshold prunes factors with near-zero delta from
+    /// the `factors()` output. A BTC factor that ends at 1e-9
+    /// BTC (below the default 1e-8 threshold) is silently
+    /// dropped.
+    #[test]
+    fn factors_iterator_prunes_dust() {
+        let mut pf = Portfolio::new("USDT");
+        pf.register_symbol("BTCUSDT", "BTC", "USDT");
+        // A dust-sized position — below the default threshold.
+        pf.on_fill("BTCUSDT", dec!(0.000000001), dec!(50000), UNCLASSIFIED);
+        pf.mark_price("BTCUSDT", dec!(50000));
+        let factors = pf.factors();
+        // The BTC bucket is dust → pruned. The USDT quote leg
+        // is also dust-scale (50000 × 1e-9 = 5e-5, which is
+        // above the 1e-8 threshold) so it shows up.
+        let btc = factors.iter().find(|(k, _)| k == "BTC");
+        assert!(btc.is_none(), "BTC dust should be pruned");
+    }
+
+    /// Snapshot exposes `per_factor` alongside the legacy
+    /// `per_asset` map — downstream dashboards can consume
+    /// either without a second call.
+    #[test]
+    fn snapshot_exposes_per_factor_and_per_strategy() {
+        let mut pf = Portfolio::new("USDT");
+        pf.register_symbol("BTCUSDT", "BTC", "USDT");
+        pf.on_fill("BTCUSDT", dec!(2), dec!(100), "basis");
+        pf.on_fill("BTCUSDT", dec!(-1), dec!(110), "basis"); // realise +10
+        pf.mark_price("BTCUSDT", dec!(120));
+        let snap = pf.snapshot();
+        let btc = snap
+            .per_factor
+            .iter()
+            .find(|(k, _)| k == "BTC")
+            .expect("BTC factor present");
+        assert_eq!(btc.1, dec!(1));
+        // per_strategy is non-empty and carries the basis class.
+        let basis = snap
+            .per_strategy
+            .iter()
+            .find(|(k, _)| k == "basis")
+            .expect("basis bucket present");
+        assert_eq!(basis.1, dec!(10));
+    }
+
+    // ---- Epic C sub-component #2: per-strategy labeling tests ----
+
+    /// Single strategy class: realised PnL accumulates into
+    /// exactly one bucket.
+    #[test]
+    fn per_strategy_pnl_single_class() {
+        let mut pf = Portfolio::new("USDT");
+        pf.register_symbol("BTCUSDT", "BTC", "USDT");
+        pf.on_fill("BTCUSDT", dec!(2), dec!(100), "avellaneda");
+        pf.on_fill("BTCUSDT", dec!(-2), dec!(110), "avellaneda");
+        let map = pf.per_strategy_pnl();
+        assert_eq!(map.get("avellaneda").copied(), Some(dec!(20)));
+    }
+
+    /// Multiple strategy classes quoting the same symbol do
+    /// NOT commingle — each gets its own bucket. Models the
+    /// funding-arb driver and the basis engine pushing into
+    /// the same Portfolio on the same leg.
+    #[test]
+    fn per_strategy_pnl_multi_class_does_not_commingle() {
+        let mut pf = Portfolio::new("USDT");
+        pf.register_symbol("BTCUSDT", "BTC", "USDT");
+        // Basis engine buys 1 at 100 then sells 1 at 105 → +5.
+        pf.on_fill("BTCUSDT", dec!(1), dec!(100), "basis");
+        pf.on_fill("BTCUSDT", dec!(-1), dec!(105), "basis");
+        // Funding-arb driver buys 1 at 102 then sells 1 at 108 → +6.
+        // Shares the same BTCUSDT position bucket, so the
+        // second buy re-opens the position at avg 102 before
+        // the second sell closes it at 108.
+        pf.on_fill("BTCUSDT", dec!(1), dec!(102), "funding_arb");
+        pf.on_fill("BTCUSDT", dec!(-1), dec!(108), "funding_arb");
+        let map = pf.per_strategy_pnl();
+        assert_eq!(map.get("basis").copied(), Some(dec!(5)));
+        assert_eq!(map.get("funding_arb").copied(), Some(dec!(6)));
+        // Sum matches total realised.
+        assert_eq!(map.values().sum::<Decimal>(), dec!(11));
+    }
+
+    /// Unknown strategy classes get their own bucket. No
+    /// silent dropping, no "unknown" catch-all — every string
+    /// the caller passes becomes a first-class key.
+    #[test]
+    fn per_strategy_pnl_unknown_class_becomes_own_bucket() {
+        let mut pf = Portfolio::new("USDT");
+        pf.register_symbol("BTCUSDT", "BTC", "USDT");
+        pf.on_fill("BTCUSDT", dec!(1), dec!(100), "experimental_v2");
+        pf.on_fill("BTCUSDT", dec!(-1), dec!(110), "experimental_v2");
+        assert_eq!(
+            pf.per_strategy_pnl().get("experimental_v2").copied(),
+            Some(dec!(10))
+        );
+    }
+
+    /// Per-strategy PnL sorted output is deterministic —
+    /// daily reports need stable ordering.
+    #[test]
+    fn per_strategy_sorted_is_alphabetical() {
+        let mut pf = Portfolio::new("USDT");
+        pf.register_symbol("BTCUSDT", "BTC", "USDT");
+        pf.on_fill("BTCUSDT", dec!(1), dec!(100), "zebra");
+        pf.on_fill("BTCUSDT", dec!(-1), dec!(101), "zebra");
+        pf.on_fill("BTCUSDT", dec!(1), dec!(100), "alpha");
+        pf.on_fill("BTCUSDT", dec!(-1), dec!(102), "alpha");
+        let sorted = pf.per_strategy_sorted();
+        let keys: Vec<&str> = sorted.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["alpha", "zebra"]);
     }
 }

@@ -16,6 +16,7 @@ use mm_risk::audit::{AuditEventType, AuditLog};
 use mm_risk::borrow::BorrowManager;
 use mm_risk::circuit_breaker::{CircuitBreaker, TripReason};
 use mm_risk::exposure::ExposureManager;
+use mm_risk::hedge_optimizer::{HedgeBasket, HedgeOptimizer};
 use mm_risk::inventory::InventoryManager;
 use mm_risk::inventory_drift::InventoryDriftReconciler;
 use mm_risk::kill_switch::{KillLevel, KillSwitch, KillSwitchConfig};
@@ -23,6 +24,7 @@ use mm_risk::otr::OrderToTradeRatio;
 use mm_risk::pnl::PnlTracker;
 use mm_risk::sla::{SlaConfig, SlaTracker};
 use mm_risk::toxicity::{AdverseSelectionTracker, KyleLambda, VpinEstimator};
+use mm_risk::var_guard::{VarGuard, VarGuardConfig};
 use mm_strategy::autotune::AutoTuner;
 use mm_strategy::funding_arb_driver::{DriverEvent, FundingArbDriver};
 use mm_strategy::inventory_skew::AdvancedInventoryManager;
@@ -44,6 +46,20 @@ use tracing::{debug, error, info, warn};
 fn decimal_to_f64(d: Decimal) -> f64 {
     use std::str::FromStr;
     f64::from_str(&d.to_string()).unwrap_or(0.0)
+}
+
+/// Best-effort `symbol → (base, quote)` split for the hedge-leg
+/// registration path in `with_portfolio`. Recognises the
+/// canonical fiat / stablecoin / BTC / ETH suffixes the v0.4.0
+/// venue matrix trades on. Used only for the Portfolio seed —
+/// never for order routing.
+fn split_symbol_bq(symbol: &str) -> (&str, &str) {
+    for suffix in ["USDT", "USDC", "BUSD", "FDUSD", "TUSD", "DAI", "BTC", "ETH"] {
+        if let Some(base) = symbol.strip_suffix(suffix) {
+            return (base, suffix);
+        }
+    }
+    (symbol, "")
 }
 
 use crate::balance_cache::BalanceCache;
@@ -118,6 +134,35 @@ pub struct MarketMakerEngine {
     /// halted symbol — closes the "venue sends fills after a
     /// halt" hole.
     lifecycle_paused: bool,
+    /// Per-strategy VaR guard (Epic C sub-component #4).
+    /// Rolling 24 h ring buffer of PnL samples, parametric
+    /// Gaussian VaR, composes into the effective size
+    /// multiplier via `min()`. `None` when
+    /// `config.market_maker.var_guard_enabled = false`.
+    var_guard: Option<VarGuard>,
+    /// Cross-asset hedge optimizer (Epic C sub-component #3).
+    /// Stateless — the engine re-runs `optimize()` on every
+    /// refresh tick with fresh inputs and exposes the result
+    /// via [`Self::last_hedge_basket`]. Always initialised;
+    /// the recommendation is a read-only advisory the
+    /// operator / dashboard can consume without acting on it.
+    hedge_optimizer: HedgeOptimizer,
+    /// Latest hedge basket recommendation from
+    /// `hedge_optimizer::optimize()`. Refreshed on every
+    /// quote tick where the engine has a portfolio snapshot.
+    /// Not acted on automatically — stage-2 dispatch via an
+    /// `ExecAlgorithm` is tracked in ROADMAP.
+    last_hedge_basket: HedgeBasket,
+    /// Tracks the last throttle value per strategy class so
+    /// `VarGuardThrottleApplied` audit events fire only on
+    /// **transitions** rather than every refresh tick while
+    /// the throttle is stable.
+    var_guard_last_throttle: Option<Decimal>,
+    /// Total PnL at the last VaR sample so the 60-second
+    /// `record_pnl_sample` can push the **delta** since the
+    /// previous sample rather than the cumulative PnL. Reset
+    /// on engine start.
+    var_guard_last_total_pnl: Decimal,
     /// Second `OrderManager` for the hedge leg, built lazily when
     /// `connectors.hedge` is present. Kept strictly separate
     /// from the primary `order_manager` so per-leg diffing,
@@ -275,6 +320,18 @@ impl MarketMakerEngine {
                 None
             },
             lifecycle_paused: false,
+            var_guard: if config.market_maker.var_guard_enabled {
+                Some(VarGuard::new(VarGuardConfig {
+                    limit_95: config.market_maker.var_guard_limit_95,
+                    limit_99: config.market_maker.var_guard_limit_99,
+                }))
+            } else {
+                None
+            },
+            hedge_optimizer: HedgeOptimizer::new(dec!(1)),
+            last_hedge_basket: HedgeBasket::default(),
+            var_guard_last_throttle: None,
+            var_guard_last_total_pnl: dec!(0),
             hedge_order_manager,
             order_manager: OrderManager::new(),
             inventory_manager: InventoryManager::new(),
@@ -338,6 +395,29 @@ impl MarketMakerEngine {
     /// `PnlTracker` remains the sole source of truth for dashboard
     /// gauges.
     pub fn with_portfolio(mut self, portfolio: Arc<Mutex<Portfolio>>) -> Self {
+        // Epic C sub-component #1: seed the per-factor delta
+        // aggregator with this engine's base/quote asset pair
+        // before the first fill lands. Idempotent — multiple
+        // engines registering the same symbol with the same
+        // tuple is a no-op.
+        if let Ok(mut pf) = portfolio.lock() {
+            pf.register_symbol(
+                &self.symbol,
+                &self.product.base_asset,
+                &self.product.quote_asset,
+            );
+            // If this engine is running with a cross-product
+            // hedge leg, register the hedge symbol too. The
+            // hedge `ProductSpec` is not carried on the engine
+            // directly — we approximate base/quote from the
+            // hedge symbol's suffix (USDT/USDC/BTC/ETH), which
+            // covers every pair the v0.4.0 venue matrix
+            // currently supports.
+            if let Some(pair) = self.connectors.pair.as_ref() {
+                let (base, quote) = split_symbol_bq(&pair.hedge_symbol);
+                pf.register_symbol(&pair.hedge_symbol, base, quote);
+            }
+        }
         self.portfolio = Some(portfolio);
         self
     }
@@ -661,7 +741,19 @@ impl MarketMakerEngine {
                 // across the two legs of a pair.
                 if let (Some(pf), Some(pair)) = (&self.portfolio, self.connectors.pair.as_ref()) {
                     if let Ok(mut pf) = pf.lock() {
-                        pf.on_fill(&pair.hedge_symbol, signed_qty, fill.price);
+                        // Hedge-leg fills from the funding-arb or
+                        // cross-venue basis path — tag the PnL
+                        // bucket so per-strategy attribution is
+                        // clean. `Strategy::name()` on the primary
+                        // engine's strategy is the right label
+                        // because the hedge leg is the paired
+                        // counterpart of that strategy.
+                        pf.on_fill(
+                            &pair.hedge_symbol,
+                            signed_qty,
+                            fill.price,
+                            self.strategy.name(),
+                        );
                     }
                 }
 
@@ -773,6 +865,24 @@ impl MarketMakerEngine {
         self.sla_tracker.tick();
         self.kill_switch.tick_second();
         self.adv_inventory.tick(self.inventory_manager.inventory());
+
+        // Epic C sub-component #4: feed the VaR guard one
+        // PnL-delta sample per minute. Gated on
+        // `tick_count % 60 == 0` so the sampling cadence is
+        // independent of the engine's sub-second quote
+        // refresh. Uses the total_pnl delta rather than the
+        // cumulative value so the ring buffer carries per-
+        // minute returns, which is what the parametric
+        // Gaussian VaR formulation expects.
+        if self.var_guard.is_some() && self.tick_count.is_multiple_of(60) {
+            let total_pnl = self.pnl_tracker.attribution.total_pnl();
+            let delta = total_pnl - self.var_guard_last_total_pnl;
+            self.var_guard_last_total_pnl = total_pnl;
+            let class = self.strategy.name().to_string();
+            if let Some(vg) = self.var_guard.as_mut() {
+                vg.record_pnl_sample(&class, delta);
+            }
+        }
 
         if let Some(mid) = self.book_keeper.book.mid_price() {
             self.adverse_selection
@@ -1024,7 +1134,7 @@ impl MarketMakerEngine {
                         mm_common::types::Side::Sell => -fill.qty,
                     };
                     if let Ok(mut pf) = pf.lock() {
-                        pf.on_fill(&self.symbol, signed_qty, fill.price);
+                        pf.on_fill(&self.symbol, signed_qty, fill.price, self.strategy.name());
                     }
                 }
 
@@ -1236,7 +1346,34 @@ impl MarketMakerEngine {
         // Kill switch multipliers.
         let effective_level = self.effective_kill_level();
         let ks_spread = effective_level.spread_multiplier();
-        let ks_size = effective_level.size_multiplier();
+        // Base size multiplier from the kill switch, then
+        // composed with the VaR guard's per-strategy throttle
+        // via `min()` (max-restrictive wins). Epic C
+        // sub-component #4.
+        let ks_base_size = effective_level.size_multiplier();
+        let strategy_class = self.strategy.name().to_string();
+        let var_throttle = self
+            .var_guard
+            .as_ref()
+            .map(|vg| vg.effective_throttle(&strategy_class))
+            .unwrap_or(Decimal::ONE);
+        let ks_size = ks_base_size.min(var_throttle);
+
+        // Fire a transition audit event when the VaR throttle
+        // flips. Stable-state ticks do not spam the trail.
+        if self.var_guard.is_some() {
+            let prior = self.var_guard_last_throttle;
+            if prior != Some(var_throttle) {
+                if var_throttle < Decimal::ONE {
+                    self.audit.risk_event(
+                        &self.symbol,
+                        AuditEventType::VarGuardThrottleApplied,
+                        &format!("strategy={strategy_class}, throttle={var_throttle}"),
+                    );
+                }
+                self.var_guard_last_throttle = Some(var_throttle);
+            }
+        }
 
         // Push the current inventory + time-remaining snapshot
         // into the auto-tuner so the optional inventory γ
@@ -1517,7 +1654,47 @@ impl MarketMakerEngine {
     }
 
     /// Push state to dashboard for HTTP API + Prometheus metrics.
-    fn update_dashboard(&self) {
+    /// Current recommended hedge basket from the last
+    /// optimizer refresh. Read-only accessor for tests +
+    /// the dashboard. Epic C sub-component #3.
+    pub fn last_hedge_basket(&self) -> &HedgeBasket {
+        &self.last_hedge_basket
+    }
+
+    /// Build the per-refresh hedge universe from the engine's
+    /// known products. Stage-1 only knows about the primary
+    /// symbol; stage-2 will wire in a proper per-venue
+    /// universe from the connector bundle. For now the v1
+    /// universe is a single synthetic perp instrument per
+    /// base asset, using `config.risk.max_inventory` as the
+    /// position cap and a conservative 1 bps default funding.
+    fn build_hedge_universe(&self) -> Vec<mm_risk::hedge_optimizer::HedgeInstrument> {
+        use mm_risk::hedge_optimizer::HedgeInstrument;
+        let base = self.product.base_asset.clone();
+        if base.is_empty() {
+            return Vec::new();
+        }
+        vec![HedgeInstrument {
+            symbol: format!("{base}-PERP"),
+            factor: base,
+            funding_bps: dec!(1),
+            position_cap: self.config.risk.max_inventory,
+        }]
+    }
+
+    /// Per-factor variance map used by the hedge optimizer.
+    /// Stage-1 returns a constant `1.0` for every factor in
+    /// the portfolio snapshot — the closed form collapses to
+    /// the trivial `-x` hedge when every variance is equal.
+    /// Stage-2 will thread a rolling 30-day mid-price
+    /// variance estimate from the backtester here.
+    fn factor_variances(&self) -> std::collections::HashMap<String, Decimal> {
+        let mut out = std::collections::HashMap::new();
+        out.insert(self.product.base_asset.clone(), dec!(1));
+        out
+    }
+
+    fn update_dashboard(&mut self) {
         let Some(ds) = &self.dashboard else { return };
 
         // Publish the unified portfolio snapshot on every
@@ -1526,7 +1703,37 @@ impl MarketMakerEngine {
         // symbols in a multi-engine deployment.
         if let Some(pf) = &self.portfolio {
             if let Ok(pf) = pf.lock() {
-                ds.update_portfolio(pf.snapshot());
+                let snapshot = pf.snapshot();
+                // Epic C sub-component #3: refresh the hedge
+                // basket recommendation from the latest
+                // per-factor delta. Universe is constructed
+                // from the primary connector's product (plus
+                // the hedge connector's product when dual
+                // mode is active). Operators see the result
+                // in the dashboard; nothing trades
+                // automatically in stage-1.
+                let universe = self.build_hedge_universe();
+                let factor_variances = self.factor_variances();
+                let basket = self.hedge_optimizer.optimize(
+                    &snapshot.per_factor,
+                    &universe,
+                    &factor_variances,
+                );
+                if !basket.is_empty() && basket.entries != self.last_hedge_basket.entries {
+                    let summary = basket
+                        .entries
+                        .iter()
+                        .map(|(s, q)| format!("{s}={q}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    self.audit.risk_event(
+                        &self.symbol,
+                        AuditEventType::HedgeBasketRecommended,
+                        &summary,
+                    );
+                }
+                self.last_hedge_basket = basket;
+                ds.update_portfolio(snapshot);
             }
         }
 

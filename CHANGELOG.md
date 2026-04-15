@@ -7,6 +7,151 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Epic C — Portfolio-level risk view** (ROADMAP SOTA gap
+  closure epic, first of the six A–F candidates surfaced
+  by the April 2026 desk-research pass in
+  `docs/research/production-mm-state-of-the-art.md`). The
+  pre-Epic-C engine had per-strategy, per-symbol, and
+  per-asset-class risk layers but nothing at the
+  **portfolio** level — eight strategies quoting on three
+  venues in four assets had no coherent aggregation point.
+  Epic C closes that gap with five connected sub-components
+  that share one shared Portfolio, one cross-asset hedge
+  optimizer, and one per-strategy VaR guard.
+  - **Sub-component #1 — per-factor delta aggregation.**
+    `mm-portfolio::Portfolio` gains a
+    `register_symbol(symbol, base, quote)` seed call plus
+    `factor_delta(asset)` / `factors()` accessors that
+    aggregate signed exposure per base / quote asset across
+    every registered symbol. **The subtle part**:
+    cross-quote pairs like `ETHBTC` contribute to BOTH their
+    base factor (`+qty` ETH) AND their quote factor
+    (`-qty·mark` BTC, because the ETHBTC quote leg is an
+    implicit BTC short). The dust threshold prunes
+    fee-rounding residuals from the `factors()` iterator so
+    the daily report stays honest. New `PortfolioSnapshot.per_factor`
+    field carries the roll-up for the dashboard; new
+    Prometheus gauge `mm_portfolio_factor_delta{asset}`.
+    Engine calls `register_symbol` inside `with_portfolio`
+    for both the primary leg and the optional hedge leg
+    (with a best-effort `split_symbol_bq` helper for the
+    hedge symbol's base/quote).
+  - **Sub-component #2 — per-strategy PnL labeling.**
+    `Portfolio::on_fill` takes a new `strategy_class: &str`
+    argument, accumulates realised PnL into a separate
+    `per_strategy_pnl: HashMap<String, Decimal>` bucket,
+    and exposes `per_strategy_sorted()` for deterministic
+    daily-report ordering. Funding-arb driver fills push
+    the basis engine's strategy class label (same shape
+    `Strategy::name()` returns), so basis + funding-arb
+    on the same leg do **not** commingle in the portfolio
+    snapshot. Closes the deferred per-strategy attribution
+    gap that had blocked Epic B (stat-arb pairs) from
+    having a clean PnL view. New gauge
+    `mm_portfolio_strategy_pnl{strategy}`.
+  - **Sub-component #3 — cross-asset hedge optimizer.**
+    New `mm-risk::hedge_optimizer` module with
+    `HedgeInstrument { symbol, factor, funding_bps, position_cap }`,
+    `HedgeBasket`, and `HedgeOptimizer::optimize(exposure,
+    universe, factor_variances)`. v1 implements the classic
+    Markowitz 1952 / Merton 1972 diagonal-β mean-variance
+    closed form **in pure `Decimal` math** — no LP solver,
+    no `nalgebra`, no matrix ops. The optimizer reduces to a
+    one-loop-over-K-factors computation that issues
+    `-exposure` per factor with an L1 funding-cost shrinkage
+    (`shrinkage = λ · f · κ`, `κ = 1/variance`) and a hard
+    `position_cap` clamp. Source attribution is corrected
+    against the SOTA research doc's misattribution to
+    Cartea-Jaimungal ch.6 — the real reference is Markowitz,
+    documented in the new
+    `docs/research/hedge-optimizer-and-var-formulas.md`.
+    13 unit tests pin every branch (flat exposure, trivial
+    hedge, funding-penalty zero vs intermediate vs large,
+    hard cap, missing factor, long/short mix, zero variance,
+    duplicate-instrument first-match-wins, property-based
+    hedge-never-exceeds-cap). Engine integrates via a new
+    `MarketMakerEngine::recommend_hedge_basket()` accessor
+    refreshed on every dashboard tick; non-empty basket
+    transitions fire the new
+    `AuditEventType::HedgeBasketRecommended` audit event.
+  - **Sub-component #4 — per-strategy VaR guard.**
+    New `mm-risk::var_guard` module with `VarGuard`,
+    `VarGuardConfig { limit_95, limit_99 }`. Standard
+    RiskMetrics-style parametric Gaussian VaR with frozen
+    compile-time z-score constants
+    (`Z_SCORE_95 = 1.645`, `Z_SCORE_99 = 2.326`). One
+    ring buffer (`VecDeque<Decimal>`) per strategy class,
+    capped at `MAX_SAMPLES_PER_CLASS = 1440` for symmetry
+    with the P2.2 presence buckets. 60-second sample
+    cadence — the engine pushes one PnL-delta sample per
+    minute from the existing `sla_interval` arm, gated on
+    `tick_count % 60 == 0`. Warm-up below
+    `MIN_SAMPLES_FOR_VAR = 30` returns `1.0` (no throttle)
+    to avoid the "first few minutes after start have a
+    random throttle" failure mode. Throttle tiers 1.0 /
+    0.5 / 0.0 on 95 % / 99 % breaches; composition with
+    the kill switch / Market Resilience / Inventory-γ
+    multipliers via `min()` (max-restrictive wins). New
+    `AuditEventType::VarGuardThrottleApplied` fires only on
+    throttle **transitions** so the audit trail isn't
+    spammed during stable throttle states. Self-contained
+    `decimal_sqrt` Newton-Raphson helper because
+    `rust_decimal` does not ship a sqrt of its own. 11
+    unit tests including multi-strategy isolation,
+    rolling-window eviction, and the composition
+    precedence with MR / kill switch.
+  - **Sub-component #5 — stress replay library + CLI.**
+    New `mm-backtester::stress` module with the five
+    canonical crypto-crash scenarios (COVID-19 March 2020,
+    China ban May 2021, LUNA May 2022, FTX November 2022,
+    USDC depeg March 2023) defined as `StressScenario`
+    catalogue entries. Each carries a `ShockProfile` with
+    peak price move / peak time / volume multiplier /
+    spread multiplier / depth fraction / sell-flow share.
+    Synthetic-first per the Sprint C-1 decision:
+    `generate_ticks` produces a deterministic piecewise-
+    linear price path from baseline → peak → recovery at a
+    1-minute cadence, with no RNG, no external data, and no
+    Tardis subscription required. `run_stress` drives the
+    tick stream through a simulated
+    Portfolio + VarGuard + KillSwitch + HedgeOptimizer
+    combo and captures `StressReport { max_drawdown,
+    time_to_recovery_secs, inventory_peak_value,
+    kill_switch_trips, var_throttle_hits,
+    hedge_baskets_recommended, final_total_pnl }`. New
+    `mm-stress-test` binary with `--scenario=<slug>`,
+    `--all`, `--output=<path>`, `--list` flags. 9 unit
+    tests on the generator (cadence, baseline, peak,
+    monotone legs, determinism) and 4 on the runner
+    (end-to-end covid path, `run_all` catalogue, report
+    markdown shape, VaR opt-out zeros the throttle hits).
+    Real historical Tardis replay is a **stage-2**
+    follow-up tracked in ROADMAP Epic C.
+  - **Source-attribution correction.** The SOTA research
+    doc cited "Cartea-Jaimungal-Penalva ch.6 for the
+    hedge optimizer closed form" and "ch.7 for VaR /
+    drawdown". Both were wrong. Web-verified TOC
+    (Cambridge Uni Press frontmatter) shows ch. 6-8 are
+    execution, ch. 10 is Market Making, ch. 11 is pairs
+    trading. The correct references are Markowitz 1952 /
+    Merton 1972 for the hedge optimizer and the
+    RiskMetrics 1996 technical document for the Gaussian
+    VaR formula. Full corrected bibliography in
+    `docs/research/hedge-optimizer-and-var-formulas.md`.
+  - **Stage-2 follow-ups (tracked under ROADMAP Epic C).**
+    Real historical Tardis replay for the five scenarios,
+    cross-beta hedging (off-diagonal β from rolling
+    regression), off-diagonal factor covariance, LP solver
+    for the constrained LASSO variant of the hedge
+    optimization, EWMA variance in the VaR guard,
+    historical-simulation VaR as a cross-check, CVaR /
+    expected-shortfall, and the full-engine stress
+    integration test (Sprint C-4 runs the stress path
+    through the synthetic runner only; the full
+    `MarketMakerEngine` end-to-end drive is deferred).
+
 ## [0.4.0] - 2026-04-15
 
 **Production-spot-MM gap closure epic.** Closes the eight-item

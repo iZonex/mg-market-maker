@@ -421,6 +421,31 @@ pub struct MarketMakerConfig {
     #[serde(default = "default_pair_lifecycle_refresh_secs")]
     pub pair_lifecycle_refresh_secs: u64,
 
+    /// Enable the per-strategy VaR guard (Epic C
+    /// sub-component #4). When `true` the engine samples PnL
+    /// deltas every 60 s, maintains a rolling 24 h window
+    /// per strategy class, and throttles quote size via the
+    /// same `min()` composition the kill switch / MR / IGP
+    /// multipliers already use. Default `false` so existing
+    /// deployments do not get a surprise size reduction.
+    #[serde(default = "default_false")]
+    pub var_guard_enabled: bool,
+
+    /// 95 %-VaR floor in the reporting currency (usually
+    /// USDT). The guard drops the strategy's size multiplier
+    /// to `0.5` when the computed VaR_95 falls below this
+    /// value. Typically a negative number. `None` disables
+    /// the 95 % tier even when `var_guard_enabled = true`.
+    #[serde(default)]
+    pub var_guard_limit_95: Option<Decimal>,
+
+    /// 99 %-VaR floor. On breach the strategy throttles to
+    /// `0.0` (hard halt). Typically a more negative number
+    /// than `var_guard_limit_95`. `None` disables the 99 %
+    /// tier.
+    #[serde(default)]
+    pub var_guard_limit_99: Option<Decimal>,
+
     /// Maximum acceptable hedge-book staleness in milliseconds
     /// for the cross-venue basis strategy (P1.4 stage-1).
     /// Default `1500` — typical cross-venue WS feeds jitter
@@ -730,6 +755,9 @@ impl Default for AppConfig {
                 borrow_buffer_base: dec!(0),
                 pair_lifecycle_enabled: true,
                 pair_lifecycle_refresh_secs: 300,
+                var_guard_enabled: false,
+                var_guard_limit_95: None,
+                var_guard_limit_99: None,
                 cross_venue_basis_max_staleness_ms: 1500,
             },
             kill_switch: KillSwitchCfg::default(),

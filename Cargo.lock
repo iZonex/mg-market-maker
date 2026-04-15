@@ -1194,6 +1194,7 @@ dependencies = [
  "chrono",
  "mm-common",
  "mm-indicators",
+ "mm-portfolio",
  "mm-risk",
  "mm-strategy",
  "rand 0.8.5",

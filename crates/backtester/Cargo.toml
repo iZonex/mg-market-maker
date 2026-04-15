@@ -6,6 +6,7 @@ version.workspace = true
 [dependencies]
 mm-common = { workspace = true }
 mm-indicators = { workspace = true }
+mm-portfolio = { workspace = true }
 mm-risk = { workspace = true }
 mm-strategy = { workspace = true }
 tokio = { workspace = true }
@@ -23,3 +24,7 @@ rand_chacha = "0.3"
 [[bin]]
 name = "mm-probe"
 path = "src/bin/mm_probe.rs"
+
+[[bin]]
+name = "mm-stress-test"
+path = "src/bin/mm_stress_test.rs"

@@ -4,7 +4,7 @@ Production-grade market maker for the custom exchange at `../exchange/` with mul
 
 ## Stats
 
-**18 crates, 136 files, ~43.2K lines Rust, 662 tests**
+**18 crates, 140 files, ~46K lines Rust, 712 tests**
 
 ## Architecture
 
@@ -59,6 +59,8 @@ risk/                  Risk management:
   ├── toxicity         VPIN, Kyle's Lambda, adverse selection
   ├── inventory_drift  Inventory-vs-wallet drift reconciler (P0.2)
   ├── borrow           Borrow-cost surcharge state machine (P1.3 s1)
+  ├── hedge_optimizer  Markowitz mean-variance cross-asset hedge (Epic C)
+  ├── var_guard        Parametric Gaussian VaR per strategy class (Epic C)
   ├── otr              Order-to-Trade Ratio (MiCA surveillance metric)
   ├── sla              Exchange obligation compliance + per-minute presence (P2.2)
   ├── pnl              Attribution (spread/inventory/rebates/fees)
@@ -77,6 +79,7 @@ backtester/            Backtesting + paper trading:
   ├── lookahead        Generic lookahead-bias detector (O(N²) prefix check)
   ├── paper            Real-time paper trading with fill simulation
   ├── data             JSONL event recorder/loader
+  ├── stress           Synthetic stress scenarios + runner + report (Epic C)
   └── report           Performance report with PnL attribution
 persistence/         State management:
   ├── checkpoint     Atomic JSON checkpoint with auto-flush

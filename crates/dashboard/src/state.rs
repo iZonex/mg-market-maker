@@ -241,6 +241,18 @@ impl DashboardState {
                 .with_label_values(&[symbol])
                 .set(decimal_to_f64(asset.unrealised_pnl_reporting));
         }
+        // P2.3 Epic C sub-component #1: per-factor delta gauges.
+        for (factor, delta) in &snap.per_factor {
+            crate::metrics::PORTFOLIO_FACTOR_DELTA
+                .with_label_values(&[factor])
+                .set(decimal_to_f64(*delta));
+        }
+        // P2.3 Epic C sub-component #2: per-strategy PnL gauges.
+        for (strategy, pnl) in &snap.per_strategy {
+            crate::metrics::PORTFOLIO_STRATEGY_PNL
+                .with_label_values(&[strategy])
+                .set(decimal_to_f64(*pnl));
+        }
         self.inner.write().unwrap().portfolio = Some(snap);
     }
 

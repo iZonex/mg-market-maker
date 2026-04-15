@@ -231,6 +231,31 @@ pub static PORTFOLIO_ASSET_UNREALISED: Lazy<GaugeVec> = Lazy::new(|| {
     )
     .unwrap()
 });
+/// P2.3 Epic C sub-component #1: per-factor (base / quote)
+/// delta aggregation across every registered symbol. Cross-quote
+/// pairs contribute to BOTH their base factor (+qty) and their
+/// quote factor (-qty·mark).
+pub static PORTFOLIO_FACTOR_DELTA: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_portfolio_factor_delta",
+        "Portfolio per-factor delta — signed exposure in the factor's native asset",
+        &["asset"]
+    )
+    .unwrap()
+});
+/// P2.3 Epic C sub-component #2: per-strategy-class realised
+/// PnL in the reporting currency, keyed by `Strategy::name()`.
+/// Funding-arb, basis, avellaneda-stoikov, etc. each get their
+/// own bucket so operators can distinguish which strategy is
+/// carrying the book.
+pub static PORTFOLIO_STRATEGY_PNL: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_portfolio_strategy_pnl",
+        "Portfolio per-strategy realised PnL in reporting currency",
+        &["strategy"]
+    )
+    .unwrap()
+});
 
 /// Initialize all metrics (call once at startup).
 pub fn init() {
@@ -262,6 +287,8 @@ pub fn init() {
     let _ = &*PORTFOLIO_REALISED_PNL;
     let _ = &*PORTFOLIO_UNREALISED_PNL;
     let _ = &*PORTFOLIO_ASSET_QTY;
+    let _ = &*PORTFOLIO_FACTOR_DELTA;
+    let _ = &*PORTFOLIO_STRATEGY_PNL;
     let _ = &*PORTFOLIO_ASSET_UNREALISED;
     let _ = &*ORDER_ENTRY_LATENCY;
 }
