@@ -28,7 +28,9 @@
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
-use mm_common::types::Side;
+use mm_common::types::{PriceLevel, Side};
+
+use crate::features::market_impact;
 
 /// Side convention: `Primary` is the maker venue, `Hedge` is where
 /// we offload the resulting inventory.
@@ -170,6 +172,111 @@ impl XemmExecutor {
 
         // Edge is the inverse of the adverse; a positive edge means
         // the hedge is BETTER than the maker price (profitable cross).
+        let edge_bps = -adverse_bps;
+        if edge_bps < self.config.min_edge_bps {
+            return XemmDecision::HedgeWithWarning {
+                side: hedge_side,
+                qty: maker_qty,
+                expected_price: hedge_price,
+                edge_bps,
+            };
+        }
+
+        XemmDecision::Hedge {
+            side: hedge_side,
+            qty: maker_qty,
+            expected_price: hedge_price,
+        }
+    }
+
+    /// Same as [`on_maker_fill`] but computes the expected
+    /// hedge price from the **full book depth** via
+    /// [`crate::features::market_impact`], not just top-of-book.
+    /// Use this when the hedge qty is large enough that a
+    /// single-level bid/ask quote under-estimates the real
+    /// slippage — the VWAP over multiple levels is the price we
+    /// will actually get.
+    ///
+    /// `hedge_bids` / `hedge_asks` must be ordered best-first
+    /// (highest bid first, lowest ask first). `LocalOrderBook`
+    /// already yields levels in that order.
+    ///
+    /// When the book side is empty or cannot cover `maker_qty`
+    /// at all, returns `RejectSlippage` with `partial_book` in
+    /// the reason — the caller should treat this as an
+    /// inventory-stuck signal and escalate.
+    pub fn on_maker_fill_with_book(
+        &mut self,
+        maker_side: Side,
+        maker_qty: Decimal,
+        maker_price: Decimal,
+        hedge_bids: &[PriceLevel],
+        hedge_asks: &[PriceLevel],
+    ) -> XemmDecision {
+        // Update primary inventory optimistically, same as
+        // `on_maker_fill`.
+        self.primary_inventory += match maker_side {
+            Side::Buy => maker_qty,
+            Side::Sell => -maker_qty,
+        };
+
+        // The hedge side is always opposite of the maker side.
+        let hedge_side = match maker_side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+
+        let levels = match hedge_side {
+            // Hedge sell walks the bid side; hedge buy walks
+            // the ask side.
+            Side::Sell => hedge_bids,
+            Side::Buy => hedge_asks,
+        };
+
+        // `features::market_impact` uses the same "positive bps =
+        // unfavourable" convention as the simple top-of-book
+        // path below, so the slippage comparison reads the
+        // same way.
+        let Some(impact) = market_impact(levels, hedge_side, maker_qty, maker_price) else {
+            // Empty book on the hedge side — can't price the
+            // hedge at all. Treat as a hard reject so the
+            // caller surfaces it immediately.
+            return XemmDecision::RejectSlippage {
+                reason: "hedge book side empty".to_string(),
+                adverse_bps: Decimal::ZERO,
+            };
+        };
+
+        if impact.partial {
+            return XemmDecision::RejectSlippage {
+                reason: format!(
+                    "hedge book too thin: only {} / {} fills; VWAP {} vs maker {}",
+                    impact.filled_qty, maker_qty, impact.vwap, maker_price
+                ),
+                adverse_bps: impact.impact_bps,
+            };
+        }
+
+        let hedge_price = impact.vwap;
+        let adverse_bps = impact.impact_bps;
+
+        if adverse_bps > self.config.max_slippage_bps {
+            return XemmDecision::RejectSlippage {
+                reason: format!(
+                    "adverse slippage (full-book VWAP) {} bps > limit {}",
+                    adverse_bps, self.config.max_slippage_bps
+                ),
+                adverse_bps,
+            };
+        }
+
+        // Emit the hedge and bump the hedge-leg inventory
+        // optimistically.
+        self.hedge_inventory += match hedge_side {
+            Side::Buy => maker_qty,
+            Side::Sell => -maker_qty,
+        };
+
         let edge_bps = -adverse_bps;
         if edge_bps < self.config.min_edge_bps {
             return XemmDecision::HedgeWithWarning {
@@ -342,5 +449,107 @@ mod tests {
         let mut e = exec(dec!(100), dec!(0));
         let d = e.on_maker_fill(Side::Buy, dec!(1), dec!(0), dec!(0), dec!(0));
         assert!(matches!(d, XemmDecision::RejectSlippage { .. }));
+    }
+
+    // ---- on_maker_fill_with_book (market-impact path) ----
+
+    fn level(price: Decimal, qty: Decimal) -> PriceLevel {
+        PriceLevel { price, qty }
+    }
+
+    #[test]
+    fn with_book_matches_top_of_book_when_qty_fits_level_one() {
+        // Single-level fill: the VWAP equals the touch, so the
+        // full-book path must produce the same answer as the
+        // legacy top-of-book path.
+        let mut e1 = exec(dec!(100), dec!(0));
+        let top = e1.on_maker_fill(Side::Buy, dec!(1), dec!(100), dec!(99.9), dec!(100.1));
+
+        let mut e2 = exec(dec!(100), dec!(0));
+        let book_bids = vec![level(dec!(99.9), dec!(5)), level(dec!(99.8), dec!(10))];
+        let book_asks = vec![level(dec!(100.1), dec!(5)), level(dec!(100.2), dec!(10))];
+        let deep =
+            e2.on_maker_fill_with_book(Side::Buy, dec!(1), dec!(100), &book_bids, &book_asks);
+        assert_eq!(top, deep);
+    }
+
+    #[test]
+    fn with_book_rejects_thin_book_via_partial_flag() {
+        // Maker bought 10 BTC on the primary leg, but the hedge
+        // book only has 3 BTC total — partial fill, must reject.
+        let mut e = exec(dec!(20), dec!(0));
+        let hedge_bids = vec![level(dec!(99.9), dec!(3))];
+        let hedge_asks = vec![level(dec!(100.1), dec!(50))];
+        let d = e.on_maker_fill_with_book(Side::Buy, dec!(10), dec!(100), &hedge_bids, &hedge_asks);
+        assert!(matches!(d, XemmDecision::RejectSlippage { .. }));
+    }
+
+    #[test]
+    fn with_book_rejects_when_deep_vwap_exceeds_slippage_band() {
+        // Top-of-book is 99.95 (within a 20 bps band from 100),
+        // but the second level is far enough that the full-fill
+        // VWAP blows past the limit. The top-of-book path would
+        // accept; the full-book path must reject.
+        let mut e_top = exec(dec!(20), dec!(0));
+        let top = e_top.on_maker_fill(Side::Buy, dec!(10), dec!(100), dec!(99.95), dec!(100.05));
+        assert!(
+            matches!(
+                top,
+                XemmDecision::Hedge { .. } | XemmDecision::HedgeWithWarning { .. }
+            ),
+            "top-of-book path should accept, got {top:?}"
+        );
+
+        let mut e_deep = exec(dec!(20), dec!(0));
+        // 1 BTC at 99.95 (touch), 9 BTC at 99.00 — full-fill
+        // VWAP is ~99.095, i.e. ~90 bps below maker. Exceeds
+        // 20 bps band → reject.
+        let hedge_bids = vec![level(dec!(99.95), dec!(1)), level(dec!(99.00), dec!(9))];
+        let hedge_asks = vec![level(dec!(100.05), dec!(50))];
+        let deep = e_deep.on_maker_fill_with_book(
+            Side::Buy,
+            dec!(10),
+            dec!(100),
+            &hedge_bids,
+            &hedge_asks,
+        );
+        assert!(
+            matches!(deep, XemmDecision::RejectSlippage { .. }),
+            "deep book path should reject, got {deep:?}"
+        );
+    }
+
+    #[test]
+    fn with_book_fires_hedge_when_vwap_is_inside_band() {
+        // Deeper VWAP is slightly worse than the touch but still
+        // inside the 20 bps slippage band — hedge should fire
+        // with `expected_price == vwap` (not touch).
+        let mut e = exec(dec!(20), dec!(0));
+        let hedge_bids = vec![level(dec!(99.99), dec!(5)), level(dec!(99.98), dec!(10))];
+        let hedge_asks = vec![level(dec!(100.01), dec!(10))];
+        let d = e.on_maker_fill_with_book(Side::Buy, dec!(6), dec!(100), &hedge_bids, &hedge_asks);
+        match d {
+            XemmDecision::HedgeWithWarning { expected_price, .. }
+            | XemmDecision::Hedge { expected_price, .. } => {
+                // VWAP = (5 * 99.99 + 1 * 99.98) / 6 = 99.9883...
+                // which is strictly below the top-of-book bid.
+                assert!(expected_price < dec!(99.99));
+                assert!(expected_price > dec!(99.98));
+            }
+            other => panic!("expected hedge dispatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_book_inventory_tracking_matches_top_of_book_path() {
+        // After a successful hedge via the full-book path the
+        // executor's inventory accounting must match what the
+        // legacy path would produce.
+        let mut e = exec(dec!(100), dec!(0));
+        let hedge_bids = vec![level(dec!(99.99), dec!(10))];
+        let hedge_asks = vec![level(dec!(100.01), dec!(10))];
+        let _ = e.on_maker_fill_with_book(Side::Buy, dec!(1), dec!(100), &hedge_bids, &hedge_asks);
+        assert_eq!(e.primary_inventory(), dec!(1));
+        assert_eq!(e.hedge_inventory(), dec!(-1));
     }
 }

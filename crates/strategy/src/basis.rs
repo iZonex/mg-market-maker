@@ -34,11 +34,13 @@
 //! handling can layer on top exactly as it does for
 //! `AvellanedaStoikov`).
 
-use mm_common::types::{Price, Quote, QuotePair, Side};
+use mm_common::orderbook::LocalOrderBook;
+use mm_common::types::{Price, PriceLevel, Quote, QuotePair, Side};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tracing::debug;
 
+use crate::features::market_impact;
 use crate::r#trait::{bps_to_frac, Strategy, StrategyContext};
 
 /// Basis-shifted quoting strategy.
@@ -86,6 +88,75 @@ impl BasisStrategy {
             Some(perp) if !spot_mid.is_zero() => (perp - spot_mid) / spot_mid * dec!(10_000),
             _ => dec!(0),
         }
+    }
+
+    /// Expected **real** cross edge for a hypothetical maker
+    /// fill on the primary leg plus a taker hedge on the hedge
+    /// leg, in bps of the spot mid.
+    ///
+    /// - `maker_side` — side of the PRIMARY leg fill (buy = we
+    ///   received base, need to hedge by selling perp;
+    ///   sell = we delivered base, hedge by buying perp).
+    /// - `maker_price` — the assumed primary-leg fill price.
+    /// - `size` — order size in base units.
+    /// - `hedge_book` — full hedge-leg order book at the moment
+    ///   of the hypothetical decision.
+    ///
+    /// Returns the edge as `(expected_hedge_price - maker_price) /
+    /// maker_price * 10_000` signed so **positive = edge is
+    /// profitable** for the cross (we buy on the primary leg
+    /// below the real hedge VWAP, or sell above it). Returns
+    /// `None` when the hedge book cannot absorb the full size
+    /// (partial fill) or is empty.
+    ///
+    /// Unlike the midpoint-shift logic in `compute_quotes` —
+    /// which uses `ref_price` (a single scalar mid) — this
+    /// helper walks the real depth via
+    /// [`crate::features::market_impact`]. Callers that have
+    /// access to the hedge book (engines running in
+    /// dual-connector mode with `StrategyContext.hedge_book =
+    /// Some(_)`) can use this to gate quote placement on a
+    /// real profitable cross, not just a mid-based estimate.
+    pub fn expected_cross_edge_bps(
+        &self,
+        maker_side: Side,
+        maker_price: Price,
+        size: Decimal,
+        hedge_book: &LocalOrderBook,
+    ) -> Option<Decimal> {
+        if maker_price.is_zero() || size <= Decimal::ZERO {
+            return None;
+        }
+        // Hedge side is always opposite of the maker side.
+        let hedge_side = match maker_side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+        let levels: Vec<PriceLevel> = match hedge_side {
+            // Hedge sell walks the hedge bids (best-first).
+            Side::Sell => hedge_book
+                .bids
+                .iter()
+                .rev()
+                .map(|(p, q)| PriceLevel { price: *p, qty: *q })
+                .collect(),
+            // Hedge buy walks the hedge asks (best-first).
+            Side::Buy => hedge_book
+                .asks
+                .iter()
+                .map(|(p, q)| PriceLevel { price: *p, qty: *q })
+                .collect(),
+        };
+        let impact = market_impact(&levels, hedge_side, size, maker_price)?;
+        if impact.partial {
+            return None;
+        }
+        // `market_impact::impact_bps` is signed so positive =
+        // unfavourable to the taker. Edge to the maker leg is
+        // the NEGATION: a taker cost of -10 bps (the taker is
+        // getting a better price than the reference) is a +10
+        // bps edge to the maker.
+        Some(-impact.impact_bps)
     }
 }
 
@@ -256,6 +327,7 @@ mod tests {
             time_remaining: dec!(1),
             mid_price: mid,
             ref_price,
+            hedge_book: None,
         }
     }
 
@@ -422,5 +494,80 @@ mod tests {
         let bid0 = q0.bid.as_ref().unwrap();
         let ask0 = q0.ask.as_ref().unwrap();
         assert_eq!((bid0.price + ask0.price) / dec!(2), dec!(49_950));
+    }
+
+    // ---- expected_cross_edge_bps ----
+
+    fn hedge_book_at(bid: Decimal, ask: Decimal, depth: Decimal) -> LocalOrderBook {
+        let mut hb = LocalOrderBook::new("BTC-PERP".into());
+        hb.apply_snapshot(
+            vec![PriceLevel {
+                price: bid,
+                qty: depth,
+            }],
+            vec![PriceLevel {
+                price: ask,
+                qty: depth,
+            }],
+            1,
+        );
+        hb
+    }
+
+    #[test]
+    fn cross_edge_buy_primary_sell_hedge_above_reference_is_positive() {
+        let s = BasisStrategy::new(dec!(0.5), dec!(50));
+        // Maker buys at 50_000 on primary. Hedge bid is 50_050
+        // (perp above spot → positive basis → sell perp at
+        // higher price than we paid → positive edge).
+        let hb = hedge_book_at(dec!(50_050), dec!(50_060), dec!(10));
+        let edge = s
+            .expected_cross_edge_bps(Side::Buy, dec!(50_000), dec!(1), &hb)
+            .unwrap();
+        // 50_050 - 50_000 = +50 on 50_000 → +10 bps.
+        assert!(edge > dec!(9) && edge < dec!(11));
+    }
+
+    #[test]
+    fn cross_edge_returns_none_on_thin_hedge_book() {
+        let s = BasisStrategy::new(dec!(0.5), dec!(50));
+        // Only 0.5 BTC on the hedge bid — can't absorb our 1 BTC size.
+        let hb = hedge_book_at(dec!(50_050), dec!(50_060), dec!(0.5));
+        assert!(s
+            .expected_cross_edge_bps(Side::Buy, dec!(50_000), dec!(1), &hb)
+            .is_none());
+    }
+
+    #[test]
+    fn cross_edge_sell_primary_buy_hedge_flips_sign() {
+        let s = BasisStrategy::new(dec!(0.5), dec!(50));
+        // Maker sells at 50_000 on primary; hedge asks at
+        // 49_950 (perp below spot → buy perp cheap → +10 bps).
+        let hb = hedge_book_at(dec!(49_940), dec!(49_950), dec!(10));
+        let edge = s
+            .expected_cross_edge_bps(Side::Sell, dec!(50_000), dec!(1), &hb)
+            .unwrap();
+        assert!(edge > dec!(9) && edge < dec!(11));
+    }
+
+    #[test]
+    fn cross_edge_negative_when_basis_moves_against_maker() {
+        let s = BasisStrategy::new(dec!(0.5), dec!(50));
+        // Maker buys at 50_000; hedge bid is 49_950 → selling
+        // hedge at 49_950 means we lock in -10 bps loss.
+        let hb = hedge_book_at(dec!(49_950), dec!(49_960), dec!(10));
+        let edge = s
+            .expected_cross_edge_bps(Side::Buy, dec!(50_000), dec!(1), &hb)
+            .unwrap();
+        assert!(edge < dec!(-9) && edge > dec!(-11));
+    }
+
+    #[test]
+    fn cross_edge_zero_size_returns_none() {
+        let s = BasisStrategy::new(dec!(0.5), dec!(50));
+        let hb = hedge_book_at(dec!(50_000), dec!(50_010), dec!(10));
+        assert!(s
+            .expected_cross_edge_bps(Side::Buy, dec!(50_000), dec!(0), &hb)
+            .is_none());
     }
 }

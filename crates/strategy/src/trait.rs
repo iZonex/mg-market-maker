@@ -20,6 +20,12 @@ pub struct StrategyContext<'a> {
     /// reservation price toward this). `None` in single-connector
     /// mode or before the hedge book has seen its first update.
     pub ref_price: Option<Price>,
+    /// Hedge-leg order book. Populated in dual-connector mode so
+    /// strategies that need **real taker cost on the hedge** (as
+    /// opposed to a single top-of-book scalar in `ref_price`) can
+    /// walk the full depth via `features::market_impact`.
+    /// `None` in single-connector mode.
+    pub hedge_book: Option<&'a LocalOrderBook>,
 }
 
 /// Trait for market-making strategies.

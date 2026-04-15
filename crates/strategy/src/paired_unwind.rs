@@ -51,10 +51,12 @@
 //!   leg's mid (configurable bps aggressiveness), one level per
 //!   side. Mid-heavy urgency pricing is a follow-up.
 
-use mm_common::types::{InstrumentPair, Price, Qty, Quote, Side};
+use mm_common::types::{InstrumentPair, Price, PriceLevel, Qty, Quote, Side};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tracing::{debug, info};
+
+use crate::features::market_impact;
 
 /// Result of one `next_slice` tick — zero or one quote per leg.
 /// Both fields are `None` when the executor is idle, complete, or
@@ -207,6 +209,74 @@ impl PairedUnwindExecutor {
             hedge_remaining / self.pair.multiplier
         };
         primary_remaining - hedge_in_primary
+    }
+
+    /// Taker cost (in bps of `reference_price`) of
+    /// liquidating the **remaining** primary-leg qty right now
+    /// against the supplied book levels. Positive = the
+    /// taker walk is unfavourable (pays above / receives below
+    /// the reference).
+    ///
+    /// Used by higher-level callers to decide whether the
+    /// executor should escalate from its current post-only
+    /// slice pattern to an aggressive taker sweep — if the
+    /// residual taker cost is small enough the extra aggression
+    /// is cheap; if it is large the operator may prefer to keep
+    /// slicing passively and hope the book deepens.
+    ///
+    /// Returns `None` when the executor has no remaining
+    /// primary qty to unwind, when the book side is empty, or
+    /// when the book cannot fully absorb the remainder (partial
+    /// fill — the caller should treat that as "book too thin to
+    /// taker-out").
+    pub fn primary_residual_impact_bps(
+        &self,
+        primary_bids: &[PriceLevel],
+        primary_asks: &[PriceLevel],
+        reference_price: Price,
+    ) -> Option<Decimal> {
+        let remaining = self.target_primary - self.executed_primary;
+        if remaining <= Decimal::ZERO {
+            return None;
+        }
+        // The UNWIND side is opposite the ORIGINAL position
+        // direction: a long-spot position unwinds by SELLING
+        // the primary leg (walking the bids), etc.
+        let unwind_side = self.primary_side.opposite();
+        let levels = match unwind_side {
+            Side::Sell => primary_bids,
+            Side::Buy => primary_asks,
+        };
+        let impact = market_impact(levels, unwind_side, remaining, reference_price)?;
+        if impact.partial {
+            return None;
+        }
+        Some(impact.impact_bps)
+    }
+
+    /// Same as [`primary_residual_impact_bps`] for the hedge
+    /// leg. `reference_price` is typically the hedge-leg mid at
+    /// the moment of the check.
+    pub fn hedge_residual_impact_bps(
+        &self,
+        hedge_bids: &[PriceLevel],
+        hedge_asks: &[PriceLevel],
+        reference_price: Price,
+    ) -> Option<Decimal> {
+        let remaining = self.target_hedge - self.executed_hedge;
+        if remaining <= Decimal::ZERO {
+            return None;
+        }
+        let unwind_side = self.hedge_side.opposite();
+        let levels = match unwind_side {
+            Side::Sell => hedge_bids,
+            Side::Buy => hedge_asks,
+        };
+        let impact = market_impact(levels, unwind_side, remaining, reference_price)?;
+        if impact.partial {
+            return None;
+        }
+        Some(impact.impact_bps)
     }
 
     /// Emit the next slice pair. Returns `SlicePair::EMPTY` when
@@ -476,5 +546,86 @@ mod tests {
         exec.cancel();
         let slice = exec.next_slice(dec!(50_000), dec!(50_010));
         assert!(slice.is_empty());
+    }
+
+    // ---- residual impact helpers ----
+
+    fn lvl(price: Decimal, qty: Decimal) -> PriceLevel {
+        PriceLevel { price, qty }
+    }
+
+    #[test]
+    fn primary_residual_impact_reports_none_when_fully_filled() {
+        let mut exec = mk(pair_1to1(), Side::Buy, Side::Sell, dec!(0.1), 5);
+        exec.on_primary_fill(dec!(0.1));
+        let bids = vec![lvl(dec!(100), dec!(10))];
+        let asks = vec![lvl(dec!(101), dec!(10))];
+        assert!(exec
+            .primary_residual_impact_bps(&bids, &asks, dec!(100.5))
+            .is_none());
+    }
+
+    #[test]
+    fn primary_residual_impact_returns_positive_bps_for_long_unwind_at_lower_price() {
+        // Long-primary position unwinding — we SELL the
+        // remaining 0.1 BTC walking the bid side. Best bid is
+        // below reference → impact is positive.
+        let exec = mk(pair_1to1(), Side::Buy, Side::Sell, dec!(0.1), 5);
+        let bids = vec![lvl(dec!(99), dec!(1))];
+        let asks = vec![lvl(dec!(101), dec!(1))];
+        let bps = exec
+            .primary_residual_impact_bps(&bids, &asks, dec!(100))
+            .unwrap();
+        // (100 - 99) / 100 * 10000 = 100 bps.
+        assert!(bps > dec!(99) && bps < dec!(101));
+    }
+
+    #[test]
+    fn primary_residual_impact_none_when_book_is_thinner_than_remaining() {
+        let exec = mk(pair_1to1(), Side::Buy, Side::Sell, dec!(0.1), 5);
+        // Only 0.05 BTC on the bid side vs 0.1 BTC remaining.
+        let bids = vec![lvl(dec!(99), dec!(0.05))];
+        let asks = vec![lvl(dec!(101), dec!(10))];
+        assert!(exec
+            .primary_residual_impact_bps(&bids, &asks, dec!(100))
+            .is_none());
+    }
+
+    #[test]
+    fn hedge_residual_impact_walks_the_right_side_for_a_short_hedge_unwind() {
+        // Short-hedge position unwinds by BUYING the hedge leg
+        // → walks the hedge asks.
+        let exec = mk(pair_1to1(), Side::Buy, Side::Sell, dec!(0.1), 5);
+        let hedge_bids = vec![lvl(dec!(99), dec!(10))];
+        let hedge_asks = vec![lvl(dec!(101), dec!(10))];
+        let bps = exec
+            .hedge_residual_impact_bps(&hedge_bids, &hedge_asks, dec!(100))
+            .unwrap();
+        // Walking asks at 101 vs reference 100 → 100 bps taker cost.
+        assert!(bps > dec!(99) && bps < dec!(101));
+    }
+
+    #[test]
+    fn hedge_residual_impact_scales_with_multiplier() {
+        // Pair multiplier 5 → hedge qty is 5x primary qty.
+        // Book must be 5x deeper for the full remainder to fit.
+        let exec = mk(
+            pair_with_multiplier(dec!(5)),
+            Side::Buy,
+            Side::Sell,
+            dec!(0.1),
+            5,
+        );
+        let hedge_bids = vec![lvl(dec!(99), dec!(10))];
+        let hedge_asks = vec![lvl(dec!(101), dec!(0.3))]; // only 0.3, need 0.5
+        assert!(exec
+            .hedge_residual_impact_bps(&hedge_bids, &hedge_asks, dec!(100))
+            .is_none());
+
+        let hedge_asks = vec![lvl(dec!(101), dec!(1))]; // 1 > 0.5, fits
+        let bps = exec
+            .hedge_residual_impact_bps(&hedge_bids, &hedge_asks, dec!(100))
+            .unwrap();
+        assert!(bps > dec!(99) && bps < dec!(101));
     }
 }

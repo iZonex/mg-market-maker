@@ -74,6 +74,7 @@ fn bench_avellaneda(c: &mut Criterion) {
                 time_remaining: dec!(0.8),
                 mid_price: mid,
                 ref_price: None,
+                hedge_book: None,
             };
             black_box(strategy.compute_quotes(&ctx))
         })
@@ -98,6 +99,7 @@ fn bench_glft(c: &mut Criterion) {
                 time_remaining: dec!(0.8),
                 mid_price: mid,
                 ref_price: None,
+                hedge_book: None,
             };
             black_box(strategy.compute_quotes(&ctx))
         })
@@ -122,6 +124,7 @@ fn bench_grid(c: &mut Criterion) {
                 time_remaining: dec!(0.8),
                 mid_price: mid,
                 ref_price: None,
+                hedge_book: None,
             };
             black_box(strategy.compute_quotes(&ctx))
         })

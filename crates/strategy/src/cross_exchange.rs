@@ -199,6 +199,7 @@ mod tests {
             time_remaining: dec!(1),
             mid_price: book.mid_price().unwrap(),
             ref_price: None,
+            hedge_book: None,
         };
 
         let quotes = strategy.compute_quotes(&ctx);

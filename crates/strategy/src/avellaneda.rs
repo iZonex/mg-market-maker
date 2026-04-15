@@ -202,6 +202,7 @@ mod tests {
             time_remaining: dec!(1),
             mid_price: mid,
             ref_price: None,
+            hedge_book: None,
         };
 
         let strategy = AvellanedaStoikov;
@@ -247,6 +248,7 @@ mod tests {
             time_remaining: dec!(1),
             mid_price: mid,
             ref_price: None,
+            hedge_book: None,
         };
 
         let strategy = AvellanedaStoikov;

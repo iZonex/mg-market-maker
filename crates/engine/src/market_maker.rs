@@ -988,6 +988,7 @@ impl MarketMakerEngine {
         tuned.min_spread_bps = eff_spread;
 
         let ref_price = self.hedge_book.as_ref().and_then(|hb| hb.book.mid_price());
+        let hedge_book_ref = self.hedge_book.as_ref().map(|hb| &hb.book);
 
         let ctx = StrategyContext {
             book: &self.book_keeper.book,
@@ -998,6 +999,7 @@ impl MarketMakerEngine {
             time_remaining: t_remaining,
             mid_price: alpha_mid,
             ref_price,
+            hedge_book: hedge_book_ref,
         };
 
         let mut quotes = self.strategy.compute_quotes(&ctx);
