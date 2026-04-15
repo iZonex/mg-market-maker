@@ -306,8 +306,41 @@ pub struct MarketMakerConfig {
     /// continues without the learned microprice signal —
     /// it never panics on a missing or malformed file.
     /// Default `None`.
+    ///
+    /// **Per-pair override:** when the engine's symbol has
+    /// an entry in [`Self::momentum_learned_microprice_pair_paths`],
+    /// that path takes precedence over this system-wide
+    /// fallback. Multi-symbol deployments that want
+    /// distinct fitted models per pair use the pair map;
+    /// single-symbol or homogeneous deployments use this
+    /// system-wide path.
     #[serde(default)]
     pub momentum_learned_microprice_path: Option<String>,
+
+    /// Epic D stage-3 — per-pair learned microprice TOML
+    /// paths keyed by symbol. Multi-symbol deployments fit
+    /// a separate `LearnedMicroprice` per pair offline and
+    /// drop the resulting TOML files into config:
+    ///
+    /// ```toml
+    /// [market_maker.momentum_learned_microprice_pair_paths]
+    /// BTCUSDT = "/etc/mm/lmp/btcusdt.toml"
+    /// ETHUSDT = "/etc/mm/lmp/ethusdt.toml"
+    /// SOLUSDT = "/etc/mm/lmp/solusdt.toml"
+    /// ```
+    ///
+    /// Lookup order at engine construction time:
+    /// 1. `momentum_learned_microprice_pair_paths.get(symbol)` —
+    ///    per-pair entry takes precedence
+    /// 2. `momentum_learned_microprice_path` — system-wide
+    ///    fallback
+    /// 3. None — no learned MP signal attached
+    ///
+    /// Same load-failure semantics as the system-wide path:
+    /// a malformed or missing file logs a warning and
+    /// continues without the signal. Default empty map.
+    #[serde(default)]
+    pub momentum_learned_microprice_pair_paths: std::collections::HashMap<String, String>,
 
     /// Enable the Binance listen-key user-data stream. When
     /// `true` (the default), the server spawns a background
@@ -767,6 +800,7 @@ impl Default for AppConfig {
                 hma_window: 9,
                 momentum_ofi_enabled: false,
                 momentum_learned_microprice_path: None,
+                momentum_learned_microprice_pair_paths: std::collections::HashMap::new(),
                 user_stream_enabled: true,
                 inventory_drift_tolerance: dec!(0.0001),
                 inventory_drift_auto_correct: false,

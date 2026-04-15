@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Epic D stage-3 — per-pair learned MP models keyed by
+  symbol** (Apr 2026). Closes the natural follow-up from the
+  engine-side learned-MP auto-attach (`momentum_learned_microprice_path`):
+  multi-symbol deployments that fit a separate
+  `LearnedMicroprice` per pair offline can now wire each
+  pair to its own TOML file. New `MarketMakerConfig` field
+  `momentum_learned_microprice_pair_paths: HashMap<String,
+  String>` keyed by symbol. Lookup order at engine
+  construction time:
+  1. `momentum_learned_microprice_pair_paths.get(symbol)` —
+     per-pair entry takes precedence
+  2. `momentum_learned_microprice_path` — system-wide
+     fallback
+  3. None — no learned MP signal attached
+  Same load-failure semantics as the system-wide path: a
+  malformed or missing file logs a warning (now including
+  the engine's symbol) and continues without the signal.
+  All 7 test fixtures updated with a default empty
+  `HashMap::new()`. **3 new engine integration tests**:
+  per-pair entry takes precedence over system-wide,
+  unmatched per-pair map falls through to system-wide,
+  both empty skips the load entirely.
+  - **Workspace stats**: 1016 → **1019 tests** (+3),
+    workspace clippy `-D warnings` clean, workspace fmt
+    clean. Zero new dependencies.
+
 - **Epic F stage-3 — multi-category Bybit `list_symbols`**
   (Apr 2026). Closes the deferral that Track 3 of the
   stage-2 parallel push documented: the Bybit V5

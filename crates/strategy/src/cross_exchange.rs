@@ -179,6 +179,7 @@ mod tests {
             hma_window: 9,
             momentum_ofi_enabled: false,
             momentum_learned_microprice_path: None,
+            momentum_learned_microprice_pair_paths: std::collections::HashMap::new(),
             user_stream_enabled: true,
             inventory_drift_tolerance: dec!(0.0001),
             inventory_drift_auto_correct: false,
