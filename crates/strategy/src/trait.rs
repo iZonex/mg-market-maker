@@ -49,9 +49,28 @@ pub struct StrategyContext<'a> {
     /// leaves the quoted spread unchanged; values > 0.5 narrow
     /// the spread (MM gets out of informed flow's way) and
     /// values < 0.5 widen it. `None` reverts to the pre-Epic-D
-    /// spread formula. Only [`crate::AvellanedaStoikov`]
-    /// consumes this in v1; GLFT integration is stage-2.
+    /// spread formula.
+    ///
+    /// Both `AvellanedaStoikov` and `GlftStrategy` consume this
+    /// (after Epic D stage-2). When the per-side fields below
+    /// are also populated they take precedence; `as_prob` is
+    /// the symmetric fallback.
     pub as_prob: Option<Decimal>,
+    /// Epic D stage-3 — per-side asymmetric adverse-selection
+    /// probability for the **bid** side. Threaded by the engine
+    /// from
+    /// `AdverseSelectionTracker::adverse_selection_bps_bid` via
+    /// `cartea_spread::as_prob_from_bps`. When **both**
+    /// [`Self::as_prob_bid`] and [`Self::as_prob_ask`] are
+    /// `Some`, the strategy uses the per-side
+    /// `quoted_half_spread_per_side` path and ignores
+    /// [`Self::as_prob`]. When either is `None` the strategy
+    /// falls back to the symmetric `as_prob` path. `None`
+    /// preserves byte-identical pre-stage-3 behaviour.
+    pub as_prob_bid: Option<Decimal>,
+    /// Epic D stage-3 — per-side asymmetric adverse-selection
+    /// probability for the **ask** side. See [`Self::as_prob_bid`].
+    pub as_prob_ask: Option<Decimal>,
 }
 
 /// Trait for market-making strategies.

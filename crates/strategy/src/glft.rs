@@ -158,35 +158,54 @@ impl Strategy for GlftStrategy {
         // Epic D stage-2 sub-component 2B — Cartea
         // adverse-selection closed-form spread widening
         // (Cartea-Jaimungal-Penalva 2015 ch.4 §4.3 eq. 4.20).
-        // Mirrors the Avellaneda path in `avellaneda.rs`: when
-        // `ctx.as_prob` is `Some(ρ)`, additively widen the
-        // GLFT half-spread by `(1 − 2ρ) · σ · √(T − t)` and
-        // re-clamp at the `min_spread / 2` floor.
+        // Stage-3 promotes the symmetric path to a per-side
+        // variant when both `as_prob_bid` AND `as_prob_ask`
+        // are populated — each side gets its own additive
+        // `(1 − 2·ρ_side) · σ · √(T − t)` term.
         //
-        // `ρ > 0.5` narrows toward the floor (MM retreats from
-        // informed flow), `ρ < 0.5` widens. `ctx.as_prob ==
-        // None` OR `ctx.as_prob == Some(0.5)` produce a
-        // *byte-identical* half-spread to the pre-stage-2
-        // wave-1 path — guaranteed by explicitly early-out on
-        // both cases so neither the floor nor the arithmetic
-        // can perturb the output.
-        let half_spread_t = match ctx.as_prob {
-            None => half_spread_t,
-            Some(rho) if rho == dec!(0.5) => half_spread_t,
-            Some(rho) => {
-                let as_delta = (dec!(1) - dec!(2) * rho) * sigma * decimal_sqrt(ctx.time_remaining);
-                let min_half_spread = min_spread / dec!(2);
-                (half_spread_t + as_delta).max(min_half_spread)
+        // `ρ > 0.5` narrows toward the floor; `ρ < 0.5`
+        // widens. When per-side fields are absent the
+        // symmetric `as_prob` path is the fallback. `as_prob
+        // == None` OR `Some(0.5)` produce a byte-identical
+        // half-spread to the pre-stage-2 wave-1 path.
+        let min_half_spread = min_spread / dec!(2);
+        let sqrt_t_remaining = decimal_sqrt(ctx.time_remaining);
+        let (bid_half_spread_t, ask_half_spread_t) = match (ctx.as_prob_bid, ctx.as_prob_ask) {
+            (Some(rho_b), Some(rho_a)) => {
+                // Per-side path — Epic D stage-3.
+                let bid_widen = (dec!(1) - dec!(2) * rho_b) * sigma * sqrt_t_remaining;
+                let ask_widen = (dec!(1) - dec!(2) * rho_a) * sigma * sqrt_t_remaining;
+                (
+                    (half_spread_t + bid_widen).max(min_half_spread),
+                    (half_spread_t + ask_widen).max(min_half_spread),
+                )
+            }
+            _ => {
+                // Symmetric fallback (Epic D stage-2 path).
+                let half = match ctx.as_prob {
+                    None => half_spread_t,
+                    Some(rho) if rho == dec!(0.5) => half_spread_t,
+                    Some(rho) => {
+                        let as_delta = (dec!(1) - dec!(2) * rho) * sigma * sqrt_t_remaining;
+                        (half_spread_t + as_delta).max(min_half_spread)
+                    }
+                };
+                (half, half)
             }
         };
 
         let mut quotes = Vec::with_capacity(ctx.config.num_levels);
 
         for level in 0..ctx.config.num_levels {
-            let level_offset = Decimal::from(level as u64) * half_spread_t;
+            // Per-side level offsets — symmetric on the
+            // existing average half-spread for backward
+            // compat with the wave-1 level-spreading
+            // semantics.
+            let avg_half = (bid_half_spread_t + ask_half_spread_t) / dec!(2);
+            let level_offset = Decimal::from(level as u64) * avg_half;
 
-            let bid_price = fair - (half_spread_t + skew_t * q + level_offset);
-            let ask_price = fair + (half_spread_t - skew_t * q + level_offset);
+            let bid_price = fair - (bid_half_spread_t + skew_t * q + level_offset);
+            let ask_price = fair + (ask_half_spread_t - skew_t * q + level_offset);
 
             // Enforce minimum spread.
             let actual_spread = ask_price - bid_price;
@@ -230,7 +249,8 @@ impl Strategy for GlftStrategy {
             strategy = "glft",
             c1 = %c1,
             c2 = %c2,
-            half_spread = %half_spread_t,
+            bid_half_spread = %bid_half_spread_t,
+            ask_half_spread = %ask_half_spread_t,
             skew = %skew_t,
             k = %self.calibration.k,
             inventory = %q,
@@ -302,6 +322,8 @@ mod tests {
             borrow_cost_bps: None,
             hedge_book_age_ms: None,
             as_prob: None,
+            as_prob_bid: None,
+            as_prob_ask: None,
         }
     }
 
@@ -485,6 +507,17 @@ mod tests {
         config: &'a MarketMakerConfig,
         as_prob: Option<Decimal>,
     ) -> StrategyContext<'a> {
+        glft_ctx_with_per_side_as_prob(book, product, config, as_prob, None, None)
+    }
+
+    fn glft_ctx_with_per_side_as_prob<'a>(
+        book: &'a LocalOrderBook,
+        product: &'a ProductSpec,
+        config: &'a MarketMakerConfig,
+        as_prob: Option<Decimal>,
+        as_prob_bid: Option<Decimal>,
+        as_prob_ask: Option<Decimal>,
+    ) -> StrategyContext<'a> {
         StrategyContext {
             book,
             product,
@@ -498,6 +531,8 @@ mod tests {
             borrow_cost_bps: None,
             hedge_book_age_ms: None,
             as_prob,
+            as_prob_bid,
+            as_prob_ask,
         }
     }
 
@@ -689,5 +724,91 @@ mod tests {
             }
             prev = Some(spread);
         }
+    }
+
+    // -------- Epic D stage-3 — per-side asymmetric ρ --------
+
+    #[test]
+    fn glft_per_side_none_is_byte_identical_to_symmetric() {
+        let (book, product, config) = glft_as_test_fixtures();
+        let strategy = GlftStrategy::new();
+        let ctx_sym = glft_ctx_with_as_prob(&book, &product, &config, Some(dec!(0.3)));
+        let ctx_per_side =
+            glft_ctx_with_per_side_as_prob(&book, &product, &config, Some(dec!(0.3)), None, None);
+        let q_sym = strategy.compute_quotes(&ctx_sym);
+        let q_per = strategy.compute_quotes(&ctx_per_side);
+        assert_eq!(
+            q_sym[0].bid.as_ref().unwrap().price,
+            q_per[0].bid.as_ref().unwrap().price
+        );
+        assert_eq!(
+            q_sym[0].ask.as_ref().unwrap().price,
+            q_per[0].ask.as_ref().unwrap().price
+        );
+    }
+
+    #[test]
+    fn glft_per_side_only_one_set_falls_back_to_symmetric() {
+        let (book, product, config) = glft_as_test_fixtures();
+        let strategy = GlftStrategy::new();
+        let ctx_sym = glft_ctx_with_as_prob(&book, &product, &config, Some(dec!(0.5)));
+        let ctx_partial = glft_ctx_with_per_side_as_prob(
+            &book,
+            &product,
+            &config,
+            Some(dec!(0.5)),
+            Some(dec!(0)),
+            None,
+        );
+        let q_sym = strategy.compute_quotes(&ctx_sym);
+        let q_partial = strategy.compute_quotes(&ctx_partial);
+        assert_eq!(
+            q_sym[0].bid.as_ref().unwrap().price,
+            q_partial[0].bid.as_ref().unwrap().price
+        );
+        assert_eq!(
+            q_sym[0].ask.as_ref().unwrap().price,
+            q_partial[0].ask.as_ref().unwrap().price
+        );
+    }
+
+    #[test]
+    fn glft_per_side_asymmetric_widens_one_side_independently() {
+        let (book, product, config) = glft_as_test_fixtures();
+        let strategy = GlftStrategy::new();
+        let mid = book.mid_price().unwrap();
+
+        let ctx_neutral = glft_ctx_with_per_side_as_prob(
+            &book,
+            &product,
+            &config,
+            None,
+            Some(dec!(0.5)),
+            Some(dec!(0.5)),
+        );
+        let ctx_widen_ask = glft_ctx_with_per_side_as_prob(
+            &book,
+            &product,
+            &config,
+            None,
+            Some(dec!(0.5)),
+            Some(dec!(0)),
+        );
+        let q_n = strategy.compute_quotes(&ctx_neutral);
+        let q_w = strategy.compute_quotes(&ctx_widen_ask);
+
+        let bid_dist_neutral = mid - q_n[0].bid.as_ref().unwrap().price;
+        let bid_dist_widen = mid - q_w[0].bid.as_ref().unwrap().price;
+        let ask_dist_neutral = q_n[0].ask.as_ref().unwrap().price - mid;
+        let ask_dist_widen = q_w[0].ask.as_ref().unwrap().price - mid;
+
+        assert!(
+            ask_dist_widen > ask_dist_neutral,
+            "ρ_a=0 must widen the ask: neutral={ask_dist_neutral}, widen={ask_dist_widen}"
+        );
+        // Bid side should be unchanged (or only marginally
+        // affected by the level-offset averaging).
+        // Allow tick rounding tolerance.
+        assert!((bid_dist_widen - bid_dist_neutral).abs() < dec!(50));
     }
 }

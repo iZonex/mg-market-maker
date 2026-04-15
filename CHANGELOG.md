@@ -9,6 +9,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Epic D stage-3 — per-side ρ end-to-end wiring** (Apr 2026).
+  Closes the deferral that Epic D stage-2 Track 2 documented:
+  per-side asymmetric `ρ_b` / `ρ_a` for the Cartea closed-form
+  spread shipped only as a pure function in `cartea_spread.rs`
+  in stage-2 because threading it through `StrategyContext`
+  would have conflicted with Track 1's file ownership of
+  `crates/engine/src/market_maker.rs`. Stage-3 wires it end
+  to end now that no concurrent agents are touching the
+  engine.
+  - **`AdverseSelectionTracker` per-side bps**
+    (`mm-risk::toxicity`). New private helper
+    `adverse_selection_bps_filter(side_filter)` that takes
+    an `Option<Side>`. New public methods
+    `adverse_selection_bps_for_side(side)`,
+    `adverse_selection_bps_bid()` (= `Buy` fills),
+    `adverse_selection_bps_ask()` (= `Sell` fills). Existing
+    `adverse_selection_bps()` delegates to the new helper
+    with `None` — byte-identical output. 4 new tests.
+  - **`StrategyContext` per-side fields** (`mm-strategy::trait`).
+    Two new optional fields `as_prob_bid: Option<Decimal>`
+    and `as_prob_ask: Option<Decimal>`. Existing `as_prob`
+    stays as the symmetric fallback. **Per-side wins only
+    when both fields are `Some`** — either being `None`
+    falls back to the symmetric path inside the strategy.
+    All ~10 construction sites updated with `None` defaults.
+  - **`AvellanedaStoikov` per-side path**
+    (`mm-strategy::avellaneda`). `compute_quotes` now computes
+    `(bid_half_spread, ask_half_spread)` separately via a
+    `match` on the per-side fields. Per-side adds the AS
+    additive term independently to each side, each clamped
+    at `min_spread/2`. Symmetric fallback preserves the
+    Epic D stage-2 path byte-identically. 3 new tests.
+  - **`GlftStrategy` per-side path** (`mm-strategy::glft`).
+    Mirrors the Avellaneda shape. Level-offset spreading
+    uses the average half-spread to preserve wave-1
+    level-stacking semantics. 3 new tests.
+  - **Engine `refresh_quotes` per-side threading**
+    (`mm-engine::market_maker`). Derives `as_prob_bid` and
+    `as_prob_ask` from the new tracker accessors via
+    `cartea_spread::as_prob_from_bps` and populates the new
+    `StrategyContext` fields. Either side returning `None`
+    (under-sampled) cleanly falls back to the symmetric
+    path inside the strategy — no conditional logic at the
+    engine level.
+  - **Pre-stage-3 byte-identical fallback**: when the
+    tracker has fewer than 5 completed fills on a side,
+    that side's bps is `None`, the strategy falls back
+    to the symmetric `as_prob`, and quotes are byte-
+    identical to Epic D stage-2 output. The per-side path
+    only fires when the tracker has enough data on BOTH
+    sides simultaneously.
+  - **Workspace stats**: 1001 → **1011 tests** (+10),
+    workspace clippy `-D warnings` clean, workspace fmt
+    clean. Zero new dependencies.
+
 - **Stage-2 parallel push — 4 tracks across A/B/D/F epics**
   (Apr 2026). After all 6 SOTA gap closure epics closed
   stage-1, the user requested parallel execution of the

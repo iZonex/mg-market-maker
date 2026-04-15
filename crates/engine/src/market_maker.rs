@@ -2011,6 +2011,22 @@ impl MarketMakerEngine {
             .adverse_selection
             .adverse_selection_bps()
             .map(mm_strategy::cartea_spread::as_prob_from_bps);
+        // Epic D stage-3 — per-side ρ threading. When the
+        // tracker has enough completed fills on each side
+        // (≥5 each), populate the per-side fields so the
+        // strategy uses the asymmetric Cartea path. Either
+        // side returning `None` falls back to the symmetric
+        // `as_prob` path inside the strategy. Pre-stage-3
+        // behaviour is byte-identical when neither per-side
+        // path fires.
+        let as_prob_bid = self
+            .adverse_selection
+            .adverse_selection_bps_bid()
+            .map(mm_strategy::cartea_spread::as_prob_from_bps);
+        let as_prob_ask = self
+            .adverse_selection
+            .adverse_selection_bps_ask()
+            .map(mm_strategy::cartea_spread::as_prob_from_bps);
         let ctx = StrategyContext {
             book: &self.book_keeper.book,
             product: &self.product,
@@ -2024,6 +2040,8 @@ impl MarketMakerEngine {
             borrow_cost_bps,
             hedge_book_age_ms,
             as_prob,
+            as_prob_bid,
+            as_prob_ask,
         };
 
         let mut quotes = self.strategy.compute_quotes(&ctx);
@@ -4154,6 +4172,8 @@ mod signal_wave_2_integration {
                 borrow_cost_bps: None,
                 hedge_book_age_ms: None,
                 as_prob: prob,
+                as_prob_bid: None,
+                as_prob_ask: None,
             };
             let q = &engine.strategy.compute_quotes(&ctx)[0];
             let spread = q.ask.as_ref().unwrap().price - q.bid.as_ref().unwrap().price;

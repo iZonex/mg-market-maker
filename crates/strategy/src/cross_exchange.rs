@@ -226,6 +226,8 @@ mod tests {
             borrow_cost_bps: None,
             hedge_book_age_ms: None,
             as_prob: None,
+            as_prob_bid: None,
+            as_prob_ask: None,
         };
 
         let quotes = strategy.compute_quotes(&ctx);

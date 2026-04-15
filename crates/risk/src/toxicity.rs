@@ -544,10 +544,43 @@ impl AdverseSelectionTracker {
     /// Calculate adverse selection cost in bps.
     /// Positive = we're losing money on average after fills.
     pub fn adverse_selection_bps(&self) -> Option<Decimal> {
+        self.adverse_selection_bps_filter(None)
+    }
+
+    /// Epic D stage-3 — per-side adverse selection bps.
+    ///
+    /// Filters the fill window to one side and returns the
+    /// average adverse cost in bps for that side. Used by the
+    /// per-side `cartea_spread::quoted_half_spread_per_side`
+    /// path so the strategy can widen each side independently
+    /// when only one side is being run over by informed flow.
+    ///
+    /// `Side::Buy` returns the adverse-selection bps over our
+    /// **bid fills** (we bought at the touch — informed sells
+    /// hit us); `Side::Sell` returns it over our **ask fills**
+    /// (we sold at the touch — informed buys lifted us).
+    /// Returns `None` when fewer than 5 completed fills are
+    /// available on the requested side.
+    pub fn adverse_selection_bps_for_side(&self, side: Side) -> Option<Decimal> {
+        self.adverse_selection_bps_filter(Some(side))
+    }
+
+    /// Convenience for the bid side (our buy fills).
+    pub fn adverse_selection_bps_bid(&self) -> Option<Decimal> {
+        self.adverse_selection_bps_for_side(Side::Buy)
+    }
+
+    /// Convenience for the ask side (our sell fills).
+    pub fn adverse_selection_bps_ask(&self) -> Option<Decimal> {
+        self.adverse_selection_bps_for_side(Side::Sell)
+    }
+
+    fn adverse_selection_bps_filter(&self, side_filter: Option<Side>) -> Option<Decimal> {
         let completed: Vec<&FillOutcome> = self
             .fills
             .iter()
             .filter(|f| f.mid_after.is_some())
+            .filter(|f| side_filter.is_none_or(|s| f.side == s))
             .collect();
         if completed.len() < 5 {
             return None;
@@ -570,7 +603,7 @@ impl AdverseSelectionTracker {
         }
 
         let avg = total_adverse / n;
-        if avg > dec!(5) {
+        if side_filter.is_none() && avg > dec!(5) {
             warn!(
                 adverse_bps = %avg,
                 "high adverse selection detected"
@@ -791,5 +824,87 @@ mod tests {
     #[should_panic(expected = "nu must be positive")]
     fn bvc_panics_on_nonpositive_nu() {
         BvcClassifier::new(Decimal::ZERO, 10);
+    }
+
+    // ---------------------------------------------------------
+    // Epic D stage-3 — per-side adverse-selection bps
+    // ---------------------------------------------------------
+
+    fn seed_completed_fill(
+        tracker: &mut AdverseSelectionTracker,
+        side: Side,
+        fill_price: Decimal,
+        mid_at_fill: Decimal,
+        mid_after: Decimal,
+    ) {
+        tracker.fills.push_back(FillOutcome {
+            fill_price,
+            side,
+            mid_at_fill,
+            mid_after: Some(mid_after),
+            timestamp_ms: 0,
+        });
+    }
+
+    #[test]
+    fn per_side_bps_returns_none_below_threshold() {
+        // Fewer than 5 completed fills on a side → None.
+        let mut t = AdverseSelectionTracker::new(50);
+        for _ in 0..3 {
+            seed_completed_fill(&mut t, Side::Buy, dec!(100), dec!(100), dec!(99));
+        }
+        assert!(t.adverse_selection_bps_bid().is_none());
+        assert!(t.adverse_selection_bps_ask().is_none());
+        // Symmetric path also requires 5 — only 3 total.
+        assert!(t.adverse_selection_bps().is_none());
+    }
+
+    #[test]
+    fn per_side_bps_filters_buy_only() {
+        let mut t = AdverseSelectionTracker::new(50);
+        // 6 buy fills — adverse 100 bps each (bought at 100, mid dropped to 99).
+        for _ in 0..6 {
+            seed_completed_fill(&mut t, Side::Buy, dec!(100), dec!(100), dec!(99));
+        }
+        // 5 sell fills — neutral (sold at 100, mid stayed at 100).
+        for _ in 0..5 {
+            seed_completed_fill(&mut t, Side::Sell, dec!(100), dec!(100), dec!(100));
+        }
+        // Bid path sees only the buys → ~+100 bps adverse.
+        let bid = t.adverse_selection_bps_bid().unwrap();
+        assert!((bid - dec!(100)).abs() < dec!(0.001));
+        // Ask path sees only the sells → 0 bps.
+        let ask = t.adverse_selection_bps_ask().unwrap();
+        assert_eq!(ask, dec!(0));
+    }
+
+    #[test]
+    fn per_side_bps_filters_sell_only() {
+        let mut t = AdverseSelectionTracker::new(50);
+        // 5 sell fills — adverse 50 bps each (sold at 100, mid rose to 100.5).
+        for _ in 0..5 {
+            seed_completed_fill(&mut t, Side::Sell, dec!(100), dec!(100), dec!(100.5));
+        }
+        // 6 buy fills — neutral.
+        for _ in 0..6 {
+            seed_completed_fill(&mut t, Side::Buy, dec!(100), dec!(100), dec!(100));
+        }
+        let ask = t.adverse_selection_bps_ask().unwrap();
+        assert!((ask - dec!(50)).abs() < dec!(0.001));
+        let bid = t.adverse_selection_bps_bid().unwrap();
+        assert_eq!(bid, dec!(0));
+    }
+
+    #[test]
+    fn per_side_average_matches_symmetric_when_one_sided() {
+        // When all fills are on one side, that side's per-side
+        // average equals the symmetric average.
+        let mut t = AdverseSelectionTracker::new(50);
+        for _ in 0..7 {
+            seed_completed_fill(&mut t, Side::Buy, dec!(50_000), dec!(50_000), dec!(49_995));
+        }
+        let symmetric = t.adverse_selection_bps().unwrap();
+        let bid = t.adverse_selection_bps_bid().unwrap();
+        assert_eq!(symmetric, bid);
     }
 }

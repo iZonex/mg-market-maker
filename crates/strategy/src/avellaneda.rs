@@ -62,39 +62,60 @@ impl Strategy for AvellanedaStoikov {
 
         // Epic D sub-component #4 — Cartea adverse-selection
         // closed-form spread widening (CJP 2015 ch.4 §4.3 eq.
-        // 4.20). When `ctx.as_prob` is `Some(ρ)`, add
-        // `(1 − 2ρ) · σ · √(T − t)` to the spread. ρ > 0.5
-        // (informed flow) produces a negative additive →
-        // spread shrinks (MM retreats); ρ < 0.5 (uninformed
-        // flow) produces positive additive → spread widens.
-        // Final value is re-clamped at the `min_spread_bps`
-        // floor so ρ close to 1 can never produce a
-        // sub-minimum quote.
-        let spread = if let Some(rho) = ctx.as_prob {
-            let as_delta = (dec!(1) - dec!(2) * rho) * sigma * crate::volatility::decimal_sqrt(t);
-            (spread + as_delta).max(min_spread)
-        } else {
-            spread
+        // 4.20). Stage-3 promotes the symmetric path to a
+        // per-side variant when both `as_prob_bid` AND
+        // `as_prob_ask` are populated:
+        //
+        //   bid_half = base + (1 − 2·ρ_b) · σ · √(T−t)
+        //   ask_half = base + (1 − 2·ρ_a) · σ · √(T−t)
+        //
+        // (each side individually clamped at min_spread/2)
+        //
+        // Symmetric `as_prob` stays as the fallback when
+        // per-side fields are absent. ρ > 0.5 (informed flow)
+        // shrinks a side; ρ < 0.5 (uninformed flow) widens it.
+        let half_min = min_spread / dec!(2);
+        let sqrt_t = crate::volatility::decimal_sqrt(t);
+        let (bid_half_spread, ask_half_spread) = match (ctx.as_prob_bid, ctx.as_prob_ask) {
+            (Some(rho_b), Some(rho_a)) => {
+                // Per-side path — Epic D stage-3.
+                let base = spread / dec!(2);
+                let bid_widen = (dec!(1) - dec!(2) * rho_b) * sigma * sqrt_t;
+                let ask_widen = (dec!(1) - dec!(2) * rho_a) * sigma * sqrt_t;
+                (
+                    (base + bid_widen).max(half_min),
+                    (base + ask_widen).max(half_min),
+                )
+            }
+            _ => {
+                // Symmetric fallback (Epic D stage-2 path).
+                let spread = if let Some(rho) = ctx.as_prob {
+                    let as_delta = (dec!(1) - dec!(2) * rho) * sigma * sqrt_t;
+                    (spread + as_delta).max(min_spread)
+                } else {
+                    spread
+                };
+                let half = spread / dec!(2);
+                (half, half)
+            }
         };
 
         // Apply maximum distance.
         let max_distance = bps_to_frac(ctx.config.max_distance_bps) * ctx.mid_price;
-
-        let half_spread = spread / dec!(2);
 
         let mut quotes = Vec::with_capacity(ctx.config.num_levels);
 
         for level in 0..ctx.config.num_levels {
             let level_offset = Decimal::from(level as u64) * ctx.config.order_size * dec!(0.5);
 
-            // Bid: reservation - half_spread - level_offset.
-            let raw_bid = reservation - half_spread - level_offset;
+            // Bid: reservation - bid_half_spread - level_offset.
+            let raw_bid = reservation - bid_half_spread - level_offset;
             let bid_price = ctx
                 .product
                 .round_price(raw_bid.max(dec!(0)).min(ctx.mid_price + max_distance));
 
-            // Ask: reservation + half_spread + level_offset.
-            let raw_ask = reservation + half_spread + level_offset;
+            // Ask: reservation + ask_half_spread + level_offset.
+            let raw_ask = reservation + ask_half_spread + level_offset;
             let ask_price = ctx
                 .product
                 .round_price(raw_ask.max(ctx.mid_price - max_distance));
@@ -129,7 +150,8 @@ impl Strategy for AvellanedaStoikov {
         debug!(
             strategy = "avellaneda",
             %reservation,
-            %spread,
+            %bid_half_spread,
+            %ask_half_spread,
             inventory = %q,
             sigma = %sigma,
             levels = quotes.len(),
@@ -255,6 +277,8 @@ mod tests {
             borrow_cost_bps: None,
             hedge_book_age_ms: None,
             as_prob: None,
+            as_prob_bid: None,
+            as_prob_ask: None,
         };
 
         let strategy = AvellanedaStoikov;
@@ -304,6 +328,8 @@ mod tests {
             borrow_cost_bps: None,
             hedge_book_age_ms: None,
             as_prob: None,
+            as_prob_bid: None,
+            as_prob_ask: None,
         };
 
         let strategy = AvellanedaStoikov;
@@ -358,6 +384,8 @@ mod tests {
             borrow_cost_bps: None,
             hedge_book_age_ms: None,
             as_prob: None,
+            as_prob_bid: None,
+            as_prob_ask: None,
         };
         let ctx_on = StrategyContext {
             book: &book,
@@ -372,6 +400,8 @@ mod tests {
             borrow_cost_bps: Some(dec!(10)),
             hedge_book_age_ms: None,
             as_prob: None,
+            as_prob_bid: None,
+            as_prob_ask: None,
         };
         let strategy = AvellanedaStoikov;
         let q_off = &strategy.compute_quotes(&ctx_off)[0];
@@ -411,11 +441,24 @@ mod tests {
 
     /// Helper: build a simple `StrategyContext` with a
     /// configurable `as_prob`, holding everything else fixed.
+    /// Per-side `as_prob_bid` / `as_prob_ask` default to `None`
+    /// (symmetric path); the per-side overload below sets them.
     fn ctx_with_as_prob<'a>(
         book: &'a mm_common::orderbook::LocalOrderBook,
         product: &'a ProductSpec,
         config: &'a MarketMakerConfig,
         as_prob: Option<Decimal>,
+    ) -> StrategyContext<'a> {
+        ctx_with_per_side_as_prob(book, product, config, as_prob, None, None)
+    }
+
+    fn ctx_with_per_side_as_prob<'a>(
+        book: &'a mm_common::orderbook::LocalOrderBook,
+        product: &'a ProductSpec,
+        config: &'a MarketMakerConfig,
+        as_prob: Option<Decimal>,
+        as_prob_bid: Option<Decimal>,
+        as_prob_ask: Option<Decimal>,
     ) -> StrategyContext<'a> {
         let mid = book.mid_price().unwrap();
         StrategyContext {
@@ -431,6 +474,8 @@ mod tests {
             borrow_cost_bps: None,
             hedge_book_age_ms: None,
             as_prob,
+            as_prob_bid,
+            as_prob_ask,
         }
     }
 
@@ -525,5 +570,106 @@ mod tests {
             spread_narrow + dec!(0.02) >= min_spread,
             "spread must respect the min_spread_bps floor"
         );
+    }
+
+    // -------- Epic D stage-3 — per-side asymmetric ρ --------
+
+    #[test]
+    fn per_side_none_is_byte_identical_to_symmetric() {
+        // When per-side fields are both None, the strategy
+        // must produce byte-identical quotes to the
+        // symmetric-only path.
+        let product = test_product();
+        let config = test_config();
+        let book = seeded_book();
+        let ctx_sym = ctx_with_as_prob(&book, &product, &config, Some(dec!(0.3)));
+        let ctx_per_side =
+            ctx_with_per_side_as_prob(&book, &product, &config, Some(dec!(0.3)), None, None);
+        let strategy = AvellanedaStoikov;
+        let q_sym = &strategy.compute_quotes(&ctx_sym)[0];
+        let q_per = &strategy.compute_quotes(&ctx_per_side)[0];
+        assert_eq!(
+            q_sym.bid.as_ref().unwrap().price,
+            q_per.bid.as_ref().unwrap().price
+        );
+        assert_eq!(
+            q_sym.ask.as_ref().unwrap().price,
+            q_per.ask.as_ref().unwrap().price
+        );
+    }
+
+    #[test]
+    fn per_side_only_one_set_falls_back_to_symmetric() {
+        // If only as_prob_bid is Some (as_prob_ask is None),
+        // the strategy must NOT use the per-side path — it
+        // falls back to the symmetric `as_prob`.
+        let product = test_product();
+        let config = test_config();
+        let book = seeded_book();
+        let ctx_sym = ctx_with_as_prob(&book, &product, &config, Some(dec!(0.5)));
+        let ctx_partial = ctx_with_per_side_as_prob(
+            &book,
+            &product,
+            &config,
+            Some(dec!(0.5)),
+            Some(dec!(0)),
+            None,
+        );
+        let strategy = AvellanedaStoikov;
+        let q_sym = &strategy.compute_quotes(&ctx_sym)[0];
+        let q_partial = &strategy.compute_quotes(&ctx_partial)[0];
+        // Only one per-side field set → symmetric fallback
+        // → outputs identical to the symmetric-only path.
+        assert_eq!(
+            q_sym.bid.as_ref().unwrap().price,
+            q_partial.bid.as_ref().unwrap().price
+        );
+        assert_eq!(
+            q_sym.ask.as_ref().unwrap().price,
+            q_partial.ask.as_ref().unwrap().price
+        );
+    }
+
+    #[test]
+    fn per_side_asymmetric_widens_one_side_independently() {
+        // ρ_b = 0 (uninformed bid → widen bid),
+        // ρ_a = 0.5 (neutral ask → no change).
+        // Bid should move further from mid; ask should
+        // stay near the symmetric-baseline ask.
+        let product = test_product();
+        let config = test_config();
+        let book = seeded_book();
+        let mid = book.mid_price().unwrap();
+        let ctx_neutral = ctx_with_per_side_as_prob(
+            &book,
+            &product,
+            &config,
+            None,
+            Some(dec!(0.5)),
+            Some(dec!(0.5)),
+        );
+        let ctx_widen_bid = ctx_with_per_side_as_prob(
+            &book,
+            &product,
+            &config,
+            None,
+            Some(dec!(0)),
+            Some(dec!(0.5)),
+        );
+        let strategy = AvellanedaStoikov;
+        let q_n = &strategy.compute_quotes(&ctx_neutral)[0];
+        let q_w = &strategy.compute_quotes(&ctx_widen_bid)[0];
+
+        let bid_dist_neutral = mid - q_n.bid.as_ref().unwrap().price;
+        let bid_dist_widen = mid - q_w.bid.as_ref().unwrap().price;
+        let ask_dist_neutral = q_n.ask.as_ref().unwrap().price - mid;
+        let ask_dist_widen = q_w.ask.as_ref().unwrap().price - mid;
+
+        assert!(
+            bid_dist_widen > bid_dist_neutral,
+            "ρ_b=0 must widen the bid: neutral={bid_dist_neutral}, widen={bid_dist_widen}"
+        );
+        // Ask side untouched by the bid-only widening.
+        assert_eq!(ask_dist_widen, ask_dist_neutral);
     }
 }
