@@ -32,6 +32,19 @@ pub struct MockConnector {
     orderbook: Mutex<(Vec<PriceLevel>, Vec<PriceLevel>)>,
     pub placed: Mutex<Vec<NewOrder>>,
     pub cancelled: Mutex<Vec<OrderId>>,
+    /// Epic E sub-component #1 — call-path counters so tests
+    /// can assert the engine routed through the batch helpers
+    /// (and not the per-order fallback) on a multi-quote diff.
+    pub place_batch_calls: Mutex<usize>,
+    pub place_single_calls: Mutex<usize>,
+    pub cancel_batch_calls: Mutex<usize>,
+    pub cancel_single_calls: Mutex<usize>,
+    /// One-shot batch-failure injection. When `true`, the next
+    /// `place_orders_batch` (or `cancel_orders_batch`) call
+    /// returns `Err` and clears the flag. Used to test the
+    /// per-order fallback path.
+    fail_next_batch_place: Mutex<bool>,
+    fail_next_batch_cancel: Mutex<bool>,
 }
 
 impl MockConnector {
@@ -52,7 +65,46 @@ impl MockConnector {
             orderbook: Mutex::new((vec![], vec![])),
             placed: Mutex::new(vec![]),
             cancelled: Mutex::new(vec![]),
+            place_batch_calls: Mutex::new(0),
+            place_single_calls: Mutex::new(0),
+            cancel_batch_calls: Mutex::new(0),
+            cancel_single_calls: Mutex::new(0),
+            fail_next_batch_place: Mutex::new(false),
+            fail_next_batch_cancel: Mutex::new(false),
         }
+    }
+
+    /// Builder: override `max_batch_size` from the default.
+    /// Used by Epic E batch-entry tests to exercise both small
+    /// (5) and large (20) chunk sizes.
+    pub fn with_max_batch_size(mut self, n: usize) -> Self {
+        self.caps.max_batch_size = n;
+        self
+    }
+
+    /// Arm the next `place_orders_batch` call to return `Err`
+    /// once. Cleared after the failure fires. Used to test the
+    /// per-order fallback path.
+    pub fn arm_batch_place_failure(&self) {
+        *self.fail_next_batch_place.lock().unwrap() = true;
+    }
+
+    /// Arm the next `cancel_orders_batch` call to return `Err`.
+    pub fn arm_batch_cancel_failure(&self) {
+        *self.fail_next_batch_cancel.lock().unwrap() = true;
+    }
+
+    pub fn place_batch_calls(&self) -> usize {
+        *self.place_batch_calls.lock().unwrap()
+    }
+    pub fn place_single_calls(&self) -> usize {
+        *self.place_single_calls.lock().unwrap()
+    }
+    pub fn cancel_batch_calls(&self) -> usize {
+        *self.cancel_batch_calls.lock().unwrap()
+    }
+    pub fn cancel_single_calls(&self) -> usize {
+        *self.cancel_single_calls.lock().unwrap()
     }
 
     /// Push a market event to subscribers. Call **after**
@@ -110,10 +162,20 @@ impl ExchangeConnector for MockConnector {
         Ok((bids, asks, 0))
     }
     async fn place_order(&self, order: &NewOrder) -> anyhow::Result<OrderId> {
+        *self.place_single_calls.lock().unwrap() += 1;
         self.placed.lock().unwrap().push(order.clone());
         Ok(OrderId::new_v4())
     }
     async fn place_orders_batch(&self, orders: &[NewOrder]) -> anyhow::Result<Vec<OrderId>> {
+        *self.place_batch_calls.lock().unwrap() += 1;
+        // One-shot failure injection.
+        {
+            let mut flag = self.fail_next_batch_place.lock().unwrap();
+            if *flag {
+                *flag = false;
+                return Err(anyhow::anyhow!("injected batch place failure"));
+            }
+        }
         let mut ids = Vec::with_capacity(orders.len());
         let mut placed = self.placed.lock().unwrap();
         for o in orders {
@@ -123,6 +185,7 @@ impl ExchangeConnector for MockConnector {
         Ok(ids)
     }
     async fn cancel_order(&self, _symbol: &str, order_id: OrderId) -> anyhow::Result<()> {
+        *self.cancel_single_calls.lock().unwrap() += 1;
         self.cancelled.lock().unwrap().push(order_id);
         Ok(())
     }
@@ -131,6 +194,14 @@ impl ExchangeConnector for MockConnector {
         _symbol: &str,
         order_ids: &[OrderId],
     ) -> anyhow::Result<()> {
+        *self.cancel_batch_calls.lock().unwrap() += 1;
+        {
+            let mut flag = self.fail_next_batch_cancel.lock().unwrap();
+            if *flag {
+                *flag = false;
+                return Err(anyhow::anyhow!("injected batch cancel failure"));
+            }
+        }
         self.cancelled.lock().unwrap().extend_from_slice(order_ids);
         Ok(())
     }
@@ -141,13 +212,26 @@ impl ExchangeConnector for MockConnector {
         Ok(vec![])
     }
     async fn get_balances(&self) -> anyhow::Result<Vec<Balance>> {
-        Ok(vec![Balance {
-            asset: "USDT".to_string(),
-            wallet: self.wallet,
-            total: dec!(100_000),
-            locked: dec!(0),
-            available: dec!(100_000),
-        }])
+        // Return both USDT and BTC so that engine tests
+        // calling `refresh_balances` populate the cache for
+        // both ask-side (BTC base) and bid-side (USDT quote)
+        // affordability checks.
+        Ok(vec![
+            Balance {
+                asset: "USDT".to_string(),
+                wallet: self.wallet,
+                total: dec!(100_000),
+                locked: dec!(0),
+                available: dec!(100_000),
+            },
+            Balance {
+                asset: "BTC".to_string(),
+                wallet: self.wallet,
+                total: dec!(10),
+                locked: dec!(0),
+                available: dec!(10),
+            },
+        ])
     }
     async fn get_product_spec(&self, symbol: &str) -> anyhow::Result<ProductSpec> {
         Ok(ProductSpec {

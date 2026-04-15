@@ -4,7 +4,7 @@ Production-grade market maker for the custom exchange at `../exchange/` with mul
 
 ## Stats
 
-**18 crates, 154 files, ~49K lines Rust, 906 tests**
+**18 crates, 154 files, ~49K lines Rust, 920 tests**
 
 ## Architecture
 
@@ -12,7 +12,7 @@ Production-grade market maker for the custom exchange at `../exchange/` with mul
 server/                Entry point, config validation, secrets from env, file logging
 engine/                Main event loop — ALL subsystems wired:
   ├── market_maker     Book → Strategy → Risk → Order diff → Exchange
-  ├── order_manager    Cancel/place with order diffing + amend (P1.1)
+  ├── order_manager    Cancel/place with order diffing + amend (P1.1) + batch entry (Epic E)
   ├── book_keeper      Local orderbook from WS
   ├── order_id_map     UUID ↔ exchange native ID mapping
   ├── pair_lifecycle   Halt / delisting / tick-lot drift (P2.3 s1)
@@ -97,7 +97,7 @@ persistence/         State management:
 
 ```bash
 cargo build                    # build all
-cargo test                     # 906 tests
+cargo test                     # 920 tests
 cargo clippy --all-targets -- -D warnings
 cargo run -p mm-server         # run live
 MM_MODE=paper cargo run -p mm-server   # paper trading

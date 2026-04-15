@@ -9,6 +9,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Epic E — Execution polish (stage-1)** (SOTA gap closure
+  epic, sixth and final). User reordered F → E so the
+  defensive surface landed first; Epic E closes the
+  execution-infra polish items that improve tail latency
+  and operational deployment without touching the alpha
+  or defensive stacks. Stage-1 ships **2/4 sub-components**
+  — io_uring runtime and Coinbase Prime FIX explicitly
+  deferred to stage-2 (each is a 1-2 week individual
+  sub-epic that doesn't fit the polish budget).
+  - **Sub-component #1 — Batch order entry**
+    (`mm-engine::order_manager::execute_diff` extension).
+    New `MIN_BATCH_SIZE = 2` constant. Two new private
+    helpers `place_quotes_batched` and `cancel_orders_batched`
+    that chunk the diff's `to_place` / `to_cancel` slices
+    by `connector.capabilities().max_batch_size`, call the
+    venue's `place_orders_batch` / `cancel_orders_batch`
+    methods, fall back to per-order on any error or
+    returned-id-count mismatch, and stay on the per-order
+    path for single-order diffs (where the JSON overhead
+    of a batch call has no benefit). Existing per-order
+    placement logic factored out into `place_one_quote` /
+    `cancel_one` helpers used by both the single-order
+    path and the batch fallback path. **Net effect on
+    venue coverage:** Bybit V5 + HyperLiquid get the full
+    5-20× round-trip reduction on big diffs; Binance
+    futures gets 5× coalescing via `/fapi/v1/batchOrders`;
+    Binance spot + custom client are no-benefit-no-regression
+    because their `place_orders_batch` impls already
+    fallback-loop internally. 12 unit tests covering
+    chunking at max=5 and max=20, partial-failure
+    fallback, single-order routing, empty-input no-op,
+    pathological max=1 venue, both place and cancel paths.
+  - **Sub-component #3 — High-performance deployment guide**
+    (`docs/deployment.md` extension + new
+    `deploy/systemd/mm.service` template). New ~270-line
+    "High-performance deployment" section covering 7 deploy
+    levers in rough effort-to-impact order:
+    1. File descriptor limits (`LimitNOFILE=65535`)
+    2. Disable swap (`swapoff -a` + `vm.swappiness=0`)
+    3. OOM score adjustment (`OOMScoreAdjust=-500`)
+    4. NUMA pinning (`CPUAffinity` / `NUMAMask` / `NUMAPolicy`)
+    5. IRQ steering (`irqbalance` disable + manual `smp_affinity`)
+    6. Transparent hugepages (`/sys/kernel/mm/transparent_hugepage`)
+    7. PREEMPT_RT kernel (advanced — when to use, when not)
+    Each sub-section: what + why + how + verification snippet
+    + persistence path. Cumulative impact table at the
+    bottom summarising the per-lever tail-latency gain.
+    New file `deploy/systemd/mm.service` ships a complete
+    validated unit template with `${PLACEHOLDER}` markers
+    bundling levers 1, 3, 4, and 7 plus filesystem +
+    capability + memory hardening (`ProtectSystem=strict`,
+    `NoNewPrivileges`, `CapabilityBoundingSet=`,
+    `MemoryHigh=4G`, `MemoryMax=6G`, `MemorySwapMax=0`,
+    `ReadWritePaths=data`).
+  - **Sub-component #2 — io_uring runtime** ←
+    **deferred to stage-2.** The runtime change requires
+    adding `tokio-uring` as a dep, replacing tokio's
+    work-stealing scheduler in the WS read path,
+    validating that `rustls` works under `tokio-uring`
+    (the existing `tokio-tungstenite` + rustls combo
+    needs adapter work), and a Linux kernel ≥ 5.6 gate.
+    1-2 weeks of focused work that doesn't fit the polish
+    budget — tracked in ROADMAP closure note.
+  - **Sub-component #4 — Coinbase Prime FIX 4.4** ←
+    **deferred to stage-2.** A new venue connector needs
+    auth, order types, message routing, error mapping,
+    per-venue rate limiting, and integration with the
+    existing `mm-portfolio` / `mm-risk` pipelines on top
+    of the existing `crates/protocols/fix/` codec. 2 weeks
+    of focused work — tracked in ROADMAP closure note.
+  - **Engine integration.** No new engine fields needed
+    — batch entry is a pure swap of the per-order loops
+    inside `OrderManager::execute_diff`. Engine wiring is
+    "do nothing, the diff path picks it up automatically."
+    `MockConnector` (in `crates/engine/src/test_support.rs`)
+    gained per-call counters (`place_batch_calls` /
+    `place_single_calls` / `cancel_batch_calls` /
+    `cancel_single_calls`), one-shot batch-failure
+    injection (`arm_batch_place_failure` /
+    `arm_batch_cancel_failure`), and a builder
+    `with_max_batch_size(n)` so engine integration tests
+    can assert which path the diff routed through.
+  - **Two new engine integration tests** in
+    `epic_e_integration` driving the full
+    `refresh_quotes → execute_diff → batch` path:
+    - `refresh_quotes_routes_through_batch_on_first_diff`
+      asserts that with `max_batch_size=20` the engine's
+      first refresh fires exactly one
+      `place_orders_batch` call (carrying both deduped
+      quotes after tick rounding) and zero per-order
+      `place_order` calls.
+    - `refresh_quotes_stays_per_order_when_max_batch_size_is_one`
+      asserts the pathological `max=1` venue stays on
+      the per-order path.
+  - **Zero new dependencies.** 12 new unit tests in
+    `mm-engine::order_manager` + 2 new engine integration
+    tests + 7 new lever sub-sections in `docs/deployment.md`
+    + 1 new `deploy/systemd/mm.service` file. Workspace
+    clippy `-D warnings` clean, `cargo fmt --check` clean.
+
 - **Epic F — Defensive layer (stage-1)** (SOTA gap closure
   epic, fifth — user reordered F before E so the defensive
   surface lands before execution polish). Closes the

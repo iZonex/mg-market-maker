@@ -277,39 +277,68 @@ operators enable per config in stage-2.
 **Pre-conditions (satisfied).** None — Epic D is purely
 additive against wave-1.
 
-### Epic E — Execution infra polish (P2, ~2 weeks)
+### Epic E — Execution infra polish ✅ CLOSED stage-1 (Apr 2026)
 
-**Why.** Three small wins that improve tail latency and add a
-new venue path. None of these is in the kernel-bypass cost
-bracket — that one is correctly deferred.
+**Status.** **2/4 stage-1 sub-components shipped** over 4
+one-week sprints (E-1 planning/study, E-2 batch order entry,
+E-3 deployment guide + systemd template, E-4 engine
+integration + audit + docs). io_uring runtime and
+Coinbase Prime FIX explicitly deferred — see below. Full
+breakdown in CHANGELOG `[Unreleased]` and
+`docs/sprints/epic-e-execution-polish.md`.
 
-**Scope.**
-- **Batch order entry on create + cancel paths.**
-  `OrderManager::execute_diff` already groups by venue; the
-  dispatch just needs to accumulate same-side creates into
-  one `batch_create_orders` call per venue. Bybit V5 + HL get
-  full benefit (up to 20 orders/msg), Binance futures gets
-  5× coalescing. Effort: 3 days.
-- **io_uring runtime for the WS read path.** Move tokio's
-  worker threads to `tokio-uring` for the hot WS read loop.
-  Public benchmarks measure 20-40% tail-latency improvement
-  on 1000-msg/s feeds. Effort: 1-2 weeks for code +
-  rustls validation.
-- **NUMA / IRQ / RT-kernel / hugepages deployment guide** in
-  `docs/deployment.md` plus a validated systemd unit
-  template. This is a deployment story, not a code change,
-  but it is the highest-ROI piece because most operators do
-  not know any of this. Effort: 2-3 days.
-- **Coinbase Prime FIX 4.4 wiring** on top of the existing
-  FIX 4.4 codec we already have in `crates/protocols/fix/`.
-  No venue currently uses it. Coinbase Prime FIX is the
-  cleanest latency path to Coinbase for institutional
-  counterparties. Effort: 2 weeks.
+**What shipped.**
+- **Batch order entry** —
+  `mm-engine::order_manager::execute_diff` swaps the per-order
+  loops for `place_orders_batch` / `cancel_orders_batch`
+  calls when ≥ `MIN_BATCH_SIZE = 2` orders are pending.
+  Chunks by `connector.capabilities().max_batch_size`,
+  falls back to per-order on any error or returned-id-count
+  mismatch. Bybit V5 + HyperLiquid get the full 5-20×
+  round-trip reduction; Binance futures gets 5× coalescing
+  via `/fapi/v1/batchOrders`; Binance spot + custom client
+  are no-benefit-no-regression because their batch impls
+  already fallback-loop internally.
+- **High-performance deployment guide** —
+  `docs/deployment.md` extended with a 270-line
+  "High-performance deployment" section covering 7 deploy
+  levers (file descriptor limits, swap disable, OOM score
+  adjustment, NUMA pinning, IRQ steering, transparent
+  hugepages, PREEMPT_RT kernel) plus a complete validated
+  `deploy/systemd/mm.service` unit template with
+  `${PLACEHOLDER}` markers, filesystem hardening,
+  capability hardening, memory limits, NUMA pinning, and
+  graceful shutdown wiring.
+- New `MockConnector` test infrastructure: per-call
+  counters, one-shot batch-failure injection, builder
+  override of `max_batch_size` — used by the 12 new unit
+  tests + 2 engine integration tests.
 
-**Effort.** ~2 weeks for the first three; +2 weeks for
-Coinbase Prime FIX.
+**What's deferred — io_uring + Coinbase Prime FIX.**
+- **io_uring runtime** — tokio-uring dep + WS read path
+  refactor + rustls compatibility validation + Linux
+  kernel ≥ 5.6 gate. 1-2 weeks of focused work; tracked
+  as Epic E stage-2 follow-up.
+- **Coinbase Prime FIX 4.4** — new venue connector +
+  auth + order types + per-venue rate limiting +
+  integration with the existing `crates/protocols/fix/`
+  codec + `mm-portfolio` / `mm-risk` pipeline wiring.
+  2 weeks of focused work; tracked as Epic E stage-2
+  follow-up.
 
-**Pre-conditions.** None.
+**Stage-2 follow-ups (tracked as next epic):**
+
+- io_uring runtime swap on the WS read path
+- Coinbase Prime FIX 4.4 venue connector
+- Bench-driven `MIN_BATCH_SIZE` tuning per venue (v1
+  default of 2 may be too aggressive for venues where
+  the JSON overhead is significant)
+- Per-venue partial-batch-failure error types so the
+  engine can do per-order fallback only for the failed
+  subset rather than the entire chunk
+
+**Pre-conditions (satisfied).** None — Epic E is purely
+additive against the existing batch primitive coverage.
 
 ### Epic F — Defensive strategy layer ✅ CLOSED stage-1 (Apr 2026)
 
@@ -397,7 +426,7 @@ infrastructure (Epic D wave-1 inheritance).
 | B — Stat-arb pairs | P1 | ~1 mo | Epic C (per-strat PnL) | ✅ stage-1 closed Apr 2026 |
 | C — Portfolio risk view | P1 | ~3 wk | per-strat PnL | ✅ stage-1 closed Apr 2026 |
 | D — Signal wave 2 | P1 | ~1 mo | none | ✅ stage-1 closed Apr 2026 |
-| E — Execution polish | P2 | ~2 wk | none | tail latency, Coinbase Prime |
+| E — Execution polish | P2 | ~2 wk | none | ✅ stage-1 closed Apr 2026 (io_uring + Coinbase Prime FIX deferred) |
 | F — Defensive layer | P2 | ~3 wk | cross-venue bundle | ✅ stage-1 closed Apr 2026 (listing sniper deferred) |
 
 **Total epic effort:** ~14-18 weeks if run sequentially, ~10

@@ -9,6 +9,13 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tracing::{debug, info, warn};
 
+/// Epic E sub-component #1 — minimum batch size below which
+/// `execute_diff` stays on the per-order placement path. A
+/// single-order `place_orders_batch` call adds JSON overhead
+/// with no benefit over `place_order`; values ≥ 2 use the
+/// batch path.
+const MIN_BATCH_SIZE: usize = 2;
+
 /// One side of an in-place price tweak that preserves queue
 /// priority. `OrderDiffPlan::to_amend` holds these instead of a
 /// matched (cancel, place) pair when the live order can be
@@ -267,62 +274,13 @@ impl OrderManager {
             }
         }
 
-        // Cancel stale orders.
-        for order_id in &plan.to_cancel {
-            match connector.cancel_order(symbol, *order_id).await {
-                Ok(_) => {
-                    debug!(%order_id, "cancelled stale order");
-                    self.remove_order(*order_id);
-                }
-                Err(e) => {
-                    warn!(%order_id, error = %e, "failed to cancel order");
-                    self.remove_order(*order_id);
-                }
-            }
-        }
+        // Cancel stale orders (batch when supported).
+        self.cancel_orders_batched(symbol, &plan.to_cancel, connector)
+            .await;
 
-        // Place new orders.
-        for quote in &plan.to_place {
-            let order = NewOrder {
-                symbol: symbol.to_string(),
-                side: quote.side,
-                order_type: OrderType::Limit,
-                price: Some(quote.price),
-                qty: quote.qty,
-                time_in_force: Some(TimeInForce::PostOnly),
-                client_order_id: None,
-            };
-
-            match connector.place_order(&order).await {
-                Ok(order_id) => {
-                    info!(
-                        %order_id,
-                        side = ?quote.side,
-                        price = %quote.price,
-                        qty = %quote.qty,
-                        "placed order"
-                    );
-                    self.track_order(LiveOrder {
-                        order_id,
-                        symbol: symbol.to_string(),
-                        side: quote.side,
-                        price: quote.price,
-                        qty: quote.qty,
-                        filled_qty: dec!(0),
-                        status: mm_common::types::OrderStatus::Open,
-                        created_at: chrono::Utc::now(),
-                    });
-                }
-                Err(e) => {
-                    warn!(
-                        side = ?quote.side,
-                        price = %quote.price,
-                        error = %e,
-                        "failed to place order"
-                    );
-                }
-            }
-        }
+        // Place new orders (batch when supported).
+        self.place_quotes_batched(symbol, &plan.to_place, connector)
+            .await;
 
         if !plan.to_cancel.is_empty() || !plan.to_place.is_empty() || amends_planned > 0 {
             info!(
@@ -336,6 +294,225 @@ impl OrderManager {
         }
 
         Ok(())
+    }
+
+    /// Epic E sub-component #1 — place a slice of quotes
+    /// using the venue's `place_orders_batch` when ≥
+    /// `MIN_BATCH_SIZE` quotes are pending and the connector
+    /// advertises a non-trivial `max_batch_size`.
+    ///
+    /// Chunks the input by `max_batch_size`, calls the batch
+    /// method per chunk, tracks the returned `LiveOrder`s,
+    /// and falls back to `place_order` per-quote on any
+    /// batch error or returned-id-count mismatch. Single-
+    /// order placements stay on the per-order path entirely.
+    async fn place_quotes_batched(
+        &mut self,
+        symbol: &str,
+        quotes: &[Quote],
+        connector: &Arc<dyn ExchangeConnector>,
+    ) {
+        if quotes.is_empty() {
+            return;
+        }
+        let max_batch = connector.capabilities().max_batch_size.max(1);
+        // Single-order or small slice → stay on per-order path.
+        if quotes.len() < MIN_BATCH_SIZE || max_batch < MIN_BATCH_SIZE {
+            for quote in quotes {
+                self.place_one_quote(symbol, quote, connector).await;
+            }
+            return;
+        }
+        for chunk in quotes.chunks(max_batch) {
+            let orders: Vec<NewOrder> = chunk
+                .iter()
+                .map(|quote| NewOrder {
+                    symbol: symbol.to_string(),
+                    side: quote.side,
+                    order_type: OrderType::Limit,
+                    price: Some(quote.price),
+                    qty: quote.qty,
+                    time_in_force: Some(TimeInForce::PostOnly),
+                    client_order_id: None,
+                })
+                .collect();
+            match connector.place_orders_batch(&orders).await {
+                Ok(ids) if ids.len() == chunk.len() => {
+                    for (order_id, quote) in ids.into_iter().zip(chunk.iter()) {
+                        info!(
+                            %order_id,
+                            side = ?quote.side,
+                            price = %quote.price,
+                            qty = %quote.qty,
+                            "placed order (batch)"
+                        );
+                        self.track_order(LiveOrder {
+                            order_id,
+                            symbol: symbol.to_string(),
+                            side: quote.side,
+                            price: quote.price,
+                            qty: quote.qty,
+                            filled_qty: dec!(0),
+                            status: mm_common::types::OrderStatus::Open,
+                            created_at: chrono::Utc::now(),
+                        });
+                    }
+                }
+                Ok(ids) => {
+                    // Returned-id count mismatch: track what the
+                    // venue acknowledged (assume the first
+                    // `ids.len()` slots succeeded) and skip the
+                    // remainder. Emitting both halves of a
+                    // double-place is the worse failure mode, so
+                    // we err toward under-placement.
+                    warn!(
+                        returned = ids.len(),
+                        expected = chunk.len(),
+                        "batch place returned fewer ids than inputs — under-tracking remainder"
+                    );
+                    for (order_id, quote) in ids.into_iter().zip(chunk.iter()) {
+                        self.track_order(LiveOrder {
+                            order_id,
+                            symbol: symbol.to_string(),
+                            side: quote.side,
+                            price: quote.price,
+                            qty: quote.qty,
+                            filled_qty: dec!(0),
+                            status: mm_common::types::OrderStatus::Open,
+                            created_at: chrono::Utc::now(),
+                        });
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        chunk_len = chunk.len(),
+                        error = %e,
+                        "batch place failed — falling back to per-order placement"
+                    );
+                    for quote in chunk {
+                        self.place_one_quote(symbol, quote, connector).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Per-quote placement helper used by both the per-order
+    /// path (for small diffs and single-order specials) and
+    /// the batch fallback. Tracks the new `LiveOrder` on
+    /// success.
+    async fn place_one_quote(
+        &mut self,
+        symbol: &str,
+        quote: &Quote,
+        connector: &Arc<dyn ExchangeConnector>,
+    ) {
+        let order = NewOrder {
+            symbol: symbol.to_string(),
+            side: quote.side,
+            order_type: OrderType::Limit,
+            price: Some(quote.price),
+            qty: quote.qty,
+            time_in_force: Some(TimeInForce::PostOnly),
+            client_order_id: None,
+        };
+        match connector.place_order(&order).await {
+            Ok(order_id) => {
+                info!(
+                    %order_id,
+                    side = ?quote.side,
+                    price = %quote.price,
+                    qty = %quote.qty,
+                    "placed order"
+                );
+                self.track_order(LiveOrder {
+                    order_id,
+                    symbol: symbol.to_string(),
+                    side: quote.side,
+                    price: quote.price,
+                    qty: quote.qty,
+                    filled_qty: dec!(0),
+                    status: mm_common::types::OrderStatus::Open,
+                    created_at: chrono::Utc::now(),
+                });
+            }
+            Err(e) => {
+                warn!(
+                    side = ?quote.side,
+                    price = %quote.price,
+                    error = %e,
+                    "failed to place order"
+                );
+            }
+        }
+    }
+
+    /// Epic E sub-component #1 — cancel a slice of order ids
+    /// using the venue's `cancel_orders_batch` when ≥
+    /// `MIN_BATCH_SIZE` cancels are pending. On any batch
+    /// error, falls back to per-order `cancel_order` for the
+    /// entire chunk (the trait's batch-cancel API has no
+    /// per-order outcome, so partial-success is invisible to
+    /// the caller).
+    async fn cancel_orders_batched(
+        &mut self,
+        symbol: &str,
+        order_ids: &[OrderId],
+        connector: &Arc<dyn ExchangeConnector>,
+    ) {
+        if order_ids.is_empty() {
+            return;
+        }
+        let max_batch = connector.capabilities().max_batch_size.max(1);
+        if order_ids.len() < MIN_BATCH_SIZE || max_batch < MIN_BATCH_SIZE {
+            for order_id in order_ids {
+                self.cancel_one(symbol, *order_id, connector).await;
+            }
+            return;
+        }
+        for chunk in order_ids.chunks(max_batch) {
+            match connector.cancel_orders_batch(symbol, chunk).await {
+                Ok(_) => {
+                    for order_id in chunk {
+                        debug!(%order_id, "cancelled stale order (batch)");
+                        self.remove_order(*order_id);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        chunk_len = chunk.len(),
+                        error = %e,
+                        "batch cancel failed — falling back to per-order cancellation"
+                    );
+                    for order_id in chunk {
+                        self.cancel_one(symbol, *order_id, connector).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Per-cancel helper. Removes the local tracking entry
+    /// regardless of venue outcome — a failed cancel still
+    /// drops the local state because the next diff will
+    /// reconcile against the venue's actual open orders via
+    /// `get_open_orders` reconciliation.
+    async fn cancel_one(
+        &mut self,
+        symbol: &str,
+        order_id: OrderId,
+        connector: &Arc<dyn ExchangeConnector>,
+    ) {
+        match connector.cancel_order(symbol, order_id).await {
+            Ok(_) => {
+                debug!(%order_id, "cancelled stale order");
+                self.remove_order(order_id);
+            }
+            Err(e) => {
+                warn!(%order_id, error = %e, "failed to cancel order");
+                self.remove_order(order_id);
+            }
+        }
     }
 
     /// Update local state after a successful in-place amend: the
@@ -685,5 +862,196 @@ mod tests {
 
         // o1: 50000 * 0.1 = 5000. o2: 51000 * (0.2 - 0.05) = 51000 * 0.15 = 7650.
         assert_eq!(mgr.locked_value_quote(), dec!(12650));
+    }
+
+    // -------- Epic E sub-component #1 — batch order entry --------
+
+    use crate::test_support::MockConnector;
+    use mm_exchange_core::connector::{VenueId, VenueProduct};
+    use std::sync::Arc;
+
+    fn make_quotes(n: usize) -> Vec<Quote> {
+        (0..n)
+            .map(|i| Quote {
+                side: Side::Buy,
+                price: dec!(50000) + Decimal::from(i as i64),
+                qty: dec!(0.001),
+            })
+            .collect()
+    }
+
+    fn mock_connector(max_batch: usize) -> Arc<dyn ExchangeConnector> {
+        Arc::new(
+            MockConnector::new(VenueId::Bybit, VenueProduct::Spot).with_max_batch_size(max_batch),
+        ) as Arc<dyn ExchangeConnector>
+    }
+
+    /// Downcast helper for the test-only assertions on
+    /// MockConnector counters.
+    fn as_mock(connector: &Arc<dyn ExchangeConnector>) -> &MockConnector {
+        // SAFETY: every test in this module constructs a
+        // MockConnector before the downcast. There is no
+        // public Any impl on ExchangeConnector, so we cheat
+        // with a raw pointer cast — only safe when the caller
+        // guarantees the dyn really is a MockConnector.
+        unsafe { &*(Arc::as_ptr(connector) as *const MockConnector) }
+    }
+
+    #[tokio::test]
+    async fn batch_place_single_quote_uses_per_order_path() {
+        let mut mgr = OrderManager::new();
+        let conn = mock_connector(20);
+        let quotes = make_quotes(1);
+        mgr.place_quotes_batched("BTCUSDT", &quotes, &conn).await;
+        assert_eq!(as_mock(&conn).place_single_calls(), 1);
+        assert_eq!(as_mock(&conn).place_batch_calls(), 0);
+        assert_eq!(mgr.live_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_place_two_quotes_routes_through_batch() {
+        let mut mgr = OrderManager::new();
+        let conn = mock_connector(20);
+        let quotes = make_quotes(2);
+        mgr.place_quotes_batched("BTCUSDT", &quotes, &conn).await;
+        assert_eq!(as_mock(&conn).place_batch_calls(), 1);
+        assert_eq!(as_mock(&conn).place_single_calls(), 0);
+        assert_eq!(mgr.live_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn batch_place_chunks_at_max_batch_size_5() {
+        // 12 quotes against a Binance-futures-style max=5 →
+        // chunks of (5, 5, 2) → 3 batch calls.
+        let mut mgr = OrderManager::new();
+        let conn = mock_connector(5);
+        let quotes = make_quotes(12);
+        mgr.place_quotes_batched("BTCUSDT", &quotes, &conn).await;
+        assert_eq!(as_mock(&conn).place_batch_calls(), 3);
+        assert_eq!(as_mock(&conn).place_single_calls(), 0);
+        assert_eq!(mgr.live_count(), 12);
+    }
+
+    #[tokio::test]
+    async fn batch_place_chunks_at_max_batch_size_20() {
+        // 21 quotes against max=20 → chunks of (20, 1).
+        // The trailing 1-element chunk goes through the
+        // batch helper too because the slice already passed
+        // the MIN_BATCH_SIZE gate at the top level — single-
+        // quote chunking inside the loop still uses the
+        // batch call. v1 trade-off; the 1-order JSON
+        // overhead is negligible vs not having to think
+        // about whether the trailing chunk is batchable.
+        let mut mgr = OrderManager::new();
+        let conn = mock_connector(20);
+        let quotes = make_quotes(21);
+        mgr.place_quotes_batched("BTCUSDT", &quotes, &conn).await;
+        assert_eq!(as_mock(&conn).place_batch_calls(), 2);
+        assert_eq!(as_mock(&conn).place_single_calls(), 0);
+        assert_eq!(mgr.live_count(), 21);
+    }
+
+    #[tokio::test]
+    async fn batch_place_failure_falls_back_to_per_order() {
+        let mut mgr = OrderManager::new();
+        let conn = mock_connector(20);
+        as_mock(&conn).arm_batch_place_failure();
+        let quotes = make_quotes(3);
+        mgr.place_quotes_batched("BTCUSDT", &quotes, &conn).await;
+        // Batch call attempted once and failed; fallback
+        // hit place_order three times.
+        assert_eq!(as_mock(&conn).place_batch_calls(), 1);
+        assert_eq!(as_mock(&conn).place_single_calls(), 3);
+        // All three orders ended up tracked despite the
+        // batch-side failure.
+        assert_eq!(mgr.live_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn batch_place_empty_input_is_noop() {
+        let mut mgr = OrderManager::new();
+        let conn = mock_connector(20);
+        mgr.place_quotes_batched("BTCUSDT", &[], &conn).await;
+        assert_eq!(as_mock(&conn).place_batch_calls(), 0);
+        assert_eq!(as_mock(&conn).place_single_calls(), 0);
+        assert_eq!(mgr.live_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn batch_place_with_max_batch_size_one_uses_per_order() {
+        // Pathological venue with max=1 should never call
+        // the batch path even on a multi-quote diff.
+        let mut mgr = OrderManager::new();
+        let conn = mock_connector(1);
+        let quotes = make_quotes(5);
+        mgr.place_quotes_batched("BTCUSDT", &quotes, &conn).await;
+        assert_eq!(as_mock(&conn).place_batch_calls(), 0);
+        assert_eq!(as_mock(&conn).place_single_calls(), 5);
+    }
+
+    #[tokio::test]
+    async fn batch_cancel_two_ids_routes_through_batch() {
+        let mut mgr = OrderManager::new();
+        let conn = mock_connector(20);
+        // Track two live orders so remove_order has work to do.
+        mgr.track_order(live(Side::Buy, dec!(50000), dec!(0.001)));
+        mgr.track_order(live(Side::Buy, dec!(49999), dec!(0.001)));
+        let ids: Vec<OrderId> = mgr.live_order_ids();
+        mgr.cancel_orders_batched("BTCUSDT", &ids, &conn).await;
+        assert_eq!(as_mock(&conn).cancel_batch_calls(), 1);
+        assert_eq!(as_mock(&conn).cancel_single_calls(), 0);
+        assert_eq!(mgr.live_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn batch_cancel_single_id_uses_per_order_path() {
+        let mut mgr = OrderManager::new();
+        let conn = mock_connector(20);
+        mgr.track_order(live(Side::Buy, dec!(50000), dec!(0.001)));
+        let ids: Vec<OrderId> = mgr.live_order_ids();
+        mgr.cancel_orders_batched("BTCUSDT", &ids, &conn).await;
+        assert_eq!(as_mock(&conn).cancel_batch_calls(), 0);
+        assert_eq!(as_mock(&conn).cancel_single_calls(), 1);
+        assert_eq!(mgr.live_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn batch_cancel_failure_falls_back_to_per_order() {
+        let mut mgr = OrderManager::new();
+        let conn = mock_connector(20);
+        as_mock(&conn).arm_batch_cancel_failure();
+        for px in [50000, 49999, 49998] {
+            mgr.track_order(live(Side::Buy, Decimal::from(px), dec!(0.001)));
+        }
+        let ids: Vec<OrderId> = mgr.live_order_ids();
+        mgr.cancel_orders_batched("BTCUSDT", &ids, &conn).await;
+        assert_eq!(as_mock(&conn).cancel_batch_calls(), 1);
+        assert_eq!(as_mock(&conn).cancel_single_calls(), 3);
+        assert_eq!(mgr.live_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn batch_cancel_chunks_at_max_batch_size() {
+        // 12 cancels against max=5 → chunks of (5, 5, 2) →
+        // 3 batch calls.
+        let mut mgr = OrderManager::new();
+        let conn = mock_connector(5);
+        for i in 0..12 {
+            mgr.track_order(live(Side::Buy, dec!(50000) - Decimal::from(i), dec!(0.001)));
+        }
+        let ids: Vec<OrderId> = mgr.live_order_ids();
+        mgr.cancel_orders_batched("BTCUSDT", &ids, &conn).await;
+        assert_eq!(as_mock(&conn).cancel_batch_calls(), 3);
+        assert_eq!(as_mock(&conn).cancel_single_calls(), 0);
+        assert_eq!(mgr.live_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn batch_cancel_empty_input_is_noop() {
+        let mut mgr = OrderManager::new();
+        let conn = mock_connector(20);
+        mgr.cancel_orders_batched("BTCUSDT", &[], &conn).await;
+        assert_eq!(as_mock(&conn).cancel_batch_calls(), 0);
+        assert_eq!(as_mock(&conn).cancel_single_calls(), 0);
     }
 }

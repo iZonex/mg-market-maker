@@ -1,0 +1,148 @@
+# MG Market Maker — systemd unit template (Epic E sub-component #3).
+#
+# Bundles the high-perf deployment levers from
+# docs/deployment.md §"High-performance deployment":
+#
+#   1. File descriptor limits      → LimitNOFILE
+#   2. Swap discouragement         → MemorySwapMax (cgroup)
+#   3. OOM score adjustment        → OOMScoreAdjust
+#   4. NUMA pinning                → CPUAffinity / NUMAMask / NUMAPolicy
+#   5. IRQ steering                → done OUTSIDE this unit (manual)
+#   6. Transparent hugepages       → done OUTSIDE this unit (sysfs)
+#   7. PREEMPT_RT scheduling       → optional CPUSchedulingPolicy=fifo
+#
+# Substitute placeholders before installing:
+#
+#   sed \
+#     -e 's|${USER}|mm|g' \
+#     -e 's|${GROUP}|mm|g' \
+#     -e 's|${INSTALL_DIR}|/opt/market-maker|g' \
+#     -e 's|${CONFIG_PATH}|/opt/market-maker/config.toml|g' \
+#     deploy/systemd/mm.service \
+#     | sudo tee /etc/systemd/system/mm.service
+#
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mm
+#
+# This template assumes a DEDICATED box with the MM as the
+# primary workload. Operators on shared boxes should remove
+# the CPUAffinity / NUMAMask / NUMAPolicy lines and relax
+# OOMScoreAdjust to -100 or so.
+
+[Unit]
+Description=MG Market Maker
+Documentation=https://github.com/your-org/market-maker
+After=network-online.target
+Wants=network-online.target
+# Don't start until the system clock is sane — the engine
+# uses wall-clock timestamps for audit and SLA tracking.
+Requires=time-sync.target
+After=time-sync.target
+
+[Service]
+Type=simple
+User=${USER}
+Group=${GROUP}
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=${INSTALL_DIR}/mm-server
+Restart=on-failure
+RestartSec=5s
+
+# Environment — secrets come from a separate EnvironmentFile
+# the operator drops at /etc/mm/secrets.env (chmod 600).
+Environment="MM_CONFIG=${CONFIG_PATH}"
+Environment="MM_MODE=live"
+Environment="RUST_LOG=info,mm_engine=debug"
+EnvironmentFile=-/etc/mm/secrets.env
+
+# --- Lever 1: file descriptor limits ---
+# Default Linux ulimit of 1024 is too low for a multi-venue
+# MM holding dozens of WebSocket connections + dashboard +
+# audit log + Prometheus exporter.
+LimitNOFILE=65535
+
+# --- Lever 3: OOM score adjustment ---
+# Make the MM the LAST thing the OOM killer touches. Kill
+# the dashboard, the metrics scraper, the log shipper,
+# but NEVER kill the engine.
+OOMScoreAdjust=-500
+
+# --- Lever 4: NUMA pinning ---
+# Pin to NUMA node 0 cores 0-15 (typical for a 32-core
+# dual-socket box). Adjust to match your topology — run
+# `numactl --hardware` to discover the node count and
+# core-to-node mapping.
+CPUAffinity=0-15
+NUMAMask=0
+NUMAPolicy=bind
+
+# --- Lever 7 (optional): real-time scheduling ---
+# Uncomment ONLY when running on a PREEMPT_RT kernel. On a
+# non-RT kernel the FIFO policy can starve other workloads
+# and is not worth the marginal benefit.
+# CPUSchedulingPolicy=fifo
+# CPUSchedulingPriority=50
+
+# --- Resource accounting ---
+# Required for cgroup-based monitoring + Prometheus
+# `node_systemd_unit_*` metrics.
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+TasksAccounting=yes
+
+# --- Memory + IO limits (operator-adjustable) ---
+# Cap MM memory at 4 GB so a runaway leak does not eat
+# the whole box. Tune for your hardware.
+MemoryHigh=4G
+MemoryMax=6G
+# Discourage swap usage at the cgroup level.
+MemorySwapMax=0
+
+# --- Filesystem hardening ---
+# Read-only system directories so a code bug cannot
+# scribble over /usr or /etc. Audit + checkpoint paths
+# are explicitly writable via ReadWritePaths.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ReadWritePaths=${INSTALL_DIR}/data
+
+# --- Capability + privilege hardening ---
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=no
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+# The MM is a userspace process — no kernel capabilities
+# needed at all.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# --- Process limits ---
+TasksMax=4096
+LimitNPROC=4096
+
+# --- Stdout / stderr → journal for `journalctl -u mm` ---
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mm-server
+
+# --- Watchdog ---
+# Set if the MM exposes an sd_notify() heartbeat.
+# WatchdogSec=30s
+
+# --- Graceful shutdown ---
+# The engine listens for SIGTERM and runs cancel-all +
+# checkpoint flush before exiting. 30s is plenty even on
+# a slow REST cancel-all path.
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target
