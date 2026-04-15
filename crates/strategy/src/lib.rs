@@ -1,6 +1,8 @@
 pub mod autotune;
 pub mod avellaneda;
 pub mod basis;
+pub mod cartea_spread;
+pub mod cks_ofi;
 pub mod cross_exchange;
 pub mod exec_algo;
 pub mod features;
@@ -9,6 +11,7 @@ pub mod funding_arb_driver;
 pub mod glft;
 pub mod grid;
 pub mod inventory_skew;
+pub mod learned_microprice;
 pub mod market_resilience;
 pub mod momentum;
 pub mod paired_unwind;

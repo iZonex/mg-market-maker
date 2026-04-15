@@ -178,6 +178,20 @@ pub enum AuditEventType {
     /// estimate. Same advisory-only caveat as
     /// [`AuditEventType::StatArbEntered`].
     StatArbExited,
+
+    // Epic D — Signal wave 2 (OFI / learned MP / BVC / Cartea AS).
+    /// Periodic snapshot of the Cont-Kukanov-Stoikov OFI
+    /// EWMA produced by `MomentumSignals`. Fires once per
+    /// 30 s summary interval (NOT per L1 event — that would
+    /// flood the audit log). `detail` carries the latest
+    /// EWMA value plus the smoothed depth-normalised OFI.
+    OfiFeatureSnapshot,
+    /// Cartea adverse-selection spread widening crossed a
+    /// state boundary (no-effect → widening or back).
+    /// Fires only on transitions so the audit log is not
+    /// spammed every refresh tick. `detail` carries the
+    /// `ρ` value and the new spread multiplier direction.
+    AsSpreadWidened,
 }
 
 impl AuditLog {

@@ -414,6 +414,7 @@ mod tests {
             hedge_book: None,
             borrow_cost_bps: None,
             hedge_book_age_ms: None,
+            as_prob: None,
         }
     }
 

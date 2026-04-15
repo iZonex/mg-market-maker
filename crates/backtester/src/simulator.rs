@@ -209,6 +209,7 @@ impl Simulator {
                             hedge_book: None,
                             borrow_cost_bps: None,
                             hedge_book_age_ms: None,
+                            as_prob: None,
                         };
 
                         let quotes = strategy.compute_quotes(&ctx);

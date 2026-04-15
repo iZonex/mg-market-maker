@@ -217,40 +217,65 @@ ends).
 **Unlocks.** Institutional risk story, USDC↔USDT micro-hedge
 (P1.4 stage-2), options MM when that epic gets picked up.
 
-### Epic D — Signal sophistication wave 2 (P1, ~1 month)
+### Epic D — Signal sophistication wave 2 ✅ CLOSED stage-1 (Apr 2026)
 
-**Why.** The microstructure stack ships ~20 features but
-several of the highest-cited production-MM signals are still
-missing or only have a weaker proxy. Each one is small to
-build and most have a pure-function shape that drops into the
-existing `MomentumSignals` autotune path with no plumbing.
+**Status.** All 4 stage-1 sub-components shipped over 4
+one-week sprints (D-1 planning/study, D-2 OFI + learned
+microprice, D-3 BVC + Cartea AS spread, D-4 strategy +
+engine wiring + audit + docs). Full breakdown in CHANGELOG
+`[Unreleased]` and `docs/sprints/epic-d-signal-wave-2.md`.
 
-**Scope.**
-- **OFI on the book event path** (Cont-Kukanov-Stoikov 2014).
-  Add `OrderFlowImbalance` in `mm-strategy::features`. Sums
-  signed changes in best-bid / best-ask sizes event-by-event,
-  normalizes by depth. Wire as a fifth alpha component in
-  `MomentumSignals` alongside book imbalance, trade flow,
-  micro-price, HMA. Probably the single highest-ROI signal
-  upgrade we can make. Effort: 3-5 days.
-- **Learned microprice G-function** (Stoikov 2017 §3).
-  Replace `micro_price_weighted` with a per-symbol learned
-  lookup table over (imbalance decile × spread decile).
-  Training runs offline in the backtester against recorded
-  event JSONL; production path loads the table at startup
-  and refreshes nightly. Effort: 1 week.
-- **BVC trade classification** (Easley-Lopez de Prado 2012).
-  Cheap port for the venues that don't expose `isBuyerMaker`
-  reliably. Effort: 1-2 days.
-- **Cartea adverse-selection closed form** in
-  Avellaneda reservation. Currently we use VPIN /
-  Kyle's Lambda to widen spread; the production form is the
-  closed-form additive term in Cartea-Jaimungal ch.10.
-  Effort: 3-5 days.
+**What shipped.**
+- `mm-strategy::cks_ofi::OfiTracker` — Cont-Kukanov-Stoikov
+  2014 L1 order-flow-imbalance process. Auto-seeds on first
+  update; six branches for `(bid/ask) × (up/unchanged/down)`.
+- `mm-strategy::learned_microprice::LearnedMicroprice` —
+  Stoikov 2018 G-function histogram fit with under-sampled
+  bucket clamping and a two-pass spread-bucket path.
+- `mm-risk::toxicity::BvcClassifier` + `VpinEstimator::on_bvc_bar`
+  — Easley-de Prado-O'Hara 2012 BVC volume classification
+  via Student-t CDF (regularized incomplete beta in f64).
+  Tick-rule and BVC paths coexist.
+- `mm-strategy::cartea_spread::quoted_half_spread` — CJP
+  2015 ch.4 §4.3 eq. 4.20 closed-form spread with the
+  `(1 − 2ρ)·σ·√(T−t)` adverse-selection term. New
+  pure-`Decimal` `decimal_ln` helper.
+- `MomentumSignals::with_ofi()` + `with_learned_microprice(model)`
+  builder hooks; `alpha()` rebalances component weights
+  dynamically.
+- `AvellanedaStoikov::compute_quotes` reads
+  `StrategyContext.as_prob` and applies the Cartea additive
+  term. `MarketMakerEngine::refresh_quotes` threads the
+  existing `AdverseSelectionTracker` measurement through
+  `cartea_spread::as_prob_from_bps` into the strategy.
+- New `OfiFeatureSnapshot` / `AsSpreadWidened` audit event
+  types.
 
-**Effort.** 3-5 weeks total.
+**Stage-1 scope split.** The Cartea AS path is fully wired
+and live (engine → strategy → quoted spread). The OFI and
+learned-MP consumers are wired into `MomentumSignals` as
+opt-in builder knobs but not yet attached at the engine's
+default `MomentumSignals::new(...).with_hma(...)` site —
+operators enable per config in stage-2.
 
-**Pre-conditions.** None.
+**Stage-2 follow-ups (tracked as next epic):**
+
+- `LearnedMicroprice::from_toml` / `to_toml` + offline
+  `mm-learned-microprice-fit` CLI binary (v1 ships the
+  in-memory core only).
+- Engine-side default attachment of OFI + learned-MP to
+  `MomentumSignals` via a `MarketMakerConfig` knob.
+- GLFT integration of the Cartea AS spread component
+  (currently only Avellaneda-Stoikov consumes it).
+- Per-side asymmetric `ρ_b` / `ρ_a` for the AS spread.
+- Stoikov 2018 iterative fixed-point fit as an upgrade
+  from the v1 histogram fit if sparse buckets surface.
+- Online streaming learned-MP fit (operationally heavier
+  than the offline CLI path).
+- ADF lag selection via AIC for BVC stationarity.
+
+**Pre-conditions (satisfied).** None — Epic D is purely
+additive against wave-1.
 
 ### Epic E — Execution infra polish (P2, ~2 weeks)
 
@@ -329,7 +354,7 @@ place since v0.2.0 Sprint G).
 | A — Cross-venue SOR | P1 | ~1 mo | none | ✅ stage-1 closed Apr 2026 |
 | B — Stat-arb pairs | P1 | ~1 mo | Epic C (per-strat PnL) | ✅ stage-1 closed Apr 2026 |
 | C — Portfolio risk view | P1 | ~3 wk | per-strat PnL | ✅ stage-1 closed Apr 2026 |
-| D — Signal wave 2 | P1 | ~1 mo | none | tighter spreads on liquid pairs |
+| D — Signal wave 2 | P1 | ~1 mo | none | ✅ stage-1 closed Apr 2026 |
 | E — Execution polish | P2 | ~2 wk | none | tail latency, Coinbase Prime |
 | F — Defensive layer | P2 | ~3 wk | cross-venue bundle | adverse-selection survival |
 

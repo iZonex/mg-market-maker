@@ -133,6 +133,7 @@ fn test_all_strategies_produce_valid_quotes() {
             hedge_book: None,
             borrow_cost_bps: None,
             hedge_book_age_ms: None,
+            as_prob: None,
         };
 
         let quotes = strategy.compute_quotes(&ctx);
@@ -196,6 +197,7 @@ fn test_inventory_skew_direction() {
         hedge_book: None,
         borrow_cost_bps: None,
         hedge_book_age_ms: None,
+        as_prob: None,
     };
     let q_neutral = strategy.compute_quotes(&ctx_neutral);
     let neutral_ask = q_neutral[0].ask.as_ref().unwrap().price;
@@ -215,6 +217,7 @@ fn test_inventory_skew_direction() {
         hedge_book: None,
         borrow_cost_bps: None,
         hedge_book_age_ms: None,
+        as_prob: None,
     };
     let q_long = strategy.compute_quotes(&ctx_long);
     let long_ask = q_long[0].ask.as_ref().unwrap().price;
@@ -245,6 +248,7 @@ fn test_inventory_skew_direction() {
         hedge_book: None,
         borrow_cost_bps: None,
         hedge_book_age_ms: None,
+        as_prob: None,
     };
     let q_short = strategy.compute_quotes(&ctx_short);
     let short_ask = q_short[0].ask.as_ref().unwrap().price;

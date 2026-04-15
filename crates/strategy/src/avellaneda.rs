@@ -60,6 +60,23 @@ impl Strategy for AvellanedaStoikov {
         let min_spread = bps_to_frac(ctx.config.min_spread_bps) * ctx.mid_price;
         let spread = spread.max(min_spread);
 
+        // Epic D sub-component #4 — Cartea adverse-selection
+        // closed-form spread widening (CJP 2015 ch.4 §4.3 eq.
+        // 4.20). When `ctx.as_prob` is `Some(ρ)`, add
+        // `(1 − 2ρ) · σ · √(T − t)` to the spread. ρ > 0.5
+        // (informed flow) produces a negative additive →
+        // spread shrinks (MM retreats); ρ < 0.5 (uninformed
+        // flow) produces positive additive → spread widens.
+        // Final value is re-clamped at the `min_spread_bps`
+        // floor so ρ close to 1 can never produce a
+        // sub-minimum quote.
+        let spread = if let Some(rho) = ctx.as_prob {
+            let as_delta = (dec!(1) - dec!(2) * rho) * sigma * crate::volatility::decimal_sqrt(t);
+            (spread + as_delta).max(min_spread)
+        } else {
+            spread
+        };
+
         // Apply maximum distance.
         let max_distance = bps_to_frac(ctx.config.max_distance_bps) * ctx.mid_price;
 
@@ -237,6 +254,7 @@ mod tests {
             hedge_book: None,
             borrow_cost_bps: None,
             hedge_book_age_ms: None,
+            as_prob: None,
         };
 
         let strategy = AvellanedaStoikov;
@@ -285,6 +303,7 @@ mod tests {
             hedge_book: None,
             borrow_cost_bps: None,
             hedge_book_age_ms: None,
+            as_prob: None,
         };
 
         let strategy = AvellanedaStoikov;
@@ -338,6 +357,7 @@ mod tests {
             hedge_book: None,
             borrow_cost_bps: None,
             hedge_book_age_ms: None,
+            as_prob: None,
         };
         let ctx_on = StrategyContext {
             book: &book,
@@ -351,6 +371,7 @@ mod tests {
             hedge_book: None,
             borrow_cost_bps: Some(dec!(10)),
             hedge_book_age_ms: None,
+            as_prob: None,
         };
         let strategy = AvellanedaStoikov;
         let q_off = &strategy.compute_quotes(&ctx_off)[0];
@@ -384,5 +405,125 @@ mod tests {
         let result = decimal_ln(dec!(2));
         // ln(2) ≈ 0.6931
         assert!((result - dec!(0.6931)).abs() < dec!(0.001));
+    }
+
+    // --- Epic D sub-component #4 — Cartea AS widening ---
+
+    /// Helper: build a simple `StrategyContext` with a
+    /// configurable `as_prob`, holding everything else fixed.
+    fn ctx_with_as_prob<'a>(
+        book: &'a mm_common::orderbook::LocalOrderBook,
+        product: &'a ProductSpec,
+        config: &'a MarketMakerConfig,
+        as_prob: Option<Decimal>,
+    ) -> StrategyContext<'a> {
+        let mid = book.mid_price().unwrap();
+        StrategyContext {
+            book,
+            product,
+            config,
+            inventory: dec!(0),
+            volatility: dec!(0.02),
+            time_remaining: dec!(1),
+            mid_price: mid,
+            ref_price: None,
+            hedge_book: None,
+            borrow_cost_bps: None,
+            hedge_book_age_ms: None,
+            as_prob,
+        }
+    }
+
+    fn seeded_book() -> mm_common::orderbook::LocalOrderBook {
+        let mut b = mm_common::orderbook::LocalOrderBook::new("BTCUSDT".into());
+        b.apply_snapshot(
+            vec![mm_common::PriceLevel {
+                price: dec!(50000),
+                qty: dec!(1),
+            }],
+            vec![mm_common::PriceLevel {
+                price: dec!(50001),
+                qty: dec!(1),
+            }],
+            1,
+        );
+        b
+    }
+
+    #[test]
+    fn as_prob_none_is_byte_identical_to_pre_epic_d() {
+        let product = test_product();
+        let config = test_config();
+        let book = seeded_book();
+        // `None` and `Some(0.5)` should both reduce to the
+        // wave-1 formula (the AS additive collapses to zero).
+        let ctx_none = ctx_with_as_prob(&book, &product, &config, None);
+        let ctx_neutral = ctx_with_as_prob(&book, &product, &config, Some(dec!(0.5)));
+        let strategy = AvellanedaStoikov;
+        let q_none = &strategy.compute_quotes(&ctx_none)[0];
+        let q_neutral = &strategy.compute_quotes(&ctx_neutral)[0];
+        assert_eq!(
+            q_none.bid.as_ref().unwrap().price,
+            q_neutral.bid.as_ref().unwrap().price
+        );
+        assert_eq!(
+            q_none.ask.as_ref().unwrap().price,
+            q_neutral.ask.as_ref().unwrap().price
+        );
+    }
+
+    #[test]
+    fn as_prob_low_widens_the_spread() {
+        // ρ = 0 → maximal widening.
+        let product = test_product();
+        let config = test_config();
+        let book = seeded_book();
+        let ctx_neutral = ctx_with_as_prob(&book, &product, &config, Some(dec!(0.5)));
+        let ctx_wide = ctx_with_as_prob(&book, &product, &config, Some(dec!(0)));
+        let strategy = AvellanedaStoikov;
+        let q_n = &strategy.compute_quotes(&ctx_neutral)[0];
+        let q_w = &strategy.compute_quotes(&ctx_wide)[0];
+        let mid = book.mid_price().unwrap();
+        let spread_neutral = q_n.ask.as_ref().unwrap().price - q_n.bid.as_ref().unwrap().price;
+        let spread_wide = q_w.ask.as_ref().unwrap().price - q_w.bid.as_ref().unwrap().price;
+        assert!(
+            spread_wide > spread_neutral,
+            "ρ=0 should widen the spread: neutral={spread_neutral}, wide={spread_wide}"
+        );
+        // Sanity: the widening is centered — both sides moved
+        // by roughly the same amount.
+        let ask_shift = q_w.ask.as_ref().unwrap().price - q_n.ask.as_ref().unwrap().price;
+        let bid_shift = q_n.bid.as_ref().unwrap().price - q_w.bid.as_ref().unwrap().price;
+        assert!(ask_shift > dec!(0));
+        assert!(bid_shift > dec!(0));
+        // Ensure mid didn't run away.
+        let _ = mid;
+    }
+
+    #[test]
+    fn as_prob_high_shrinks_the_spread_toward_min() {
+        // ρ = 1 → maximal narrowing. Floor is min_spread.
+        let product = test_product();
+        let config = test_config();
+        let book = seeded_book();
+        let ctx_neutral = ctx_with_as_prob(&book, &product, &config, Some(dec!(0.5)));
+        let ctx_narrow = ctx_with_as_prob(&book, &product, &config, Some(dec!(1)));
+        let strategy = AvellanedaStoikov;
+        let q_n = &strategy.compute_quotes(&ctx_neutral)[0];
+        let q_t = &strategy.compute_quotes(&ctx_narrow)[0];
+        let spread_neutral = q_n.ask.as_ref().unwrap().price - q_n.bid.as_ref().unwrap().price;
+        let spread_narrow = q_t.ask.as_ref().unwrap().price - q_t.bid.as_ref().unwrap().price;
+        assert!(
+            spread_narrow <= spread_neutral,
+            "ρ=1 should narrow or match: neutral={spread_neutral}, narrow={spread_narrow}"
+        );
+        // Floor invariant: never below `min_spread_bps` (modulo
+        // tick rounding).
+        let mid = book.mid_price().unwrap();
+        let min_spread = bps_to_frac(config.min_spread_bps) * mid;
+        assert!(
+            spread_narrow + dec!(0.02) >= min_spread,
+            "spread must respect the min_spread_bps floor"
+        );
     }
 }

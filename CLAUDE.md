@@ -4,7 +4,7 @@ Production-grade market maker for the custom exchange at `../exchange/` with mul
 
 ## Stats
 
-**18 crates, 149 files, ~48K lines Rust, 800 tests**
+**18 crates, 152 files, ~49K lines Rust, 866 tests**
 
 ## Architecture
 
@@ -44,7 +44,10 @@ strategy/              Strategies + signals + execution:
   ├── paired_unwind    L4 kill-switch flatten for paired basis/funding positions
   ├── exec_algo        ExecAlgorithm trait + TWAP/VWAP/POV/Iceberg impls
   ├── features         Microstructure feature extractors (imbalance, trade flow, …)
-  ├── momentum         Alpha signals (book imbalance, trade flow, micro-price)
+  ├── cks_ofi          Cont-Kukanov-Stoikov L1 OFI tracker (Epic D)
+  ├── learned_microprice Stoikov 2018 G-function histogram fit (Epic D)
+  ├── cartea_spread    Cartea AS closed-form spread + decimal_ln helper (Epic D)
+  ├── momentum         Alpha signals (book imbalance, trade flow, micro-price, OFI, learned MP)
   ├── twap             Time-weighted execution for single-leg inventory unwinding
   ├── autotune         Regime detection + toxicity-based parameter adjustment
   ├── market_resilience Event-driven shock detector + recovery score (MR)
@@ -92,7 +95,7 @@ persistence/         State management:
 
 ```bash
 cargo build                    # build all
-cargo test                     # 800 tests
+cargo test                     # 866 tests
 cargo clippy --all-targets -- -D warnings
 cargo run -p mm-server         # run live
 MM_MODE=paper cargo run -p mm-server   # paper trading

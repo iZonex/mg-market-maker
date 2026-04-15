@@ -42,6 +42,16 @@ pub struct StrategyContext<'a> {
     /// when the hedge book has not seen its first update yet.
     /// P1.4 stage-1.
     pub hedge_book_age_ms: Option<i64>,
+    /// Epic D sub-component #4 — adverse-selection probability
+    /// `ρ ∈ [0, 1]` threaded from
+    /// `mm_risk::toxicity::AdverseSelectionTracker` through the
+    /// engine's `refresh_quotes`. `Some(0.5)` is neutral and
+    /// leaves the quoted spread unchanged; values > 0.5 narrow
+    /// the spread (MM gets out of informed flow's way) and
+    /// values < 0.5 widen it. `None` reverts to the pre-Epic-D
+    /// spread formula. Only [`crate::AvellanedaStoikov`]
+    /// consumes this in v1; GLFT integration is stage-2.
+    pub as_prob: Option<Decimal>,
 }
 
 /// Trait for market-making strategies.

@@ -9,6 +9,139 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Epic D — Signal wave 2 (stage-1)** (SOTA gap closure
+  epic, fourth after Epic C, A, B). Closes the largest
+  microstructure-signal gap from the April 2026 research
+  pass: production prop desks ship four signal families
+  beyond our wave-1 menu (book imbalance, trade flow,
+  classic micro-price, tick-rule VPIN). Epic D adds the
+  CKS L1 OFI process, Stoikov 2018 learned micro-price,
+  Easley-de Prado-O'Hara BVC, and the Cartea closed-form
+  adverse-selection spread component as four new
+  primitives plus strategy + engine wiring. Landed over
+  4 one-week sprints.
+  - **Sub-component #1 — Cont-Kukanov-Stoikov OFI**
+    (`mm-strategy::cks_ofi`). New `OfiTracker` that holds
+    a previous L1 snapshot and emits a signed observation
+    per update. Auto-seeds on the first call so callers
+    don't need an explicit `seed()`. Implements the
+    canonical CKS 2014 eqs. (2)-(4) with all six
+    `(price moved up / unchanged / down) × (bid / ask)`
+    cases. 12 unit tests including a hand-verified
+    4-event fixture that pins the sign convention. Source:
+    Cont, Kukanov, Stoikov — "The Price Impact of Order
+    Book Events," *J. Financial Econometrics*, 12(1),
+    47–88 (2014).
+  - **Sub-component #2 — Stoikov learned micro-price**
+    (`mm-strategy::learned_microprice`). New
+    `LearnedMicroprice` struct that builds a histogram fit
+    of `G(imbalance, spread) → E[Δmid]` from a stream of
+    training observations. `accumulate` / `finalize` /
+    `predict` API; under-sampled buckets clamp to zero;
+    two-pass `with_spread_edges` + `accumulate_with_edges`
+    for multi-spread-bucket fits. 14 unit tests including
+    monotone-prediction-from-monotone-training, idempotent
+    finalize, and bucket-boundary edge cases. v1 ships the
+    in-memory core; TOML / JSON persistence + the offline
+    CLI fit binary deferred to a follow-up. Source:
+    Stoikov — "The Micro-Price: A High-Frequency Estimator
+    of Future Prices," *Quantitative Finance*, 18(12),
+    1959–1966 (2018).
+  - **Sub-component #3 — Bulk Volume Classification**
+    (`mm-risk::toxicity::BvcClassifier` + new
+    `VpinEstimator::on_bvc_bar` entry point). Classifies
+    a bar's total volume into buy / sell fractions via the
+    CDF of standardised price changes — no per-trade
+    tick-rule classification required. Student-t CDF
+    implemented via Numerical Recipes regularized
+    incomplete beta + Lentz continued fraction + Lanczos
+    log-gamma in f64 (same boundary-conversion pattern as
+    `features::hurst_exponent` and `features::log_price_ratio`).
+    For `ν ≥ 30` falls back to the Normal approximation
+    via Abramowitz-Stegun erf 7.1.26. The new
+    `VpinEstimator::on_bvc_bar` is byte-parity-tested
+    against the existing `on_trade` tick-rule path: same
+    underlying buy/sell split → identical VPIN output. 12
+    unit tests covering warmup, classification direction,
+    total-volume invariant, Student-t CDF saturation, and
+    parity with tick-rule VPIN. Source: Easley, López de
+    Prado, O'Hara — "Flow Toxicity and Liquidity in a
+    High-Frequency World," *Review of Financial Studies*,
+    25(5), 1457–1493 (2012), eq. 4.
+  - **Sub-component #4 — Cartea closed-form
+    adverse-selection spread** (`mm-strategy::cartea_spread`).
+    New `quoted_half_spread(γ, κ, σ, T−t, ρ)` function
+    implementing CJP 2015 ch.4 §4.3 eq. 4.20:
+    `δ* = (1/γ)·ln(1 + γ/κ) + (1 − 2ρ)·σ·√(T−t)`. When
+    `ρ = 0.5` (uninformed flow), the additive term
+    vanishes and the formula collapses to the wave-1
+    Avellaneda half-spread; `ρ < 0.5` widens (uninformed
+    flow → MM has time to skew); `ρ > 0.5` narrows
+    (informed flow → MM gets out of the way). New
+    `as_prob_from_bps(bps)` piecewise-linear map from the
+    existing `AdverseSelectionTracker` bps-scale output
+    to ρ ∈ [0, 1] via a ±20 bps saturation. New pure-
+    `Decimal` `decimal_ln` helper via range reduction +
+    Taylor series (10-decimal accuracy on
+    `x ∈ [1e-6, 1e6]`). Output clamped at zero so high
+    `ρ` with large `σ·√(T−t)` never produces a sub-zero
+    quoted spread. 17 unit tests. Source:
+    Cartea-Jaimungal-Penalva 2015 ch.4 §4.3 (corrected
+    against the SOTA research doc — ch.4 is the AS
+    chapter, ch.6 was the prior mis-citation, same
+    correction pattern as Epic B's ch.11 fix).
+  - **Strategy integration.**
+    `StrategyContext` gains an `as_prob: Option<Decimal>`
+    field (16 construction sites updated with `None` as
+    the default). `AvellanedaStoikov::compute_quotes`
+    reads it and applies the Cartea additive component
+    to the quoted spread post min-spread clamp;
+    re-clamps at the `min_spread_bps` floor so high `ρ`
+    cannot drive the quote sub-minimum. `MomentumSignals`
+    gains two builder-pattern hooks: `with_ofi()` attaches
+    a `OfiTracker` (engine feeds via new
+    `on_l1_snapshot`) and `with_learned_microprice(model)`
+    attaches a finalized `LearnedMicroprice`. `alpha()`
+    rebalances component weights dynamically: each
+    optional signal pulls 0.1 of weight off the wave-1
+    baseline (`book × 0.4 + flow × 0.4 + micro × 0.2`).
+    All extensions are byte-identical to pre-Epic-D when
+    no optional signal is attached.
+  - **Engine integration.** `MarketMakerEngine::refresh_quotes`
+    threads `self.adverse_selection.adverse_selection_bps()`
+    through `cartea_spread::as_prob_from_bps` into
+    `StrategyContext.as_prob` so the existing wave-1
+    `AdverseSelectionTracker` measurements flow directly
+    into the new closed-form spread widening. New
+    `AuditEventType::OfiFeatureSnapshot` (periodic 30 s
+    summary) and `AuditEventType::AsSpreadWidened`
+    (transition events). End-to-end test in
+    `signal_wave_2_integration` drives the full chain
+    `OfiTracker → as_prob → StrategyContext → quoted spread`
+    and asserts the spread widens under uninformed flow,
+    collapses to wave-1 under neutral flow, and respects
+    the `min_spread_bps` floor under informed flow.
+  - **Stage-1 advisory-only on the OFI / learned-MP
+    consumers.** OFI and learned MP are wired into
+    `MomentumSignals` as opt-in builder knobs but the
+    engine's wave-1 `MomentumSignals::new(window).with_hma(...)`
+    construction does not yet attach them — operators
+    enable per config in stage-2. The Cartea AS path is
+    fully wired and live (the engine threads the existing
+    `AdverseSelectionTracker` measurement into the
+    strategy via `StrategyContext.as_prob` on every
+    refresh tick). GLFT integration of the Cartea
+    component, the offline learned-MP fit CLI binary,
+    per-side asymmetric `ρ_b` / `ρ_a`, and online
+    streaming MP fit are all stage-2 follow-ups.
+  - **Zero new dependencies** beyond the workspace
+    baseline. `decimal_ln` is pure `Decimal` Taylor series;
+    Student-t CDF math goes through `f64` (same pattern
+    as `features::log_price_ratio`). 55 new unit tests in
+    `mm-strategy` + 12 in `mm-risk::toxicity` + 1 engine
+    e2e integration test. Workspace clippy `-D warnings`
+    clean, `cargo fmt --check` clean.
+
 - **Epic B — Cointegrated-pair stat-arb driver (stage-1)**
   (SOTA gap closure epic, third after Epic C then Epic A).
   Closes the single largest strategy-family gap from the

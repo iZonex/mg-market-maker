@@ -100,6 +100,7 @@ fn bench_avellaneda(c: &mut Criterion) {
                 hedge_book: None,
                 borrow_cost_bps: None,
                 hedge_book_age_ms: None,
+                as_prob: None,
             };
             black_box(strategy.compute_quotes(&ctx))
         })
@@ -127,6 +128,7 @@ fn bench_glft(c: &mut Criterion) {
                 hedge_book: None,
                 borrow_cost_bps: None,
                 hedge_book_age_ms: None,
+                as_prob: None,
             };
             black_box(strategy.compute_quotes(&ctx))
         })
@@ -154,6 +156,7 @@ fn bench_grid(c: &mut Criterion) {
                 hedge_book: None,
                 borrow_cost_bps: None,
                 hedge_book_age_ms: None,
+                as_prob: None,
             };
             black_box(strategy.compute_quotes(&ctx))
         })

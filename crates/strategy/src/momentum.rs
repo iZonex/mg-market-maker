@@ -1,3 +1,5 @@
+use crate::cks_ofi::OfiTracker;
+use crate::learned_microprice::LearnedMicroprice;
 use mm_common::orderbook::LocalOrderBook;
 use mm_common::types::{Price, Side, Trade};
 use mm_indicators::Hma;
@@ -11,6 +13,10 @@ use tracing::debug;
 /// lag of ~3 samples on mid-price updates.
 pub const DEFAULT_HMA_WINDOW: usize = 9;
 
+/// Default EWMA smoothing applied to CKS OFI observations when
+/// they fold into `alpha()`. Half-life of ~10 events.
+const OFI_EWMA_ALPHA: Decimal = dec!(0.07);
+
 /// Momentum / alpha signals for quote adjustment.
 ///
 /// Short-term price predictability from:
@@ -19,6 +25,10 @@ pub const DEFAULT_HMA_WINDOW: usize = 9;
 /// 3. Micro-price (improved mid estimate)
 /// 4. Hull Moving Average slope on mid-price (optional,
 ///    opt-in via `with_hma`)
+/// 5. Cont-Kukanov-Stoikov L1 OFI (optional, opt-in via
+///    `with_ofi`). Epic D sub-component #1.
+/// 6. Stoikov 2018 learned-microprice drift (optional, opt-in
+///    via `with_learned_microprice`). Epic D sub-component #2.
 ///
 /// The output is an `alpha` value (expected price change direction)
 /// that shifts the reservation price per Cartea-Jaimungal:
@@ -36,6 +46,19 @@ pub struct MomentumSignals {
     /// update. Used to compute the HMA slope as
     /// `(now - prev) / mid`.
     hma_prev: Option<Decimal>,
+    /// Optional CKS OFI tracker. When attached, the engine
+    /// feeds top-of-book snapshots via
+    /// [`MomentumSignals::on_l1_snapshot`] and `alpha()` folds
+    /// the EWMA of emitted OFI observations.
+    ofi: Option<OfiTracker>,
+    /// EWMA state for OFI contributions. Maintained in
+    /// lockstep with `ofi` — reset to `None` when `with_ofi`
+    /// is re-called.
+    ofi_ewma: Option<Decimal>,
+    /// Optional learned-microprice model. When attached,
+    /// `alpha()` folds `(mp_learned − mid) / mid` as a
+    /// micro-price drift component.
+    learned_mp: Option<LearnedMicroprice>,
 }
 
 impl MomentumSignals {
@@ -45,6 +68,9 @@ impl MomentumSignals {
             window,
             hma: None,
             hma_prev: None,
+            ofi: None,
+            ofi_ewma: None,
+            learned_mp: None,
         }
     }
 
@@ -56,6 +82,63 @@ impl MomentumSignals {
     pub fn with_hma(mut self, window: usize) -> Self {
         self.hma = Some(Hma::new(window));
         self
+    }
+
+    /// Attach a Cont-Kukanov-Stoikov OFI tracker (Epic D
+    /// sub-component #1). The engine feeds new L1 snapshots via
+    /// [`MomentumSignals::on_l1_snapshot`]; emitted observations
+    /// are EWMA-smoothed and the result folds into
+    /// `alpha()` as an additional predictive component.
+    pub fn with_ofi(mut self) -> Self {
+        self.ofi = Some(OfiTracker::new());
+        self.ofi_ewma = None;
+        self
+    }
+
+    /// Attach a Stoikov 2018 learned micro-price model (Epic D
+    /// sub-component #2). The model must already be `finalize`d;
+    /// `alpha()` reads `predict(imbalance, spread)` on every
+    /// call and folds the drift-to-mid ratio.
+    pub fn with_learned_microprice(mut self, model: LearnedMicroprice) -> Self {
+        self.learned_mp = Some(model);
+        self
+    }
+
+    /// Feed a top-of-book L1 snapshot into the optional OFI
+    /// tracker. No-op when [`with_ofi`] has not been called.
+    /// Callers should invoke this on every book update so the
+    /// tracker sees the full event stream.
+    pub fn on_l1_snapshot(
+        &mut self,
+        bid_px: Decimal,
+        bid_qty: Decimal,
+        ask_px: Decimal,
+        ask_qty: Decimal,
+    ) {
+        let Some(tracker) = self.ofi.as_mut() else {
+            return;
+        };
+        if let Some(obs) = tracker.update(bid_px, bid_qty, ask_px, ask_qty) {
+            // Normalise by average depth so the EWMA stays
+            // dimensionless — a 10-qty arrival on a BTC book
+            // should not swamp a 0.1-qty arrival on an SOL book.
+            let depth = bid_qty + ask_qty;
+            let normalised = if depth.is_zero() {
+                Decimal::ZERO
+            } else {
+                obs / depth
+            };
+            self.ofi_ewma = Some(match self.ofi_ewma {
+                None => normalised,
+                Some(prev) => OFI_EWMA_ALPHA * normalised + (dec!(1) - OFI_EWMA_ALPHA) * prev,
+            });
+        }
+    }
+
+    /// Current smoothed OFI, `None` when `with_ofi` is off or
+    /// before the first observation has landed.
+    pub fn ofi_ewma(&self) -> Option<Decimal> {
+        self.ofi_ewma
     }
 
     /// Feed a mid-price update into the optional HMA stream.
@@ -132,59 +215,105 @@ impl MomentumSignals {
     /// Positive = expected up-move, negative = expected down-move.
     ///
     /// The alpha is in terms of fraction of mid-price.
+    ///
+    /// Component weights rebalance dynamically based on which
+    /// optional signals are attached. Wave-1 components
+    /// (imbalance, flow, microprice) always contribute; HMA,
+    /// OFI, and learned micro-price shave fixed fractions off
+    /// the wave-1 weights when attached. The raw alpha is kept
+    /// in `[-1, 1]` and then scaled by `0.0001` so a full-
+    /// saturation signal produces at most 1 bps of mid-price
+    /// shift.
     pub fn alpha(&self, book: &LocalOrderBook, mid: Price) -> Decimal {
         if mid.is_zero() {
             return dec!(0);
         }
 
-        // Component 1: Book imbalance (weight 0.4 when HMA is
-        // absent, 0.3 when present).
+        // Wave-1 components.
         let book_imb = Self::book_imbalance(book, 5);
-
-        // Component 2: Trade flow (same weights as component 1).
         let flow_imb = self.trade_flow_imbalance();
-
-        // Component 3: Micro-price deviation (weight 0.2 both
-        // ways).
         let micro_dev = Self::micro_price(book)
             .map(|mp| (mp - mid) / mid)
             .unwrap_or(dec!(0));
 
-        // Component 4: HMA slope (weight 0.2, only when the
-        // HMA is attached AND warmed up; otherwise the slope
-        // component is skipped and the other weights revert
-        // to the 0.4 / 0.4 / 0.2 split).
+        // Wave-1 optional: HMA slope.
         let hma_slope = self.hma_slope(mid);
 
-        let alpha = match hma_slope {
-            Some(slope) => {
-                book_imb * dec!(0.3)
-                    + flow_imb * dec!(0.3)
-                    + micro_dev * dec!(0.2)
-                    // HMA slope is already a fraction of mid —
-                    // keep it on the same scale as micro_dev.
-                    // Clip to [-1, 1] so a wild HMA swing
-                    // cannot single-handedly blow the alpha
-                    // past the saturation cap below.
-                    + slope.max(dec!(-1)).min(dec!(1)) * dec!(0.2)
-            }
-            None => book_imb * dec!(0.4) + flow_imb * dec!(0.4) + micro_dev * dec!(0.2),
-        };
+        // Wave-2 optional components (Epic D sub-components #1 + #2).
+        let ofi_component = self.ofi_ewma;
+        let learned_mp_dev = self.learned_microprice_drift(book, mid);
 
-        // Scale: raw alpha is in [-1, 1], scale to a small fraction of price.
-        // This determines how aggressive the momentum adjustment is.
-        let scaled = alpha * dec!(0.0001); // 1 bps max shift per unit of signal.
+        // Dynamically balance weights. The rule: wave-1
+        // baseline is 0.4 / 0.4 / 0.2 (book / flow / micro).
+        // Each optional signal that is attached pulls
+        // 0.1 of aggregate weight off the wave-1 baseline.
+        // The remaining 0.1 allocation rebalances across the
+        // wave-1 components proportionally.
+        let hma_on = hma_slope.is_some();
+        let ofi_on = ofi_component.is_some();
+        let lmp_on = learned_mp_dev.is_some();
+        let optional_count = u32::from(hma_on) + u32::from(ofi_on) + u32::from(lmp_on);
+        let optional_weight = Decimal::from(optional_count) * dec!(0.1);
+        let wave1_scale = dec!(1) - optional_weight;
+
+        let mut alpha =
+            (book_imb * dec!(0.4) + flow_imb * dec!(0.4) + micro_dev * dec!(0.2)) * wave1_scale;
+
+        if let Some(slope) = hma_slope {
+            alpha += slope.max(dec!(-1)).min(dec!(1)) * dec!(0.1);
+        }
+        if let Some(ofi) = ofi_component {
+            alpha += ofi.max(dec!(-1)).min(dec!(1)) * dec!(0.1);
+        }
+        if let Some(lmp) = learned_mp_dev {
+            alpha += lmp.max(dec!(-1)).min(dec!(1)) * dec!(0.1);
+        }
+
+        // Scale: raw alpha is in [-1, 1], scale to a small
+        // fraction of price. This determines how aggressive
+        // the momentum adjustment is.
+        let scaled = alpha * dec!(0.0001);
 
         debug!(
             book_imbalance = %book_imb,
             trade_flow = %flow_imb,
             micro_dev = %micro_dev,
             hma_slope = ?hma_slope,
+            ofi = ?ofi_component,
+            learned_mp = ?learned_mp_dev,
             alpha = %scaled,
             "momentum signals"
         );
 
         scaled
+    }
+
+    /// Learned-microprice drift relative to the current mid,
+    /// as a fraction of mid. Returns `None` when no model is
+    /// attached or the model hasn't been finalized yet.
+    fn learned_microprice_drift(&self, book: &LocalOrderBook, mid: Price) -> Option<Decimal> {
+        let model = self.learned_mp.as_ref()?;
+        if !model.is_finalized() || mid.is_zero() {
+            return None;
+        }
+        // Compute the L1 imbalance + spread on the fly from
+        // the local book so callers don't have to maintain a
+        // parallel feature-extraction path.
+        let bid_px = book.best_bid()?;
+        let ask_px = book.best_ask()?;
+        let bid_qty = *book.bids.get(&bid_px)?;
+        let ask_qty = *book.asks.get(&ask_px)?;
+        let total = bid_qty + ask_qty;
+        if total.is_zero() {
+            return None;
+        }
+        let imbalance = (bid_qty - ask_qty) / total;
+        let spread = ask_px - bid_px;
+        let predicted_delta = model.predict(imbalance, spread);
+        if predicted_delta.is_zero() {
+            return None;
+        }
+        Some(predicted_delta / mid)
     }
 }
 
@@ -337,5 +466,157 @@ mod tests {
         // direct comparison is a sanity check: neither should
         // be zero, and neither should be NaN-like.
         assert!(base_alpha > dec!(0));
+    }
+
+    // ------ Epic D sub-component #1 + #2 — OFI + learned MP ------
+
+    fn balanced_book() -> LocalOrderBook {
+        let mut b = LocalOrderBook::new("BTCUSDT".into());
+        b.apply_snapshot(
+            vec![PriceLevel {
+                price: dec!(100),
+                qty: dec!(10),
+            }],
+            vec![PriceLevel {
+                price: dec!(101),
+                qty: dec!(10),
+            }],
+            1,
+        );
+        b
+    }
+
+    #[test]
+    fn ofi_is_none_by_default() {
+        let m = MomentumSignals::new(20);
+        assert!(m.ofi_ewma().is_none());
+    }
+
+    #[test]
+    fn with_ofi_then_l1_snapshots_populate_ewma() {
+        let mut m = MomentumSignals::new(20).with_ofi();
+        // Seed.
+        m.on_l1_snapshot(dec!(99), dec!(10), dec!(101), dec!(10));
+        assert!(m.ofi_ewma().is_none(), "first snapshot only seeds");
+        // Aggressive bid arrival → positive OFI.
+        m.on_l1_snapshot(dec!(100), dec!(10), dec!(101), dec!(10));
+        let ewma = m.ofi_ewma().expect("EWMA populated");
+        assert!(ewma > dec!(0), "positive OFI expected, got {ewma}");
+    }
+
+    #[test]
+    fn ofi_stream_emits_positive_ewma_on_growing_bid_depth() {
+        // Run a stream of monotonically growing bid depth at
+        // a fixed touch — every event contributes a strictly
+        // positive bid delta, so the EWMA accumulates upward.
+        let mut m = MomentumSignals::new(20).with_ofi();
+        m.on_l1_snapshot(dec!(99), dec!(10), dec!(101), dec!(10));
+        for n in 1..=20 {
+            let bid_qty = dec!(10) + Decimal::from(n);
+            m.on_l1_snapshot(dec!(99), bid_qty, dec!(101), dec!(10));
+        }
+        let ewma = m.ofi_ewma().expect("EWMA populated");
+        assert!(ewma > dec!(0), "expected positive smoothed OFI, got {ewma}");
+    }
+
+    #[test]
+    fn ofi_alpha_tilts_versus_baseline() {
+        // Direct alpha comparison: balanced book → baseline = 0.
+        // Attach OFI + feed positive depth growth → alpha tilts up.
+        let book = balanced_book();
+        let mid = book.mid_price().unwrap();
+        let base = MomentumSignals::new(20).alpha(&book, mid);
+        assert_eq!(base, dec!(0));
+
+        let mut m = MomentumSignals::new(20).with_ofi();
+        m.on_l1_snapshot(dec!(99), dec!(10), dec!(101), dec!(10));
+        for n in 1..=20 {
+            m.on_l1_snapshot(dec!(99), dec!(10) + Decimal::from(n), dec!(101), dec!(10));
+        }
+        let ofi_alpha = m.alpha(&book, mid);
+        assert!(
+            ofi_alpha > dec!(0),
+            "OFI-attached alpha should be positive, got {ofi_alpha}"
+        );
+    }
+
+    #[test]
+    fn learned_mp_is_none_until_attached_and_finalized() {
+        let book = balanced_book();
+        let mid = book.mid_price().unwrap();
+        let m = MomentumSignals::new(20);
+        // No model attached → drift is None.
+        assert!(m.learned_microprice_drift(&book, mid).is_none());
+
+        // Attach an unfinalized model → still None.
+        let model = crate::learned_microprice::LearnedMicroprice::empty(
+            crate::learned_microprice::LearnedMicropriceConfig::default(),
+        );
+        let m2 = MomentumSignals::new(20).with_learned_microprice(model);
+        assert!(m2.learned_microprice_drift(&book, mid).is_none());
+    }
+
+    #[test]
+    fn learned_mp_finalized_with_zero_buckets_returns_none() {
+        let book = balanced_book();
+        let mid = book.mid_price().unwrap();
+        // A fresh `empty` + `finalize` model has zero in
+        // every bucket → predict returns 0 → drift is None.
+        let mut model = crate::learned_microprice::LearnedMicroprice::empty(
+            crate::learned_microprice::LearnedMicropriceConfig::default(),
+        );
+        model.finalize();
+        let m = MomentumSignals::new(20).with_learned_microprice(model);
+        assert!(m.learned_microprice_drift(&book, mid).is_none());
+    }
+
+    #[test]
+    fn learned_mp_negative_prediction_pulls_alpha_below_baseline() {
+        // Train a model so the high-imbalance bucket predicts
+        // a *negative* Δmid (mean-reversion). On a bid-heavy
+        // book, the wave-1 components want to push alpha up;
+        // the LMP component pushes it back down. Net: the
+        // LMP-attached alpha should be strictly less than the
+        // baseline.
+        let cfg = crate::learned_microprice::LearnedMicropriceConfig {
+            n_imbalance_buckets: 4,
+            n_spread_buckets: 1,
+            min_bucket_samples: 2,
+        };
+        let mut model = crate::learned_microprice::LearnedMicroprice::empty(cfg);
+        for _ in 0..5 {
+            // Big magnitude → enough drift to overcome the
+            // wave-1-weight reduction from attaching one
+            // optional signal.
+            model.accumulate(dec!(0.9), dec!(1), dec!(-50));
+        }
+        model.finalize();
+
+        let mut tilted = LocalOrderBook::new("BTCUSDT".into());
+        tilted.apply_snapshot(
+            vec![PriceLevel {
+                price: dec!(100),
+                qty: dec!(50),
+            }],
+            vec![PriceLevel {
+                price: dec!(101),
+                qty: dec!(2),
+            }],
+            1,
+        );
+        let mid = tilted.mid_price().unwrap();
+
+        let base = MomentumSignals::new(20).alpha(&tilted, mid);
+        let withlmp = MomentumSignals::new(20).with_learned_microprice(model);
+        let lmp_alpha = withlmp.alpha(&tilted, mid);
+        assert!(
+            base > dec!(0),
+            "baseline should be positive on bid-heavy book"
+        );
+        assert!(
+            lmp_alpha < base,
+            "LMP-attached alpha should be pulled below baseline by negative prediction: \
+             base={base}, lmp={lmp_alpha}"
+        );
     }
 }

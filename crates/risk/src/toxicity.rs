@@ -1,4 +1,5 @@
 use mm_common::types::{Side, Trade};
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::VecDeque;
@@ -90,6 +91,336 @@ impl VpinEstimator {
     pub fn is_toxic(&self, threshold: Decimal) -> bool {
         self.vpin().map(|v| v > threshold).unwrap_or(false)
     }
+
+    /// Epic D sub-component #3 — Bulk Volume Classification
+    /// entry point. Feeds *already-classified* buy / sell
+    /// volumes directly into the bucketiser, bypassing the
+    /// per-trade tick-rule path in [`Self::on_trade`].
+    ///
+    /// Operators pick the classification path per config:
+    /// `on_trade` retains the classic Lee-Ready tick rule via
+    /// `Trade::taker_side`; `on_bvc_bar` accepts the
+    /// CDF-classified output from [`BvcClassifier::classify`].
+    /// Both paths coexist and produce the same
+    /// `vpin()` output shape — only the classification step
+    /// upstream differs.
+    pub fn on_bvc_bar(&mut self, buy_vol: Decimal, sell_vol: Decimal) {
+        let total = buy_vol + sell_vol;
+        self.current_buy_vol += buy_vol;
+        self.current_sell_vol += sell_vol;
+        self.current_total_vol += total;
+
+        while self.current_total_vol >= self.bucket_size {
+            let overflow = self.current_total_vol - self.bucket_size;
+            let imbalance = (self.current_buy_vol - self.current_sell_vol).abs();
+            self.buckets.push_back((imbalance, self.bucket_size));
+            if self.buckets.len() > self.num_buckets {
+                self.buckets.pop_front();
+            }
+            // Carry overflow into next bucket, proportionally
+            // to the current buy/sell split.
+            if self.current_total_vol > dec!(0) {
+                let buy_ratio = self.current_buy_vol / self.current_total_vol;
+                self.current_buy_vol = overflow * buy_ratio;
+                self.current_sell_vol = overflow * (dec!(1) - buy_ratio);
+            } else {
+                self.current_buy_vol = dec!(0);
+                self.current_sell_vol = dec!(0);
+            }
+            self.current_total_vol = overflow;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Epic D sub-component #3 — Bulk Volume Classification
+// ---------------------------------------------------------------------------
+
+/// Easley-López de Prado-O'Hara 2012 Bulk Volume Classification.
+///
+/// Splits a bar's total traded volume into *buy* and *sell*
+/// fractions based on the bar's price change — no trade-level
+/// tick-rule classification required. The split uses the
+/// Student-t CDF of the standardised price change:
+///
+/// ```text
+/// V_buy  = V · CDF_ν((ΔP − μ) / σ)
+/// V_sell = V − V_buy
+/// ```
+///
+/// Source: Easley, D., López de Prado, M., O'Hara, M. —
+/// "Flow Toxicity and Liquidity in a High-Frequency World,"
+/// *Review of Financial Studies*, 25(5), 1457–1493 (2012),
+/// eq. 4.
+///
+/// v1 default `ν = 0.25` matches the source paper on
+/// S&P E-minis. Crypto's heavier tails may warrant tuning —
+/// operators override in config per venue.
+pub struct BvcClassifier {
+    nu: Decimal,
+    window: VecDeque<Decimal>,
+    window_size: usize,
+    sum: Decimal,
+    sum_sq: Decimal,
+}
+
+impl BvcClassifier {
+    /// New classifier with Student-t degrees of freedom `nu`
+    /// and rolling-window size `window_size` for the mean/std
+    /// of bar price changes.
+    pub fn new(nu: Decimal, window_size: usize) -> Self {
+        assert!(window_size >= 2, "window_size must be >= 2");
+        assert!(nu > Decimal::ZERO, "nu must be positive");
+        Self {
+            nu,
+            window: VecDeque::with_capacity(window_size),
+            window_size,
+            sum: Decimal::ZERO,
+            sum_sq: Decimal::ZERO,
+        }
+    }
+
+    /// Classify one bar's total volume into `(buy, sell)`
+    /// fractions. Returns `None` during warmup (window <
+    /// 10 samples) or when the rolling std is zero (no
+    /// signal). After warmup the caller feeds the split
+    /// directly into [`VpinEstimator::on_bvc_bar`].
+    pub fn classify(&mut self, bar_dp: Decimal, bar_volume: Decimal) -> Option<(Decimal, Decimal)> {
+        self.push(bar_dp);
+        if self.window.len() < 10 {
+            return None;
+        }
+        let mean = self.mean()?;
+        let std = self.std()?;
+        if std.is_zero() {
+            return None;
+        }
+        let z = (bar_dp - mean) / std;
+        let cdf_z = student_t_cdf(z, self.nu);
+        let buy = bar_volume * cdf_z;
+        let sell = bar_volume - buy;
+        Some((buy, sell))
+    }
+
+    /// Rolling mean of `bar_dp`, `None` during warmup.
+    pub fn rolling_mean(&self) -> Option<Decimal> {
+        self.mean()
+    }
+
+    /// Rolling std of `bar_dp`, `None` during warmup.
+    pub fn rolling_std(&self) -> Option<Decimal> {
+        self.std()
+    }
+
+    fn push(&mut self, dp: Decimal) {
+        if self.window.len() == self.window_size {
+            let evicted = self.window.pop_front().expect("len == window_size");
+            self.sum -= evicted;
+            self.sum_sq -= evicted * evicted;
+        }
+        self.window.push_back(dp);
+        self.sum += dp;
+        self.sum_sq += dp * dp;
+    }
+
+    fn mean(&self) -> Option<Decimal> {
+        if self.window.is_empty() {
+            return None;
+        }
+        Some(self.sum / Decimal::from(self.window.len()))
+    }
+
+    fn std(&self) -> Option<Decimal> {
+        let n = self.window.len();
+        if n < 2 {
+            return None;
+        }
+        let mean = self.mean()?;
+        let n_dec = Decimal::from(n);
+        let ss = self.sum_sq - n_dec * mean * mean;
+        if ss <= Decimal::ZERO {
+            return Some(Decimal::ZERO);
+        }
+        let var = ss / (n_dec - Decimal::ONE);
+        Some(decimal_sqrt_newton(var))
+    }
+}
+
+/// Newton's method sqrt for `Decimal`. Local copy to keep
+/// `mm-risk::toxicity` free of cross-module helper
+/// dependencies (same pattern as `var_guard`'s local copy).
+fn decimal_sqrt_newton(x: Decimal) -> Decimal {
+    if x <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    let mut guess = x / dec!(2);
+    if guess.is_zero() {
+        guess = dec!(1);
+    }
+    for _ in 0..30 {
+        let next = (guess + x / guess) / dec!(2);
+        if (next - guess).abs() < dec!(0.0000000001) {
+            return next;
+        }
+        guess = next;
+    }
+    guess
+}
+
+/// Student-t CDF. Delegates to f64 internally via the
+/// regularized incomplete beta function — same boundary-
+/// conversion pattern as `features::log_price_ratio` and
+/// `features::hurst_exponent`. Transcendentals (ln, pow, exp)
+/// have no closed-form `Decimal` implementation, so this is
+/// the canonical escape hatch.
+///
+/// For `ν ≥ 30` we fall back to the Normal approximation
+/// (Abramowitz-Stegun erf 7.1.26). For smaller `ν` we use
+/// the identity
+///
+/// ```text
+/// CDF_ν(z) = 1 − (1/2) · I_x(ν/2, 1/2)    for z > 0
+/// ```
+///
+/// with `x = ν / (ν + z²)`, symmetric for `z < 0`.
+pub fn student_t_cdf(z: Decimal, nu: Decimal) -> Decimal {
+    let z_f = z.to_f64().unwrap_or(0.0);
+    let nu_f = nu.to_f64().unwrap_or(1.0);
+    let p = student_t_cdf_f64(z_f, nu_f);
+    Decimal::from_f64(p).unwrap_or(dec!(0.5))
+}
+
+fn student_t_cdf_f64(z: f64, nu: f64) -> f64 {
+    if !z.is_finite() || !nu.is_finite() || nu <= 0.0 {
+        return 0.5;
+    }
+    if nu >= 30.0 {
+        return normal_cdf(z);
+    }
+    if z.abs() < 1e-15 {
+        return 0.5;
+    }
+    let x = nu / (nu + z * z);
+    let ibeta = regularized_incomplete_beta(x, nu / 2.0, 0.5);
+    if z > 0.0 {
+        1.0 - 0.5 * ibeta
+    } else {
+        0.5 * ibeta
+    }
+}
+
+fn normal_cdf(z: f64) -> f64 {
+    0.5 * (1.0 + erf_as(z / std::f64::consts::SQRT_2))
+}
+
+/// Abramowitz-Stegun 7.1.26 erf approximation, max error
+/// ≈ 1.5e-7 on all of `ℝ`.
+fn erf_as(x: f64) -> f64 {
+    const A1: f64 = 0.254_829_592;
+    const A2: f64 = -0.284_496_736;
+    const A3: f64 = 1.421_413_741;
+    const A4: f64 = -1.453_152_027;
+    const A5: f64 = 1.061_405_429;
+    const P: f64 = 0.327_591_1;
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let ax = x.abs();
+    let t = 1.0 / (1.0 + P * ax);
+    let y = 1.0 - (((((A5 * t + A4) * t) + A3) * t + A2) * t + A1) * t * (-ax * ax).exp();
+    sign * y
+}
+
+/// Regularized incomplete beta function `I_x(a, b)` via the
+/// Numerical Recipes in C §6.4 continued fraction. ~10
+/// decimal places of accuracy for `a, b > 0` and
+/// `x ∈ [0, 1]`. Uses the `I_x(a,b) = 1 − I_{1−x}(b,a)`
+/// symmetry to pick the branch where the continued fraction
+/// converges fastest.
+fn regularized_incomplete_beta(x: f64, a: f64, b: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+    let bt = (ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b) + a * x.ln() + b * (1.0 - x).ln()).exp();
+    if x < (a + 1.0) / (a + b + 2.0) {
+        bt * betacf(x, a, b) / a
+    } else {
+        1.0 - bt * betacf(1.0 - x, b, a) / b
+    }
+}
+
+/// Lentz's method continued-fraction expansion of the
+/// regularized incomplete beta. From Numerical Recipes in C
+/// §6.4 "betacf".
+fn betacf(x: f64, a: f64, b: f64) -> f64 {
+    const MAX_ITER: usize = 200;
+    const EPS: f64 = 3e-7;
+    const TINY: f64 = 1e-30;
+    let qab = a + b;
+    let qap = a + 1.0;
+    let qam = a - 1.0;
+    let mut c = 1.0;
+    let mut d = 1.0 - qab * x / qap;
+    if d.abs() < TINY {
+        d = TINY;
+    }
+    d = 1.0 / d;
+    let mut h = d;
+    for m in 1..=MAX_ITER {
+        let m_f = m as f64;
+        let m2 = 2.0 * m_f;
+        let aa1 = m_f * (b - m_f) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa1 * d;
+        if d.abs() < TINY {
+            d = TINY;
+        }
+        c = 1.0 + aa1 / c;
+        if c.abs() < TINY {
+            c = TINY;
+        }
+        d = 1.0 / d;
+        h *= d * c;
+        let aa2 = -(a + m_f) * (qab + m_f) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa2 * d;
+        if d.abs() < TINY {
+            d = TINY;
+        }
+        c = 1.0 + aa2 / c;
+        if c.abs() < TINY {
+            c = TINY;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        if (del - 1.0).abs() < EPS {
+            return h;
+        }
+    }
+    h
+}
+
+/// Lanczos approximation to log-gamma, good to ~12 decimals
+/// for `x > 0`. From Numerical Recipes in C §6.1 "gammln".
+fn ln_gamma(x: f64) -> f64 {
+    const COEF: [f64; 6] = [
+        76.180_091_729_471_46,
+        -86.505_320_329_416_77,
+        24.014_098_240_830_91,
+        -1.231_739_572_450_155,
+        0.001_208_650_973_866_179,
+        -0.000_005_395_239_384_953,
+    ];
+    let y = x;
+    let mut xx = x;
+    let tmp = xx + 5.5;
+    let tmp = (xx + 0.5) * tmp.ln() - tmp;
+    let mut ser = 1.000_000_000_190_015;
+    for c in &COEF {
+        xx += 1.0;
+        ser += c / xx;
+    }
+    tmp + (2.506_628_274_631 * ser / y).ln()
 }
 
 /// Kyle's Lambda — price impact estimator.
@@ -302,5 +633,163 @@ mod tests {
         }
         let lambda = kl.lambda().unwrap();
         assert!(lambda > dec!(0), "lambda should be positive");
+    }
+
+    // ---------------------------------------------------------------
+    // Epic D sub-component #3 — BVC classifier + VPIN on_bvc_bar
+    // ---------------------------------------------------------------
+
+    fn approx(a: Decimal, b: Decimal, eps: Decimal) -> bool {
+        (a - b).abs() < eps
+    }
+
+    #[test]
+    fn bvc_warmup_returns_none() {
+        let mut b = BvcClassifier::new(dec!(0.25), 50);
+        // Fewer than 10 observations → None.
+        for i in 0..5 {
+            let res = b.classify(Decimal::from(i), dec!(100));
+            assert!(res.is_none(), "warmup i={i}");
+        }
+    }
+
+    #[test]
+    fn bvc_zero_variance_window_returns_none() {
+        let mut b = BvcClassifier::new(dec!(0.25), 50);
+        // All bars identical → zero std → None.
+        for _ in 0..15 {
+            let res = b.classify(dec!(1), dec!(100));
+            assert!(res.is_none());
+        }
+    }
+
+    #[test]
+    fn bvc_positive_price_change_classifies_majority_buy() {
+        let mut b = BvcClassifier::new(dec!(0.25), 50);
+        // Warm up the window with mean-zero dp.
+        for i in 0..20 {
+            let dp = if i % 2 == 0 { dec!(-1) } else { dec!(1) };
+            let _ = b.classify(dp, dec!(100));
+        }
+        // Now feed a strongly positive dp — should land in
+        // the right tail of the Student-t, producing
+        // majority buy.
+        let (buy, sell) = b.classify(dec!(5), dec!(100)).expect("warmup done");
+        assert!(buy > sell, "buy={buy} sell={sell}");
+        assert!(approx(buy + sell, dec!(100), dec!(0.0001)));
+    }
+
+    #[test]
+    fn bvc_negative_price_change_classifies_majority_sell() {
+        let mut b = BvcClassifier::new(dec!(0.25), 50);
+        for i in 0..20 {
+            let dp = if i % 2 == 0 { dec!(-1) } else { dec!(1) };
+            let _ = b.classify(dp, dec!(100));
+        }
+        let (buy, sell) = b.classify(dec!(-5), dec!(100)).expect("warmup done");
+        assert!(sell > buy, "buy={buy} sell={sell}");
+        assert!(approx(buy + sell, dec!(100), dec!(0.0001)));
+    }
+
+    #[test]
+    fn bvc_total_volume_invariant() {
+        let mut b = BvcClassifier::new(dec!(0.25), 50);
+        for i in 0..15 {
+            let dp = Decimal::from(i as i64 % 5 - 2);
+            if let Some((buy, sell)) = b.classify(dp, dec!(200)) {
+                assert!(
+                    approx(buy + sell, dec!(200), dec!(0.0001)),
+                    "buy+sell != 200 (buy={buy}, sell={sell})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn student_t_cdf_at_zero_is_half_for_any_nu() {
+        assert!(approx(
+            student_t_cdf(dec!(0), dec!(0.25)),
+            dec!(0.5),
+            dec!(0.0001)
+        ));
+        assert!(approx(
+            student_t_cdf(dec!(0), dec!(3)),
+            dec!(0.5),
+            dec!(0.0001)
+        ));
+        assert!(approx(
+            student_t_cdf(dec!(0), dec!(30)),
+            dec!(0.5),
+            dec!(0.0001)
+        ));
+    }
+
+    #[test]
+    fn student_t_cdf_saturates_in_tails() {
+        // Very large positive z → ~1, very large negative → ~0.
+        let high = student_t_cdf(dec!(1000), dec!(5));
+        let low = student_t_cdf(dec!(-1000), dec!(5));
+        assert!(high > dec!(0.99));
+        assert!(low < dec!(0.01));
+    }
+
+    #[test]
+    fn student_t_cdf_large_nu_matches_normal() {
+        // At ν = 30+, the Student-t CDF collapses to Normal.
+        // CDF(1.0) for Normal ≈ 0.8413.
+        let v = student_t_cdf(dec!(1), dec!(50));
+        assert!(
+            approx(v, dec!(0.8413), dec!(0.001)),
+            "Φ(1) ≈ 0.8413, got {v}"
+        );
+    }
+
+    #[test]
+    fn on_bvc_bar_produces_same_vpin_shape_as_on_trade() {
+        // Feed two VpinEstimators the same underlying
+        // buy/sell split — one via the tick-rule path, one
+        // via the BVC bar path. VPIN outputs should be
+        // byte-identical.
+        let mut vpin_tick = VpinEstimator::new(dec!(1000), 10);
+        let mut vpin_bvc = VpinEstimator::new(dec!(1000), 10);
+
+        for _ in 0..100 {
+            // 60 qty @ 100 buy + 40 qty @ 100 sell per iteration
+            // → 60/100 buy-share.
+            vpin_tick.on_trade(&trade("100", "6", Side::Buy));
+            vpin_tick.on_trade(&trade("100", "4", Side::Sell));
+
+            // Same split via BVC path: 600 quote buy + 400 quote sell.
+            vpin_bvc.on_bvc_bar(dec!(600), dec!(400));
+        }
+
+        let v_tick = vpin_tick.vpin();
+        let v_bvc = vpin_bvc.vpin();
+        assert_eq!(v_tick, v_bvc);
+    }
+
+    #[test]
+    fn bvc_classifier_rolling_mean_and_std_accessors() {
+        let mut b = BvcClassifier::new(dec!(0.25), 10);
+        for i in 1..=5 {
+            b.classify(Decimal::from(i), dec!(100));
+        }
+        let mean = b.rolling_mean().unwrap();
+        // Mean of 1..=5 is 3.
+        assert_eq!(mean, dec!(3));
+        let std = b.rolling_std().unwrap();
+        assert!(std > Decimal::ZERO);
+    }
+
+    #[test]
+    #[should_panic(expected = "window_size must be >= 2")]
+    fn bvc_panics_on_tiny_window() {
+        BvcClassifier::new(dec!(0.25), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "nu must be positive")]
+    fn bvc_panics_on_nonpositive_nu() {
+        BvcClassifier::new(Decimal::ZERO, 10);
     }
 }
