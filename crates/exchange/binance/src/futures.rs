@@ -626,6 +626,10 @@ impl ExchangeConnector for BinanceFuturesConnector {
         Ok(resp.status().is_success())
     }
 
+    async fn rate_limit_remaining(&self) -> u32 {
+        self.rate_limiter.remaining().await
+    }
+
     /// USDⓈ-M futures fee schedule via
     /// `GET /fapi/v1/commissionRate?symbol=`. Returns a single
     /// `{ makerCommissionRate, takerCommissionRate }` object that

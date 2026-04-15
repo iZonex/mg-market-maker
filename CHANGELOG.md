@@ -9,6 +9,144 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Epic A — Cross-venue Smart Order Router (stage-1)**
+  (SOTA gap closure epic, second after Epic C). Every
+  primitive a cost-aware cross-venue router needs was
+  already in the codebase — seven venue × product
+  connectors, live per-account fee tiers from P1.2, the
+  queue-position fill model from v0.4.0, `BalanceCache`
+  keyed on `(asset, WalletType)`. What was missing was
+  the coordinator that looks at them all together and
+  decides where to route a given fill. Epic A closes that
+  gap with four connected sub-components sharing one
+  `VenueStateAggregator`, one `VenueCostModel`, and one
+  `GreedyRouter`.
+  - **Prerequisite plumbing.** `ConnectorBundle` gains an
+    `extra: Vec<Arc<dyn ExchangeConnector>>` field plus a
+    `with_extra` builder so the SOR can route across
+    3+ venues (primary + optional hedge + `extra`). New
+    `all_connectors()` iterator walks every slot in a
+    deterministic order the aggregator relies on for
+    tie-breaking. Every existing call site gets a
+    default-empty `extra` vec, so single-connector and
+    dual-connector modes are byte-for-byte compatible.
+    New `ExchangeConnector::rate_limit_remaining() -> u32`
+    async trait method with a default `u32::MAX`
+    ("unlimited") — overridden on Binance spot, Binance
+    USDⓈ-M futures, Bybit V5, and HyperLiquid to
+    delegate to their existing `RateLimiter::remaining()`
+    accessor. The custom `mm-exchange-client` connector
+    inherits the default.
+  - **Sub-component #1 — Venue cost model**
+    (`mm-engine::sor::cost`). Pure function
+    `VenueCostModel::price(snapshot, side, urgency)`
+    emits a `RouteCost { venue, taker_cost_bps,
+    maker_cost_bps, effective_cost_bps }` in basis
+    points. v1 formula:
+    `effective = urgency · taker_fee_bps +
+    (1 − urgency) · (maker_fee_bps +
+    queue_wait_bps_per_sec · queue_wait_secs)`.
+    Negative `maker_fee_bps` (rebate) carries through
+    end-to-end so rebate venues legitimately produce
+    negative `effective_cost_bps` at low urgency.
+    Urgency is clamped to `[0, 1]` inside the function.
+    10 unit tests pin the zero / half / one urgency
+    boundaries, the rebate sign flow, the linear-in-
+    inputs scaling, the clamping, the side symmetry, and
+    the venue tag carry-through.
+  - **Sub-component #2 — Venue state aggregator**
+    (`mm-engine::sor::venue_state`). `VenueSnapshot`
+    pure data struct + `VenueSeed` per-venue config seed
+    + `VenueStateAggregator` that owns a
+    `HashMap<VenueId, VenueSeed>` and exposes
+    `register_venue(venue, seed)` /
+    `update_book(venue, bid, ask)` /
+    `update_queue_wait(venue, secs)` mutators plus an
+    async `collect(bundle, side) -> Vec<VenueSnapshot>`
+    walk path that pulls live
+    `rate_limit_remaining()` from every connector in
+    the bundle. The **"seed + optional runtime
+    refresh"** split keeps the aggregator testable as
+    pure data — `collect_synthetic(&[(venue,
+    remaining)])` is the sync variant the tests and the
+    engine-integration path drive. 9 unit tests cover
+    register idempotency, book / queue wait mutation
+    scope, deterministic venue iteration, synthetic
+    collect, mid-price averaging + zero guard, and the
+    `is_available()` gate.
+  - **Sub-component #3 — Greedy router**
+    (`mm-engine::sor::router`). `GreedyRouter::route(
+    side, qty, urgency, snapshots) -> RouteDecision`.
+    Algorithm: filter `is_available()` venues, price
+    each via the cost model, sort ascending by
+    `effective_cost_bps` with venue-ordinal tiebreaker
+    for determinism, greedy fill up to the target qty
+    with per-venue cap-or-remainder allocation. Emits a
+    `RouteDecision { target_side, target_qty,
+    filled_qty, is_complete, legs: Vec<RouteLeg> }`
+    where each leg carries `(venue, qty, is_taker,
+    expected_cost_bps)`. Taker/maker classification
+    uses a single `TAKER_THRESHOLD = 0.5` inclusive —
+    `urgency ≥ 0.5` marks every leg as a take.
+    Partial-fill semantics: an `is_complete = false`
+    decision still lists whatever legs did fill plus a
+    `filled_qty` below the target. 13 unit tests pin
+    zero-target → empty-complete, single-venue full
+    fill, two-venue cheaper-first, target-exceeds-single-
+    venue split, partial fill on insufficient universe,
+    unavailable / rate-limited venue filter, urgency
+    threshold classification, deterministic tiebreaker,
+    rebate venue winning over non-rebate, total cost
+    rollup, empty-snapshots incomplete decision, and a
+    property-style never-overfills invariant across
+    five random-ish scenarios.
+  - **Sub-component #4 — Engine hook + audit + metrics.**
+    `MarketMakerEngine` gains `sor_aggregator` +
+    `sor_router` fields initialised at construction
+    time. The primary venue is **auto-seeded** from
+    `self.product` inside `new()` — operators do not
+    need to call anything for the single-venue default
+    to work. New `with_sor_venue(venue, seed)` builder
+    lets the server add hedge-leg and any `extra`
+    venues before handing the engine to the run loop.
+    `async recommend_route(side, qty, urgency)
+    -> RouteDecision` is the public advisory API that
+    collects a live snapshot, runs the router,
+    publishes per-venue Prometheus gauges
+    (`mm_sor_route_cost_bps{venue}`,
+    `mm_sor_fill_attribution{venue}`), fires a
+    `RouteDecisionEmitted` audit event with the full
+    per-leg breakdown, and returns the decision.
+    **Does not dispatch** — Epic A is explicitly
+    advisory, stage-2 wires inline dispatch through an
+    `ExecAlgorithm`. 2 engine-level integration tests
+    pin the auto-seed path (single-venue full fill)
+    and the multi-venue split (cheap Bybit fills 3 of
+    5 units, remainder rolls to Binance).
+  - **Source attribution.** The v1 cost model is a
+    vanilla urgency-weighted blend of fee + queue wait.
+    No academic reference — the shape is from the
+    SOTA research doc's Axis 3 "cost-aware mix"
+    description of Hummingbot's `smart_order_placement`
+    flag, pinned to pure `Decimal` arithmetic without
+    new dependencies. The full formula transcription +
+    audit findings live in
+    `docs/sprints/epic-a-cross-venue-sor.md` Sprint
+    A-1 section.
+  - **Stage-2 follow-ups (tracked under ROADMAP Epic A).**
+    LP solver for the constrained quadratic variant
+    of the cost minimisation, inline dispatch via an
+    `ExecAlgorithm` (Epic A-stage-1 is strictly
+    advisory), real trade-rate estimator wired into
+    the queue-wait cost (v1 uses a fixed
+    `queue_wait_bps_per_sec` config constant), full
+    `B` matrix cross-beta routing across assets,
+    multi-symbol snapshot per venue, auto-refresh of
+    venue seeds from the P1.2 fee-tier refresh task,
+    server-side composition of a multi-venue
+    `ConnectorBundle` for the operator's production
+    config, stage-2 `mm-route` CLI dry-runner for
+    calibration.
 - **Epic C — Portfolio-level risk view** (ROADMAP SOTA gap
   closure epic, first of the six A–F candidates surfaced
   by the April 2026 desk-research pass in

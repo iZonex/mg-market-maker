@@ -154,6 +154,16 @@ pub enum AuditEventType {
     /// spammed on every refresh tick while the throttle is
     /// stable.
     VarGuardThrottleApplied,
+
+    // Epic A — Cross-venue Smart Order Router.
+    /// Smart Order Router produced a non-empty route
+    /// decision. `detail` carries the target side + qty +
+    /// the per-venue legs with their effective cost. Fires
+    /// inside [`MarketMakerEngine::recommend_route`] so
+    /// every advisory routing call leaves a breadcrumb in
+    /// the audit trail, even before stage-2 inline
+    /// dispatch lands.
+    RouteDecisionEmitted,
 }
 
 impl AuditLog {

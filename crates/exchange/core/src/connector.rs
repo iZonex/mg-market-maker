@@ -371,4 +371,26 @@ pub trait ExchangeConnector: Send + Sync {
 
     /// Health check.
     async fn health_check(&self) -> anyhow::Result<bool>;
+
+    // --- Routing ---
+
+    /// Remaining rate-limit budget in the venue's native
+    /// units (tokens / weights / requests-per-window). The
+    /// Smart Order Router (Epic A) queries this during
+    /// `VenueStateAggregator::collect` to decide whether a
+    /// candidate venue has headroom for another dispatch on
+    /// the current tick.
+    ///
+    /// Default `u32::MAX` means "unlimited" — connectors
+    /// that do not maintain a rate limiter inherit the
+    /// default and the SOR treats them as infinitely
+    /// available. Concrete connectors override with their
+    /// `RateLimiter::remaining().await` value.
+    ///
+    /// Async on purpose — the underlying `RateLimiter`
+    /// holds a `tokio::Mutex` so the remaining-token query
+    /// has to await the lock.
+    async fn rate_limit_remaining(&self) -> u32 {
+        u32::MAX
+    }
 }

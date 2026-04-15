@@ -125,6 +125,35 @@ pub static TAKER_FEE_BPS: Lazy<GaugeVec> = Lazy::new(|| {
     .unwrap()
 });
 
+// Smart Order Router (Epic A)
+
+/// Latest per-venue effective cost in basis points from the
+/// SOR. Pushed by the engine on every `recommend_route` call
+/// that produces a non-empty decision. Non-breaking — a
+/// quiet SOR leaves the gauge at its previous value.
+pub static SOR_ROUTE_COST_BPS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_sor_route_cost_bps",
+        "Smart Order Router per-venue effective cost in basis points",
+        &["venue"]
+    )
+    .unwrap()
+});
+
+/// Last-recommended per-venue fill attribution qty. The
+/// operator dashboard renders this alongside the
+/// hedge-basket recommendation so "we should route via
+/// Binance for 2 units and Bybit for 0.5 units" is visible
+/// at a glance.
+pub static SOR_FILL_ATTRIBUTION: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_sor_fill_attribution",
+        "Smart Order Router per-venue recommended fill quantity",
+        &["venue"]
+    )
+    .unwrap()
+});
+
 // Cross-venue basis (P1.4 stage-1)
 pub static CROSS_VENUE_BASIS_BPS: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge_vec!(
@@ -279,6 +308,8 @@ pub fn init() {
     let _ = &*BORROW_RATE_BPS_HOURLY;
     let _ = &*BORROW_CARRY_BPS;
     let _ = &*CROSS_VENUE_BASIS_BPS;
+    let _ = &*SOR_ROUTE_COST_BPS;
+    let _ = &*SOR_FILL_ATTRIBUTION;
     let _ = &*SLA_PRESENCE_PCT_24H;
     let _ = &*KILL_SWITCH_LEVEL;
     let _ = &*SLA_UPTIME;

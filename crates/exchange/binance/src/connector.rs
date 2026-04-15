@@ -547,6 +547,10 @@ impl ExchangeConnector for BinanceConnector {
         Ok(resp.status().is_success())
     }
 
+    async fn rate_limit_remaining(&self) -> u32 {
+        self.rate_limiter.remaining().await
+    }
+
     /// Per-account fee tier for `symbol` from
     /// `GET /sapi/v1/asset/tradeFee`. Binance returns either an
     /// array (one row per symbol) or a single object — the

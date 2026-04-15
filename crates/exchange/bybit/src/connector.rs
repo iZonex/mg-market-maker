@@ -631,6 +631,10 @@ impl ExchangeConnector for BybitConnector {
         let resp = self.client.get(&url).send().await?;
         Ok(resp.status().is_success())
     }
+
+    async fn rate_limit_remaining(&self) -> u32 {
+        self.rate_limiter.remaining().await
+    }
 }
 
 /// Parse the `result` payload of `GET /v5/account/fee-rate` into a

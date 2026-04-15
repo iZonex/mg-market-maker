@@ -850,6 +850,10 @@ impl ExchangeConnector for HyperLiquidConnector {
             }
         }
     }
+
+    async fn rate_limit_remaining(&self) -> u32 {
+        self.rate_limiter.remaining().await
+    }
 }
 
 fn parse_hl_levels(side: &Value) -> Vec<PriceLevel> {

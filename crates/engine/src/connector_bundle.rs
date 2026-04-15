@@ -21,6 +21,16 @@ pub struct ConnectorBundle {
     pub primary: Arc<dyn ExchangeConnector>,
     pub hedge: Option<Arc<dyn ExchangeConnector>>,
     pub pair: Option<InstrumentPair>,
+    /// Extra venues the SOR can route across beyond the
+    /// primary + hedge pair (Epic A). Defaults to an empty
+    /// vector for every existing call site, so
+    /// single-connector and dual-connector modes remain
+    /// byte-for-byte compatible. Adding a venue here does
+    /// **not** make it a quoting leg — only the primary
+    /// connector is used for `OrderManager::execute_diff`.
+    /// The extras are read-only references the router
+    /// pulls snapshots from during `recommend_route`.
+    pub extra: Vec<Arc<dyn ExchangeConnector>>,
 }
 
 impl ConnectorBundle {
@@ -31,6 +41,7 @@ impl ConnectorBundle {
             primary,
             hedge: None,
             pair: None,
+            extra: Vec::new(),
         }
     }
 
@@ -44,11 +55,30 @@ impl ConnectorBundle {
             primary,
             hedge: Some(hedge),
             pair: Some(pair),
+            extra: Vec::new(),
         }
+    }
+
+    /// Attach extra SOR-only venues. Builder-style so the
+    /// server can compose `ConnectorBundle::dual(...).with_extra(vec![...])`
+    /// at engine construction time. Epic A sub-component #2.
+    pub fn with_extra(mut self, extra: Vec<Arc<dyn ExchangeConnector>>) -> Self {
+        self.extra = extra;
+        self
     }
 
     pub fn is_dual(&self) -> bool {
         self.hedge.is_some()
+    }
+
+    /// Iterator over every connector the bundle carries —
+    /// primary first, then the optional hedge, then the
+    /// `extra` vec. Preserves the deterministic order the
+    /// SOR aggregator relies on for tie-breaking.
+    pub fn all_connectors(&self) -> impl Iterator<Item = &Arc<dyn ExchangeConnector>> {
+        std::iter::once(&self.primary)
+            .chain(self.hedge.iter())
+            .chain(self.extra.iter())
     }
 }
 

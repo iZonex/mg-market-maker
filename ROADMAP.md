@@ -36,7 +36,37 @@ single execution win and unlocks both XEMM and triangular arb,
 itself the fastest in $/eng-week, (d) D / E / F are
 incrementally additive once A-C land.
 
-### Epic A — Cross-venue Smart Order Router (P1, ~1 month)
+### Epic A — Cross-venue Smart Order Router ✅ CLOSED stage-1 (Apr 2026)
+
+**Status.** All 4 stage-1 sub-components shipped over 4
+one-week sprints (A-1 planning/study, A-2 cost model +
+venue state aggregator, A-3 greedy router + engine hook,
+A-4 audit + metrics + docs). Full breakdown in CHANGELOG
+`[Unreleased]` and in
+`docs/sprints/epic-a-cross-venue-sor.md`.
+
+**Stage-2 follow-ups (tracked as next epic):**
+
+- LP solver for the constrained quadratic variant of
+  the cost minimisation (`good_lp` or `clarabel`)
+- Inline dispatch via an `ExecAlgorithm` — stage-1 is
+  strictly advisory, stage-2 adds auto-routing
+- Real trade-rate estimator wired into the queue-wait
+  cost (v1 uses a fixed `queue_wait_bps_per_sec`
+  constant)
+- Full `B` matrix cross-beta routing across assets
+  (diagonal-β only in v1)
+- Multi-symbol snapshot per venue (one symbol per
+  venue in v1)
+- Auto-refresh of venue seeds from the P1.2 fee-tier
+  refresh task
+- Server-side composition of a multi-venue
+  `ConnectorBundle` for operator's production config
+- `mm-route` CLI dry-runner for calibration
+
+---
+
+### Epic A — Cross-venue Smart Order Router (P1, ~1 month) — ORIGINAL SCOPE
 
 **Why.** Every venue connector is built (Binance spot+futures,
 Bybit spot/linear/inverse, HL spot+perp, custom) and every

@@ -68,6 +68,9 @@ use crate::connector_bundle::ConnectorBundle;
 use crate::order_id_map::OrderIdMap;
 use crate::order_manager::OrderManager;
 use crate::pair_lifecycle::{PairLifecycleEvent, PairLifecycleManager};
+use crate::sor::cost::VenueCostModel;
+use crate::sor::router::{GreedyRouter, RouteDecision};
+use crate::sor::venue_state::{VenueSeed, VenueStateAggregator};
 
 /// The main market-making engine for a single symbol.
 ///
@@ -153,6 +156,15 @@ pub struct MarketMakerEngine {
     /// Not acted on automatically — stage-2 dispatch via an
     /// `ExecAlgorithm` is tracked in ROADMAP.
     last_hedge_basket: HedgeBasket,
+    /// Epic A SOR venue-state aggregator. Seeded by the
+    /// engine at construction (one entry for the primary
+    /// connector's venue) plus any additional entries
+    /// operators add via `with_sor_venue`. Consumed by
+    /// [`Self::recommend_route`] on demand.
+    sor_aggregator: VenueStateAggregator,
+    /// Epic A SOR greedy router. Stateless; reused across
+    /// every `recommend_route` call.
+    sor_router: GreedyRouter,
     /// Tracks the last throttle value per strategy class so
     /// `VarGuardThrottleApplied` audit events fire only on
     /// **transitions** rather than every refresh tick while
@@ -330,6 +342,20 @@ impl MarketMakerEngine {
             },
             hedge_optimizer: HedgeOptimizer::new(dec!(1)),
             last_hedge_basket: HedgeBasket::default(),
+            sor_aggregator: {
+                let mut agg = VenueStateAggregator::new();
+                // Seed the primary venue from the engine's
+                // own product spec. Available qty defaults
+                // to the configured max-inventory cap so
+                // the router has a non-zero budget out of
+                // the box. Operators override via
+                // `with_sor_venue` when running against
+                // more than one venue.
+                let seed = VenueSeed::new(&symbol, product.clone(), config.risk.max_inventory);
+                agg.register_venue(connectors.primary.venue_id(), seed);
+                agg
+            },
+            sor_router: GreedyRouter::new(VenueCostModel::default_v1()),
             var_guard_last_throttle: None,
             var_guard_last_total_pnl: dec!(0),
             hedge_order_manager,
@@ -433,6 +459,110 @@ impl MarketMakerEngine {
     pub fn with_asset_class_switch(mut self, switch: Arc<Mutex<KillSwitch>>) -> Self {
         self.asset_class_switch = Some(switch);
         self
+    }
+
+    /// Register an additional venue for the Smart Order
+    /// Router (Epic A). The engine already seeds the
+    /// primary connector's venue automatically; use this
+    /// builder to add hedge-leg and any `extra` venues the
+    /// bundle carries so the SOR can route across them.
+    ///
+    /// Idempotent — re-registering the same venue
+    /// overwrites its seed. Stage-2 will refresh seeds
+    /// automatically from the fee-tier refresh path.
+    pub fn with_sor_venue(
+        mut self,
+        venue: mm_exchange_core::connector::VenueId,
+        seed: VenueSeed,
+    ) -> Self {
+        self.sor_aggregator.register_venue(venue, seed);
+        self
+    }
+
+    /// Advisory cross-venue routing recommendation
+    /// (Epic A). Collects a fresh snapshot from every
+    /// registered SOR venue, runs the greedy router, and
+    /// returns the decision. **Does not dispatch** — the
+    /// caller (operator, dashboard, stage-2 engine) owns
+    /// the decision.
+    ///
+    /// `urgency` is clamped to `[0, 1]` internally:
+    /// `0` = "post as maker, patient hedge", `1` = "take
+    /// against the book, crash out fast", `0.5` = balanced.
+    ///
+    /// Returns an empty decision when no venues are
+    /// registered — the engine's primary venue is seeded
+    /// automatically so this path is unreachable in
+    /// practice unless the operator manually cleared the
+    /// aggregator. Still guards against it for safety.
+    pub async fn recommend_route(
+        &self,
+        side: mm_common::types::Side,
+        qty: Decimal,
+        urgency: Decimal,
+    ) -> RouteDecision {
+        let snapshots = self.sor_aggregator.collect(&self.connectors, side).await;
+        let decision = self.sor_router.route(side, qty, urgency, &snapshots);
+        self.publish_route_decision(&decision);
+        decision
+    }
+
+    /// Push per-venue Prometheus gauges + fire the
+    /// `RouteDecisionEmitted` audit event for a freshly
+    /// produced [`RouteDecision`]. Split out from
+    /// `recommend_route` so the synthetic test path can
+    /// exercise the exact same publishing logic.
+    fn publish_route_decision(&self, decision: &RouteDecision) {
+        if decision.legs.is_empty() {
+            return;
+        }
+        for leg in &decision.legs {
+            let venue_label = format!("{:?}", leg.venue);
+            mm_dashboard::metrics::SOR_ROUTE_COST_BPS
+                .with_label_values(&[&venue_label])
+                .set(decimal_to_f64(leg.expected_cost_bps));
+            mm_dashboard::metrics::SOR_FILL_ATTRIBUTION
+                .with_label_values(&[&venue_label])
+                .set(decimal_to_f64(leg.qty));
+        }
+        let summary = decision
+            .legs
+            .iter()
+            .map(|l| format!("{:?}={}({:.2}bps)", l.venue, l.qty, l.expected_cost_bps))
+            .collect::<Vec<_>>()
+            .join(",");
+        let detail = format!(
+            "side={:?}, qty={}, filled={}, complete={}, legs=[{}]",
+            decision.target_side,
+            decision.target_qty,
+            decision.filled_qty,
+            decision.is_complete,
+            summary,
+        );
+        self.audit
+            .risk_event(&self.symbol, AuditEventType::RouteDecisionEmitted, &detail);
+    }
+
+    /// Test-only synchronous variant of `recommend_route`
+    /// that drives the router off pre-built synthetic
+    /// snapshots rather than querying the live connectors.
+    /// Used by the engine integration test to exercise the
+    /// full Portfolio → snapshot → router pipeline
+    /// without a tokio runtime. Fires the same
+    /// audit + metrics path as the async variant so the
+    /// publishing contract is covered by the same tests.
+    #[cfg(test)]
+    pub(crate) fn recommend_route_synthetic(
+        &self,
+        side: mm_common::types::Side,
+        qty: Decimal,
+        urgency: Decimal,
+        venues: &[(mm_exchange_core::connector::VenueId, u32)],
+    ) -> RouteDecision {
+        let snapshots = self.sor_aggregator.collect_synthetic(venues);
+        let decision = self.sor_router.route(side, qty, urgency, &snapshots);
+        self.publish_route_decision(&decision);
+        decision
     }
 
     /// Effective kill level for soft-decision purposes — the
@@ -2590,6 +2720,69 @@ mod paired_unwind_tests {
             .manual_trigger(KillLevel::WidenSpreads, "shared escalation");
         assert_eq!(engine_a.effective_kill_level(), KillLevel::WidenSpreads);
         assert_eq!(engine_b.effective_kill_level(), KillLevel::WidenSpreads);
+    }
+
+    /// Epic A engine integration: a single-connector engine
+    /// auto-seeds its primary venue into the SOR aggregator,
+    /// and `recommend_route_synthetic` produces a non-empty
+    /// decision that fills the full target on that venue.
+    /// Regression anchor for the "auto-seed primary" path so
+    /// a future refactor can't silently drop the
+    /// `register_venue` call in `new`.
+    ///
+    /// Default `config.risk.max_inventory = 0.1`, so the
+    /// test target stays well under that budget.
+    #[test]
+    fn recommend_route_auto_seeds_primary_venue() {
+        let engine = single_engine();
+        let decision = engine.recommend_route_synthetic(
+            Side::Buy,
+            dec!(0.05),
+            dec!(0.5),
+            &[(VenueId::Binance, 100)],
+        );
+        assert_eq!(decision.target_qty, dec!(0.05));
+        assert!(decision.is_complete);
+        assert_eq!(decision.legs.len(), 1);
+        assert_eq!(decision.legs[0].venue, VenueId::Binance);
+    }
+
+    /// A single-connector engine with a second SOR venue
+    /// registered via `with_sor_venue` routes a fill that
+    /// exceeds the cheap venue's capacity across both
+    /// venues in cost order. Pins the full chain:
+    /// engine → aggregator → cost model → greedy router →
+    /// decision.
+    #[test]
+    fn recommend_route_splits_across_multiple_sor_venues() {
+        // Cheap Bybit seed — taker fee 0.01 % (1 bps),
+        // 0.03 available (strictly less than the target
+        // below so the router has to roll the remainder to
+        // the more expensive Binance venue).
+        let mut cheap_product = sample_product("BTCUSDT");
+        cheap_product.maker_fee = dec!(0);
+        cheap_product.taker_fee = dec!(0.0001);
+        let cheap_seed = VenueSeed::new("BTCUSDT", cheap_product, dec!(0.03));
+
+        // Single-venue engine seeded with the primary
+        // (Binance) venue at the default sample fees; then
+        // add Bybit as a cheaper extra SOR venue.
+        let engine = single_engine().with_sor_venue(VenueId::Bybit, cheap_seed);
+
+        // Target 0.05 — Bybit (cheaper, 0.03 available)
+        // fills first, the 0.02 remainder rolls to Binance.
+        let decision = engine.recommend_route_synthetic(
+            Side::Buy,
+            dec!(0.05),
+            dec!(1), // full urgency → pure taker cost sort
+            &[(VenueId::Binance, 100), (VenueId::Bybit, 100)],
+        );
+        assert_eq!(decision.legs.len(), 2);
+        assert_eq!(decision.legs[0].venue, VenueId::Bybit);
+        assert_eq!(decision.legs[0].qty, dec!(0.03));
+        assert_eq!(decision.legs[1].venue, VenueId::Binance);
+        assert_eq!(decision.legs[1].qty, dec!(0.02));
+        assert!(decision.is_complete);
     }
 
     fn buy_fill(qty: Decimal, price: Decimal) -> MarketEvent {
