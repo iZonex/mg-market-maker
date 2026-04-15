@@ -885,6 +885,69 @@ pub struct FeatureVector {
     pub vol_ratio: Option<Decimal>,
 }
 
+// ---------------------------------------------------------------------------
+// Immediacy-weighted depth (rank-churn invariant)
+// ---------------------------------------------------------------------------
+
+/// Immediacy-weighted depth on the bid side:
+///
+/// `D_bid = Σ qty_i · 1 / (1 + d_i)²`, where
+/// `d_i = (best_bid - price_i) / spread` is the distance from the
+/// best bid in **spread units**.
+///
+/// Inner levels dominate the sum and outer levels fall off
+/// quadratically. Unlike a plain top-k qty sum, this metric is
+/// **invariant to rank churn**: when an inner level disappears
+/// and an outer level bubbles up, the top-k sum stays flat but
+/// immediacy-weighted depth drops because the surviving mass
+/// sits farther from the touch.
+///
+/// Used by the Market Resilience detector to track depth
+/// depletion and recovery. Returns `0` if the bid side is
+/// empty or `spread_basis` is non-positive.
+pub fn immediacy_depth_bid(bids: &[PriceLevel], spread_basis: Decimal) -> Decimal {
+    if bids.is_empty() || spread_basis <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    let best = bids[0].price;
+    let mut acc = Decimal::ZERO;
+    for level in bids {
+        let raw = best - level.price;
+        let d = if raw < Decimal::ZERO {
+            Decimal::ZERO
+        } else {
+            raw / spread_basis
+        };
+        let x = Decimal::ONE + d;
+        let w = Decimal::ONE / (x * x);
+        acc += level.qty * w;
+    }
+    acc
+}
+
+/// Immediacy-weighted depth on the ask side. Symmetric to
+/// [`immediacy_depth_bid`] — see that function for the formula
+/// and rationale.
+pub fn immediacy_depth_ask(asks: &[PriceLevel], spread_basis: Decimal) -> Decimal {
+    if asks.is_empty() || spread_basis <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    let best = asks[0].price;
+    let mut acc = Decimal::ZERO;
+    for level in asks {
+        let raw = level.price - best;
+        let d = if raw < Decimal::ZERO {
+            Decimal::ZERO
+        } else {
+            raw / spread_basis
+        };
+        let x = Decimal::ONE + d;
+        let w = Decimal::ONE / (x * x);
+        acc += level.qty * w;
+    }
+    acc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1586,5 +1649,53 @@ mod tests {
         w.on_trade(dec!(-5), Side::Sell);
         assert!(w.is_empty());
         assert!(w.value().is_none());
+    }
+
+    // ----- immediacy-weighted depth tests -----
+
+    #[test]
+    fn immediacy_depth_empty_side_is_zero() {
+        let empty: Vec<PriceLevel> = vec![];
+        assert_eq!(immediacy_depth_bid(&empty, dec!(1)), Decimal::ZERO);
+        assert_eq!(immediacy_depth_ask(&empty, dec!(1)), Decimal::ZERO);
+    }
+
+    #[test]
+    fn immediacy_depth_non_positive_spread_basis_is_zero() {
+        let bids = vec![bid(dec!(100), dec!(5))];
+        assert_eq!(immediacy_depth_bid(&bids, Decimal::ZERO), Decimal::ZERO);
+        assert_eq!(immediacy_depth_bid(&bids, dec!(-1)), Decimal::ZERO);
+    }
+
+    /// Rank-churn invariance: the metric must DROP when an
+    /// inner level is removed and an outer level of equal size
+    /// is revealed. A plain top-k sum would stay flat.
+    #[test]
+    fn immediacy_depth_penalises_rank_churn() {
+        let spread = dec!(1);
+        // Before: touch at 100, next level at 99.
+        let before = vec![bid(dec!(100), dec!(10)), bid(dec!(98), dec!(10))];
+        // After: inner level drained, an outer level at 97 is
+        // now visible. Same total qty, worse immediacy.
+        let after = vec![bid(dec!(100), dec!(10)), bid(dec!(97), dec!(10))];
+        let d_before = immediacy_depth_bid(&before, spread);
+        let d_after = immediacy_depth_bid(&after, spread);
+        assert!(
+            d_after < d_before,
+            "immediacy must fall when inner depth is replaced with outer depth: \
+             before={d_before}, after={d_after}"
+        );
+    }
+
+    /// Symmetric sanity: a mirror-symmetric book must produce
+    /// identical bid and ask immediacy.
+    #[test]
+    fn immediacy_depth_is_symmetric_on_mirrored_book() {
+        let spread = dec!(1);
+        let bids = vec![bid(dec!(100), dec!(5)), bid(dec!(99), dec!(8))];
+        let asks = vec![bid(dec!(101), dec!(5)), bid(dec!(102), dec!(8))];
+        let db = immediacy_depth_bid(&bids, spread);
+        let da = immediacy_depth_ask(&asks, spread);
+        assert_eq!(db, da);
     }
 }

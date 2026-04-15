@@ -138,6 +138,27 @@ impl InventoryManager {
         }
     }
 
+    /// Force-reset the tracked inventory to the given value
+    /// without touching the average entry price or realized
+    /// PnL fields. Used by the inventory drift reconciler
+    /// when `auto_correct = true` detects a mismatch against
+    /// the wallet balance — the correction is a last-resort
+    /// self-heal, not a normal code path.
+    ///
+    /// **Warning.** Because `avg_entry_price` / `realized_pnl`
+    /// are not adjusted, subsequent PnL attribution after a
+    /// forced reset should be treated as approximate until the
+    /// position is flat again. Operators should prefer
+    /// alert-only mode and manually intervene on drift.
+    pub fn force_reset_inventory_to(&mut self, new_inventory: Decimal) {
+        warn!(
+            old = %self.inventory,
+            new = %new_inventory,
+            "force-resetting tracked inventory (drift auto-correct)"
+        );
+        self.inventory = new_inventory;
+    }
+
     /// Apply inventory limits to quotes — scale down or remove quotes
     /// on the side that would increase inventory beyond limits.
     pub fn apply_limits(&self, quotes: &mut [QuotePair], config: &RiskConfig) {

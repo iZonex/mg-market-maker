@@ -59,15 +59,40 @@ pub struct BasisStrategy {
     /// strategy returns an empty quote set — safer to stand down
     /// than chase a dislocated book.
     pub max_basis_bps: Decimal,
+    /// Maximum acceptable hedge-book staleness in milliseconds.
+    /// `None` disables the gate (the legacy same-venue
+    /// behaviour); `Some(ms)` is the cross-venue mode where the
+    /// strategy stands down whenever
+    /// `StrategyContext.hedge_book_age_ms > ms`. Cross-venue
+    /// feeds have higher latency variance than same-venue ones,
+    /// so a stale hedge mid is a much louder failure mode.
+    /// P1.4 stage-1.
+    pub max_hedge_staleness_ms: Option<i64>,
 }
 
 impl BasisStrategy {
-    /// Create a basis strategy with the given shift and max-basis
-    /// threshold.
+    /// Create a same-venue basis strategy with the given shift
+    /// and max-basis threshold.
     pub fn new(shift: Decimal, max_basis_bps: Decimal) -> Self {
         Self {
             shift,
             max_basis_bps,
+            max_hedge_staleness_ms: None,
+        }
+    }
+
+    /// Create a cross-venue basis strategy. Identical to `new`
+    /// but with a non-zero hedge-book staleness gate. Production
+    /// cross-venue feeds (Coinbase spot ↔ Binance perp,
+    /// Binance spot ↔ Bybit perp) routinely jitter 200-800 ms;
+    /// the default 1500 ms gate stands down the strategy when
+    /// the hedge feed pauses long enough that the basis signal
+    /// becomes unreliable. P1.4 stage-1.
+    pub fn cross_venue(shift: Decimal, max_basis_bps: Decimal, max_staleness_ms: i64) -> Self {
+        Self {
+            shift,
+            max_basis_bps,
+            max_hedge_staleness_ms: Some(max_staleness_ms),
         }
     }
 
@@ -171,6 +196,32 @@ impl Strategy for BasisStrategy {
             return vec![];
         }
 
+        // Cross-venue staleness gate (P1.4 stage-1): when the
+        // strategy is configured with a non-None
+        // `max_hedge_staleness_ms`, stand down entirely if the
+        // hedge feed is older than the gate. Cross-venue feeds
+        // jitter much more than same-venue ones, and a stale
+        // reference price is a louder failure mode than a wide
+        // basis — better to skip a refresh than quote against a
+        // dead mid.
+        if let Some(gate) = self.max_hedge_staleness_ms {
+            let stale = match ctx.hedge_book_age_ms {
+                Some(age) => age > gate,
+                // No staleness reading at all (no hedge book yet)
+                // is also unsafe in cross-venue mode.
+                None => true,
+            };
+            if stale {
+                debug!(
+                    strategy = "basis",
+                    age_ms = ?ctx.hedge_book_age_ms,
+                    gate_ms = gate,
+                    "hedge book stale — quoting disabled"
+                );
+                return vec![];
+            }
+        }
+
         // Basis gate: |basis| > threshold → stand down entirely.
         let abs_basis_bps = self.basis_bps(spot_mid, ctx.ref_price).abs();
         if abs_basis_bps > self.max_basis_bps {
@@ -183,7 +234,17 @@ impl Strategy for BasisStrategy {
             return vec![];
         }
 
-        let reservation = self.reservation_price(spot_mid, ctx.ref_price);
+        let mut reservation = self.reservation_price(spot_mid, ctx.ref_price);
+        // P1.3 borrow-cost shim — same shape as Avellaneda. When
+        // the engine threads in `borrow_cost_bps`, push the
+        // basis-shifted reservation up by the carry surcharge so
+        // the spot ask side compensates for the loan we'd take
+        // to deliver against the fill.
+        if let Some(bps) = ctx.borrow_cost_bps {
+            if bps > dec!(0) {
+                reservation += bps_to_frac(bps) * spot_mid;
+            }
+        }
 
         // Symmetric post-only ladder around the reservation.
         // Each level is min_spread_bps wider than the previous.
@@ -268,6 +329,7 @@ mod tests {
             min_notional: dec!(10),
             maker_fee: dec!(0.0001),
             taker_fee: dec!(0.0005),
+            trading_status: Default::default(),
         }
     }
 
@@ -286,6 +348,25 @@ mod tests {
             momentum_enabled: false,
             momentum_window: 200,
             basis_shift: dec!(0.5),
+            market_resilience_enabled: true,
+            otr_enabled: true,
+            hma_enabled: true,
+            hma_window: 9,
+            user_stream_enabled: true,
+            inventory_drift_tolerance: dec!(0.0001),
+            inventory_drift_auto_correct: false,
+            amend_enabled: true,
+            amend_max_ticks: 2,
+            fee_tier_refresh_enabled: true,
+            fee_tier_refresh_secs: 600,
+            borrow_enabled: false,
+            borrow_rate_refresh_secs: 1800,
+            borrow_holding_secs: 3600,
+            borrow_max_base: dec!(0),
+            borrow_buffer_base: dec!(0),
+            pair_lifecycle_enabled: true,
+            pair_lifecycle_refresh_secs: 300,
+            cross_venue_basis_max_staleness_ms: 1500,
         }
     }
 
@@ -328,7 +409,22 @@ mod tests {
             mid_price: mid,
             ref_price,
             hedge_book: None,
+            borrow_cost_bps: None,
+            hedge_book_age_ms: None,
         }
+    }
+
+    fn ctx_with_age<'a>(
+        book: &'a LocalOrderBook,
+        product: &'a ProductSpec,
+        config: &'a MarketMakerConfig,
+        mid: Price,
+        ref_price: Option<Price>,
+        age_ms: Option<i64>,
+    ) -> StrategyContext<'a> {
+        let mut c = ctx(book, product, config, mid, ref_price);
+        c.hedge_book_age_ms = age_ms;
+        c
     }
 
     #[test]
@@ -569,5 +665,88 @@ mod tests {
         assert!(s
             .expected_cross_edge_bps(Side::Buy, dec!(50_000), dec!(0), &hb)
             .is_none());
+    }
+
+    /// P1.4 stage-1: cross-venue mode with a fresh hedge book
+    /// must quote normally. Regression anchor for the
+    /// happy-path branch through the staleness gate.
+    #[test]
+    fn cross_venue_fresh_book_quotes_normally() {
+        let product = test_product();
+        let config = test_config();
+        let book = book_at(dec!(50_000), dec!(50));
+        let s = BasisStrategy::cross_venue(dec!(0.5), dec!(50), 1500);
+        let context = ctx_with_age(
+            &book,
+            &product,
+            &config,
+            dec!(50_000),
+            Some(dec!(50_010)),
+            Some(200),
+        );
+        let quotes = s.compute_quotes(&context);
+        assert!(!quotes.is_empty());
+    }
+
+    /// Cross-venue mode with a stale hedge book (age > gate)
+    /// must stand down — empty quote set, regardless of how
+    /// reasonable the basis is.
+    #[test]
+    fn cross_venue_stale_hedge_book_stands_down() {
+        let product = test_product();
+        let config = test_config();
+        let book = book_at(dec!(50_000), dec!(50));
+        let s = BasisStrategy::cross_venue(dec!(0.5), dec!(50), 1500);
+        let context = ctx_with_age(
+            &book,
+            &product,
+            &config,
+            dec!(50_000),
+            Some(dec!(50_010)),
+            Some(2000),
+        );
+        assert!(s.compute_quotes(&context).is_empty());
+    }
+
+    /// Cross-venue mode without any age reading at all (no
+    /// hedge book yet, or engine forgot to thread it) must
+    /// also stand down — better to skip the refresh than
+    /// quote against an unknown freshness.
+    #[test]
+    fn cross_venue_no_age_reading_stands_down() {
+        let product = test_product();
+        let config = test_config();
+        let book = book_at(dec!(50_000), dec!(50));
+        let s = BasisStrategy::cross_venue(dec!(0.5), dec!(50), 1500);
+        let context = ctx_with_age(
+            &book,
+            &product,
+            &config,
+            dec!(50_000),
+            Some(dec!(50_010)),
+            None,
+        );
+        assert!(s.compute_quotes(&context).is_empty());
+    }
+
+    /// Same-venue mode (`max_hedge_staleness_ms = None`) must
+    /// preserve the legacy behaviour: a stale or missing age
+    /// reading does not cause stand-down. Regression anchor
+    /// for the "P1.4 must not break P0/P1.x" invariant.
+    #[test]
+    fn same_venue_mode_ignores_staleness() {
+        let product = test_product();
+        let config = test_config();
+        let book = book_at(dec!(50_000), dec!(50));
+        let s = BasisStrategy::new(dec!(0.5), dec!(50));
+        let context = ctx_with_age(
+            &book,
+            &product,
+            &config,
+            dec!(50_000),
+            Some(dec!(50_010)),
+            Some(60_000),
+        );
+        assert!(!s.compute_quotes(&context).is_empty());
     }
 }

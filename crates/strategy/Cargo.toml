@@ -6,6 +6,7 @@ version.workspace = true
 [dependencies]
 mm-common = { workspace = true }
 mm-exchange-core = { workspace = true }
+mm-indicators = { workspace = true }
 mm-persistence = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }

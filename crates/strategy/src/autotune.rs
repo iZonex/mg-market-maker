@@ -1,4 +1,4 @@
-use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::VecDeque;
@@ -284,11 +284,202 @@ impl RegimeParams {
     }
 }
 
+/// Closed-form state-space policy for the risk-aversion
+/// parameter γ inspired by
+/// <https://github.com/im1235/ISAC> — an RL agent that learned to
+/// drive γ from two normalised state features:
+///
+///   (|q| / max_inventory, time_remaining ∈ [0, 1])
+///
+/// Their policy surface is monotonic in both axes:
+/// - γ rises with `|q|` (convex) — push the reservation price
+///   harder against inventory, accept tighter fills on the
+///   reducing side to dump the position.
+/// - γ rises as `time_remaining` shrinks — widen spreads toward
+///   session end so the taker leg is less likely to load us up
+///   right before we have to liquidate.
+///
+/// We **do not** port their SAC network — no PyTorch, no
+/// inference runtime, no blessed weights, no desire to ship a
+/// black-box controller. Instead this struct approximates the
+/// shape they learned with a closed-form formula:
+///
+/// ```text
+/// γ_mult = 1 + q_weight * (|q| / max_q)^q_exp
+///             + t_weight * (1 - time_remaining)^t_exp
+/// ```
+///
+/// The same quadratic-in-inventory + polynomial-in-time-left
+/// shape falls out of the original Avellaneda-Stoikov optimal
+/// control derivation; ISAC's contribution is empirical
+/// evidence that SAC converges to that shape under their
+/// simulator, which is reassurance that the closed form is
+/// correct up to coefficients.
+///
+/// Plugged into `AutoTuner::effective_gamma_mult` via
+/// [`AutoTuner::with_inventory_gamma_policy`], the tuner
+/// multiplies the regime- and toxicity-driven γ multipliers by
+/// the policy's output each tick. Bypass by not setting a
+/// policy — `None` is the default, engines that don't want
+/// inventory-aware γ see the same behaviour as before.
+#[derive(Debug, Clone, Copy)]
+pub struct InventoryGammaPolicy {
+    /// Maximum expected inventory in base asset. Used to
+    /// normalise `|q|` into `[0, 1]`. Should match
+    /// `RiskConfig::max_inventory`.
+    pub max_inventory: Decimal,
+    /// Coefficient on the inventory term. Higher = harder push
+    /// on `|q|`. Typical: `0.5 .. 2.0`.
+    pub q_weight: Decimal,
+    /// Exponent on the inventory term. `2.0` matches the
+    /// canonical quadratic penalty, `1.0` is linear, higher
+    /// exponents saturate toward `max_q`.
+    pub q_exp: Decimal,
+    /// Coefficient on the time term. Higher = harder widening
+    /// as the session elapses.
+    pub t_weight: Decimal,
+    /// Exponent on the time term. `3.0` matches the
+    /// cubic-in-time-remaining shape ISAC's RL agent
+    /// approximates after training on 2000 price paths.
+    pub t_exp: Decimal,
+    /// Hard floor on the multiplier. Defaults to `1.0` — γ is
+    /// never allowed to go BELOW its base setting via this
+    /// policy. Lower would be a tightening, which this policy
+    /// is deliberately not in charge of.
+    pub min_mult: Decimal,
+    /// Hard cap on the multiplier. Clamps the output so a
+    /// wildly-loaded position at session end does not produce
+    /// an untradable γ.
+    pub max_mult: Decimal,
+}
+
+impl InventoryGammaPolicy {
+    /// Sensible defaults tuned to mirror the ISAC policy
+    /// surface on a `max_inventory = 0.1` sim:
+    /// `γ_mult ∈ [1.0, ~3.5]` across the state space.
+    pub fn new(max_inventory: Decimal) -> Self {
+        assert!(
+            max_inventory > Decimal::ZERO,
+            "InventoryGammaPolicy: max_inventory must be > 0"
+        );
+        Self {
+            max_inventory,
+            q_weight: dec!(1.5),
+            q_exp: dec!(2),
+            t_weight: dec!(0.5),
+            t_exp: dec!(3),
+            min_mult: dec!(1),
+            max_mult: dec!(5),
+        }
+    }
+
+    /// Compute the γ multiplier for the current state. `q` is
+    /// signed inventory; the policy reads `|q|`. `time_remaining`
+    /// is the fraction of the strategy horizon still ahead, in
+    /// `[0, 1]` (1 = full horizon ahead, 0 = session close).
+    pub fn multiplier(&self, q: Decimal, time_remaining: Decimal) -> Decimal {
+        if self.max_inventory.is_zero() {
+            return Decimal::ONE;
+        }
+        let q_norm = (q.abs() / self.max_inventory).min(Decimal::ONE);
+        let t_elapsed = (Decimal::ONE - time_remaining)
+            .max(Decimal::ZERO)
+            .min(Decimal::ONE);
+
+        // Decimal has no native `powf`, so small-integer exponents
+        // go through iterative multiply and the general case
+        // falls back to an f64 round-trip. The coefficients are
+        // feature-level — not money-critical — so the rounding
+        // is acceptable.
+        let q_term = self.q_weight * dec_pow(q_norm, self.q_exp);
+        let t_term = self.t_weight * dec_pow(t_elapsed, self.t_exp);
+
+        let raw = Decimal::ONE + q_term + t_term;
+        raw.max(self.min_mult).min(self.max_mult)
+    }
+}
+
+/// Decimal exponentiation via integer fast path where possible.
+/// Integer exponents `0..=6` use repeated multiplication (exact);
+/// fractional exponents fall back to an f64 round-trip. Kept
+/// private because the f64 fallback is feature-level only.
+fn dec_pow(base: Decimal, exp: Decimal) -> Decimal {
+    if exp == Decimal::ZERO {
+        return Decimal::ONE;
+    }
+    if exp == Decimal::ONE {
+        return base;
+    }
+    // Small positive integer exponents — exact.
+    if exp.fract().is_zero() && exp > Decimal::ZERO && exp <= dec!(6) {
+        let n = exp.to_u32().unwrap_or(1);
+        let mut acc = Decimal::ONE;
+        for _ in 0..n {
+            acc *= base;
+        }
+        return acc;
+    }
+    // General case via f64.
+    let b = base.to_f64().unwrap_or(0.0);
+    let e = exp.to_f64().unwrap_or(1.0);
+    let v = b.powf(e);
+    Decimal::from_f64(v).unwrap_or(base)
+}
+
+/// Compute an ISAC-style risk penalty on an inventory of `q`
+/// over one tick of width `dt_seconds`, given a per-second
+/// volatility `sigma`. Returns the penalty in the same unit as
+/// PnL (quote asset). Use with
+/// [`mm_hyperopt::LossFn`][crate::r#trait] to score a strategy
+/// on risk-adjusted reward rather than raw PnL.
+///
+/// Formula from ISAC's `inventory_sac.py`:
+///
+/// ```text
+/// penalty = 0.5 * |q| * sigma * sqrt(dt)
+/// ```
+///
+/// The 0.5 coefficient matches the mean-variance utility used
+/// in the original Avellaneda-Stoikov paper; it's conservative
+/// — twice the penalty the "textbook" optimal control
+/// derivation would apply — so treating it as an UPPER BOUND on
+/// the risk charge is appropriate.
+pub fn inventory_risk_penalty(q: Decimal, sigma_per_sec: Decimal, dt_seconds: Decimal) -> Decimal {
+    if dt_seconds <= Decimal::ZERO || sigma_per_sec <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    let sqrt_dt_f = dt_seconds.to_f64().unwrap_or(0.0).max(0.0).sqrt();
+    let Some(sqrt_dt) = Decimal::from_f64(sqrt_dt_f) else {
+        return Decimal::ZERO;
+    };
+    dec!(0.5) * q.abs() * sigma_per_sec * sqrt_dt
+}
+
 /// Auto-tuner that adjusts strategy parameters based on regime + toxicity.
 pub struct AutoTuner {
     pub regime_detector: RegimeDetector,
     /// VPIN-based spread multiplier [1.0, 3.0].
     pub toxicity_spread_mult: Decimal,
+    /// Optional closed-form state-space γ policy. When set,
+    /// `effective_gamma_mult()` multiplies the regime- and
+    /// toxicity-derived multiplier by `policy.multiplier(q,
+    /// time_remaining)`. `None` → no inventory-aware adjustment
+    /// (legacy behaviour).
+    pub inventory_gamma_policy: Option<InventoryGammaPolicy>,
+    /// Cached policy inputs from the engine's last tick, so
+    /// `effective_gamma_mult()` can read them without an extra
+    /// plumbing argument. The engine calls
+    /// [`AutoTuner::update_policy_state`] once per tick before
+    /// the quote computation.
+    inventory_snapshot: Decimal,
+    time_remaining_snapshot: Decimal,
+    /// Latest Market Resilience score in `[0, 1]`. `None` means
+    /// the caller has not attached an MR detector; the spread
+    /// multiplier is untouched in that case. `Some(s)` feeds
+    /// `1 / max(s, 0.2)` into `effective_spread_mult()` so a
+    /// depressed score widens the book until the detector
+    /// decays back toward 1.0.
+    market_resilience: Option<Decimal>,
 }
 
 impl AutoTuner {
@@ -296,7 +487,27 @@ impl AutoTuner {
         Self {
             regime_detector: RegimeDetector::new(window),
             toxicity_spread_mult: dec!(1),
+            inventory_gamma_policy: None,
+            inventory_snapshot: Decimal::ZERO,
+            time_remaining_snapshot: Decimal::ONE,
+            market_resilience: None,
         }
+    }
+
+    /// Attach a closed-form inventory/time γ policy. Returns
+    /// `self` for builder-style use.
+    pub fn with_inventory_gamma_policy(mut self, policy: InventoryGammaPolicy) -> Self {
+        self.inventory_gamma_policy = Some(policy);
+        self
+    }
+
+    /// Update the inventory / time-remaining snapshot the γ
+    /// policy reads on its next `effective_gamma_mult()` call.
+    /// The engine tick loop calls this once per tick before
+    /// asking for multipliers.
+    pub fn update_policy_state(&mut self, inventory: Decimal, time_remaining: Decimal) {
+        self.inventory_snapshot = inventory;
+        self.time_remaining_snapshot = time_remaining;
     }
 
     /// Update with a new mid-price return.
@@ -311,10 +522,18 @@ impl AutoTuner {
         debug!(vpin = %vpin, mult = %self.toxicity_spread_mult, "toxicity spread adjustment");
     }
 
-    /// Get effective gamma multiplier.
+    /// Get effective gamma multiplier. When an
+    /// `InventoryGammaPolicy` is attached the result is further
+    /// multiplied by its state-space output so heavy inventory
+    /// and/or session-end conditions tighten reservation prices.
     pub fn effective_gamma_mult(&self) -> Decimal {
         let regime_params = RegimeParams::for_regime(self.regime_detector.regime());
-        regime_params.gamma_mult * self.toxicity_spread_mult
+        let base = regime_params.gamma_mult * self.toxicity_spread_mult;
+        if let Some(policy) = &self.inventory_gamma_policy {
+            base * policy.multiplier(self.inventory_snapshot, self.time_remaining_snapshot)
+        } else {
+            base
+        }
     }
 
     /// Get effective size multiplier.
@@ -326,10 +545,37 @@ impl AutoTuner {
         regime_params.size_mult * toxicity_size
     }
 
-    /// Get effective spread multiplier.
+    /// Set the latest Market Resilience score. Values outside
+    /// `[0, 1]` are clamped. See
+    /// [`crate::market_resilience::MarketResilienceCalculator`]
+    /// for the source signal.
+    pub fn set_market_resilience(&mut self, score: Decimal) {
+        let clamped = score.max(Decimal::ZERO).min(Decimal::ONE);
+        self.market_resilience = Some(clamped);
+    }
+
+    /// Clear any attached Market Resilience reading. After this
+    /// call `effective_spread_mult()` returns to the
+    /// regime+toxicity-only baseline.
+    pub fn clear_market_resilience(&mut self) {
+        self.market_resilience = None;
+    }
+
+    /// Get effective spread multiplier. When a Market
+    /// Resilience reading is attached the regime+toxicity
+    /// product is further divided by `max(mr, 0.2)` — a low
+    /// score widens the book post-shock, and the floor keeps
+    /// the multiplier bounded at `5×` even when MR is at zero.
     pub fn effective_spread_mult(&self) -> Decimal {
         let regime_params = RegimeParams::for_regime(self.regime_detector.regime());
-        regime_params.spread_mult * self.toxicity_spread_mult
+        let base = regime_params.spread_mult * self.toxicity_spread_mult;
+        if let Some(mr) = self.market_resilience {
+            let floor = dec!(0.2);
+            let denom = mr.max(floor);
+            base / denom
+        } else {
+            base
+        }
     }
 
     /// Get effective refresh interval multiplier.
@@ -507,5 +753,212 @@ mod tests {
         // Just assert `regime()` returns something; the
         // specific label depends on the variance threshold.
         let _ = det.regime();
+    }
+
+    // ----- InventoryGammaPolicy tests -----
+
+    #[test]
+    fn policy_returns_min_mult_at_zero_state() {
+        let p = InventoryGammaPolicy::new(dec!(0.1));
+        // q = 0, time_remaining = 1 (start of session). Both
+        // terms vanish → multiplier = 1, clamped at min_mult.
+        assert_eq!(p.multiplier(Decimal::ZERO, Decimal::ONE), Decimal::ONE);
+    }
+
+    #[test]
+    fn policy_scales_up_with_inventory() {
+        let p = InventoryGammaPolicy::new(dec!(0.1));
+        let at_zero = p.multiplier(Decimal::ZERO, Decimal::ONE);
+        let at_half = p.multiplier(dec!(0.05), Decimal::ONE);
+        let at_max = p.multiplier(dec!(0.1), Decimal::ONE);
+        assert!(at_half > at_zero, "inventory term must push mult up");
+        assert!(at_max > at_half, "mult should be monotone in |q|");
+    }
+
+    #[test]
+    fn policy_scales_up_as_time_runs_out() {
+        let p = InventoryGammaPolicy::new(dec!(0.1));
+        let early = p.multiplier(Decimal::ZERO, Decimal::ONE);
+        let late = p.multiplier(Decimal::ZERO, dec!(0.1));
+        let end = p.multiplier(Decimal::ZERO, Decimal::ZERO);
+        assert!(late > early, "time term must push mult up as t→0");
+        assert!(end > late, "session close hits max time term");
+    }
+
+    #[test]
+    fn policy_clamps_to_max_mult() {
+        // Custom policy with low cap so we can force clamping.
+        let p = InventoryGammaPolicy {
+            max_inventory: dec!(0.1),
+            q_weight: dec!(10),
+            q_exp: dec!(1),
+            t_weight: dec!(10),
+            t_exp: dec!(1),
+            min_mult: dec!(1),
+            max_mult: dec!(2),
+        };
+        let m = p.multiplier(dec!(0.1), Decimal::ZERO);
+        assert_eq!(m, dec!(2), "must clamp at max_mult");
+    }
+
+    #[test]
+    fn policy_clamps_abs_inventory_above_max() {
+        let p = InventoryGammaPolicy::new(dec!(0.1));
+        let at_max = p.multiplier(dec!(0.1), Decimal::ONE);
+        let above_max = p.multiplier(dec!(0.5), Decimal::ONE);
+        assert_eq!(at_max, above_max, "q_norm must saturate at 1");
+    }
+
+    #[test]
+    fn policy_negative_inventory_uses_abs() {
+        let p = InventoryGammaPolicy::new(dec!(0.1));
+        let long = p.multiplier(dec!(0.05), Decimal::ONE);
+        let short = p.multiplier(dec!(-0.05), Decimal::ONE);
+        assert_eq!(long, short, "policy must be symmetric in q sign");
+    }
+
+    #[test]
+    fn autotune_applies_policy_via_effective_gamma_mult() {
+        let mut t =
+            AutoTuner::new(32).with_inventory_gamma_policy(InventoryGammaPolicy::new(dec!(0.1)));
+        let base = t.effective_gamma_mult();
+        t.update_policy_state(dec!(0.1), Decimal::ZERO);
+        let loaded = t.effective_gamma_mult();
+        assert!(
+            loaded > base,
+            "loaded/end-of-session state must widen γ above the unloaded baseline"
+        );
+    }
+
+    #[test]
+    fn autotune_none_policy_leaves_gamma_untouched() {
+        let mut t = AutoTuner::new(32);
+        let before = t.effective_gamma_mult();
+        t.update_policy_state(dec!(0.1), Decimal::ZERO);
+        let after = t.effective_gamma_mult();
+        assert_eq!(
+            before, after,
+            "no policy attached → state updates must be ignored"
+        );
+    }
+
+    // ----- inventory_risk_penalty tests -----
+
+    #[test]
+    fn risk_penalty_zero_for_zero_inventory() {
+        let r = inventory_risk_penalty(Decimal::ZERO, dec!(0.01), dec!(1));
+        assert_eq!(r, Decimal::ZERO);
+    }
+
+    #[test]
+    fn risk_penalty_zero_for_non_positive_sigma_or_dt() {
+        assert_eq!(
+            inventory_risk_penalty(dec!(1), Decimal::ZERO, dec!(1)),
+            Decimal::ZERO
+        );
+        assert_eq!(
+            inventory_risk_penalty(dec!(1), dec!(0.01), Decimal::ZERO),
+            Decimal::ZERO
+        );
+        assert_eq!(
+            inventory_risk_penalty(dec!(1), dec!(-0.01), dec!(1)),
+            Decimal::ZERO
+        );
+    }
+
+    #[test]
+    fn risk_penalty_scales_linearly_with_absolute_inventory() {
+        let a = inventory_risk_penalty(dec!(1), dec!(0.02), dec!(4));
+        let b = inventory_risk_penalty(dec!(2), dec!(0.02), dec!(4));
+        assert_eq!(b, a * dec!(2));
+    }
+
+    #[test]
+    fn risk_penalty_is_symmetric_in_inventory_sign() {
+        let long = inventory_risk_penalty(dec!(1.5), dec!(0.02), dec!(4));
+        let short = inventory_risk_penalty(dec!(-1.5), dec!(0.02), dec!(4));
+        assert_eq!(long, short);
+    }
+
+    #[test]
+    fn risk_penalty_canonical_hand_computed_value() {
+        // 0.5 * |2| * 0.02 * sqrt(4) = 0.5 * 2 * 0.02 * 2 = 0.04
+        let r = inventory_risk_penalty(dec!(2), dec!(0.02), dec!(4));
+        assert_eq!(r, dec!(0.04));
+    }
+
+    // ----- Market Resilience wiring tests -----
+
+    /// Without an MR reading the spread multiplier falls back
+    /// to the regime+toxicity product.
+    #[test]
+    fn effective_spread_mult_ignores_unset_market_resilience() {
+        let t = AutoTuner::new(32);
+        let before = t.effective_spread_mult();
+        // No reading attached → unchanged.
+        assert!(before > Decimal::ZERO);
+    }
+
+    /// A resilient MR score of 1.0 must leave the spread
+    /// multiplier unchanged (1 / 1 = 1).
+    #[test]
+    fn mr_of_one_is_a_noop_on_spread_mult() {
+        let mut t = AutoTuner::new(32);
+        let before = t.effective_spread_mult();
+        t.set_market_resilience(Decimal::ONE);
+        let after = t.effective_spread_mult();
+        assert_eq!(before, after);
+    }
+
+    /// A depressed MR score must widen the effective spread
+    /// multiplier compared to the default (no reading).
+    #[test]
+    fn low_mr_widens_effective_spread_mult() {
+        let mut t = AutoTuner::new(32);
+        let base = t.effective_spread_mult();
+        t.set_market_resilience(dec!(0.3));
+        let after = t.effective_spread_mult();
+        assert!(
+            after > base,
+            "MR=0.3 must widen the book: base={base}, after={after}"
+        );
+    }
+
+    /// The spread multiplier is capped by the MR floor at 0.2 —
+    /// even an MR of 0 cannot push the widen factor past 5×.
+    #[test]
+    fn mr_floor_caps_the_widen_factor() {
+        let mut t = AutoTuner::new(32);
+        let base = t.effective_spread_mult();
+        t.set_market_resilience(Decimal::ZERO);
+        let after = t.effective_spread_mult();
+        // base / 0.2 = base * 5.
+        assert_eq!(after, base * dec!(5));
+    }
+
+    /// Out-of-range MR inputs are clamped into `[0, 1]` before
+    /// they influence the multiplier.
+    #[test]
+    fn out_of_range_mr_is_clamped() {
+        let mut t = AutoTuner::new(32);
+        let base = t.effective_spread_mult();
+        t.set_market_resilience(dec!(-3));
+        let after_low = t.effective_spread_mult();
+        assert_eq!(after_low, base * dec!(5), "negative MR clamps to 0");
+        t.set_market_resilience(dec!(5));
+        let after_high = t.effective_spread_mult();
+        assert_eq!(after_high, base, "MR above 1 clamps to 1");
+    }
+
+    /// `clear_market_resilience` removes the reading so the
+    /// baseline is restored.
+    #[test]
+    fn clearing_mr_restores_baseline() {
+        let mut t = AutoTuner::new(32);
+        let base = t.effective_spread_mult();
+        t.set_market_resilience(dec!(0.3));
+        t.clear_market_resilience();
+        let after = t.effective_spread_mult();
+        assert_eq!(after, base);
     }
 }

@@ -55,6 +55,15 @@ export function createDemoStore() {
       vpin: (0.35 + Math.sin(tick * 0.08) * 0.15).toFixed(3),
       kyle_lambda: (0.000042 + Math.random() * 0.00001).toFixed(6),
       adverse_bps: (1.8 + Math.random() * 1.2).toFixed(2),
+      // Synthesised Market Resilience — dips every 300 ticks
+      // to show the panel's recovery animation.
+      market_resilience: (tick % 300 < 30
+        ? 0.2 + (tick % 300) / 150
+        : 0.9 + Math.random() * 0.1).toFixed(3),
+      // Random walk around 2.0 — elevated OTR territory.
+      order_to_trade_ratio: (2.0 + Math.sin(tick * 0.05) * 1.2).toFixed(2),
+      // HMA tracks mid with a small lag.
+      hma_value: (mid + Math.sin(tick * 0.1 - 0.3) * 12).toFixed(2),
       volatility: (0.0234 + Math.sin(tick * 0.02) * 0.005).toFixed(4),
       sla_uptime_pct: '97.3',
       regime: tick % 200 < 120 ? 'Quiet' : tick % 200 < 160 ? 'Trending' : 'Volatile',
@@ -109,6 +118,9 @@ function generateSymbolData(mid) {
     total_fills: 47,
     vpin: '0.342',
     kyle_lambda: '0.000042',
+    market_resilience: '0.95',
+    order_to_trade_ratio: '2.10',
+    hma_value: mid.toFixed(2),
     adverse_bps: '1.83',
     volatility: '0.0234',
     kill_level: 0,

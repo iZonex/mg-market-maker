@@ -4,6 +4,7 @@
   import SpreadChart from './lib/components/SpreadChart.svelte'
   import OrderBook from './lib/components/OrderBook.svelte'
   import InventoryPanel from './lib/components/InventoryPanel.svelte'
+  import SignalsPanel from './lib/components/SignalsPanel.svelte'
   import OpenOrders from './lib/components/OpenOrders.svelte'
   import FillHistory from './lib/components/FillHistory.svelte'
   import Controls from './lib/components/Controls.svelte'
@@ -53,6 +54,10 @@
       <div class="panel">
         <InventoryPanel data={ws} />
       </div>
+      <div class="panel">
+        <SignalsPanel data={ws} />
+      </div>
+
       <div class="panel">
         {#if auth.canControl()}
           <Controls data={ws} />

@@ -134,6 +134,7 @@ impl ExchangeConnector for MockConnector {
             min_notional: dec!(10),
             maker_fee: dec!(0.0001),
             taker_fee: dec!(0.0005),
+            trading_status: Default::default(),
         })
     }
     async fn health_check(&self) -> anyhow::Result<bool> {

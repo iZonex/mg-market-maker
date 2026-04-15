@@ -133,6 +133,32 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
                 );
             }
         }
+        StrategyType::CrossVenueBasis => {
+            if config.hedge.is_none() {
+                errors.push(
+                    "strategy=cross_venue_basis requires a [hedge] section with \
+                     primary_symbol, hedge_symbol, and exchange config on a \
+                     different venue from [exchange]"
+                        .to_string(),
+                );
+            } else if let Some(hedge) = &config.hedge {
+                if hedge.exchange.exchange_type == config.exchange.exchange_type {
+                    warnings.push(
+                        "strategy=cross_venue_basis with hedge.exchange == exchange — \
+                         configure the hedge on a different venue, otherwise pick \
+                         strategy=basis (same-venue) instead"
+                            .to_string(),
+                    );
+                }
+            }
+            if mm.cross_venue_basis_max_staleness_ms <= 0 {
+                errors.push(
+                    "market_maker.cross_venue_basis_max_staleness_ms must be > 0 \
+                     for strategy=cross_venue_basis (default 1500)"
+                        .to_string(),
+                );
+            }
+        }
         StrategyType::FundingArb => {
             if config.hedge.is_none() {
                 errors.push(
@@ -178,6 +204,41 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
                      but never used for quoting",
                     mm.strategy
                 ));
+            }
+        }
+    }
+
+    // P2.1 — per-asset-class kill switch sanity. Each symbol
+    // listed in `kill_switch.asset_classes[*].symbols` must
+    // exist in the top-level `symbols` array, and no symbol
+    // may belong to more than one class. Either mistake means
+    // an asset-wide escalation either misses an engine or
+    // double-fires across classes.
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for cls in &config.kill_switch.asset_classes {
+        if cls.name.trim().is_empty() {
+            errors.push("kill_switch.asset_classes[*].name must be non-empty".to_string());
+        }
+        if cls.symbols.is_empty() {
+            warnings.push(format!(
+                "kill_switch.asset_classes.{} has no symbols — the class will never escalate",
+                cls.name
+            ));
+        }
+        for sym in &cls.symbols {
+            if !config.symbols.contains(sym) {
+                errors.push(format!(
+                    "kill_switch.asset_classes.{}: symbol {} is not in the top-level [[symbols]] array",
+                    cls.name, sym
+                ));
+            }
+            if let Some(prev) = seen.get(sym) {
+                errors.push(format!(
+                    "symbol {sym} appears in two asset classes ({prev} and {}) — pick one",
+                    cls.name
+                ));
+            } else {
+                seen.insert(sym.clone(), cls.name.clone());
             }
         }
     }

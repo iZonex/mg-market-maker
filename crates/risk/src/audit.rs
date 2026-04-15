@@ -74,6 +74,22 @@ pub enum AuditEventType {
     StrategyQuoteRefresh,
     RegimeChange,
 
+    // Compliance / surveillance.
+    /// Periodic Order-to-Trade Ratio snapshot, emitted every
+    /// aggregation window. `detail` carries the numeric ratio
+    /// so regulators can reconstruct the time series from the
+    /// audit trail alone. MiCA compliance signal.
+    OrderToTradeRatioSnapshot,
+
+    /// Reconciliation detected a drift between the tracked
+    /// `InventoryManager.inventory()` and the wallet balance
+    /// delta since engine start. `detail` carries the signed
+    /// drift, baseline wallet, current wallet, and whether the
+    /// tracker was force-corrected. Fires on every reconcile
+    /// cycle where the drift exceeds the configured
+    /// tolerance; reset on manual intervention.
+    InventoryDriftDetected,
+
     // Cross-product pair dispatch (funding arb / basis trade).
     /// Atomic pair dispatch succeeded — both legs placed.
     PairDispatchEntered,
@@ -88,6 +104,41 @@ pub enum AuditEventType {
     /// uncompensated break is the cue to escalate the kill
     /// switch to L2 StopNewOrders.
     PairBreak,
+
+    /// Cross-venue basis crossed below the entry threshold —
+    /// `detail` carries the signed basis bps and the venue
+    /// pair. Emitted by the engine the first refresh tick
+    /// after the threshold flips. P1.4 stage-1.
+    CrossVenueBasisEntered,
+    /// Cross-venue basis crossed above the exit threshold —
+    /// `detail` carries the signed basis bps and the venue
+    /// pair. Emitted exactly once per round-trip so the audit
+    /// trail records both sides of every cross-venue position.
+    CrossVenueBasisExited,
+
+    // Pair lifecycle (P2.3 stage-1).
+    /// Lifecycle manager observed the symbol for the first
+    /// time on its periodic refresh. `detail` carries the
+    /// snapshot's tick/lot/min_notional.
+    PairLifecycleListed,
+    /// Venue removed the symbol entirely (or `get_product_spec`
+    /// returned "symbol not found"). Engine cancels every order
+    /// and refuses to ever requote until restart.
+    PairLifecycleDelisted,
+    /// `trading_status` flipped from Trading to Halted /
+    /// Break / PreTrading. Engine cancels all + paused.
+    PairLifecycleHalted,
+    /// `trading_status` flipped back to Trading. Engine
+    /// clears the paused flag.
+    PairLifecycleResumed,
+    /// Tick or lot size changed without a status flip.
+    /// Engine updates `self.product` in place and re-rounds
+    /// the next quote refresh.
+    PairLifecycleTickLotChanged,
+    /// `min_notional` changed without a status or tick/lot
+    /// flip. Surfaced separately so the audit trail records
+    /// exactly what moved.
+    PairLifecycleMinNotionalChanged,
 }
 
 impl AuditLog {
@@ -185,6 +236,35 @@ impl AuditLog {
             price: None,
             qty: None,
             detail: None,
+        });
+    }
+
+    /// Convenience: emit a periodic Order-to-Trade Ratio
+    /// snapshot into the audit trail. MiCA compliance: the
+    /// regulator expects the time series to be reconstructable
+    /// from the persistent log.
+    pub fn order_to_trade_ratio_snapshot(
+        &self,
+        symbol: &str,
+        ratio: rust_decimal::Decimal,
+        adds: u64,
+        updates: u64,
+        cancels: u64,
+        trades: u64,
+    ) {
+        let detail = format!(
+            "ratio={ratio} adds={adds} updates={updates} cancels={cancels} trades={trades}"
+        );
+        self.log(AuditEvent {
+            seq: 0,
+            timestamp: Utc::now(),
+            event_type: AuditEventType::OrderToTradeRatioSnapshot,
+            symbol: symbol.to_string(),
+            order_id: None,
+            side: None,
+            price: None,
+            qty: None,
+            detail: Some(detail),
         });
     }
 

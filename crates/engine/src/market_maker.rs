@@ -9,19 +9,24 @@ use mm_dashboard::alerts::{AlertManager, AlertSeverity};
 use mm_dashboard::state::{
     BookDepthLevel, DashboardState, IncidentRecord, PnlSnapshot, SymbolState,
 };
+use mm_exchange_core::connector::{BorrowError, FeeTierError};
 use mm_exchange_core::events::MarketEvent;
 use mm_portfolio::Portfolio;
 use mm_risk::audit::{AuditEventType, AuditLog};
+use mm_risk::borrow::BorrowManager;
 use mm_risk::circuit_breaker::{CircuitBreaker, TripReason};
 use mm_risk::exposure::ExposureManager;
 use mm_risk::inventory::InventoryManager;
+use mm_risk::inventory_drift::InventoryDriftReconciler;
 use mm_risk::kill_switch::{KillLevel, KillSwitch, KillSwitchConfig};
+use mm_risk::otr::OrderToTradeRatio;
 use mm_risk::pnl::PnlTracker;
 use mm_risk::sla::{SlaConfig, SlaTracker};
 use mm_risk::toxicity::{AdverseSelectionTracker, KyleLambda, VpinEstimator};
 use mm_strategy::autotune::AutoTuner;
 use mm_strategy::funding_arb_driver::{DriverEvent, FundingArbDriver};
 use mm_strategy::inventory_skew::AdvancedInventoryManager;
+use mm_strategy::market_resilience::{MarketResilienceCalculator, MrConfig};
 use mm_strategy::momentum::MomentumSignals;
 use mm_strategy::paired_unwind::PairedUnwindExecutor;
 use mm_strategy::r#trait::{Strategy, StrategyContext};
@@ -30,13 +35,23 @@ use mm_strategy::volatility::VolatilityEstimator;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+
+/// Lossy `Decimal → f64` for Prometheus exposition. The Prometheus
+/// gauge API only speaks `f64`, so a one-shot conversion at the
+/// metrics boundary is unavoidable. Used by the fee-tier refresh
+/// task to expose `mm_maker_fee_bps` / `mm_taker_fee_bps`.
+fn decimal_to_f64(d: Decimal) -> f64 {
+    use std::str::FromStr;
+    f64::from_str(&d.to_string()).unwrap_or(0.0)
+}
 
 use crate::balance_cache::BalanceCache;
 use crate::book_keeper::BookKeeper;
 use crate::connector_bundle::ConnectorBundle;
 use crate::order_id_map::OrderIdMap;
 use crate::order_manager::OrderManager;
+use crate::pair_lifecycle::{PairLifecycleEvent, PairLifecycleManager};
 
 /// The main market-making engine for a single symbol.
 ///
@@ -65,6 +80,44 @@ pub struct MarketMakerEngine {
     /// Second book for the hedge leg when `connectors.hedge` is set.
     /// Cross-product strategies read its mid as `StrategyContext.ref_price`.
     hedge_book: Option<BookKeeper>,
+    /// Per-asset borrow state machine (P1.3 stage-1). `Some` when
+    /// `config.market_maker.borrow_enabled = true`; the periodic
+    /// borrow-rate refresh task pushes APR snapshots into this
+    /// manager and the strategy reads
+    /// `BorrowManager::effective_carry_bps` via
+    /// `StrategyContext.borrow_cost_bps`.
+    borrow_manager: Option<BorrowManager>,
+    /// Tracks whether the cross-venue basis is currently
+    /// "inside" the entry threshold, so the engine emits the
+    /// `CrossVenueBasisEntered` / `Exited` audit events exactly
+    /// once per round-trip rather than every refresh tick.
+    /// `false` until the first inside crossing; flips on
+    /// every threshold crossing thereafter. P1.4 stage-1.
+    cross_venue_basis_inside: bool,
+    /// Per-asset-class kill switch (P2.1). Shared via
+    /// `Arc<Mutex<KillSwitch>>` across every engine that maps to
+    /// the same class — escalating one engine's asset-class
+    /// switch escalates the rest immediately. `None` for
+    /// engines whose symbol does not belong to any configured
+    /// asset class. The asset-class layer is **soft-only**: the
+    /// engine merges the asset level with the global level for
+    /// `WidenSpreads` / `StopNewOrders`, but hard escalation
+    /// (`CancelAll` / `FlattenAll` / `Disconnect`) is still
+    /// driven by the per-engine global state alone.
+    asset_class_switch: Option<Arc<Mutex<KillSwitch>>>,
+    /// Per-symbol pair lifecycle state machine (P2.3 stage-1).
+    /// `Some` when `config.market_maker.pair_lifecycle_enabled`
+    /// is true; the periodic refresh task polls
+    /// `connector.get_product_spec` and routes the diff into
+    /// the audit trail + the `lifecycle_paused` flag.
+    pair_lifecycle: Option<PairLifecycleManager>,
+    /// Latched by the lifecycle manager when the venue reports
+    /// a halt, break, pre-trading, or delisting state. The
+    /// `refresh_quotes` short-circuit consults this field on
+    /// every refresh tick so the engine never quotes against a
+    /// halted symbol — closes the "venue sends fills after a
+    /// halt" hole.
+    lifecycle_paused: bool,
     /// Second `OrderManager` for the hedge leg, built lazily when
     /// `connectors.hedge` is present. Kept strictly separate
     /// from the primary `order_manager` so per-leg diffing,
@@ -86,6 +139,25 @@ pub struct MarketMakerEngine {
     vpin: VpinEstimator,
     kyle_lambda: KyleLambda,
     adverse_selection: AdverseSelectionTracker,
+    /// Event-driven Market Resilience detector. Reads every
+    /// trade + book update and exposes a `[0, 1]` score that
+    /// reflects how badly a **just-happened** liquidity shock
+    /// has stressed the book. Feeds into
+    /// `AutoTuner::set_market_resilience` per tick.
+    market_resilience: MarketResilienceCalculator,
+    /// Regulatory OTR counter: `(adds + 2·updates + cancels) /
+    /// max(trades, 1) - 1`. Exported into the audit trail and
+    /// Prometheus. Market-quality / spoofing proxy tracked for
+    /// MiCA compliance.
+    otr: OrderToTradeRatio,
+    /// Inventory-vs-wallet drift reconciler. Snapshots the
+    /// wallet total at first reconcile and flags any
+    /// divergence between the wallet delta and the
+    /// `InventoryManager` tracker on subsequent reconciles.
+    /// A drift signals a missed fill, listen-key gap, or an
+    /// external transfer — the caller routes it into the
+    /// audit trail and optionally force-corrects the tracker.
+    inventory_drift: InventoryDriftReconciler,
 
     // Strategy augmentation.
     momentum: MomentumSignals,
@@ -181,9 +253,28 @@ impl MarketMakerEngine {
             .as_ref()
             .map(|pair| BookKeeper::new(&pair.hedge_symbol));
         let hedge_order_manager = connectors.hedge.as_ref().map(|_| OrderManager::new());
+        let borrow_manager = if config.market_maker.borrow_enabled {
+            Some(BorrowManager::new(
+                &product.base_asset,
+                config.market_maker.borrow_max_base,
+                config.market_maker.borrow_buffer_base,
+                config.market_maker.borrow_holding_secs,
+            ))
+        } else {
+            None
+        };
         Self {
             book_keeper: BookKeeper::new(&symbol),
             hedge_book,
+            borrow_manager,
+            cross_venue_basis_inside: false,
+            asset_class_switch: None,
+            pair_lifecycle: if config.market_maker.pair_lifecycle_enabled {
+                Some(PairLifecycleManager::new())
+            } else {
+                None
+            },
+            lifecycle_paused: false,
             hedge_order_manager,
             order_manager: OrderManager::new(),
             inventory_manager: InventoryManager::new(),
@@ -197,7 +288,20 @@ impl MarketMakerEngine {
             vpin,
             kyle_lambda: KyleLambda::new(config.toxicity.kyle_window),
             adverse_selection: AdverseSelectionTracker::new(200),
-            momentum: MomentumSignals::new(config.market_maker.momentum_window),
+            market_resilience: MarketResilienceCalculator::new(MrConfig::default()),
+            otr: OrderToTradeRatio::new(),
+            inventory_drift: InventoryDriftReconciler::new(
+                product.base_asset.clone(),
+                config.market_maker.inventory_drift_tolerance,
+                config.market_maker.inventory_drift_auto_correct,
+            ),
+            momentum: {
+                let mut ms = MomentumSignals::new(config.market_maker.momentum_window);
+                if config.market_maker.hma_enabled {
+                    ms = ms.with_hma(config.market_maker.hma_window);
+                }
+                ms
+            },
             auto_tuner: AutoTuner::new(200),
             adv_inventory: AdvancedInventoryManager::new(config.risk.max_inventory),
             twap: None,
@@ -236,6 +340,37 @@ impl MarketMakerEngine {
     pub fn with_portfolio(mut self, portfolio: Arc<Mutex<Portfolio>>) -> Self {
         self.portfolio = Some(portfolio);
         self
+    }
+
+    /// Attach a shared per-asset-class kill switch (P2.1).
+    /// Multiple engines whose symbols belong to the same
+    /// asset class call this with the **same** `Arc<Mutex<_>>`
+    /// so a coordinated escalation halts the whole class
+    /// without touching unrelated symbols. Use the global
+    /// `KillSwitch` field for hard escalation
+    /// (`CancelAll`/`FlattenAll`/`Disconnect`) — the
+    /// asset-class layer is intentionally soft-only.
+    pub fn with_asset_class_switch(mut self, switch: Arc<Mutex<KillSwitch>>) -> Self {
+        self.asset_class_switch = Some(switch);
+        self
+    }
+
+    /// Effective kill level for soft-decision purposes — the
+    /// max of the per-engine global level and the shared
+    /// per-asset-class level. Hard-decision call sites
+    /// (`CancelAll` / `FlattenAll`) keep reading
+    /// `self.kill_switch.level()` directly so an asset-wide
+    /// widening never accidentally flattens another pair's
+    /// inventory. P2.1.
+    fn effective_kill_level(&self) -> KillLevel {
+        let global = self.kill_switch.level();
+        match self.asset_class_switch.as_ref() {
+            Some(arc) => {
+                let asset = arc.lock().map(|ks| ks.level()).unwrap_or(KillLevel::Normal);
+                global.max(asset)
+            }
+            None => global,
+        }
     }
 
     /// Attach a `FundingArbDriver` to the engine. The engine's
@@ -331,6 +466,35 @@ impl MarketMakerEngine {
         // Skip the first immediate tick so a fresh driver does
         // not fire before the first market-data sample lands.
         funding_arb_interval.tick().await;
+        // Periodic fee-tier refresh (P1.2). The first tick fires
+        // immediately so the operator gets the venue's authoritative
+        // fee schedule into Prometheus before the first quote
+        // refresh, instead of starting the dashboard with the stale
+        // `ProductSpec` defaults.
+        let fee_tier_secs = self.config.market_maker.fee_tier_refresh_secs.max(1);
+        let mut fee_tier_interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(fee_tier_secs));
+        let fee_tier_enabled = self.config.market_maker.fee_tier_refresh_enabled
+            && self.config.market_maker.fee_tier_refresh_secs > 0;
+        // Periodic borrow-rate refresh (P1.3 stage-1). Same shape
+        // as the fee-tier task — first tick fires immediately so
+        // the strategy gets the venue's authoritative rate before
+        // the first quote refresh.
+        let borrow_secs = self.config.market_maker.borrow_rate_refresh_secs.max(1);
+        let mut borrow_rate_interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(borrow_secs));
+        let borrow_enabled =
+            self.borrow_manager.is_some() && self.config.market_maker.borrow_rate_refresh_secs > 0;
+        // Pair lifecycle refresh (P2.3 stage-1). Same pattern
+        // as the fee-tier and borrow-rate arms — first tick
+        // fires immediately so a halt that landed during the
+        // previous run-cycle is detected before the first
+        // quote refresh.
+        let lifecycle_secs = self.config.market_maker.pair_lifecycle_refresh_secs.max(1);
+        let mut pair_lifecycle_interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(lifecycle_secs));
+        let pair_lifecycle_enabled = self.pair_lifecycle.is_some()
+            && self.config.market_maker.pair_lifecycle_refresh_secs > 0;
         self.cycle_start = Instant::now();
 
         loop {
@@ -368,6 +532,15 @@ impl MarketMakerEngine {
                 }
                 _ = reconcile_interval.tick() => {
                     self.reconcile().await;
+                }
+                _ = fee_tier_interval.tick(), if fee_tier_enabled => {
+                    self.refresh_fee_tiers().await;
+                }
+                _ = borrow_rate_interval.tick(), if borrow_enabled => {
+                    self.refresh_borrow_rate().await;
+                }
+                _ = pair_lifecycle_interval.tick(), if pair_lifecycle_enabled => {
+                    self.refresh_pair_lifecycle().await;
                 }
                 _ = funding_arb_interval.tick(),
                     if self.funding_arb_driver.is_some() =>
@@ -540,6 +713,60 @@ impl MarketMakerEngine {
             AuditEventType::BalanceReconciled,
             &format!("cycle {}", self.reconcile_counter),
         );
+
+        // Inventory-vs-wallet drift check. The first reconcile
+        // cycle captures the wallet baseline; subsequent
+        // cycles compare the tracked inventory delta against
+        // the wallet delta and surface any mismatch to the
+        // audit trail + optional auto-correct.
+        self.check_inventory_drift();
+    }
+
+    /// Compare `InventoryManager.inventory()` against the
+    /// wallet-delta baseline and fire a drift report when the
+    /// mismatch exceeds the configured tolerance. Called from
+    /// inside `reconcile` on every reconcile cycle.
+    fn check_inventory_drift(&mut self) {
+        let wallet_total = self
+            .balance_cache
+            .total_in(&self.product.base_asset, mm_common::types::WalletType::Spot);
+        let tracked = self.inventory_manager.inventory();
+        let Some(report) = self.inventory_drift.check(wallet_total, tracked) else {
+            return;
+        };
+        warn!(
+            asset = %report.asset,
+            baseline_wallet = %report.baseline_wallet,
+            current_wallet = %report.current_wallet,
+            expected = %report.expected_inventory,
+            tracked = %report.tracked_inventory,
+            drift = %report.drift,
+            corrected = report.corrected,
+            "INVENTORY DRIFT DETECTED"
+        );
+        let detail = format!(
+            "asset={} baseline={} current={} expected={} tracked={} drift={} corrected={}",
+            report.asset,
+            report.baseline_wallet,
+            report.current_wallet,
+            report.expected_inventory,
+            report.tracked_inventory,
+            report.drift,
+            report.corrected,
+        );
+        self.audit.risk_event(
+            &self.symbol,
+            AuditEventType::InventoryDriftDetected,
+            &detail,
+        );
+        if report.corrected {
+            // Operator opted into auto-correction — force the
+            // tracker to match the wallet delta. PnL attribution
+            // becomes approximate until the position is flat
+            // again, see `force_reset_inventory_to` for details.
+            self.inventory_manager
+                .force_reset_inventory_to(report.expected_inventory);
+        }
     }
 
     async fn tick_second(&mut self) {
@@ -708,18 +935,48 @@ impl MarketMakerEngine {
         match &event {
             MarketEvent::BookSnapshot { .. } | MarketEvent::BookDelta { .. } => {
                 self.book_keeper.on_event(&event);
+                // OTR: every book event is a price-level update
+                // from the L2 perspective — we don't have L3
+                // add/cancel granularity, so we account for it
+                // under the "updates" bucket. Gated behind the
+                // `otr_enabled` toggle.
+                if self.config.market_maker.otr_enabled {
+                    self.otr.on_update();
+                }
                 if let Some(mid) = self.book_keeper.book.mid_price() {
                     self.volatility_estimator.update(mid);
                     if !self.last_mid.is_zero() {
                         let ret = (mid - self.last_mid) / self.last_mid;
                         self.auto_tuner.on_return(ret);
                     }
+                    // Feed the mid into the momentum HMA so
+                    // the alpha() call downstream can pick up
+                    // slope information.
+                    self.momentum.on_mid(mid);
                     self.last_mid = mid;
+                }
+                // Feed the current book into the Market
+                // Resilience detector so it can track spread /
+                // depth shocks alongside trade-driven shocks.
+                // Gated behind the `market_resilience_enabled`
+                // toggle.
+                if self.config.market_maker.market_resilience_enabled {
+                    let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                    let bids = self.book_keeper.book.top_bids(10);
+                    let asks = self.book_keeper.book.top_asks(10);
+                    self.market_resilience.on_book(&bids, &asks, now_ns);
                 }
             }
             MarketEvent::Trade { trade, .. } => {
                 self.vpin.on_trade(trade);
                 self.momentum.on_trade(trade);
+                if self.config.market_maker.otr_enabled {
+                    self.otr.on_trade();
+                }
+                if self.config.market_maker.market_resilience_enabled {
+                    let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                    self.market_resilience.on_trade(trade.qty, now_ns);
+                }
 
                 if !self.last_mid.is_zero() {
                     let signed_vol = match trade.taker_side {
@@ -851,6 +1108,31 @@ impl MarketMakerEngine {
     async fn refresh_quotes(&mut self) -> Result<()> {
         self.tick_count += 1;
 
+        // P2.3: lifecycle paused (halt / pre-trading / break /
+        // delisted) — refuse to quote until the lifecycle
+        // manager flips the flag back. The cancel-all that put
+        // us into the paused state already cleared the venue
+        // book on the last refresh tick.
+        if self.lifecycle_paused {
+            return Ok(());
+        }
+
+        // Periodic OTR snapshot into the audit trail — once
+        // every 60 ticks (≈1 minute at the default refresh
+        // cadence). MiCA compliance: regulators expect the OTR
+        // time series to be reconstructable from the audit log.
+        if self.config.market_maker.otr_enabled && self.tick_count.is_multiple_of(60) {
+            self.audit.order_to_trade_ratio_snapshot(
+                &self.symbol,
+                self.otr.ratio(),
+                self.otr.adds(),
+                self.otr.updates(),
+                self.otr.cancels(),
+                self.otr.trades(),
+            );
+            self.otr.reset();
+        }
+
         // Kill switch check.
         if !self.kill_switch.allow_new_orders() {
             if self.kill_switch.level() >= KillLevel::CancelAll {
@@ -952,8 +1234,38 @@ impl MarketMakerEngine {
             .unwrap_or(self.config.market_maker.sigma);
 
         // Kill switch multipliers.
-        let ks_spread = self.kill_switch.spread_multiplier();
-        let ks_size = self.kill_switch.size_multiplier();
+        let effective_level = self.effective_kill_level();
+        let ks_spread = effective_level.spread_multiplier();
+        let ks_size = effective_level.size_multiplier();
+
+        // Push the current inventory + time-remaining snapshot
+        // into the auto-tuner so the optional inventory γ
+        // policy reads them on its `effective_gamma_mult()`
+        // call. No-op when `inventory_gamma_policy` is None.
+        self.auto_tuner
+            .update_policy_state(self.inventory_manager.inventory(), t_remaining);
+
+        // Push the current Market Resilience reading into the
+        // auto-tuner so `effective_spread_mult()` can widen the
+        // book in response to a just-happened liquidity shock.
+        // Decays back to 1.0 over ~5s after the last shock, so
+        // steady-state markets stay at the regime+toxicity
+        // baseline. Gated behind the `market_resilience_enabled`
+        // toggle — when off, we explicitly clear any stale
+        // reading on the autotuner so the baseline multiplier
+        // is restored.
+        if self.config.market_maker.market_resilience_enabled {
+            let mr_now = chrono::Utc::now();
+            let mr_now_ns = mr_now.timestamp_nanos_opt().unwrap_or(0);
+            let mr_score = self.market_resilience.score(mr_now_ns);
+            self.auto_tuner.set_market_resilience(mr_score);
+            // Also feed the kill switch — a sustained dip below
+            // 0.3 for 3+ seconds trips L1 (WidenSpreads). Harder
+            // levels remain driven by PnL / position value.
+            self.kill_switch.update_market_resilience(mr_score, mr_now);
+        } else {
+            self.auto_tuner.clear_market_resilience();
+        }
 
         // Auto-tune.
         let (eff_gamma, eff_size, eff_spread) = if self.config.toxicity.autotune_enabled {
@@ -988,8 +1300,49 @@ impl MarketMakerEngine {
         tuned.min_spread_bps = eff_spread;
 
         let ref_price = self.hedge_book.as_ref().and_then(|hb| hb.book.mid_price());
-        let hedge_book_ref = self.hedge_book.as_ref().map(|hb| &hb.book);
 
+        let borrow_cost_bps = self
+            .borrow_manager
+            .as_ref()
+            .map(|bm| bm.effective_carry_bps())
+            .filter(|bps| !bps.is_zero());
+        // Cross-venue staleness reading (P1.4 stage-1). Computed
+        // here so the strategy gate has a single canonical value
+        // per refresh tick rather than a re-derived one.
+        let hedge_book_age_ms = self.hedge_book.as_ref().and_then(|hb| {
+            if hb.book.last_update_ms == 0 {
+                return None;
+            }
+            Some(chrono::Utc::now().timestamp_millis() - hb.book.last_update_ms)
+        });
+        // Also push the cross-venue basis to Prometheus + emit
+        // entry/exit audit events when the basis flips across
+        // the configured threshold. Computed BEFORE we borrow
+        // `&self.hedge_book.book` for `hedge_book_ref` so the
+        // mut borrow inside `update_cross_venue_basis_state` does
+        // not conflict with the immutable book reference the
+        // strategy context holds for the rest of the call.
+        let cross_venue_basis_bps = if let (Some(hb), Some(spot_mid)) =
+            (self.hedge_book.as_ref(), self.book_keeper.book.mid_price())
+        {
+            hb.book.mid_price().and_then(|perp_mid| {
+                if spot_mid.is_zero() {
+                    None
+                } else {
+                    Some((perp_mid - spot_mid) / spot_mid * dec!(10_000))
+                }
+            })
+        } else {
+            None
+        };
+        if let Some(basis_bps) = cross_venue_basis_bps {
+            mm_dashboard::metrics::CROSS_VENUE_BASIS_BPS
+                .with_label_values(&[&self.symbol])
+                .set(decimal_to_f64(basis_bps));
+            self.update_cross_venue_basis_state(basis_bps);
+        }
+
+        let hedge_book_ref = self.hedge_book.as_ref().map(|hb| &hb.book);
         let ctx = StrategyContext {
             book: &self.book_keeper.book,
             product: &self.product,
@@ -1000,6 +1353,8 @@ impl MarketMakerEngine {
             mid_price: alpha_mid,
             ref_price,
             hedge_book: hedge_book_ref,
+            borrow_cost_bps,
+            hedge_book_age_ms,
         };
 
         let mut quotes = self.strategy.compute_quotes(&ctx);
@@ -1092,12 +1447,18 @@ impl MarketMakerEngine {
 
         self.kill_switch.on_message_sent();
 
+        let amend_epsilon = if self.config.market_maker.amend_enabled {
+            self.config.market_maker.amend_max_ticks
+        } else {
+            0
+        };
         self.order_manager
             .execute_diff(
                 &self.symbol,
                 &quotes,
                 &self.product,
                 &self.connectors.primary,
+                amend_epsilon,
             )
             .await?;
 
@@ -1196,7 +1557,12 @@ impl MarketMakerEngine {
                 .adverse_selection
                 .adverse_selection_bps()
                 .unwrap_or(dec!(0)),
-            kill_level: self.kill_switch.level() as u8,
+            market_resilience: self
+                .market_resilience
+                .score(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)),
+            order_to_trade_ratio: self.otr.ratio(),
+            hma_value: self.momentum.hma_value(),
+            kill_level: self.effective_kill_level() as u8,
             sla_uptime_pct: self.sla_tracker.uptime_pct(),
             regime: regime_str,
             spread_compliance_pct: self.sla_tracker.spread_compliance_pct(),
@@ -1211,7 +1577,291 @@ impl MarketMakerEngine {
             locked_in_orders_quote: self.order_manager.locked_value_quote(),
             sla_max_spread_bps: self.sla_tracker.config().max_spread_bps,
             sla_min_depth_quote: self.sla_tracker.config().min_depth_quote,
+            presence_pct_24h: {
+                let s = self.sla_tracker.daily_presence_summary();
+                s.presence_pct
+            },
+            two_sided_pct_24h: self.sla_tracker.daily_presence_summary().two_sided_pct,
+            minutes_with_data_24h: self.sla_tracker.daily_presence_summary().minutes_with_data,
         });
+    }
+
+    /// Refresh the venue's effective fee schedule for this
+    /// symbol and hot-swap it into the `PnlTracker` plus the
+    /// in-memory `ProductSpec`. Called by the periodic
+    /// `fee_tier_interval` arm in `run_with_hedge`.
+    ///
+    /// The `Decimal → bps` conversion (`x × 10_000`) is done
+    /// inside this helper so the Prometheus exposition stays in
+    /// the operator-friendly basis-point unit even though the
+    /// venue API speaks fractions.
+    async fn refresh_fee_tiers(&mut self) {
+        let result = self.connectors.primary.fetch_fee_tiers(&self.symbol).await;
+        match result {
+            Ok(info) => {
+                self.product.maker_fee = info.maker_fee;
+                self.product.taker_fee = info.taker_fee;
+                self.pnl_tracker
+                    .set_fee_rates(info.maker_fee, info.taker_fee);
+                let maker_bps = info.maker_fee * dec!(10000);
+                let taker_bps = info.taker_fee * dec!(10000);
+                mm_dashboard::metrics::MAKER_FEE_BPS
+                    .with_label_values(&[&self.symbol])
+                    .set(decimal_to_f64(maker_bps));
+                mm_dashboard::metrics::TAKER_FEE_BPS
+                    .with_label_values(&[&self.symbol])
+                    .set(decimal_to_f64(taker_bps));
+                debug!(
+                    symbol = %self.symbol,
+                    maker_bps = %maker_bps,
+                    taker_bps = %taker_bps,
+                    vip_tier = ?info.vip_tier,
+                    "refreshed fee tier from venue"
+                );
+            }
+            Err(FeeTierError::NotSupported) => {
+                // Venue (HL, Custom) does not have a per-account
+                // fee endpoint — keep the startup snapshot.
+                debug!(
+                    symbol = %self.symbol,
+                    "fetch_fee_tiers not supported on this venue"
+                );
+            }
+            Err(FeeTierError::Other(e)) => {
+                warn!(
+                    symbol = %self.symbol,
+                    error = %e,
+                    "fee tier refresh failed — keeping previous rates"
+                );
+            }
+        }
+    }
+
+    /// Track the cross-venue basis through its entry threshold
+    /// and emit `CrossVenueBasisEntered` / `Exited` audit events
+    /// on the first refresh tick after each crossing. The
+    /// "entry threshold" is taken from
+    /// `config.hedge.pair.basis_threshold_bps` so the same
+    /// number that gates the strategy also gates the audit
+    /// events. P1.4 stage-1.
+    fn update_cross_venue_basis_state(&mut self, basis_bps: Decimal) {
+        let Some(threshold) = self
+            .config
+            .hedge
+            .as_ref()
+            .map(|h| h.pair.basis_threshold_bps)
+        else {
+            return;
+        };
+        let inside = basis_bps.abs() <= threshold;
+        if inside == self.cross_venue_basis_inside {
+            return;
+        }
+        self.cross_venue_basis_inside = inside;
+        let event = if inside {
+            AuditEventType::CrossVenueBasisEntered
+        } else {
+            AuditEventType::CrossVenueBasisExited
+        };
+        let detail = format!("basis_bps={basis_bps}, threshold_bps={threshold}");
+        self.audit.risk_event(&self.symbol, event, &detail);
+    }
+
+    /// Refresh the venue's `ProductSpec` for this symbol and
+    /// route any lifecycle drift into the audit trail + the
+    /// `lifecycle_paused` flag (P2.3 stage-1). Periodic arm in
+    /// `run_with_hedge` calls this on the `pair_lifecycle_interval`
+    /// cadence. Quietly short-circuits when no manager is
+    /// attached.
+    async fn refresh_pair_lifecycle(&mut self) {
+        if self.pair_lifecycle.is_none() {
+            return;
+        }
+        let symbol = self.symbol.clone();
+        let result = self.connectors.primary.get_product_spec(&symbol).await;
+        let events: Vec<PairLifecycleEvent> = match result {
+            Ok(spec) => {
+                // Apply tick / lot drift into self.product so
+                // the next quote refresh rounds against the
+                // venue's authoritative values.
+                let tick_or_lot_changed = self
+                    .pair_lifecycle
+                    .as_ref()
+                    .and_then(|m| m.current())
+                    .map(|prev| prev.tick_size != spec.tick_size || prev.lot_size != spec.lot_size)
+                    .unwrap_or(false);
+                let new_status = spec.trading_status;
+                let new_tick = spec.tick_size;
+                let new_lot = spec.lot_size;
+                let new_min_notional = spec.min_notional;
+                let evts = self
+                    .pair_lifecycle
+                    .as_mut()
+                    .map(|m| m.diff(spec))
+                    .unwrap_or_default();
+                if tick_or_lot_changed {
+                    self.product.tick_size = new_tick;
+                    self.product.lot_size = new_lot;
+                }
+                self.product.trading_status = new_status;
+                self.product.min_notional = new_min_notional;
+                evts
+            }
+            Err(e) => {
+                // The "symbol not found" path on Binance Spot
+                // surfaces here. Treat any persistent error as
+                // a delisting candidate — the manager latches
+                // and refuses to recover until restart.
+                warn!(
+                    symbol = %symbol,
+                    error = %e,
+                    "get_product_spec failed during lifecycle refresh — treating as delisted"
+                );
+                self.pair_lifecycle
+                    .as_mut()
+                    .map(|m| m.on_delisted())
+                    .unwrap_or_default()
+            }
+        };
+        let mut needs_cancel = false;
+        for event in events {
+            if matches!(
+                event,
+                PairLifecycleEvent::Halted { .. } | PairLifecycleEvent::Delisted
+            ) {
+                needs_cancel = true;
+            }
+            self.handle_lifecycle_event(event);
+        }
+        if needs_cancel {
+            // Inline cancel-all on the primary leg so the venue
+            // book has none of our quotes if/when it re-opens.
+            // Hedge leg cancel is handled by the existing
+            // shutdown path — lifecycle pauses are per-symbol,
+            // not per-pair, so flushing only the primary leg is
+            // the right scope.
+            let symbol = self.symbol.clone();
+            self.order_manager
+                .cancel_all(&self.connectors.primary, &symbol)
+                .await;
+        }
+    }
+
+    /// Route one lifecycle event into the audit trail and
+    /// flip the `lifecycle_paused` flag where appropriate.
+    /// Returns nothing — the caller is responsible for the
+    /// async cancel-all that Halted/Delisted require, since
+    /// `OrderManager::cancel_all` is async and this helper
+    /// is sync.
+    fn handle_lifecycle_event(&mut self, event: PairLifecycleEvent) {
+        match &event {
+            PairLifecycleEvent::Listed => {
+                self.audit.risk_event(
+                    &self.symbol,
+                    AuditEventType::PairLifecycleListed,
+                    &format!(
+                        "tick={}, lot={}, min_notional={}",
+                        self.product.tick_size, self.product.lot_size, self.product.min_notional
+                    ),
+                );
+            }
+            PairLifecycleEvent::Halted { from, to } => {
+                self.lifecycle_paused = true;
+                self.audit.risk_event(
+                    &self.symbol,
+                    AuditEventType::PairLifecycleHalted,
+                    &format!("from={from:?}, to={to:?}"),
+                );
+                warn!(
+                    symbol = %self.symbol,
+                    from = ?from,
+                    to = ?to,
+                    "pair lifecycle: halted — pausing quoting"
+                );
+            }
+            PairLifecycleEvent::Resumed { from } => {
+                self.lifecycle_paused = false;
+                self.audit.risk_event(
+                    &self.symbol,
+                    AuditEventType::PairLifecycleResumed,
+                    &format!("from={from:?}"),
+                );
+                info!(symbol = %self.symbol, "pair lifecycle: resumed — quoting re-enabled");
+            }
+            PairLifecycleEvent::Delisted => {
+                self.lifecycle_paused = true;
+                self.audit.risk_event(
+                    &self.symbol,
+                    AuditEventType::PairLifecycleDelisted,
+                    "venue removed symbol",
+                );
+                error!(symbol = %self.symbol, "pair lifecycle: DELISTED — quoting halted permanently");
+            }
+            PairLifecycleEvent::TickLotChanged {
+                old_tick,
+                new_tick,
+                old_lot,
+                new_lot,
+            } => {
+                self.audit.risk_event(
+                    &self.symbol,
+                    AuditEventType::PairLifecycleTickLotChanged,
+                    &format!("tick {old_tick} -> {new_tick}, lot {old_lot} -> {new_lot}"),
+                );
+            }
+            PairLifecycleEvent::MinNotionalChanged { old, new } => {
+                self.audit.risk_event(
+                    &self.symbol,
+                    AuditEventType::PairLifecycleMinNotionalChanged,
+                    &format!("min_notional {old} -> {new}"),
+                );
+            }
+        }
+    }
+
+    /// Refresh the borrow rate for the base asset and push the
+    /// snapshot into `BorrowManager`. Engine select arm calls
+    /// this on the `borrow_rate_interval` cadence. Quietly
+    /// short-circuits when the venue returns `NotSupported` so
+    /// HL / custom connectors do not spam warnings.
+    async fn refresh_borrow_rate(&mut self) {
+        let Some(bm) = self.borrow_manager.as_mut() else {
+            return;
+        };
+        let asset = self.product.base_asset.clone();
+        let result = self.connectors.primary.get_borrow_rate(&asset).await;
+        match result {
+            Ok(info) => {
+                bm.apply_rate_refresh(info.rate_apr);
+                let carry_bps = bm.effective_carry_bps();
+                mm_dashboard::metrics::BORROW_RATE_BPS_HOURLY
+                    .with_label_values(&[&asset])
+                    .set(decimal_to_f64(info.rate_bps_hourly));
+                mm_dashboard::metrics::BORROW_CARRY_BPS
+                    .with_label_values(&[&asset])
+                    .set(decimal_to_f64(carry_bps));
+                debug!(
+                    asset = %asset,
+                    apr = %info.rate_apr,
+                    bps_hourly = %info.rate_bps_hourly,
+                    carry_bps = %carry_bps,
+                    "refreshed borrow rate"
+                );
+            }
+            Err(BorrowError::NotSupported) => {
+                debug!(
+                    asset = %asset,
+                    "get_borrow_rate not supported on this venue"
+                );
+            }
+            Err(BorrowError::Other(e)) => {
+                warn!(
+                    asset = %asset,
+                    error = %e,
+                    "borrow rate refresh failed — keeping previous APR"
+                );
+            }
+        }
     }
 
     fn log_periodic_summary(&self) {
@@ -1289,6 +1939,7 @@ mod dual_connector_tests {
             min_notional: dec!(10),
             maker_fee: dec!(0.0001),
             taker_fee: dec!(0.0005),
+            trading_status: Default::default(),
         }
     }
 
@@ -1482,6 +2133,7 @@ mod portfolio_tests {
             min_notional: dec!(10),
             maker_fee: dec!(0.0001),
             taker_fee: dec!(0.0005),
+            trading_status: Default::default(),
         }
     }
 
@@ -1619,6 +2271,7 @@ mod paired_unwind_tests {
             min_notional: dec!(10),
             maker_fee: dec!(0.0001),
             taker_fee: dec!(0.0005),
+            trading_status: Default::default(),
         }
     }
 
@@ -1662,6 +2315,74 @@ mod paired_unwind_tests {
             None,
             None,
         )
+    }
+
+    /// P2.1: an engine with no asset-class layer reports its
+    /// global level verbatim. Regression anchor for the
+    /// "P2.1 must not break legacy single-engine deployments"
+    /// invariant.
+    #[test]
+    fn effective_kill_level_falls_back_to_global_when_no_asset_class() {
+        let mut engine = single_engine();
+        assert_eq!(engine.effective_kill_level(), KillLevel::Normal);
+        engine
+            .kill_switch
+            .manual_trigger(KillLevel::WidenSpreads, "test global");
+        assert_eq!(engine.effective_kill_level(), KillLevel::WidenSpreads);
+    }
+
+    /// P2.1 happy path: when both a global and an asset-class
+    /// switch are armed, `effective_kill_level` returns the
+    /// max — so a class-wide widening is honoured even when
+    /// the per-engine global is still Normal, AND a per-engine
+    /// hard escalation is honoured even when the class is
+    /// still Normal.
+    #[test]
+    fn effective_kill_level_takes_max_of_global_and_asset_class() {
+        let class = Arc::new(Mutex::new(KillSwitch::new(KillSwitchConfig::default())));
+        let mut engine = single_engine().with_asset_class_switch(class.clone());
+
+        // Asset-class widens, global Normal → effective WidenSpreads.
+        class
+            .lock()
+            .unwrap()
+            .manual_trigger(KillLevel::WidenSpreads, "stETH depeg");
+        assert_eq!(engine.effective_kill_level(), KillLevel::WidenSpreads);
+
+        // Global escalates harder → effective tracks global.
+        engine
+            .kill_switch
+            .manual_trigger(KillLevel::CancelAll, "per-engine PnL stop");
+        assert_eq!(engine.effective_kill_level(), KillLevel::CancelAll);
+
+        // Asset-class escalates to StopNewOrders — global is
+        // already CancelAll which is higher, so effective stays
+        // CancelAll. Pin the max-not-replace semantics.
+        class
+            .lock()
+            .unwrap()
+            .manual_trigger(KillLevel::StopNewOrders, "ETH-family lock");
+        assert_eq!(engine.effective_kill_level(), KillLevel::CancelAll);
+    }
+
+    /// P2.1 sharing: two engines pointed at the same
+    /// `Arc<Mutex<KillSwitch>>` see each other's escalations
+    /// instantly. Models the "halt all ETH-family pairs"
+    /// failure mode the asset-class layer was added to fix.
+    #[test]
+    fn shared_asset_class_switch_propagates_across_engines() {
+        let class = Arc::new(Mutex::new(KillSwitch::new(KillSwitchConfig::default())));
+        let engine_a = single_engine().with_asset_class_switch(class.clone());
+        let engine_b = single_engine().with_asset_class_switch(class.clone());
+        assert_eq!(engine_a.effective_kill_level(), KillLevel::Normal);
+        assert_eq!(engine_b.effective_kill_level(), KillLevel::Normal);
+
+        class
+            .lock()
+            .unwrap()
+            .manual_trigger(KillLevel::WidenSpreads, "shared escalation");
+        assert_eq!(engine_a.effective_kill_level(), KillLevel::WidenSpreads);
+        assert_eq!(engine_b.effective_kill_level(), KillLevel::WidenSpreads);
     }
 
     fn buy_fill(qty: Decimal, price: Decimal) -> MarketEvent {
@@ -2036,6 +2757,7 @@ mod driver_event_tests {
                 min_notional: dec!(10),
                 maker_fee: dec!(0.0001),
                 taker_fee: dec!(0.0005),
+                trading_status: Default::default(),
             },
             Box::new(AvellanedaStoikov),
             bundle,
@@ -2188,6 +2910,7 @@ mod spread_gate_tests {
                 min_notional: dec!(10),
                 maker_fee: dec!(0.0001),
                 taker_fee: dec!(0.0005),
+                trading_status: Default::default(),
             },
             Box::new(AvellanedaStoikov),
             bundle,

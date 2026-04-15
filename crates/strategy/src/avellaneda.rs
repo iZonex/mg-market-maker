@@ -37,7 +37,16 @@ impl Strategy for AvellanedaStoikov {
 
         // Reservation price: mid - q * γ * σ² * (T-t).
         // This skews the midpoint away from our inventory.
-        let reservation = ctx.mid_price - q * gamma_sigma_sq_t;
+        let mut reservation = ctx.mid_price - q * gamma_sigma_sq_t;
+        // P1.3 borrow-cost shim: when the engine threads in a
+        // non-zero `borrow_cost_bps`, push the reservation UP by
+        // that fraction of mid so we are less willing to be
+        // short (the side that accrues the carry cost).
+        if let Some(bps) = ctx.borrow_cost_bps {
+            if bps > dec!(0) {
+                reservation += bps_to_frac(bps) * ctx.mid_price;
+            }
+        }
 
         // Optimal spread: γσ²(T-t) + (2/γ) * ln(1 + γ/κ).
         let spread = if gamma.is_zero() || kappa.is_zero() {
@@ -154,6 +163,7 @@ mod tests {
             min_notional: dec!(10),
             maker_fee: dec!(0.001),
             taker_fee: dec!(0.002),
+            trading_status: Default::default(),
         }
     }
 
@@ -172,6 +182,25 @@ mod tests {
             momentum_enabled: false,
             momentum_window: 200,
             basis_shift: dec!(0.5),
+            market_resilience_enabled: true,
+            otr_enabled: true,
+            hma_enabled: true,
+            hma_window: 9,
+            user_stream_enabled: true,
+            inventory_drift_tolerance: dec!(0.0001),
+            inventory_drift_auto_correct: false,
+            amend_enabled: true,
+            amend_max_ticks: 2,
+            fee_tier_refresh_enabled: true,
+            fee_tier_refresh_secs: 600,
+            borrow_enabled: false,
+            borrow_rate_refresh_secs: 1800,
+            borrow_holding_secs: 3600,
+            borrow_max_base: dec!(0),
+            borrow_buffer_base: dec!(0),
+            pair_lifecycle_enabled: true,
+            pair_lifecycle_refresh_secs: 300,
+            cross_venue_basis_max_staleness_ms: 1500,
         }
     }
 
@@ -203,6 +232,8 @@ mod tests {
             mid_price: mid,
             ref_price: None,
             hedge_book: None,
+            borrow_cost_bps: None,
+            hedge_book_age_ms: None,
         };
 
         let strategy = AvellanedaStoikov;
@@ -249,6 +280,8 @@ mod tests {
             mid_price: mid,
             ref_price: None,
             hedge_book: None,
+            borrow_cost_bps: None,
+            hedge_book_age_ms: None,
         };
 
         let strategy = AvellanedaStoikov;
@@ -264,6 +297,82 @@ mod tests {
         assert!(
             ask_dist < bid_dist,
             "ask_dist={ask_dist} should be < bid_dist={bid_dist} when long"
+        );
+    }
+
+    /// P1.3 borrow-cost shim: a non-zero `borrow_cost_bps` must
+    /// shift BOTH bid and ask up by the same fraction-of-mid
+    /// amount. Catches the regression of accidentally treating
+    /// the surcharge as a one-sided ask widening, which would
+    /// break the existing inventory-skew tests.
+    #[test]
+    fn borrow_cost_shifts_reservation_up() {
+        let product = test_product();
+        let config = test_config();
+        let mut book = LocalOrderBook::new("BTCUSDT".into());
+        book.apply_snapshot(
+            vec![mm_common::PriceLevel {
+                price: dec!(50000),
+                qty: dec!(1),
+            }],
+            vec![mm_common::PriceLevel {
+                price: dec!(50001),
+                qty: dec!(1),
+            }],
+            1,
+        );
+        let mid = book.mid_price().unwrap();
+
+        let ctx_off = StrategyContext {
+            book: &book,
+            product: &product,
+            config: &config,
+            inventory: dec!(0),
+            volatility: dec!(0.02),
+            time_remaining: dec!(1),
+            mid_price: mid,
+            ref_price: None,
+            hedge_book: None,
+            borrow_cost_bps: None,
+            hedge_book_age_ms: None,
+        };
+        let ctx_on = StrategyContext {
+            book: &book,
+            product: &product,
+            config: &config,
+            inventory: dec!(0),
+            volatility: dec!(0.02),
+            time_remaining: dec!(1),
+            mid_price: mid,
+            ref_price: None,
+            hedge_book: None,
+            borrow_cost_bps: Some(dec!(10)),
+            hedge_book_age_ms: None,
+        };
+        let strategy = AvellanedaStoikov;
+        let q_off = &strategy.compute_quotes(&ctx_off)[0];
+        let q_on = &strategy.compute_quotes(&ctx_on)[0];
+        let bid_off = q_off.bid.as_ref().unwrap().price;
+        let ask_off = q_off.ask.as_ref().unwrap().price;
+        let bid_on = q_on.bid.as_ref().unwrap().price;
+        let ask_on = q_on.ask.as_ref().unwrap().price;
+
+        // Both sides shifted up by a positive amount.
+        assert!(
+            bid_on > bid_off,
+            "bid did not shift up: {bid_off} -> {bid_on}"
+        );
+        assert!(
+            ask_on > ask_off,
+            "ask did not shift up: {ask_off} -> {ask_on}"
+        );
+        // 10 bps × 50000.5 = 50.0005 in price terms; both
+        // sides should have moved by roughly that amount.
+        let bid_shift = bid_on - bid_off;
+        let ask_shift = ask_on - ask_off;
+        assert!(
+            (bid_shift - ask_shift).abs() <= dec!(0.02),
+            "bid and ask shifts must match: bid={bid_shift}, ask={ask_shift}"
         );
     }
 

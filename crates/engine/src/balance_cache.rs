@@ -91,6 +91,19 @@ impl BalanceCache {
             .unwrap_or(dec!(0))
     }
 
+    /// Get the **total** balance on a specific wallet —
+    /// `free + locked`, before our pending-order reservations
+    /// are subtracted. This is the figure the inventory-vs-
+    /// wallet drift reconciler compares against: it reflects
+    /// the true on-venue holding of the asset, independent of
+    /// our local quoting state.
+    pub fn total_in(&self, asset: &str, wallet: WalletType) -> Decimal {
+        self.balances
+            .get(&(asset.to_string(), wallet))
+            .map(|b| b.total)
+            .unwrap_or(dec!(0))
+    }
+
     /// Check if we can afford an order on the configured wallet.
     pub fn can_afford(
         &self,

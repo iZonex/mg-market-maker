@@ -24,6 +24,32 @@ pub enum KillLevel {
     Disconnect = 5,
 }
 
+impl KillLevel {
+    /// Spread multiplier driven by a kill level — the same shape
+    /// the per-engine `KillSwitch::spread_multiplier` uses, but
+    /// expressed as a free function so the engine can derive the
+    /// multiplier from a *combined* (global ∨ asset-class) level
+    /// without holding either kill switch by reference. P2.1.
+    pub fn spread_multiplier(self) -> Decimal {
+        match self {
+            KillLevel::Normal => dec!(1),
+            KillLevel::WidenSpreads => dec!(2),
+            _ => dec!(1),
+        }
+    }
+
+    /// Size multiplier driven by a kill level — `0` at and above
+    /// `StopNewOrders` so quoting evaporates regardless of which
+    /// kill switch tripped the level.
+    pub fn size_multiplier(self) -> Decimal {
+        match self {
+            KillLevel::Normal => dec!(1),
+            KillLevel::WidenSpreads => dec!(0.5),
+            _ => dec!(0),
+        }
+    }
+}
+
 impl std::fmt::Display for KillLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -82,7 +108,21 @@ pub struct KillSwitch {
     consecutive_errors: u32,
     last_fill_at: Option<DateTime<Utc>>,
     day_start: DateTime<Utc>,
+    /// Timestamp when Market Resilience first dropped below
+    /// `mr_low_threshold`. Cleared when the score recovers
+    /// above that threshold. When the dip persists longer than
+    /// `mr_sustain_secs`, the kill switch escalates to
+    /// `WidenSpreads`.
+    low_mr_since: Option<DateTime<Utc>>,
 }
+
+/// Threshold below which the Market Resilience reading is
+/// considered "under shock" for kill-switch escalation
+/// purposes.
+pub const MR_LOW_THRESHOLD: Decimal = dec!(0.3);
+/// Sustain window — MR must stay below [`MR_LOW_THRESHOLD`]
+/// for at least this many seconds before the switch widens.
+pub const MR_SUSTAIN_SECS: i64 = 3;
 
 impl KillSwitch {
     pub fn new(config: KillSwitchConfig) -> Self {
@@ -96,6 +136,7 @@ impl KillSwitch {
             consecutive_errors: 0,
             last_fill_at: None,
             day_start: Utc::now(),
+            low_mr_since: None,
         }
     }
 
@@ -167,6 +208,28 @@ impl KillSwitch {
         }
     }
 
+    /// Feed the current Market Resilience reading. Escalates
+    /// the switch to [`KillLevel::WidenSpreads`] when the score
+    /// stays below [`MR_LOW_THRESHOLD`] for at least
+    /// [`MR_SUSTAIN_SECS`] seconds. Higher levels
+    /// (`StopNewOrders` and above) are not raised from this
+    /// signal alone — MR is a soft input, PnL / position value
+    /// remain the hard escalation triggers.
+    pub fn update_market_resilience(&mut self, score: Decimal, now: DateTime<Utc>) {
+        if score < MR_LOW_THRESHOLD {
+            let anchor = self.low_mr_since.get_or_insert(now);
+            let elapsed = now.signed_duration_since(*anchor).num_seconds();
+            if elapsed >= MR_SUSTAIN_SECS && self.current_level == KillLevel::Normal {
+                self.escalate(
+                    KillLevel::WidenSpreads,
+                    "market resilience sustained below threshold",
+                );
+            }
+        } else {
+            self.low_mr_since = None;
+        }
+    }
+
     /// Record a message sent to exchange.
     pub fn on_message_sent(&mut self) {
         self.message_count_this_second += 1;
@@ -212,26 +275,74 @@ impl KillSwitch {
 
     /// Spread multiplier based on kill level.
     pub fn spread_multiplier(&self) -> Decimal {
-        match self.current_level {
-            KillLevel::Normal => dec!(1),
-            KillLevel::WidenSpreads => dec!(2),
-            _ => dec!(1), // Higher levels don't quote at all.
-        }
+        self.current_level.spread_multiplier()
     }
 
     /// Size multiplier based on kill level.
     pub fn size_multiplier(&self) -> Decimal {
-        match self.current_level {
-            KillLevel::Normal => dec!(1),
-            KillLevel::WidenSpreads => dec!(0.5),
-            _ => dec!(0),
-        }
+        self.current_level.size_multiplier()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P2.1 multiplier helpers — pin the per-level constants
+    /// so a future contributor cannot silently change them out
+    /// from under the asset-class effective-level path.
+    #[test]
+    fn level_multiplier_helpers_match_per_level_state_machine() {
+        assert_eq!(KillLevel::Normal.spread_multiplier(), dec!(1));
+        assert_eq!(KillLevel::WidenSpreads.spread_multiplier(), dec!(2));
+        assert_eq!(KillLevel::StopNewOrders.spread_multiplier(), dec!(1));
+        assert_eq!(KillLevel::CancelAll.spread_multiplier(), dec!(1));
+
+        assert_eq!(KillLevel::Normal.size_multiplier(), dec!(1));
+        assert_eq!(KillLevel::WidenSpreads.size_multiplier(), dec!(0.5));
+        assert_eq!(KillLevel::StopNewOrders.size_multiplier(), dec!(0));
+        assert_eq!(KillLevel::CancelAll.size_multiplier(), dec!(0));
+
+        // The free-fn helpers and the per-instance accessors
+        // must agree — otherwise the engine's effective-level
+        // path would diverge from the legacy single-instance
+        // path. Regression anchor for the P2.1 refactor.
+        let mut ks = KillSwitch::new(KillSwitchConfig::default());
+        ks.escalate(KillLevel::WidenSpreads, "test");
+        assert_eq!(
+            ks.spread_multiplier(),
+            KillLevel::WidenSpreads.spread_multiplier()
+        );
+        assert_eq!(
+            ks.size_multiplier(),
+            KillLevel::WidenSpreads.size_multiplier()
+        );
+    }
+
+    /// `KillLevel` must satisfy `Ord` so the engine's effective
+    /// level can be computed as `global.max(asset_class)`.
+    /// Pin the comparison so a future re-ordering of the enum
+    /// variants (which would silently break the max) fails the
+    /// test loudly.
+    #[test]
+    fn kill_level_max_picks_higher_severity() {
+        assert_eq!(
+            KillLevel::Normal.max(KillLevel::WidenSpreads),
+            KillLevel::WidenSpreads
+        );
+        assert_eq!(
+            KillLevel::WidenSpreads.max(KillLevel::StopNewOrders),
+            KillLevel::StopNewOrders
+        );
+        assert_eq!(
+            KillLevel::StopNewOrders.max(KillLevel::CancelAll),
+            KillLevel::CancelAll
+        );
+        assert_eq!(
+            KillLevel::CancelAll.max(KillLevel::FlattenAll),
+            KillLevel::FlattenAll
+        );
+    }
 
     #[test]
     fn test_escalation() {
@@ -285,5 +396,73 @@ mod tests {
 
         ks.reset();
         assert_eq!(ks.level(), KillLevel::Normal);
+    }
+
+    // ----- Market Resilience trigger tests -----
+
+    /// A single low-MR observation must not immediately
+    /// escalate — the trigger requires a sustained dip.
+    #[test]
+    fn mr_dip_below_threshold_does_not_escalate_immediately() {
+        let mut ks = KillSwitch::new(Default::default());
+        let t0 = Utc::now();
+        ks.update_market_resilience(dec!(0.1), t0);
+        assert_eq!(ks.level(), KillLevel::Normal);
+    }
+
+    /// A sustained dip must escalate to `WidenSpreads` once the
+    /// sustain window has elapsed.
+    #[test]
+    fn sustained_low_mr_escalates_to_widen_spreads() {
+        let mut ks = KillSwitch::new(Default::default());
+        let t0 = Utc::now();
+        ks.update_market_resilience(dec!(0.1), t0);
+        let t_after = t0 + chrono::Duration::seconds(MR_SUSTAIN_SECS + 1);
+        ks.update_market_resilience(dec!(0.1), t_after);
+        assert_eq!(ks.level(), KillLevel::WidenSpreads);
+    }
+
+    /// A recovery above the threshold resets the anchor, so a
+    /// subsequent dip restarts the sustain window.
+    #[test]
+    fn mr_recovery_clears_the_anchor() {
+        let mut ks = KillSwitch::new(Default::default());
+        let t0 = Utc::now();
+        ks.update_market_resilience(dec!(0.1), t0);
+        // Recover.
+        ks.update_market_resilience(dec!(0.9), t0 + chrono::Duration::seconds(1));
+        // Dip again — anchor starts fresh, so MR_SUSTAIN_SECS
+        // later the escalation must re-evaluate from zero.
+        let t_dip_again = t0 + chrono::Duration::seconds(2);
+        ks.update_market_resilience(dec!(0.1), t_dip_again);
+        // Within the sustain window of the new anchor → no
+        // escalation.
+        ks.update_market_resilience(
+            dec!(0.1),
+            t_dip_again + chrono::Duration::seconds(MR_SUSTAIN_SECS - 1),
+        );
+        assert_eq!(ks.level(), KillLevel::Normal);
+    }
+
+    /// MR never escalates past `WidenSpreads` — hard escalation
+    /// levels remain driven by PnL and position value only.
+    #[test]
+    fn mr_does_not_overwrite_higher_kill_level() {
+        let mut ks = KillSwitch::new(KillSwitchConfig {
+            daily_loss_limit: dec!(100),
+            ..Default::default()
+        });
+        ks.update_pnl(dec!(-110));
+        assert_eq!(ks.level(), KillLevel::CancelAll);
+        let t0 = Utc::now();
+        ks.update_market_resilience(dec!(0.1), t0);
+        ks.update_market_resilience(
+            dec!(0.1),
+            t0 + chrono::Duration::seconds(MR_SUSTAIN_SECS + 1),
+        );
+        // The sustained-low-MR branch guards `current_level ==
+        // Normal` so MR cannot re-escalate — and `escalate`
+        // would ignore a lower level anyway.
+        assert_eq!(ks.level(), KillLevel::CancelAll);
     }
 }

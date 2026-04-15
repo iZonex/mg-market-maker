@@ -272,6 +272,15 @@ async fn stream_loop(
     anyhow::bail!("user data stream closed")
 }
 
+/// Parse one user-data WS frame into `MarketEvent`s — public
+/// entry point for integration tests in downstream crates
+/// (e.g. `mm-engine`) that need to assert the frame → cache
+/// path end-to-end without spinning up a live listen-key
+/// session.
+pub fn parse_user_event_for_test(v: &Value, product: UserStreamProduct) -> Vec<MarketEvent> {
+    parse_user_event(v, product)
+}
+
 /// Parse one user-data WS frame into `MarketEvent`s. Exposed for
 /// unit testing without a live server.
 pub(crate) fn parse_user_event(v: &Value, product: UserStreamProduct) -> Vec<MarketEvent> {

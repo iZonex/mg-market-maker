@@ -151,6 +151,19 @@ struct SymbolDailyReport {
     avg_spread_bps: Decimal,
     uptime_pct: Decimal,
     max_inventory: Decimal,
+    /// P2.2 — per-pair daily presence rolled up from the 1440
+    /// per-minute SLA buckets. Refreshed on every dashboard
+    /// state push and reset at UTC midnight inside the engine's
+    /// `SlaTracker`.
+    presence_pct_24h: Decimal,
+    /// Two-sided-only daily presence percentage (some MM
+    /// rebate agreements pay against this independently of the
+    /// spread floor).
+    two_sided_pct_24h: Decimal,
+    /// Minutes today with any samples — distinguishes a fresh
+    /// engine ("100 % over 0 minutes") from a steady-state
+    /// one. Audit teams consume this alongside `presence_pct`.
+    minutes_with_data_24h: u32,
 }
 
 async fn get_daily_report(State(state): State<DashboardState>) -> Json<DailyReport> {
@@ -173,6 +186,9 @@ async fn get_daily_report(State(state): State<DashboardState>) -> Json<DailyRepo
                 avg_spread_bps: s.spread_bps,
                 uptime_pct: s.sla_uptime_pct,
                 max_inventory: s.inventory.abs(),
+                presence_pct_24h: s.presence_pct_24h,
+                two_sided_pct_24h: s.two_sided_pct_24h,
+                minutes_with_data_24h: s.minutes_with_data_24h,
             }
         })
         .collect();

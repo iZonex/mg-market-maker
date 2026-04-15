@@ -50,6 +50,19 @@ pub struct SymbolState {
     pub vpin: Decimal,
     pub kyle_lambda: Decimal,
     pub adverse_bps: Decimal,
+    /// Latest Market Resilience score in `[0, 1]`. `1.0` is
+    /// "fully recovered / steady state", anything lower means
+    /// the book has just been hit by a shock that hasn't fully
+    /// cleared.
+    pub market_resilience: Decimal,
+    /// Regulatory Order-to-Trade Ratio. High values indicate
+    /// spoofing / layering; MiCA compliance requires venues
+    /// and market makers to monitor this.
+    pub order_to_trade_ratio: Decimal,
+    /// Latest Hull Moving Average on mid-price. `None` before
+    /// the HMA is warmed up, `Some(value)` once it has enough
+    /// samples.
+    pub hma_value: Option<Decimal>,
     pub kill_level: u8,
     pub sla_uptime_pct: Decimal,
     pub regime: String,
@@ -63,6 +76,21 @@ pub struct SymbolState {
     pub sla_max_spread_bps: Decimal,
     /// SLA min depth from config.
     pub sla_min_depth_quote: Decimal,
+    /// Per-pair daily presence percentage rolled up from the
+    /// `SlaTracker`'s 1440 per-minute buckets (P2.2). Counts
+    /// observation seconds, not minute buckets, so a minute
+    /// with 60 samples and 30 compliant outweighs a minute
+    /// with 30 samples and 30 compliant.
+    pub presence_pct_24h: Decimal,
+    /// Per-pair daily two-sided percentage — separate from
+    /// `presence_pct_24h` because some MM rebate agreements
+    /// pay against two-sided uptime independently of the
+    /// spread floor.
+    pub two_sided_pct_24h: Decimal,
+    /// Number of distinct minutes today that recorded any
+    /// samples. Useful to distinguish a fresh start
+    /// ("100 % over 0 minutes") from a steady-state day.
+    pub minutes_with_data_24h: u32,
 }
 
 /// Depth at a specific percentage from mid price.
@@ -132,12 +160,26 @@ impl DashboardState {
         crate::metrics::ADVERSE_BPS
             .with_label_values(&[&state.symbol])
             .set(decimal_to_f64(state.adverse_bps));
+        crate::metrics::MARKET_RESILIENCE
+            .with_label_values(&[&state.symbol])
+            .set(decimal_to_f64(state.market_resilience));
+        crate::metrics::ORDER_TO_TRADE_RATIO
+            .with_label_values(&[&state.symbol])
+            .set(decimal_to_f64(state.order_to_trade_ratio));
+        if let Some(hma) = state.hma_value {
+            crate::metrics::HMA_VALUE
+                .with_label_values(&[&state.symbol])
+                .set(decimal_to_f64(hma));
+        }
         crate::metrics::KILL_SWITCH_LEVEL
             .with_label_values(&[&state.symbol])
             .set(state.kill_level as f64);
         crate::metrics::SLA_UPTIME
             .with_label_values(&[&state.symbol])
             .set(decimal_to_f64(state.sla_uptime_pct));
+        crate::metrics::SLA_PRESENCE_PCT_24H
+            .with_label_values(&[&state.symbol])
+            .set(decimal_to_f64(state.presence_pct_24h));
 
         inner.symbols.insert(state.symbol.clone(), state);
     }

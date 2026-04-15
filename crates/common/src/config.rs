@@ -169,6 +169,15 @@ pub enum StrategyType {
     /// atomic-pair entries/exits via `FundingArbExecutor`.
     /// Requires `AppConfig.hedge` and `funding_arb` sections.
     FundingArb,
+    /// Cross-venue basis (P1.4 stage-1). Same shape as `Basis`
+    /// but with an explicit hedge-book staleness gate so the
+    /// strategy stands down whenever the cross-venue feed
+    /// pauses past `cross_venue_basis_max_staleness_ms`. Use
+    /// when the primary and hedge venues are different
+    /// exchanges (Binance spot ↔ Bybit perp, Coinbase spot ↔
+    /// Binance perp, etc.) — same-venue pairs should still
+    /// pick `Basis`.
+    CrossVenueBasis,
 }
 
 /// Which exchange to connect to.
@@ -244,6 +253,227 @@ pub struct MarketMakerConfig {
     /// not `Basis`.
     #[serde(default = "default_basis_shift")]
     pub basis_shift: Decimal,
+
+    /// Enable the event-driven Market Resilience detector. When
+    /// `false`, the calculator still exists but its score is
+    /// never pushed into the autotuner or kill switch — the
+    /// book stays at the regime+toxicity spread baseline. Turn
+    /// off if MR keeps over-widening in an extremely bursty
+    /// venue and you want to fall back to the static heuristic.
+    #[serde(default = "default_true")]
+    pub market_resilience_enabled: bool,
+
+    /// Enable the Order-to-Trade Ratio compliance counter.
+    /// When `false`, OTR snapshots stop flowing into the audit
+    /// trail and the Prometheus gauge. **Leave `true` for any
+    /// MiCA-regulated venue** — this is a regulatory metric,
+    /// not a trading signal.
+    #[serde(default = "default_true")]
+    pub otr_enabled: bool,
+
+    /// Enable the Hull Moving Average alpha component in
+    /// `MomentumSignals`. When `false`, the legacy `0.4 / 0.4 /
+    /// 0.2` alpha weight split is used (book imbalance / trade
+    /// flow / micro-price only, no HMA slope). Turn off to
+    /// A/B-compare alpha quality with and without HMA.
+    #[serde(default = "default_true")]
+    pub hma_enabled: bool,
+
+    /// Hull Moving Average window for the mid-price feed.
+    /// Default 9 — matches the `mm-toolbox` quickstart and
+    /// gives a HMA lag of ≈3 samples on typical mid streams.
+    #[serde(default = "default_hma_window")]
+    pub hma_window: usize,
+
+    /// Enable the Binance listen-key user-data stream. When
+    /// `true` (the default), the server spawns a background
+    /// task that opens a signed WebSocket against
+    /// `wss://stream.binance.com/ws/<listenKey>` and pushes
+    /// `MarketEvent::Fill` + `MarketEvent::BalanceUpdate`
+    /// into the engine's event loop. Without this, fills
+    /// that don't come back through the WS-API response
+    /// envelope (REST fallback, partial fills, manual UI
+    /// orders, RFQ/OTC) silently drift inventory until the
+    /// next reconciliation cycle. **Turn off only for paper
+    /// mode or for non-Binance venues.**
+    #[serde(default = "default_true")]
+    pub user_stream_enabled: bool,
+
+    /// Absolute tolerance (in base asset units) for the
+    /// inventory-vs-wallet drift reconciler. Drift under this
+    /// threshold is absorbed silently to ignore fee-in-base
+    /// rounding noise. Default `0.0001`; operators on a pair
+    /// with finer lot sizes should tighten it, and operators
+    /// whose venue takes fees in the base asset should widen
+    /// it by roughly `2 × maker_fee × max_daily_volume`.
+    #[serde(default = "default_drift_tolerance")]
+    pub inventory_drift_tolerance: Decimal,
+
+    /// Auto-correct the `InventoryManager` tracker when a
+    /// drift is detected. `false` (the default) is **alert
+    /// only**: the drift is logged to the audit trail and the
+    /// alert manager, and the operator is expected to
+    /// investigate manually. `true` force-resets the tracker
+    /// to match the wallet delta — use only when the drift
+    /// source is known to be a listen-key gap, not a bug in
+    /// fill routing.
+    #[serde(default = "default_false")]
+    pub inventory_drift_auto_correct: bool,
+
+    /// Enable soft cancel-replace (amend) on order diffs.
+    /// When `true`, the `OrderManager` pairs cancels and
+    /// places on the same side that differ by at most
+    /// `amend_max_ticks` ticks with unchanged qty, and issues
+    /// `ExchangeConnector::amend_order` instead of a
+    /// cancel+place pair — preserving queue priority on
+    /// venues that support it. Venues without
+    /// `VenueCapabilities::supports_amend` fall back to
+    /// cancel+place automatically regardless of this flag.
+    #[serde(default = "default_true")]
+    pub amend_enabled: bool,
+
+    /// Maximum price tick distance at which an order diff is
+    /// eligible for amend instead of cancel+place. `0`
+    /// disables amend even when `amend_enabled = true`.
+    /// Default `2`: a same-side pair within 2 ticks gets an
+    /// amend. Larger budgets risk amend rejections on venues
+    /// that only preserve queue priority within a tight
+    /// window.
+    #[serde(default = "default_amend_max_ticks")]
+    pub amend_max_ticks: u32,
+
+    /// Enable the periodic fee-tier refresh task. When `true`,
+    /// the engine queries `ExchangeConnector::fetch_fee_tiers`
+    /// every `fee_tier_refresh_secs` and hot-swaps the
+    /// `PnlTracker` rates plus the `ProductSpec.maker_fee` /
+    /// `taker_fee` so a month-end VIP tier crossing affects
+    /// captured edge immediately instead of waiting for a
+    /// process restart. Connectors without a per-account fee
+    /// endpoint return `Err(NotSupported)` — the engine logs the
+    /// fallthrough at debug level and keeps the startup
+    /// snapshot.
+    #[serde(default = "default_true")]
+    pub fee_tier_refresh_enabled: bool,
+
+    /// Refresh cadence for the periodic fee-tier task. Default
+    /// `600` seconds (10 minutes) — Binance and Bybit only
+    /// recalculate VIP tiers on a daily / weekly schedule, so a
+    /// faster cadence wastes API budget. Set to `0` to disable
+    /// even when `fee_tier_refresh_enabled` is true.
+    #[serde(default = "default_fee_tier_refresh_secs")]
+    pub fee_tier_refresh_secs: u64,
+
+    /// Enable the P1.3 borrow-cost shim — when `true` the
+    /// engine periodically refreshes the venue's borrow rate
+    /// for the base asset and threads the resulting
+    /// expected-carry bps into the strategy reservation price
+    /// so the spot ask side compensates for the loan it would
+    /// take to deliver. Stage-1 only widens the reservation;
+    /// stage-2 will wire actual loan execution. Defaults to
+    /// `false` so existing operators are not silently
+    /// re-priced into a wider book.
+    #[serde(default = "default_false")]
+    pub borrow_enabled: bool,
+
+    /// Refresh cadence for the periodic borrow-rate task.
+    /// Default `1800` seconds (30 min). Binance recomputes the
+    /// daily margin rate at most once per hour so a faster
+    /// cadence wastes API budget. Set to `0` to disable even
+    /// when `borrow_enabled` is true.
+    #[serde(default = "default_borrow_rate_refresh_secs")]
+    pub borrow_rate_refresh_secs: u64,
+
+    /// Average expected holding period for one round-trip of
+    /// borrowed inventory in seconds. Used by the
+    /// `BorrowManager` to convert APR → expected-carry bps.
+    /// Default `3600` (1 hour). Tighter values shrink the
+    /// surcharge; longer values inflate it.
+    #[serde(default = "default_borrow_holding_secs")]
+    pub borrow_holding_secs: u64,
+
+    /// Maximum borrow target in base-asset units. Stage-1 only
+    /// uses this for the carry-cost bookkeeping; stage-2 will
+    /// enforce it as a hard cap on the actual loan.
+    #[serde(default = "default_borrow_max_base")]
+    pub borrow_max_base: Decimal,
+
+    /// Pre-borrow buffer in base-asset units the engine wants
+    /// available at all times. Stage-1 only persists it.
+    #[serde(default = "default_borrow_buffer_base")]
+    pub borrow_buffer_base: Decimal,
+
+    /// Enable the P2.3 pair lifecycle automation. When `true`
+    /// the engine periodically polls
+    /// `connector.get_product_spec(symbol)`, diffs against the
+    /// in-memory snapshot via `PairLifecycleManager`, and
+    /// routes Halted/Resumed/Delisted/TickLotChanged events
+    /// into the audit trail and the engine's paused flag.
+    /// Default `true` — operators on venues that do not
+    /// surface a status field still get the tick/lot drift
+    /// detection for free, with the halt branch as a no-op.
+    #[serde(default = "default_true")]
+    pub pair_lifecycle_enabled: bool,
+
+    /// Refresh cadence for the pair lifecycle task in seconds.
+    /// Default `300` (5 minutes). Faster cadences waste API
+    /// budget; slower ones leave a long window where a halt
+    /// goes unnoticed.
+    #[serde(default = "default_pair_lifecycle_refresh_secs")]
+    pub pair_lifecycle_refresh_secs: u64,
+
+    /// Maximum acceptable hedge-book staleness in milliseconds
+    /// for the cross-venue basis strategy (P1.4 stage-1).
+    /// Default `1500` — typical cross-venue WS feeds jitter
+    /// 200-800 ms in steady state, so 1.5 s catches a stalled
+    /// feed without false positives. The engine threads this
+    /// into `BasisStrategy::cross_venue` whenever
+    /// `StrategyType::CrossVenueBasis` is selected.
+    #[serde(default = "default_cross_venue_basis_max_staleness_ms")]
+    pub cross_venue_basis_max_staleness_ms: i64,
+}
+
+fn default_cross_venue_basis_max_staleness_ms() -> i64 {
+    1500
+}
+
+fn default_pair_lifecycle_refresh_secs() -> u64 {
+    300
+}
+
+fn default_borrow_rate_refresh_secs() -> u64 {
+    1800
+}
+
+fn default_borrow_holding_secs() -> u64 {
+    3600
+}
+
+fn default_borrow_max_base() -> Decimal {
+    dec!(0)
+}
+
+fn default_borrow_buffer_base() -> Decimal {
+    dec!(0)
+}
+
+fn default_fee_tier_refresh_secs() -> u64 {
+    600
+}
+
+fn default_amend_max_ticks() -> u32 {
+    2
+}
+
+fn default_drift_tolerance() -> Decimal {
+    dec!(0.0001)
+}
+
+fn default_false() -> bool {
+    false
+}
+
+fn default_hma_window() -> usize {
+    9
 }
 
 fn default_basis_shift() -> Decimal {
@@ -319,6 +549,42 @@ pub struct KillSwitchCfg {
     pub max_message_rate: u32,
     /// Max consecutive API errors → Stop New Orders.
     pub max_consecutive_errors: u32,
+    /// Per-asset-class kill switches (P2.1). Each entry owns its
+    /// own `KillSwitchCfg`-like limits and a list of symbols
+    /// that share the resulting state. Engines whose symbol
+    /// matches an entry receive a shared `Arc<Mutex<KillSwitch>>`
+    /// pointer so a coordinated escalation halts every
+    /// pair in the class without touching unrelated symbols.
+    /// Hard escalation levels (CancelAll / FlattenAll /
+    /// Disconnect) still come from the per-engine global state
+    /// only — the asset-class layer is intentionally
+    /// **soft-only**, so an asset-wide widening cannot
+    /// accidentally flatten another pair's inventory.
+    #[serde(default)]
+    pub asset_classes: Vec<AssetClassKillSwitchCfg>,
+}
+
+/// One per-asset-class kill switch entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetClassKillSwitchCfg {
+    /// Display name — used in logs, audit, and the dashboard.
+    /// Free-form; pick something operators will recognise
+    /// ("ETH-family", "stablecoins", "long-tail-alts").
+    pub name: String,
+    /// Symbols belonging to this class. Each symbol must be
+    /// quoted by exactly one engine in the deployment;
+    /// `validate.rs` errors if a symbol appears in more than
+    /// one class or in a class but not in `[[symbols]]`.
+    pub symbols: Vec<String>,
+    /// Soft-trigger thresholds for the asset-class layer. The
+    /// fields mirror `KillSwitchCfg` because the per-asset-class
+    /// `KillSwitch` is the same state machine — just shared
+    /// across the symbols listed above. Hard-trigger fields
+    /// (`daily_loss_limit`, `max_position_value`) are still
+    /// honoured but only escalate up to `StopNewOrders`; the
+    /// hard `CancelAll`/`FlattenAll` paths come from the
+    /// per-engine global state.
+    pub limits: KillSwitchCfg,
 }
 
 impl Default for KillSwitchCfg {
@@ -329,6 +595,7 @@ impl Default for KillSwitchCfg {
             max_position_value: "50000".parse().unwrap(),
             max_message_rate: 100,
             max_consecutive_errors: 10,
+            asset_classes: Vec::new(),
         }
     }
 }
@@ -445,6 +712,25 @@ impl Default for AppConfig {
                 momentum_enabled: true,
                 momentum_window: 200,
                 basis_shift: dec!(0.5),
+                market_resilience_enabled: true,
+                otr_enabled: true,
+                hma_enabled: true,
+                hma_window: 9,
+                user_stream_enabled: true,
+                inventory_drift_tolerance: dec!(0.0001),
+                inventory_drift_auto_correct: false,
+                amend_enabled: true,
+                amend_max_ticks: 2,
+                fee_tier_refresh_enabled: true,
+                fee_tier_refresh_secs: 600,
+                borrow_enabled: false,
+                borrow_rate_refresh_secs: 1800,
+                borrow_holding_secs: 3600,
+                borrow_max_base: dec!(0),
+                borrow_buffer_base: dec!(0),
+                pair_lifecycle_enabled: true,
+                pair_lifecycle_refresh_secs: 300,
+                cross_venue_basis_max_staleness_ms: 1500,
             },
             kill_switch: KillSwitchCfg::default(),
             risk: RiskConfig {

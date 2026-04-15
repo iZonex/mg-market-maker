@@ -349,6 +349,7 @@ impl HyperLiquidConnector {
             min_notional: DEFAULT_MIN_NOTIONAL,
             maker_fee: DEFAULT_MAKER_FEE,
             taker_fee: DEFAULT_TAKER_FEE,
+            trading_status: Default::default(),
         }
     }
 
@@ -446,6 +447,7 @@ impl ExchangeConnector for HyperLiquidConnector {
         let url = self.ws_url.clone();
         let coins: Vec<String> = symbols.to_vec();
         let user_hex = self.key.address_hex();
+        let is_spot = self.is_spot;
 
         // Make sure the asset map is loaded so event parsers can translate
         // asset indices back to symbols.
@@ -492,7 +494,14 @@ impl ExchangeConnector for HyperLiquidConnector {
                             }
                         }
 
-                        // Private user streams.
+                        // Private user streams. `webData2` is the only
+                        // HL channel that pushes wallet/clearinghouse
+                        // state on change, so it is the analog of
+                        // Binance's `outboundAccountPosition` and
+                        // Bybit V5's `wallet` topic — without it the
+                        // engine's `BalanceCache` would only learn
+                        // about HL balance changes via the 60 s
+                        // reconcile loop. See ROADMAP P0.1.
                         let sub_user = json!({
                             "method": "subscribe",
                             "subscription": { "type": "userEvents", "user": user_hex }
@@ -501,13 +510,18 @@ impl ExchangeConnector for HyperLiquidConnector {
                             "method": "subscribe",
                             "subscription": { "type": "orderUpdates", "user": user_hex }
                         });
+                        let sub_webdata = json!({
+                            "method": "subscribe",
+                            "subscription": { "type": "webData2", "user": user_hex }
+                        });
                         let _ = write.send(Message::Text(sub_user.to_string())).await;
                         let _ = write.send(Message::Text(sub_orders.to_string())).await;
+                        let _ = write.send(Message::Text(sub_webdata.to_string())).await;
 
                         while let Some(Ok(msg)) = read.next().await {
                             if let Message::Text(text) = msg {
                                 if let Ok(v) = serde_json::from_str::<Value>(&text.to_string()) {
-                                    for evt in parse_hl_event(&v) {
+                                    for evt in parse_hl_event(&v, is_spot) {
                                         if tx.send(evt).is_err() {
                                             return;
                                         }
@@ -854,9 +868,14 @@ fn parse_hl_levels(side: &Value) -> Vec<PriceLevel> {
 
 /// Parse a single HL WS message into zero or more `MarketEvent`s.
 ///
+/// `is_spot` selects the wallet bucket the `webData2` parser tags
+/// `BalanceUpdate` events with — perp accounts use
+/// `WalletType::UsdMarginedFutures` (USDC collateral pool), spot
+/// accounts use `WalletType::Spot` (per-token holdings).
+///
 /// Pure function — cloids are deterministic (UUID bytes → hex), so we can
 /// decode them back to `OrderId` without any cache lookup.
-fn parse_hl_event(v: &Value) -> Vec<MarketEvent> {
+pub(crate) fn parse_hl_event(v: &Value, is_spot: bool) -> Vec<MarketEvent> {
     let Some(channel) = v.get("channel").and_then(|c| c.as_str()) else {
         return Vec::new();
     };
@@ -963,6 +982,20 @@ fn parse_hl_event(v: &Value) -> Vec<MarketEvent> {
                 })
                 .collect()
         }
+        "webData2" => {
+            // HL pushes the user's full clearinghouse + spot state on
+            // every change. We translate that into the same
+            // `BalanceUpdate` events Binance (`outboundAccountPosition`)
+            // and Bybit (`wallet`) emit, so the engine's
+            // `BalanceCache` stays current without waiting for the
+            // 60 s reconcile poll.
+            let Some(d) = data else { return Vec::new() };
+            if is_spot {
+                parse_hl_spot_balances(d)
+            } else {
+                parse_hl_perp_balance(d).into_iter().collect()
+            }
+        }
         "orderUpdates" => {
             let Some(arr) = data.and_then(|d| d.as_array()) else {
                 return Vec::new();
@@ -997,6 +1030,85 @@ fn parse_hl_event(v: &Value) -> Vec<MarketEvent> {
         }
         _ => Vec::new(),
     }
+}
+
+/// Parse a HL perp `webData2` payload into a single USDC
+/// `BalanceUpdate`. Mirrors the REST `clearinghouseState` reading in
+/// `get_balances`: `marginSummary.accountValue` is the total equity,
+/// `withdrawable` is the available portion, and the difference is
+/// the margin currently locked into open positions / orders.
+fn parse_hl_perp_balance(d: &Value) -> Option<MarketEvent> {
+    // The payload nests differently across HL releases — try the
+    // documented top-level shape first, then fall back to the
+    // commonly-seen `clearinghouseState` nested form.
+    let ch = d
+        .get("clearinghouseState")
+        .or_else(|| d.get("perpClearinghouseState"))
+        .unwrap_or(d);
+    let withdrawable: Decimal = ch
+        .get("withdrawable")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(Decimal::ZERO);
+    let account_value: Decimal = ch
+        .get("marginSummary")
+        .and_then(|m| m.get("accountValue"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(withdrawable);
+    if account_value.is_zero() && withdrawable.is_zero() {
+        return None;
+    }
+    let locked = (account_value - withdrawable).max(Decimal::ZERO);
+    Some(MarketEvent::BalanceUpdate {
+        venue: VenueId::HyperLiquid,
+        asset: "USDC".to_string(),
+        wallet: WalletType::UsdMarginedFutures,
+        total: account_value,
+        locked,
+        available: withdrawable,
+    })
+}
+
+/// Parse a HL spot `webData2` payload into one `BalanceUpdate` per
+/// non-zero coin balance. Mirrors `spotClearinghouseState.balances`
+/// from the REST helper in `get_balances`.
+fn parse_hl_spot_balances(d: &Value) -> Vec<MarketEvent> {
+    let spot = d
+        .get("spotState")
+        .or_else(|| d.get("spotClearinghouseState"))
+        .unwrap_or(d);
+    let Some(balances) = spot.get("balances").and_then(|b| b.as_array()) else {
+        return Vec::new();
+    };
+    balances
+        .iter()
+        .filter_map(|b| {
+            let asset = b.get("coin")?.as_str()?.to_string();
+            let total: Decimal = b.get("total").and_then(|v| v.as_str())?.parse().ok()?;
+            let hold: Decimal = b
+                .get("hold")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(Decimal::ZERO);
+            Some(MarketEvent::BalanceUpdate {
+                venue: VenueId::HyperLiquid,
+                asset,
+                wallet: WalletType::Spot,
+                total,
+                locked: hold,
+                available: (total - hold).max(Decimal::ZERO),
+            })
+        })
+        .collect()
+}
+
+/// Parse one HL WS frame into `MarketEvent`s — public entry point for
+/// integration tests in downstream crates that need to assert the
+/// frame → cache path end-to-end without spinning up a live WS
+/// session.
+pub fn parse_hl_event_for_test(v: &Value, is_spot: bool) -> Vec<MarketEvent> {
+    parse_hl_event(v, is_spot)
 }
 
 #[cfg(test)]
@@ -1110,5 +1222,179 @@ mod tests {
         let _: fn() = || {
             let _ = std::mem::size_of::<crate::ws_post::HlWsTrader>();
         };
+    }
+
+    // ---------- webData2 → BalanceUpdate (P0.1 HL leg) ----------
+
+    /// Perp `webData2` payload → single USDC `BalanceUpdate` tagged
+    /// against the perp collateral wallet. Mirrors the field layout
+    /// the REST `clearinghouseState` reader uses, so a future schema
+    /// drift breaks both the test and the live parser symmetrically.
+    #[test]
+    fn webdata2_perp_emits_usdc_balance_update() {
+        let frame = serde_json::json!({
+            "channel": "webData2",
+            "data": {
+                "user": "0xabc",
+                "clearinghouseState": {
+                    "withdrawable": "750.50",
+                    "marginSummary": { "accountValue": "1000.00" }
+                }
+            }
+        });
+        let events = parse_hl_event(&frame, false);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            MarketEvent::BalanceUpdate {
+                asset,
+                wallet,
+                total,
+                locked,
+                available,
+                ..
+            } => {
+                assert_eq!(asset, "USDC");
+                assert_eq!(*wallet, WalletType::UsdMarginedFutures);
+                assert_eq!(*total, dec!(1000.00));
+                assert_eq!(*available, dec!(750.50));
+                assert_eq!(*locked, dec!(249.50));
+            }
+            _ => panic!("expected BalanceUpdate"),
+        }
+    }
+
+    /// Perp parser falls back to `withdrawable` as both total and
+    /// available when `marginSummary.accountValue` is missing —
+    /// guards against an HL edge case where a fresh sub-account has
+    /// no open positions and the field is omitted entirely.
+    #[test]
+    fn webdata2_perp_falls_back_when_account_value_missing() {
+        let frame = serde_json::json!({
+            "channel": "webData2",
+            "data": {
+                "clearinghouseState": { "withdrawable": "42" }
+            }
+        });
+        let events = parse_hl_event(&frame, false);
+        assert_eq!(events.len(), 1);
+        if let MarketEvent::BalanceUpdate {
+            total,
+            available,
+            locked,
+            ..
+        } = &events[0]
+        {
+            assert_eq!(*total, dec!(42));
+            assert_eq!(*available, dec!(42));
+            assert_eq!(*locked, dec!(0));
+        } else {
+            panic!("expected BalanceUpdate");
+        }
+    }
+
+    /// Spot `webData2` payload → one `BalanceUpdate` per non-zero
+    /// coin, tagged against the spot wallet bucket. Mirrors the
+    /// `spotClearinghouseState.balances[]` shape from the REST path.
+    #[test]
+    fn webdata2_spot_emits_per_coin_balance_updates() {
+        let frame = serde_json::json!({
+            "channel": "webData2",
+            "data": {
+                "user": "0xabc",
+                "spotState": {
+                    "balances": [
+                        { "coin": "USDC", "token": 0, "total": "500.0", "hold": "100.0" },
+                        { "coin": "PURR", "token": 1, "total": "10.0", "hold": "0.0" }
+                    ]
+                }
+            }
+        });
+        let events = parse_hl_event(&frame, true);
+        assert_eq!(events.len(), 2);
+        if let MarketEvent::BalanceUpdate {
+            asset,
+            wallet,
+            total,
+            locked,
+            available,
+            ..
+        } = &events[0]
+        {
+            assert_eq!(asset, "USDC");
+            assert_eq!(*wallet, WalletType::Spot);
+            assert_eq!(*total, dec!(500));
+            assert_eq!(*locked, dec!(100));
+            assert_eq!(*available, dec!(400));
+        } else {
+            panic!("expected BalanceUpdate");
+        }
+    }
+
+    /// `is_spot=true` must NOT emit perp `BalanceUpdate`s even when a
+    /// `clearinghouseState` snippet sneaks into the payload, and vice
+    /// versa. Otherwise a spot connector would surface its operator's
+    /// perp collateral as a spot balance and double-count it.
+    #[test]
+    fn webdata2_routing_is_disjoint_between_spot_and_perp() {
+        let mixed = serde_json::json!({
+            "channel": "webData2",
+            "data": {
+                "clearinghouseState": {
+                    "withdrawable": "100",
+                    "marginSummary": { "accountValue": "100" }
+                },
+                "spotState": {
+                    "balances": [{ "coin": "USDC", "total": "5", "hold": "0" }]
+                }
+            }
+        });
+        let perp_events = parse_hl_event(&mixed, false);
+        assert_eq!(perp_events.len(), 1);
+        assert!(matches!(
+            perp_events[0],
+            MarketEvent::BalanceUpdate {
+                wallet: WalletType::UsdMarginedFutures,
+                ..
+            }
+        ));
+        let spot_events = parse_hl_event(&mixed, true);
+        assert_eq!(spot_events.len(), 1);
+        assert!(matches!(
+            spot_events[0],
+            MarketEvent::BalanceUpdate {
+                wallet: WalletType::Spot,
+                ..
+            }
+        ));
+    }
+
+    /// `webData2` with no recognisable balance fields is a no-op —
+    /// guards against sending spurious zero-balance updates that
+    /// would confuse the inventory drift reconciler.
+    #[test]
+    fn webdata2_with_no_balances_is_silent() {
+        let frame = serde_json::json!({
+            "channel": "webData2",
+            "data": { "user": "0xabc" }
+        });
+        assert!(parse_hl_event(&frame, false).is_empty());
+        assert!(parse_hl_event(&frame, true).is_empty());
+    }
+
+    /// `parse_hl_event_for_test` is the public crate-export the
+    /// downstream `mm-engine` integration test pins against. Verify
+    /// it dispatches to the same internal parser.
+    #[test]
+    fn parse_hl_event_for_test_is_a_thin_pass_through() {
+        let frame = serde_json::json!({
+            "channel": "webData2",
+            "data": {
+                "clearinghouseState": {
+                    "withdrawable": "1",
+                    "marginSummary": { "accountValue": "1" }
+                }
+            }
+        });
+        assert_eq!(super::parse_hl_event_for_test(&frame, false).len(), 1);
     }
 }

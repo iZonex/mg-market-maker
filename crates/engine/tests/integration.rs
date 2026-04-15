@@ -13,6 +13,7 @@ use mm_strategy::momentum::MomentumSignals;
 use mm_strategy::r#trait::{Strategy, StrategyContext};
 use mm_strategy::volatility::VolatilityEstimator;
 use mm_strategy::{AvellanedaStoikov, GlftStrategy, GridStrategy};
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 fn test_product() -> ProductSpec {
@@ -25,6 +26,7 @@ fn test_product() -> ProductSpec {
         min_notional: dec!(10),
         maker_fee: dec!(0.001),
         taker_fee: dec!(0.002),
+        trading_status: Default::default(),
     }
 }
 
@@ -43,6 +45,25 @@ fn test_config() -> MarketMakerConfig {
         momentum_enabled: true,
         momentum_window: 200,
         basis_shift: dec!(0.5),
+        market_resilience_enabled: true,
+        otr_enabled: true,
+        hma_enabled: true,
+        hma_window: 9,
+        user_stream_enabled: true,
+        inventory_drift_tolerance: dec!(0.0001),
+        inventory_drift_auto_correct: false,
+        amend_enabled: true,
+        amend_max_ticks: 2,
+        fee_tier_refresh_enabled: true,
+        fee_tier_refresh_secs: 600,
+        borrow_enabled: false,
+        borrow_rate_refresh_secs: 1800,
+        borrow_holding_secs: 3600,
+        borrow_max_base: dec!(0),
+        borrow_buffer_base: dec!(0),
+        pair_lifecycle_enabled: true,
+        pair_lifecycle_refresh_secs: 300,
+        cross_venue_basis_max_staleness_ms: 1500,
     }
 }
 
@@ -107,6 +128,8 @@ fn test_all_strategies_produce_valid_quotes() {
             mid_price: mid,
             ref_price: None,
             hedge_book: None,
+            borrow_cost_bps: None,
+            hedge_book_age_ms: None,
         };
 
         let quotes = strategy.compute_quotes(&ctx);
@@ -168,6 +191,8 @@ fn test_inventory_skew_direction() {
         mid_price: mid,
         ref_price: None,
         hedge_book: None,
+        borrow_cost_bps: None,
+        hedge_book_age_ms: None,
     };
     let q_neutral = strategy.compute_quotes(&ctx_neutral);
     let neutral_ask = q_neutral[0].ask.as_ref().unwrap().price;
@@ -185,6 +210,8 @@ fn test_inventory_skew_direction() {
         mid_price: mid,
         ref_price: None,
         hedge_book: None,
+        borrow_cost_bps: None,
+        hedge_book_age_ms: None,
     };
     let q_long = strategy.compute_quotes(&ctx_long);
     let long_ask = q_long[0].ask.as_ref().unwrap().price;
@@ -213,6 +240,8 @@ fn test_inventory_skew_direction() {
         mid_price: mid,
         ref_price: None,
         hedge_book: None,
+        borrow_cost_bps: None,
+        hedge_book_age_ms: None,
     };
     let q_short = strategy.compute_quotes(&ctx_short);
     let short_ask = q_short[0].ask.as_ref().unwrap().price;
@@ -421,4 +450,444 @@ fn test_volatility_estimation() {
     let v = vol.volatility();
     assert!(v.is_some(), "should have volatility estimate");
     assert!(v.unwrap() > dec!(0), "volatility should be positive");
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end Market Resilience → AutoTuner → effective_spread_mult wiring.
+//
+// Proves that a just-happened large trade flows through the full signal
+// chain and actually widens the book for the strategy. Unit tests in the
+// individual modules cover correctness of each stage; this test is the
+// glue check that we didn't break the plumbing between them.
+// ---------------------------------------------------------------------------
+
+/// Feed a synthetic trade + book stream through a
+/// `MarketResilienceCalculator` paired with an `AutoTuner`.
+/// After a large trade the effective spread multiplier must
+/// widen relative to the no-shock baseline, and after the MR
+/// decay window elapses it must return to the baseline.
+#[test]
+fn large_trade_widens_autotuner_spread_mult_and_recovers() {
+    use mm_common::types::PriceLevel;
+    use mm_strategy::market_resilience::{MarketResilienceCalculator, MrConfig};
+
+    // Small config so warmup isn't 200 samples.
+    let mr_config = MrConfig {
+        warmup_samples: 5,
+        shock_timeout_ns: 1_000_000_000,
+        // 2 seconds decay so the test can assert both widening
+        // and recovery on a compressed timeline.
+        decay_window_ns: 2_000_000_000,
+        ..MrConfig::default()
+    };
+    let mut mr = MarketResilienceCalculator::new(mr_config);
+    let mut tuner = AutoTuner::new(32);
+
+    // Baseline spread multiplier with no MR attached.
+    let baseline = tuner.effective_spread_mult();
+
+    // Warmup the detector: 50 small trades + book snapshots at
+    // t=0..50ms, tight spread (0.1 units), deep levels.
+    let deep_bids = vec![
+        PriceLevel {
+            price: dec!(100.0),
+            qty: dec!(50),
+        },
+        PriceLevel {
+            price: dec!(99.9),
+            qty: dec!(40),
+        },
+        PriceLevel {
+            price: dec!(99.8),
+            qty: dec!(30),
+        },
+    ];
+    let deep_asks = vec![
+        PriceLevel {
+            price: dec!(100.1),
+            qty: dec!(50),
+        },
+        PriceLevel {
+            price: dec!(100.2),
+            qty: dec!(40),
+        },
+        PriceLevel {
+            price: dec!(100.3),
+            qty: dec!(30),
+        },
+    ];
+    for i in 0..50_i64 {
+        mr.on_trade(dec!(1), i * 100_000);
+        mr.on_book(&deep_bids, &deep_asks, i * 100_000);
+    }
+
+    // Shock: huge trade + widened ask side at t = 60ms.
+    mr.on_trade(dec!(100), 60_000_000);
+    let wide_asks = vec![
+        PriceLevel {
+            price: dec!(105.0),
+            qty: dec!(50),
+        },
+        PriceLevel {
+            price: dec!(106.0),
+            qty: dec!(40),
+        },
+    ];
+    mr.on_book(&deep_bids, &wide_asks, 60_000_000);
+    // Spread recovery: ask side returns to normal at t = 80ms.
+    mr.on_book(&deep_bids, &deep_asks, 80_000_000);
+
+    // At this point MR should have finalised a score below 1.0.
+    let shock_ns = 80_000_000;
+    let shock_score = mr.score(shock_ns);
+    assert!(
+        shock_score < Decimal::ONE,
+        "MR must drop below 1.0 after shock: got {shock_score}"
+    );
+
+    // Push the score into the autotuner and check the spread
+    // multiplier widens.
+    tuner.set_market_resilience(shock_score);
+    let widened = tuner.effective_spread_mult();
+    assert!(
+        widened > baseline,
+        "autotuner spread mult must widen after shock: baseline={baseline}, widened={widened}"
+    );
+
+    // After the decay window, the score recovers to 1.0 and
+    // the multiplier returns to the baseline.
+    let recovered_ns = shock_ns + 3_000_000_000; // 3 s later, past decay window (2 s)
+    let recovered_score = mr.score(recovered_ns);
+    assert_eq!(
+        recovered_score,
+        Decimal::ONE,
+        "MR score must decay back to 1.0 past the decay window"
+    );
+    tuner.set_market_resilience(recovered_score);
+    let restored = tuner.effective_spread_mult();
+    assert_eq!(
+        restored, baseline,
+        "autotuner spread mult must return to baseline after MR recovery"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end Binance listen-key user-data stream parsing → BalanceCache.
+//
+// Proves the invariant the engine's `handle_ws_event::BalanceUpdate`
+// branch relies on: a WS frame from the listen-key stream parses into
+// a `MarketEvent::BalanceUpdate`, and plugging that event into a
+// fresh `BalanceCache::update_from_exchange` produces a cache whose
+// `available_in(asset, wallet)` reads back the frame's free balance.
+//
+// This is the first-class test for P0.1 (ROADMAP): without it, the
+// out-of-band fill path we just wired through `spawn_event_merger`
+// in `mm-server::main` has no regression anchor.
+// ---------------------------------------------------------------------------
+
+/// Binance spot `outboundAccountPosition` frame → engine-visible
+/// balance. The frame carries two assets (BTC + USDT) with distinct
+/// free/locked splits; the cache must reflect them independently.
+#[test]
+fn binance_user_stream_frame_feeds_balance_cache() {
+    use mm_common::types::WalletType;
+    use mm_engine::balance_cache::BalanceCache;
+    use mm_exchange_binance::user_stream::{parse_user_event_for_test, UserStreamProduct};
+    use mm_exchange_core::events::MarketEvent;
+
+    // Hand-crafted snapshot matching the Binance docs' example
+    // shape for `outboundAccountPosition`. Two assets, one free,
+    // one with a locked portion.
+    let frame = serde_json::json!({
+        "e": "outboundAccountPosition",
+        "E": 1_710_000_000_000_u64,
+        "u": 1_710_000_000_001_u64,
+        "B": [
+            { "a": "BTC", "f": "0.5", "l": "0.0" },
+            { "a": "USDT", "f": "1000.0", "l": "250.0" }
+        ]
+    });
+
+    let events = parse_user_event_for_test(&frame, UserStreamProduct::Spot);
+    assert_eq!(events.len(), 2, "expected one BalanceUpdate per asset");
+
+    // Plug both events into a fresh cache via the same code path
+    // `market_maker.rs::handle_ws_event` uses — `update_from_exchange`
+    // with a single-element `Balance` slice per event.
+    let mut cache = BalanceCache::new_for(WalletType::Spot);
+    for ev in &events {
+        if let MarketEvent::BalanceUpdate {
+            asset,
+            wallet,
+            total,
+            locked,
+            available,
+            ..
+        } = ev
+        {
+            cache.update_from_exchange(&[mm_common::types::Balance {
+                asset: asset.clone(),
+                wallet: *wallet,
+                total: *total,
+                locked: *locked,
+                available: *available,
+            }]);
+        }
+    }
+
+    assert_eq!(
+        cache.available_in("BTC", WalletType::Spot),
+        dec!(0.5),
+        "BTC free balance must be surfaced into the spot wallet slot"
+    );
+    assert_eq!(
+        cache.available_in("USDT", WalletType::Spot),
+        dec!(1000),
+        "USDT free balance must carry over from the WS frame"
+    );
+}
+
+/// Bybit V5 private WS `wallet` topic frame → engine-visible
+/// balance. Mirrors `binance_user_stream_frame_feeds_balance_cache`
+/// for the second venue the listen-key wiring now covers (P0.1).
+/// Asserts that the parser, the `MarketEvent::BalanceUpdate` event
+/// type, and the `BalanceCache::update_from_exchange` chain all
+/// agree on the wallet bucket Bybit V5 UTA reports under.
+#[test]
+fn bybit_private_wallet_frame_feeds_balance_cache() {
+    use mm_common::types::WalletType;
+    use mm_engine::balance_cache::BalanceCache;
+    use mm_exchange_bybit::user_stream::parse_user_event_for_test;
+    use mm_exchange_core::events::MarketEvent;
+
+    // V5 UTA wallet snapshot — `walletBalance` is the total,
+    // `availableToWithdraw` is the post-IM available, and
+    // `totalOrderIM` is the locked collateral. Two coins so we
+    // catch any per-asset crosstalk in the cache.
+    let frame = serde_json::json!({
+        "topic": "wallet",
+        "data": [{
+            "accountType": "UNIFIED",
+            "coin": [
+                {
+                    "coin": "USDT",
+                    "walletBalance": "1000",
+                    "availableToWithdraw": "750",
+                    "totalOrderIM": "250"
+                },
+                {
+                    "coin": "BTC",
+                    "walletBalance": "0.5",
+                    "availableToWithdraw": "0.5",
+                    "totalOrderIM": "0"
+                }
+            ]
+        }]
+    });
+
+    let events = parse_user_event_for_test(&frame, WalletType::Unified);
+    assert_eq!(events.len(), 2, "expected one BalanceUpdate per coin");
+
+    let mut cache = BalanceCache::new_for(WalletType::Unified);
+    for ev in &events {
+        if let MarketEvent::BalanceUpdate {
+            asset,
+            wallet,
+            total,
+            locked,
+            available,
+            ..
+        } = ev
+        {
+            cache.update_from_exchange(&[mm_common::types::Balance {
+                asset: asset.clone(),
+                wallet: *wallet,
+                total: *total,
+                locked: *locked,
+                available: *available,
+            }]);
+        }
+    }
+
+    assert_eq!(
+        cache.available_in("USDT", WalletType::Unified),
+        dec!(750),
+        "USDT availableToWithdraw must surface as the unified-wallet available balance",
+    );
+    assert_eq!(
+        cache.available_in("BTC", WalletType::Unified),
+        dec!(0.5),
+        "BTC availableToWithdraw must carry over from the wallet frame",
+    );
+}
+
+/// HyperLiquid `webData2` perp frame → engine-visible USDC balance.
+/// Third venue in the P0.1 cluster: HL multiplexes its private
+/// stream onto the same WS connection as the public feed, so the
+/// gap was the missing `webData2` subscription rather than an
+/// entire missing user-stream module. This test pins the
+/// `webData2` → `BalanceUpdate` → `BalanceCache::available_in`
+/// pipe so a future schema drift fails the build before it
+/// silently desyncs an HL bot.
+#[test]
+fn hl_webdata2_frame_feeds_balance_cache() {
+    use mm_common::types::WalletType;
+    use mm_engine::balance_cache::BalanceCache;
+    use mm_exchange_core::events::MarketEvent;
+    use mm_exchange_hyperliquid::parse_hl_event_for_test;
+
+    let frame = serde_json::json!({
+        "channel": "webData2",
+        "data": {
+            "user": "0xdeadbeef",
+            "clearinghouseState": {
+                "withdrawable": "750.50",
+                "marginSummary": { "accountValue": "1000.00" }
+            }
+        }
+    });
+
+    let events = parse_hl_event_for_test(&frame, false);
+    assert_eq!(events.len(), 1, "expected a single USDC BalanceUpdate");
+
+    let mut cache = BalanceCache::new_for(WalletType::UsdMarginedFutures);
+    for ev in &events {
+        if let MarketEvent::BalanceUpdate {
+            asset,
+            wallet,
+            total,
+            locked,
+            available,
+            ..
+        } = ev
+        {
+            cache.update_from_exchange(&[mm_common::types::Balance {
+                asset: asset.clone(),
+                wallet: *wallet,
+                total: *total,
+                locked: *locked,
+                available: *available,
+            }]);
+        }
+    }
+
+    assert_eq!(
+        cache.available_in("USDC", WalletType::UsdMarginedFutures),
+        dec!(750.50),
+        "withdrawable must surface as the perp-collateral available balance",
+    );
+    assert_eq!(
+        cache.total_in("USDC", WalletType::UsdMarginedFutures),
+        dec!(1000.00),
+        "accountValue must surface as the perp-collateral total balance",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end inventory-vs-wallet drift detection.
+//
+// Proves the loop that ties `BalanceCache.total_in(base, Spot)` into the
+// `InventoryDriftReconciler` and fires a `DriftReport` when the tracked
+// inventory diverges from the wallet delta since the baseline reconcile.
+// This is the regression anchor for P0.2 — without it the silent-drift
+// failure mode from the ROADMAP audit has nothing to pin on.
+// ---------------------------------------------------------------------------
+
+/// Baseline reconcile captures the starting wallet balance.
+/// A subsequent reconcile with a mismatched tracker (because a
+/// BUY fill was dropped by a listen-key gap) must surface a
+/// drift report with the correct signed value.
+#[test]
+fn baseline_then_missed_buy_surfaces_drift_report() {
+    use mm_common::types::{Balance, WalletType};
+    use mm_engine::balance_cache::BalanceCache;
+    use mm_risk::inventory_drift::InventoryDriftReconciler;
+
+    let mut cache = BalanceCache::new_for(WalletType::Spot);
+    let mut reconciler = InventoryDriftReconciler::new("BTC", dec!(0.0001), false);
+
+    // Baseline: wallet starts at exactly 1 BTC. Tracker = 0
+    // (engine just started, no fills yet).
+    cache.update_from_exchange(&[Balance {
+        asset: "BTC".into(),
+        wallet: WalletType::Spot,
+        total: dec!(1),
+        locked: dec!(0),
+        available: dec!(1),
+    }]);
+    let first = reconciler.check(cache.total_in("BTC", WalletType::Spot), Decimal::ZERO);
+    assert!(first.is_none(), "baseline reconcile must return None");
+
+    // The venue processes a 0.2 BTC BUY fill but the listen-key
+    // stream dropped the executionReport frame. Wallet refresh
+    // on the next reconcile picks up the real state; tracker
+    // never heard about the fill.
+    cache.update_from_exchange(&[Balance {
+        asset: "BTC".into(),
+        wallet: WalletType::Spot,
+        total: dec!(1.2),
+        locked: dec!(0),
+        available: dec!(1.2),
+    }]);
+    let report = reconciler
+        .check(cache.total_in("BTC", WalletType::Spot), Decimal::ZERO)
+        .expect("missed BUY fill must produce a drift report");
+    assert_eq!(report.asset, "BTC");
+    assert_eq!(report.baseline_wallet, dec!(1));
+    assert_eq!(report.current_wallet, dec!(1.2));
+    assert_eq!(report.expected_inventory, dec!(0.2));
+    assert_eq!(report.tracked_inventory, dec!(0));
+    assert_eq!(report.drift, dec!(0.2));
+    assert!(!report.corrected, "alert-only mode keeps corrected = false");
+}
+
+/// With `auto_correct = true`, the report's `corrected` flag
+/// flips on and `InventoryManager::force_reset_inventory_to`
+/// is a single-shot self-heal the caller invokes.
+#[test]
+fn auto_correct_drift_force_resets_inventory_manager() {
+    use mm_common::types::{Balance, WalletType};
+    use mm_engine::balance_cache::BalanceCache;
+    use mm_risk::inventory::InventoryManager;
+    use mm_risk::inventory_drift::InventoryDriftReconciler;
+
+    let mut cache = BalanceCache::new_for(WalletType::Spot);
+    let mut reconciler = InventoryDriftReconciler::new("BTC", dec!(0.0001), true);
+    let mut inventory = InventoryManager::new();
+
+    cache.update_from_exchange(&[Balance {
+        asset: "BTC".into(),
+        wallet: WalletType::Spot,
+        total: dec!(2),
+        locked: dec!(0),
+        available: dec!(2),
+    }]);
+    // Establish baseline.
+    reconciler.check(
+        cache.total_in("BTC", WalletType::Spot),
+        inventory.inventory(),
+    );
+
+    // Wallet went to 1.75 (a 0.25 BTC sell actually happened
+    // on the venue) but tracker never saw the fill.
+    cache.update_from_exchange(&[Balance {
+        asset: "BTC".into(),
+        wallet: WalletType::Spot,
+        total: dec!(1.75),
+        locked: dec!(0),
+        available: dec!(1.75),
+    }]);
+    let report = reconciler
+        .check(
+            cache.total_in("BTC", WalletType::Spot),
+            inventory.inventory(),
+        )
+        .expect("missed SELL fill must produce a drift report");
+    assert_eq!(report.drift, dec!(-0.25));
+    assert!(report.corrected);
+
+    // Apply the correction — the engine's `check_inventory_drift`
+    // helper does exactly this when `corrected = true`.
+    inventory.force_reset_inventory_to(report.expected_inventory);
+    assert_eq!(inventory.inventory(), dec!(-0.25));
 }

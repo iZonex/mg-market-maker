@@ -82,6 +82,76 @@ pub static ADVERSE_BPS: Lazy<GaugeVec> = Lazy::new(|| {
     )
     .unwrap()
 });
+pub static MARKET_RESILIENCE: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_market_resilience",
+        "Market Resilience score (1.0 = fully recovered, 0.0 = fragile)",
+        &["symbol"]
+    )
+    .unwrap()
+});
+pub static ORDER_TO_TRADE_RATIO: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_order_to_trade_ratio",
+        "Order-to-Trade Ratio (regulatory surveillance metric)",
+        &["symbol"]
+    )
+    .unwrap()
+});
+pub static HMA_VALUE: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_hma_value",
+        "Hull Moving Average value on mid-price (None before warmup)",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
+// Fee schedule (refreshed by the periodic fee-tier task — P1.2)
+pub static MAKER_FEE_BPS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_maker_fee_bps",
+        "Effective maker fee in bps as the venue reports it for this account (negative = rebate)",
+        &["symbol"]
+    )
+    .unwrap()
+});
+pub static TAKER_FEE_BPS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_taker_fee_bps",
+        "Effective taker fee in bps as the venue reports it for this account",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
+// Cross-venue basis (P1.4 stage-1)
+pub static CROSS_VENUE_BASIS_BPS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_cross_venue_basis_bps",
+        "Signed cross-venue basis (perp_mid - spot_mid) in bps of spot mid",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
+// Borrow rate (refreshed by the periodic borrow-rate task — P1.3 stage-1)
+pub static BORROW_RATE_BPS_HOURLY: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_borrow_rate_bps_hourly",
+        "Venue-reported borrow rate for the base asset in bps/hour",
+        &["asset"]
+    )
+    .unwrap()
+});
+pub static BORROW_CARRY_BPS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_borrow_carry_bps",
+        "Expected-carry surcharge in bps the strategy bakes into the ask reservation",
+        &["asset"]
+    )
+    .unwrap()
+});
 
 // Risk
 pub static KILL_SWITCH_LEVEL: Lazy<GaugeVec> = Lazy::new(|| {
@@ -96,6 +166,18 @@ pub static KILL_SWITCH_LEVEL: Lazy<GaugeVec> = Lazy::new(|| {
 // SLA
 pub static SLA_UPTIME: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge_vec!("mm_sla_uptime_pct", "SLA uptime percentage", &["symbol"]).unwrap()
+});
+/// P2.2 — per-pair daily presence rolled up from the 1440
+/// per-minute buckets. Distinguishable from `mm_sla_uptime_pct`
+/// because the latter is the lifetime average and this gauge
+/// resets at UTC midnight.
+pub static SLA_PRESENCE_PCT_24H: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_sla_presence_pct_24h",
+        "Per-pair daily SLA presence percentage from per-minute buckets (P2.2)",
+        &["symbol"]
+    )
+    .unwrap()
 });
 
 // Regime
@@ -167,6 +249,12 @@ pub fn init() {
     let _ = &*VPIN;
     let _ = &*KYLE_LAMBDA;
     let _ = &*ADVERSE_BPS;
+    let _ = &*MAKER_FEE_BPS;
+    let _ = &*TAKER_FEE_BPS;
+    let _ = &*BORROW_RATE_BPS_HOURLY;
+    let _ = &*BORROW_CARRY_BPS;
+    let _ = &*CROSS_VENUE_BASIS_BPS;
+    let _ = &*SLA_PRESENCE_PCT_24H;
     let _ = &*KILL_SWITCH_LEVEL;
     let _ = &*SLA_UPTIME;
     let _ = &*REGIME;

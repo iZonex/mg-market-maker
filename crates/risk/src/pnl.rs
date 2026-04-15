@@ -65,6 +65,30 @@ impl PnlTracker {
         }
     }
 
+    /// Hot-swap the fee schedule. Called by the engine's
+    /// fee-tier refresh task whenever a venue reports a new
+    /// effective rate (e.g. a month-end VIP tier crossing).
+    /// Subsequent `on_fill` calls attribute fees against the new
+    /// rates; previously accrued `fees_paid` and `rebate_income`
+    /// are not retroactively rewritten — that would conflict
+    /// with the audit trail.
+    pub fn set_fee_rates(&mut self, maker_fee: Decimal, taker_fee: Decimal) {
+        self.maker_fee = maker_fee;
+        self.taker_fee = taker_fee;
+    }
+
+    /// Read the maker fee currently applied to new fills. Used by
+    /// the dashboard / Prometheus exporter to expose the
+    /// effective rate as a gauge.
+    pub fn maker_fee(&self) -> Decimal {
+        self.maker_fee
+    }
+
+    /// Read the taker fee currently applied to new fills.
+    pub fn taker_fee(&self) -> Decimal {
+        self.taker_fee
+    }
+
     /// Record a fill and attribute PnL.
     pub fn on_fill(&mut self, fill: &Fill, current_mid: Price) {
         let fill_value = fill.price * fill.qty;
@@ -166,6 +190,30 @@ mod tests {
 
         // Rebate = 49995 * 0.01 * 0.001 = 0.49995.
         assert!(tracker.attribution.rebate_income > dec!(0.49));
+    }
+
+    /// `set_fee_rates` must hot-swap so subsequent fills attribute
+    /// against the new schedule without rewriting prior accruals.
+    /// Regression anchor for the periodic fee-tier refresh task —
+    /// without this test a future contributor could refactor the
+    /// rate fields into a snapshot taken at construction and not
+    /// notice the live engine stops reflecting tier crossings.
+    #[test]
+    fn set_fee_rates_hot_swaps_for_subsequent_fills() {
+        let mut tracker = PnlTracker::new(dec!(-0.0001), dec!(0.0004));
+        let mid = dec!(50000);
+        // First fill at the original rebate rate.
+        tracker.on_fill(&fill(Side::Buy, "50000", "1", true), mid);
+        let rebate_after_first = tracker.attribution.rebate_income;
+        assert!(rebate_after_first > dec!(4.99) && rebate_after_first < dec!(5.01));
+
+        // Hot-swap to a fatter rebate (VIP 9 territory). Apply a
+        // second identical fill.
+        tracker.set_fee_rates(dec!(-0.0002), dec!(0.0004));
+        assert_eq!(tracker.maker_fee(), dec!(-0.0002));
+        tracker.on_fill(&fill(Side::Buy, "50000", "1", true), mid);
+        let rebate_delta = tracker.attribution.rebate_income - rebate_after_first;
+        assert!(rebate_delta > dec!(9.99) && rebate_delta < dec!(10.01));
     }
 
     #[test]

@@ -35,6 +35,7 @@ fn make_product() -> ProductSpec {
         min_notional: dec!(10),
         maker_fee: dec!(0.001),
         taker_fee: dec!(0.002),
+        trading_status: Default::default(),
     }
 }
 
@@ -53,6 +54,25 @@ fn make_config() -> MarketMakerConfig {
         momentum_enabled: false,
         momentum_window: 200,
         basis_shift: dec!(0.5),
+        market_resilience_enabled: true,
+        otr_enabled: true,
+        hma_enabled: true,
+        hma_window: 9,
+        user_stream_enabled: true,
+        inventory_drift_tolerance: dec!(0.0001),
+        inventory_drift_auto_correct: false,
+        amend_enabled: true,
+        amend_max_ticks: 2,
+        fee_tier_refresh_enabled: true,
+        fee_tier_refresh_secs: 600,
+        borrow_enabled: false,
+        borrow_rate_refresh_secs: 1800,
+        borrow_holding_secs: 3600,
+        borrow_max_base: dec!(0),
+        borrow_buffer_base: dec!(0),
+        pair_lifecycle_enabled: true,
+        pair_lifecycle_refresh_secs: 300,
+        cross_venue_basis_max_staleness_ms: 1500,
     }
 }
 
@@ -75,6 +95,8 @@ fn bench_avellaneda(c: &mut Criterion) {
                 mid_price: mid,
                 ref_price: None,
                 hedge_book: None,
+                borrow_cost_bps: None,
+                hedge_book_age_ms: None,
             };
             black_box(strategy.compute_quotes(&ctx))
         })
@@ -100,6 +122,8 @@ fn bench_glft(c: &mut Criterion) {
                 mid_price: mid,
                 ref_price: None,
                 hedge_book: None,
+                borrow_cost_bps: None,
+                hedge_book_age_ms: None,
             };
             black_box(strategy.compute_quotes(&ctx))
         })
@@ -125,6 +149,8 @@ fn bench_grid(c: &mut Criterion) {
                 mid_price: mid,
                 ref_price: None,
                 hedge_book: None,
+                borrow_cost_bps: None,
+                hedge_book_age_ms: None,
             };
             black_box(strategy.compute_quotes(&ctx))
         })

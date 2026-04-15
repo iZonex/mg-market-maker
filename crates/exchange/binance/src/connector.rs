@@ -44,7 +44,16 @@ impl BinanceConnector {
             rate_limiter: RateLimiter::new(1200, Duration::from_secs(60), 0.8),
             capabilities: VenueCapabilities {
                 max_batch_size: 5,
-                supports_amend: true,
+                // Binance Spot has only `order.cancelReplace`, which
+                // is a cancel + place under the hood — it loses
+                // queue priority. There is no native amend endpoint
+                // on `/api/v3`, so we honestly report no support
+                // and let the engine's amend planner fall back to
+                // cancel+place on this venue. Binance USDⓈ-M
+                // futures does have a real `PUT /fapi/v1/order`
+                // amend — that capability is reported on the
+                // separate `BinanceFuturesConnector`.
+                supports_amend: false,
                 supports_ws_trading: true,
                 // No FIX adapter exists in this crate — the generic
                 // session engine lives in `crates/protocols/fix` but no
@@ -504,6 +513,21 @@ impl ExchangeConnector for BinanceConnector {
             }
         }
 
+        // P2.3: parse the venue's per-symbol trading status so
+        // the lifecycle manager can detect halts/resumes/delistings
+        // on the periodic refresh cadence.
+        let trading_status = match sym.get("status").and_then(|v| v.as_str()) {
+            Some("TRADING") => TradingStatus::Trading,
+            Some("HALT") => TradingStatus::Halted,
+            Some("BREAK") | Some("END_OF_DAY") | Some("POST_TRADING") => TradingStatus::Break,
+            Some("PRE_TRADING") | Some("AUCTION_MATCH") => TradingStatus::PreTrading,
+            // Binance Spot does not surface a `DELISTED` status —
+            // delisted symbols disappear from `exchangeInfo`
+            // entirely and the call returns "symbol not found",
+            // which the lifecycle manager treats as `Delisted`.
+            Some(_) | None => TradingStatus::Trading,
+        };
+
         Ok(ProductSpec {
             symbol: symbol.to_string(),
             base_asset: base,
@@ -513,6 +537,7 @@ impl ExchangeConnector for BinanceConnector {
             min_notional,
             maker_fee: dec!(0.001),
             taker_fee: dec!(0.001),
+            trading_status,
         })
     }
 
@@ -521,6 +546,85 @@ impl ExchangeConnector for BinanceConnector {
         let resp = self.client.get(&url).send().await?;
         Ok(resp.status().is_success())
     }
+
+    /// Per-account fee tier for `symbol` from
+    /// `GET /sapi/v1/asset/tradeFee`. Binance returns either an
+    /// array (one row per symbol) or a single object — the
+    /// helper handles both shapes.
+    async fn fetch_fee_tiers(&self, symbol: &str) -> Result<FeeTierInfo, FeeTierError> {
+        let resp = self
+            .signed_get("/sapi/v1/asset/tradeFee", &format!("symbol={symbol}"))
+            .await
+            .map_err(|e| FeeTierError::Other(anyhow::anyhow!("{e}")))?;
+        parse_binance_spot_fee_response(&resp, symbol)
+            .ok_or_else(|| FeeTierError::Other(anyhow::anyhow!("no fee row for {symbol}")))
+    }
+
+    /// Current borrow rate for `asset` from
+    /// `GET /sapi/v1/margin/interestRateHistory?asset=&size=1`.
+    /// Binance returns the most recent **daily** interest rate
+    /// row first; the pure helper converts the daily fraction
+    /// into an APR fraction (`× 365`) so the engine's
+    /// `BorrowManager` only ever speaks APR.
+    ///
+    /// P1.3 stage-1: rate fetch only — `borrow_asset` /
+    /// `repay_asset` remain `NotSupported` until margin-mode
+    /// order routing lands in stage-2.
+    async fn get_borrow_rate(&self, asset: &str) -> Result<BorrowRateInfo, BorrowError> {
+        let resp = self
+            .signed_get(
+                "/sapi/v1/margin/interestRateHistory",
+                &format!("asset={asset}&size=1"),
+            )
+            .await
+            .map_err(|e| BorrowError::Other(anyhow::anyhow!("{e}")))?;
+        parse_binance_borrow_rate_response(&resp, asset)
+            .ok_or_else(|| BorrowError::Other(anyhow::anyhow!("no borrow rate for {asset}")))
+    }
+}
+
+/// Parse the response from
+/// `GET /sapi/v1/margin/interestRateHistory?asset=&size=1` into a
+/// `BorrowRateInfo`. Binance returns the rate as a **daily**
+/// fraction (`dailyInterestRate`) — multiply by 365 to get the
+/// APR the engine's `BorrowManager` consumes. Pure helper so the
+/// wire shape is unit-tested without an HTTP client.
+pub(crate) fn parse_binance_borrow_rate_response(
+    resp: &Value,
+    asset: &str,
+) -> Option<BorrowRateInfo> {
+    let row = match resp {
+        Value::Array(arr) => arr.first()?,
+        Value::Object(_) => resp,
+        _ => return None,
+    };
+    let daily_rate: Decimal = row.get("dailyInterestRate")?.as_str()?.parse().ok()?;
+    let apr = daily_rate * Decimal::from(365u32);
+    Some(BorrowRateInfo::from_apr(asset, apr))
+}
+
+/// Parse the response from `GET /sapi/v1/asset/tradeFee?symbol=`
+/// into a `FeeTierInfo`. Binance returns a JSON array of
+/// `{ symbol, makerCommission, takerCommission }` rows even when
+/// querying a single symbol — pure helper so the wire shape is
+/// unit-tested without an HTTP client.
+pub(crate) fn parse_binance_spot_fee_response(resp: &Value, symbol: &str) -> Option<FeeTierInfo> {
+    let row = match resp {
+        Value::Array(arr) => arr
+            .iter()
+            .find(|r| r.get("symbol").and_then(|s| s.as_str()) == Some(symbol))
+            .or_else(|| arr.first())?,
+        Value::Object(_) => resp,
+        _ => return None,
+    };
+    let maker_fee: Decimal = row.get("makerCommission")?.as_str()?.parse().ok()?;
+    let taker_fee: Decimal = row.get("takerCommission")?.as_str()?.parse().ok()?;
+    Some(FeeTierInfo {
+        maker_fee,
+        taker_fee,
+        vip_tier: None,
+        fetched_at: chrono::Utc::now(),
+    })
 }
 
 pub(crate) fn parse_binance_event(stream: &str, data: &Value) -> Option<MarketEvent> {
@@ -593,6 +697,68 @@ pub(crate) fn parse_levels(value: Option<&Value>) -> anyhow::Result<Vec<PriceLev
 mod tests {
     use super::*;
 
+    /// `GET /sapi/v1/asset/tradeFee?symbol=BTCUSDT` returns a JSON
+    /// array even for a single-symbol query — the helper must
+    /// pick the right row out of the array.
+    #[test]
+    fn spot_fee_response_array_picks_correct_symbol() {
+        let resp = serde_json::json!([
+            {"symbol": "ETHUSDT", "makerCommission": "0.001", "takerCommission": "0.001"},
+            {"symbol": "BTCUSDT", "makerCommission": "0.0008", "takerCommission": "0.001"}
+        ]);
+        let info = parse_binance_spot_fee_response(&resp, "BTCUSDT").unwrap();
+        assert_eq!(info.maker_fee, dec!(0.0008));
+        assert_eq!(info.taker_fee, dec!(0.001));
+    }
+
+    /// `dailyInterestRate` × 365 must round-trip through the
+    /// `BorrowRateInfo::from_apr` helper into an APR fraction
+    /// the BorrowManager understands. Pin the conversion so a
+    /// future refactor cannot silently drop the × 365 step.
+    #[test]
+    fn borrow_rate_response_daily_to_apr() {
+        let resp = serde_json::json!([
+            {"asset": "BTC", "dailyInterestRate": "0.0001", "timestamp": 1_700_000_000_000_u64}
+        ]);
+        let info = parse_binance_borrow_rate_response(&resp, "BTC").unwrap();
+        // 0.0001 × 365 = 0.0365 → 3.65 % APR
+        assert_eq!(info.rate_apr, dec!(0.0365));
+        assert_eq!(info.asset, "BTC");
+        // 0.0365 × 10_000 / 8_760 ≈ 0.04167 bps/hour
+        assert!(
+            info.rate_bps_hourly > dec!(0.0416) && info.rate_bps_hourly < dec!(0.0417),
+            "got {}",
+            info.rate_bps_hourly
+        );
+    }
+
+    /// Object-shape fallback so the parser is resilient to the
+    /// edge case where Binance returns a single record rather
+    /// than a wrapping array (mirrors the spot-fee parser).
+    #[test]
+    fn borrow_rate_response_accepts_object_shape() {
+        let resp = serde_json::json!({
+            "asset": "BTC",
+            "dailyInterestRate": "0.0002"
+        });
+        let info = parse_binance_borrow_rate_response(&resp, "BTC").unwrap();
+        assert_eq!(info.rate_apr, dec!(0.073));
+    }
+
+    /// Some Binance edge cases return a bare object instead of an
+    /// array — the helper must accept that shape too so the parser
+    /// is robust to either response form.
+    #[test]
+    fn spot_fee_response_object_shape_also_parses() {
+        let resp = serde_json::json!({
+            "symbol": "BTCUSDT",
+            "makerCommission": "0.0009",
+            "takerCommission": "0.001"
+        });
+        let info = parse_binance_spot_fee_response(&resp, "BTCUSDT").unwrap();
+        assert_eq!(info.maker_fee, dec!(0.0009));
+    }
+
     /// Capability audit: `supports_ws_trading` and `supports_fix` must
     /// reflect the actual presence of adapter types / session engines.
     #[test]
@@ -612,6 +778,11 @@ mod tests {
         // generic session engine in `crates/protocols/fix` is not a
         // substitute for a venue adapter.
         assert!(!caps.supports_fix);
-        assert!(caps.supports_amend);
+        // Binance Spot has no native amend (only `order.cancelReplace`,
+        // which loses queue priority). The capability flag must
+        // honestly report `false` — the engine's amend planner reads
+        // it to decide whether to fall back to cancel+place. Real
+        // amend lives on `BinanceFuturesConnector`.
+        assert!(!caps.supports_amend);
     }
 }

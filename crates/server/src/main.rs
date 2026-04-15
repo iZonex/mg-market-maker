@@ -9,9 +9,11 @@ use mm_dashboard::state::DashboardState;
 use mm_dashboard::websocket::WsBroadcast;
 use mm_engine::MarketMakerEngine;
 use mm_exchange_core::connector::ExchangeConnector;
+use mm_exchange_core::events::MarketEvent;
 use mm_persistence::checkpoint::CheckpointManager;
 use mm_strategy::{AvellanedaStoikov, BasisStrategy, GlftStrategy, GridStrategy, Strategy};
 use rust_decimal_macros::dec;
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 mod config;
@@ -159,6 +161,45 @@ async fn main() -> Result<()> {
     // quote in a different quote asset.
     let portfolio = Arc::new(std::sync::Mutex::new(mm_portfolio::Portfolio::new("USDT")));
 
+    // P2.1 — build the shared per-asset-class kill switches
+    // up-front so every engine that maps to the same class
+    // receives the SAME `Arc<Mutex<KillSwitch>>` and a
+    // coordinated escalation halts the whole class
+    // simultaneously. Engines whose symbol does not appear in
+    // any class get `None` and run with the global kill
+    // switch only.
+    let asset_class_switches: std::collections::HashMap<
+        String,
+        Arc<std::sync::Mutex<mm_risk::KillSwitch>>,
+    > = config
+        .kill_switch
+        .asset_classes
+        .iter()
+        .map(|cfg| {
+            let ks_cfg = mm_risk::kill_switch::KillSwitchConfig {
+                daily_loss_limit: cfg.limits.daily_loss_limit,
+                daily_loss_warning: cfg.limits.daily_loss_warning,
+                max_position_value: cfg.limits.max_position_value,
+                max_message_rate: cfg.limits.max_message_rate,
+                max_consecutive_errors: cfg.limits.max_consecutive_errors,
+                ..Default::default()
+            };
+            (
+                cfg.name.clone(),
+                Arc::new(std::sync::Mutex::new(mm_risk::KillSwitch::new(ks_cfg))),
+            )
+        })
+        .collect();
+    let symbol_to_class: std::collections::HashMap<String, String> = config
+        .kill_switch
+        .asset_classes
+        .iter()
+        .flat_map(|cfg| {
+            let class = cfg.name.clone();
+            cfg.symbols.iter().map(move |s| (s.clone(), class.clone()))
+        })
+        .collect();
+
     for symbol in &config.symbols {
         let symbol = symbol.clone();
         let config = config.clone();
@@ -168,6 +209,9 @@ async fn main() -> Result<()> {
         let dashboard_state = dashboard_state.clone();
         let alerts = alert_manager.clone();
         let portfolio = portfolio.clone();
+        let asset_class_switch = symbol_to_class
+            .get(&symbol)
+            .and_then(|c| asset_class_switches.get(c).cloned());
 
         let handle = tokio::spawn(async move {
             if let Err(e) = run_symbol(
@@ -179,6 +223,7 @@ async fn main() -> Result<()> {
                 dashboard_state,
                 alerts,
                 portfolio,
+                asset_class_switch,
             )
             .await
             {
@@ -216,6 +261,7 @@ async fn run_symbol(
     dashboard_state: DashboardState,
     alert_manager: AlertManager,
     portfolio: Arc<std::sync::Mutex<mm_portfolio::Portfolio>>,
+    asset_class_switch: Option<Arc<std::sync::Mutex<mm_risk::KillSwitch>>>,
 ) -> Result<()> {
     let product = product_for_symbol(&symbol);
 
@@ -248,10 +294,34 @@ async fn run_symbol(
             );
             Box::new(BasisStrategy::new(shift, max_basis_bps))
         }
+        StrategyType::CrossVenueBasis => {
+            let shift = config.market_maker.basis_shift;
+            let max_basis_bps = config
+                .hedge
+                .as_ref()
+                .map(|h| h.pair.basis_threshold_bps)
+                .unwrap_or(dec!(50));
+            let stale_ms = config.market_maker.cross_venue_basis_max_staleness_ms;
+            info!(
+                symbol = %symbol,
+                %shift,
+                %max_basis_bps,
+                stale_ms,
+                "using CrossVenueBasis strategy — requires hedge connector on a different venue"
+            );
+            Box::new(BasisStrategy::cross_venue(shift, max_basis_bps, stale_ms))
+        }
     };
 
-    // Subscribe to market data via the connector.
-    let ws_rx = connector.subscribe(std::slice::from_ref(&symbol)).await?;
+    // Subscribe to market data via the connector. The public
+    // `subscribe` task produces an `UnboundedReceiver` of
+    // `MarketEvent`s — order-book snapshots, deltas, and public
+    // trades. We merge it with the optional Binance user-data
+    // stream (listen-key) so out-of-band fills and balance
+    // updates arrive on the same channel the engine consumes
+    // in its run loop.
+    let public_rx = connector.subscribe(std::slice::from_ref(&symbol)).await?;
+    let ws_rx = spawn_event_merger(public_rx, &config, &symbol);
 
     // Build the connector bundle: single-connector by default,
     // dual when `config.hedge` is set (basis / funding-arb modes).
@@ -316,7 +386,7 @@ async fn run_symbol(
             None
         };
 
-    let engine_builder = MarketMakerEngine::new(
+    let mut engine_builder = MarketMakerEngine::new(
         symbol,
         config,
         product,
@@ -326,6 +396,9 @@ async fn run_symbol(
         Some(alert_manager),
     )
     .with_portfolio(portfolio);
+    if let Some(arc) = asset_class_switch {
+        engine_builder = engine_builder.with_asset_class_switch(arc);
+    }
 
     let mut engine = match funding_arb_wiring {
         Some((driver, tick)) => engine_builder.with_funding_arb_driver(driver, tick),
@@ -435,6 +508,79 @@ fn create_connector(config: &AppConfig) -> Result<Arc<dyn ExchangeConnector>> {
     }
 }
 
+/// Spawn a background task that forwards events from the
+/// connector's public feed into a new merged channel. When the
+/// configured venue has a private user-data stream and
+/// `user_stream_enabled` is on, this also spawns that venue's
+/// stream task and points it at the same merged channel — so
+/// out-of-band fills and balance updates arrive on the exact
+/// path the engine already knows how to consume.
+///
+/// Currently wired: Binance spot/futures (listen-key), Bybit V5
+/// (private WS auth). HyperLiquid `userEvents` is tracked under
+/// `ROADMAP.md` P0.1.
+fn spawn_event_merger(
+    mut public_rx: mpsc::UnboundedReceiver<MarketEvent>,
+    config: &AppConfig,
+    symbol: &str,
+) -> mpsc::UnboundedReceiver<MarketEvent> {
+    let (merged_tx, merged_rx) = mpsc::unbounded_channel::<MarketEvent>();
+    let forward_tx = merged_tx.clone();
+    // Forwarder: public ws_rx → merged channel.
+    tokio::spawn(async move {
+        while let Some(ev) = public_rx.recv().await {
+            if forward_tx.send(ev).is_err() {
+                return;
+            }
+        }
+    });
+
+    if !config.market_maker.user_stream_enabled {
+        return merged_rx;
+    }
+    let api_key = config.exchange.api_key.clone().unwrap_or_default();
+    let api_secret = config.exchange.api_secret.clone().unwrap_or_default();
+    if api_key.is_empty() {
+        return merged_rx;
+    }
+
+    match config.exchange.exchange_type {
+        ExchangeType::Binance => {
+            let cfg = mm_exchange_binance::UserStreamConfig::spot(&api_key);
+            info!(
+                symbol = symbol,
+                "starting Binance listen-key user-data stream"
+            );
+            let _handle = mm_exchange_binance::user_stream::start(cfg, merged_tx);
+        }
+        ExchangeType::BinanceTestnet => {
+            let mut cfg = mm_exchange_binance::UserStreamConfig::spot(&api_key);
+            cfg.rest_base = "https://testnet.binance.vision".into();
+            cfg.ws_host = "wss://testnet.binance.vision".into();
+            info!(
+                symbol = symbol,
+                "starting Binance testnet listen-key user-data stream"
+            );
+            let _handle = mm_exchange_binance::user_stream::start(cfg, merged_tx);
+        }
+        ExchangeType::Bybit if !api_secret.is_empty() => {
+            let cfg = mm_exchange_bybit::UserStreamConfig::mainnet(&api_key, &api_secret);
+            info!(symbol = symbol, "starting Bybit V5 private WS user stream");
+            let _handle = mm_exchange_bybit::user_stream::start(cfg, merged_tx);
+        }
+        ExchangeType::BybitTestnet if !api_secret.is_empty() => {
+            let cfg = mm_exchange_bybit::UserStreamConfig::testnet(&api_key, &api_secret);
+            info!(
+                symbol = symbol,
+                "starting Bybit V5 testnet private WS user stream"
+            );
+            let _handle = mm_exchange_bybit::user_stream::start(cfg, merged_tx);
+        }
+        _ => {}
+    }
+    merged_rx
+}
+
 fn product_for_symbol(symbol: &str) -> ProductSpec {
     match symbol {
         "BTCUSDT" => ProductSpec {
@@ -446,6 +592,7 @@ fn product_for_symbol(symbol: &str) -> ProductSpec {
             min_notional: dec!(10),
             maker_fee: dec!(0.001),
             taker_fee: dec!(0.002),
+            trading_status: Default::default(),
         },
         "ETHUSDT" => ProductSpec {
             symbol: "ETHUSDT".into(),
@@ -456,6 +603,7 @@ fn product_for_symbol(symbol: &str) -> ProductSpec {
             min_notional: dec!(10),
             maker_fee: dec!(0.001),
             taker_fee: dec!(0.002),
+            trading_status: Default::default(),
         },
         "SOLUSDT" => ProductSpec {
             symbol: "SOLUSDT".into(),
@@ -466,6 +614,7 @@ fn product_for_symbol(symbol: &str) -> ProductSpec {
             min_notional: dec!(5),
             maker_fee: dec!(0.001),
             taker_fee: dec!(0.002),
+            trading_status: Default::default(),
         },
         _ => panic!("unknown symbol: {symbol}"),
     }

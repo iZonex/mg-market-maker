@@ -26,6 +26,22 @@ pub struct StrategyContext<'a> {
     /// walk the full depth via `features::market_impact`.
     /// `None` in single-connector mode.
     pub hedge_book: Option<&'a LocalOrderBook>,
+    /// Expected-carry surcharge in basis points the strategy
+    /// should bake into its reservation price when quoting an
+    /// ask side that would require borrowing the base asset.
+    /// Threaded by the engine from `BorrowManager::effective_carry_bps`
+    /// — `None` (or `Some(zero)`) means borrow data is unavailable
+    /// and the strategy reverts to the pre-P1.3 reservation
+    /// formula. P1.3 stage-1.
+    pub borrow_cost_bps: Option<Decimal>,
+    /// Age of the hedge-leg order book in milliseconds, computed
+    /// by the engine as `now_ms - hedge_book.last_update_ms`.
+    /// Cross-venue basis strategies use this to stand down when
+    /// the hedge feed pauses long enough that the reference
+    /// price would be stale. `None` in single-connector mode or
+    /// when the hedge book has not seen its first update yet.
+    /// P1.4 stage-1.
+    pub hedge_book_age_ms: Option<i64>,
 }
 
 /// Trait for market-making strategies.

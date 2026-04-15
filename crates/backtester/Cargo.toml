@@ -5,8 +5,9 @@ version.workspace = true
 
 [dependencies]
 mm-common = { workspace = true }
-mm-strategy = { workspace = true }
+mm-indicators = { workspace = true }
 mm-risk = { workspace = true }
+mm-strategy = { workspace = true }
 tokio = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
@@ -18,3 +19,7 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 rand = "0.8"
 rand_chacha = "0.3"
+
+[[bin]]
+name = "mm-probe"
+path = "src/bin/mm_probe.rs"

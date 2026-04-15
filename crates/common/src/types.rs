@@ -161,8 +161,36 @@ pub struct Balance {
     pub available: Decimal,
 }
 
+/// Trading status of a product as the venue currently reports
+/// it (P2.3). Polled on a slow cadence by the engine's
+/// `PairLifecycleManager` so a halt or delisting event halts
+/// quoting before the next refresh tick — venues sometimes send
+/// fills *after* a halt, so the engine needs explicit state to
+/// reject them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TradingStatus {
+    /// Normal trading — the only state where quoting is safe.
+    #[default]
+    Trading,
+    /// Trading is halted (venue circuit breaker, oracle pause,
+    /// regulatory hold). Engine cancels all open orders and
+    /// stops requesting new ones until the venue flips back.
+    Halted,
+    /// Symbol exists but trading has not opened yet — common on
+    /// new listings during the auction phase.
+    PreTrading,
+    /// Maintenance break window — same handling as `Halted`
+    /// but a soft signal that the venue intends to resume.
+    Break,
+    /// Symbol has been removed from the venue altogether.
+    /// Engine cancels all and refuses to ever requote — only a
+    /// process restart can lift this.
+    Delisted,
+}
+
 /// Product specification from the exchange.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProductSpec {
     pub symbol: String,
     pub base_asset: String,
@@ -172,6 +200,12 @@ pub struct ProductSpec {
     pub min_notional: Decimal,
     pub maker_fee: Decimal,
     pub taker_fee: Decimal,
+    /// Live trading status as the venue reports it (P2.3).
+    /// Defaults to `Trading` so existing fixtures and venues
+    /// without an explicit status field continue to work
+    /// unchanged.
+    #[serde(default)]
+    pub trading_status: TradingStatus,
 }
 
 impl ProductSpec {

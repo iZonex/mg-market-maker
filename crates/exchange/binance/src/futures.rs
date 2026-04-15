@@ -142,6 +142,24 @@ impl BinanceFuturesConnector {
         }
         Ok(body)
     }
+
+    async fn signed_put(&self, path: &str, params: &str) -> anyhow::Result<Value> {
+        self.rate_limiter.acquire(1).await;
+        let query = auth::signed_query(&self.api_secret, params);
+        let url = format!("{}{path}?{query}", self.base_url);
+        let resp = self
+            .client
+            .put(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: Value = resp.json().await?;
+        if !status.is_success() {
+            anyhow::bail!("Binance futures API error {status}: {body}");
+        }
+        Ok(body)
+    }
 }
 
 #[async_trait]
@@ -441,6 +459,29 @@ impl ExchangeConnector for BinanceFuturesConnector {
         Ok(())
     }
 
+    /// Native USDⓈ-M futures amend — preserves queue priority via
+    /// `PUT /fapi/v1/order`. Binance requires `quantity` and
+    /// `price` on every modify; the order is identified by
+    /// `origClientOrderId` to stay consistent with how
+    /// `cancel_order` and `place_order` route the engine's UUID
+    /// through the client-order-id field.
+    ///
+    /// Binance Spot does **not** offer a true amend (only
+    /// `order.cancelReplace`, which loses queue priority), so the
+    /// override lives only on the futures connector — see the
+    /// honest `supports_amend = false` flag on `BinanceConnector`.
+    async fn amend_order(&self, amend: &AmendOrder) -> anyhow::Result<()> {
+        let params = build_amend_query(amend)?;
+        let t0 = Instant::now();
+        let result = self.signed_put("/fapi/v1/order", &params).await;
+        ORDER_ENTRY_LATENCY
+            .with_label_values(&["binance_futures", "rest", "amend_order"])
+            .observe(t0.elapsed().as_secs_f64());
+        result?;
+        debug!(order_id = %amend.order_id, "amended Binance futures order in place");
+        Ok(())
+    }
+
     async fn get_open_orders(&self, symbol: &str) -> anyhow::Result<Vec<LiveOrder>> {
         let resp = self
             .signed_get("/fapi/v1/openOrders", &format!("symbol={symbol}"))
@@ -575,6 +616,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
             // Binance futures default tier: 0.02% maker / 0.05% taker.
             maker_fee: dec!(0.0002),
             taker_fee: dec!(0.0005),
+            trading_status: Default::default(),
         })
     }
 
@@ -583,6 +625,54 @@ impl ExchangeConnector for BinanceFuturesConnector {
         let resp = self.client.get(&url).send().await?;
         Ok(resp.status().is_success())
     }
+
+    /// USDⓈ-M futures fee schedule via
+    /// `GET /fapi/v1/commissionRate?symbol=`. Returns a single
+    /// `{ makerCommissionRate, takerCommissionRate }` object that
+    /// the pure helper parses into a `FeeTierInfo`.
+    async fn fetch_fee_tiers(&self, symbol: &str) -> Result<FeeTierInfo, FeeTierError> {
+        let resp = self
+            .signed_get("/fapi/v1/commissionRate", &format!("symbol={symbol}"))
+            .await
+            .map_err(|e| FeeTierError::Other(anyhow::anyhow!("{e}")))?;
+        parse_binance_futures_fee_response(&resp)
+            .ok_or_else(|| FeeTierError::Other(anyhow::anyhow!("malformed commissionRate body")))
+    }
+}
+
+/// Parse the response from `GET /fapi/v1/commissionRate` into a
+/// `FeeTierInfo`. Binance futures returns a single object with
+/// the `makerCommissionRate` / `takerCommissionRate` fields as
+/// strings — pure helper so the wire shape is unit-tested
+/// without an HTTP client.
+pub(crate) fn parse_binance_futures_fee_response(resp: &Value) -> Option<FeeTierInfo> {
+    let maker_fee: Decimal = resp.get("makerCommissionRate")?.as_str()?.parse().ok()?;
+    let taker_fee: Decimal = resp.get("takerCommissionRate")?.as_str()?.parse().ok()?;
+    Some(FeeTierInfo {
+        maker_fee,
+        taker_fee,
+        vip_tier: None,
+        fetched_at: chrono::Utc::now(),
+    })
+}
+
+/// Build the URL-encoded query string for `PUT /fapi/v1/order`.
+/// Pure helper so the wire shape can be unit-tested without a live
+/// HTTP client. Bails when either `new_price` or `new_qty` is None
+/// because Binance requires both on every modify and a missing
+/// field would otherwise produce a malformed request that the
+/// venue rejects with a generic 400.
+pub(crate) fn build_amend_query(amend: &AmendOrder) -> anyhow::Result<String> {
+    let qty = amend
+        .new_qty
+        .ok_or_else(|| anyhow::anyhow!("Binance futures amend requires new_qty"))?;
+    let price = amend
+        .new_price
+        .ok_or_else(|| anyhow::anyhow!("Binance futures amend requires new_price"))?;
+    Ok(format!(
+        "symbol={}&origClientOrderId={}&quantity={}&price={}",
+        amend.symbol, amend.order_id, qty, price
+    ))
 }
 
 #[cfg(test)]
@@ -602,6 +692,64 @@ mod tests {
         assert!(c.capabilities().supports_amend);
         assert!(!c.capabilities().supports_ws_trading);
         assert!(!c.capabilities().supports_fix);
+    }
+
+    /// `PUT /fapi/v1/order` requires `symbol`, `origClientOrderId`,
+    /// `quantity` and `price` — pin the wire shape so any future
+    /// refactor of `build_amend_query` cannot silently drop a field.
+    #[test]
+    fn amend_query_contains_required_fields() {
+        let oid = uuid::Uuid::nil();
+        let amend = AmendOrder {
+            order_id: oid,
+            symbol: "BTCUSDT".into(),
+            new_price: Some(dec!(50000.5)),
+            new_qty: Some(dec!(0.01)),
+        };
+        let q = build_amend_query(&amend).unwrap();
+        assert!(q.contains("symbol=BTCUSDT"));
+        assert!(q.contains(&format!("origClientOrderId={oid}")));
+        assert!(q.contains("quantity=0.01"));
+        assert!(q.contains("price=50000.5"));
+    }
+
+    /// `GET /fapi/v1/commissionRate` returns a single object with
+    /// the maker / taker rates as strings. Pin the wire shape so a
+    /// schema drift breaks the test instead of silently dropping a
+    /// new tier into the default.
+    #[test]
+    fn futures_fee_response_parses_maker_taker_rates() {
+        let resp = serde_json::json!({
+            "symbol": "BTCUSDT",
+            "makerCommissionRate": "0.0002",
+            "takerCommissionRate": "0.0004"
+        });
+        let info = parse_binance_futures_fee_response(&resp).unwrap();
+        assert_eq!(info.maker_fee, dec!(0.0002));
+        assert_eq!(info.taker_fee, dec!(0.0004));
+        assert!(info.vip_tier.is_none());
+    }
+
+    /// Missing price or qty is a programmer error — bail loudly so
+    /// the engine's amend-fallback path triggers instead of sending
+    /// a malformed request that the venue rejects with a generic
+    /// 400.
+    #[test]
+    fn amend_query_bails_when_price_or_qty_missing() {
+        let amend_no_price = AmendOrder {
+            order_id: uuid::Uuid::nil(),
+            symbol: "BTCUSDT".into(),
+            new_price: None,
+            new_qty: Some(dec!(0.01)),
+        };
+        assert!(build_amend_query(&amend_no_price).is_err());
+        let amend_no_qty = AmendOrder {
+            order_id: uuid::Uuid::nil(),
+            symbol: "BTCUSDT".into(),
+            new_price: Some(dec!(50000)),
+            new_qty: None,
+        };
+        assert!(build_amend_query(&amend_no_qty).is_err());
     }
 
     #[test]

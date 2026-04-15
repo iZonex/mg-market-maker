@@ -461,6 +461,42 @@ impl ExchangeConnector for BybitConnector {
         Ok(())
     }
 
+    /// V5 per-account fee schedule for `symbol`. Calls
+    /// `GET /v5/account/fee-rate?category=&symbol=` and parses
+    /// the first row in `result.list`. Bybit does not surface a
+    /// VIP-tier label in this response, so `vip_tier` stays
+    /// `None` — the operator can read the equivalent from the
+    /// account info page if needed.
+    async fn fetch_fee_tiers(&self, symbol: &str) -> Result<FeeTierInfo, FeeTierError> {
+        let params = format!("category={}&symbol={symbol}", self.category.as_str());
+        let result = self
+            .signed_get("/v5/account/fee-rate", &params)
+            .await
+            .map_err(|e| FeeTierError::Other(anyhow::anyhow!("{e}")))?;
+        parse_bybit_fee_rate_response(&result, symbol)
+            .ok_or_else(|| FeeTierError::Other(anyhow::anyhow!("no fee row for {symbol}")))
+    }
+
+    /// Native V5 amend — preserves queue priority on Bybit.
+    /// Maps the engine-side `AmendOrder` onto `POST /v5/order/amend`
+    /// with the venue-mandatory `category` field and only the deltas
+    /// (price and / or qty) the caller actually wants to change.
+    /// Bybit returns `retCode == 0` on success; the helper
+    /// `signed_post` already promotes any non-zero `retCode` to a
+    /// Rust `Err`, so the engine's amend-fallback path triggers
+    /// on every venue-side rejection.
+    async fn amend_order(&self, amend: &AmendOrder) -> anyhow::Result<()> {
+        let body = build_amend_body(self.category.as_str(), amend);
+        let t0 = Instant::now();
+        let result = self.signed_post("/v5/order/amend", &body).await;
+        ORDER_ENTRY_LATENCY
+            .with_label_values(&["bybit", "rest", "amend_order"])
+            .observe(t0.elapsed().as_secs_f64());
+        result?;
+        debug!(order_id = %amend.order_id, "amended Bybit order in place");
+        Ok(())
+    }
+
     async fn get_open_orders(&self, symbol: &str) -> anyhow::Result<Vec<LiveOrder>> {
         let result = self
             .signed_get(
@@ -586,6 +622,7 @@ impl ExchangeConnector for BybitConnector {
             min_notional: dec!(5),
             maker_fee: dec!(0.0002),
             taker_fee: dec!(0.00055),
+            trading_status: Default::default(),
         })
     }
 
@@ -594,6 +631,46 @@ impl ExchangeConnector for BybitConnector {
         let resp = self.client.get(&url).send().await?;
         Ok(resp.status().is_success())
     }
+}
+
+/// Parse the `result` payload of `GET /v5/account/fee-rate` into a
+/// `FeeTierInfo` for the requested `symbol`. Pure function so the
+/// wire shape can be unit-tested without an HTTP client. Returns
+/// `None` when the row is missing or either field fails to parse.
+pub(crate) fn parse_bybit_fee_rate_response(result: &Value, symbol: &str) -> Option<FeeTierInfo> {
+    let list = result.get("list")?.as_array()?;
+    let row = list
+        .iter()
+        .find(|row| row.get("symbol").and_then(|s| s.as_str()) == Some(symbol))
+        .or_else(|| list.first())?;
+    let maker_fee: Decimal = row.get("makerFeeRate")?.as_str()?.parse().ok()?;
+    let taker_fee: Decimal = row.get("takerFeeRate")?.as_str()?.parse().ok()?;
+    Some(FeeTierInfo {
+        maker_fee,
+        taker_fee,
+        vip_tier: None,
+        fetched_at: chrono::Utc::now(),
+    })
+}
+
+/// Build the JSON body for `POST /v5/order/amend`. Pure function so
+/// the wire shape can be unit-tested without spinning up a live
+/// HTTP server. Only includes the fields actually changed — Bybit
+/// rejects empty `price` / `qty` strings, so we leave them out
+/// entirely when the caller did not set them.
+pub(crate) fn build_amend_body(category: &str, amend: &AmendOrder) -> Value {
+    let mut body = serde_json::json!({
+        "category": category,
+        "symbol": amend.symbol,
+        "orderId": amend.order_id.to_string(),
+    });
+    if let Some(price) = amend.new_price {
+        body["price"] = Value::String(price.to_string());
+    }
+    if let Some(qty) = amend.new_qty {
+        body["qty"] = Value::String(qty.to_string());
+    }
+    body
 }
 
 fn parse_bybit_event(v: &Value) -> Option<MarketEvent> {
@@ -676,6 +753,86 @@ fn parse_levels(value: Option<&Value>) -> anyhow::Result<Vec<PriceLevel>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec as rd;
+
+    /// `POST /v5/order/amend` body must carry `category`, `symbol`,
+    /// `orderId`, plus only the optional fields the caller actually
+    /// changed. Pins the wire shape so a refactor of
+    /// `build_amend_body` cannot silently drop fields.
+    #[test]
+    fn amend_body_carries_category_symbol_and_id() {
+        let oid = uuid::Uuid::nil();
+        let amend = AmendOrder {
+            order_id: oid,
+            symbol: "BTCUSDT".into(),
+            new_price: Some(rd!(50000.5)),
+            new_qty: Some(rd!(0.01)),
+        };
+        let body = build_amend_body("linear", &amend);
+        assert_eq!(body["category"], "linear");
+        assert_eq!(body["symbol"], "BTCUSDT");
+        assert_eq!(body["orderId"], oid.to_string());
+        assert_eq!(body["price"], "50000.5");
+        assert_eq!(body["qty"], "0.01");
+    }
+
+    /// Bybit V5 fee-rate response: pull the maker / taker rates
+    /// out of the `list` array. Wire shape pinned so a future
+    /// schema drift breaks the test before it silently drops a
+    /// fee tier into a default.
+    #[test]
+    fn fee_rate_response_parses_maker_taker_for_symbol() {
+        let result = serde_json::json!({
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "takerFeeRate": "0.00055",
+                    "makerFeeRate": "0.0002"
+                }
+            ]
+        });
+        let info = parse_bybit_fee_rate_response(&result, "BTCUSDT").unwrap();
+        assert_eq!(info.maker_fee, rd!(0.0002));
+        assert_eq!(info.taker_fee, rd!(0.00055));
+        assert!(info.vip_tier.is_none());
+    }
+
+    #[test]
+    fn fee_rate_response_picks_correct_symbol_row() {
+        let result = serde_json::json!({
+            "list": [
+                {"symbol": "ETHUSDT", "takerFeeRate": "0.001", "makerFeeRate": "0.0005"},
+                {"symbol": "BTCUSDT", "takerFeeRate": "0.00055", "makerFeeRate": "0.0002"}
+            ]
+        });
+        let info = parse_bybit_fee_rate_response(&result, "BTCUSDT").unwrap();
+        assert_eq!(info.maker_fee, rd!(0.0002));
+    }
+
+    /// Optional fields are omitted entirely (not sent as empty
+    /// strings) so Bybit doesn't reject the request with
+    /// `params error` on the missing one.
+    #[test]
+    fn amend_body_omits_unset_optional_fields() {
+        let amend = AmendOrder {
+            order_id: uuid::Uuid::nil(),
+            symbol: "BTCUSDT".into(),
+            new_price: Some(rd!(50000)),
+            new_qty: None,
+        };
+        let body = build_amend_body("spot", &amend);
+        assert!(body.get("price").is_some());
+        assert!(body.get("qty").is_none());
+        let amend2 = AmendOrder {
+            order_id: uuid::Uuid::nil(),
+            symbol: "BTCUSDT".into(),
+            new_price: None,
+            new_qty: Some(rd!(0.01)),
+        };
+        let body2 = build_amend_body("spot", &amend2);
+        assert!(body2.get("qty").is_some());
+        assert!(body2.get("price").is_none());
+    }
 
     /// Capability audit: declared capabilities must match implementation.
     ///

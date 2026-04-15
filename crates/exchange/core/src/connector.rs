@@ -125,6 +125,104 @@ pub enum FundingRateError {
     Other(#[from] anyhow::Error),
 }
 
+/// A venue's effective fee schedule for one symbol, as the venue
+/// reports it for *this* account at the moment of the query.
+///
+/// Captured by [`ExchangeConnector::fetch_fee_tiers`] so the
+/// engine can refresh `PnlTracker` rates and the strategy's
+/// spread-floor calculations whenever the operator's VIP tier
+/// changes — production prop desks see month-end tier crossings
+/// silently shave 1-2 bps off captured edge until the next
+/// process restart, which P1.2 closes.
+#[derive(Debug, Clone)]
+pub struct FeeTierInfo {
+    /// Maker fee as a fraction of notional. **Negative values
+    /// are rebates** (VIP 9 on Bybit / GTC token tier on
+    /// Binance, etc.).
+    pub maker_fee: rust_decimal::Decimal,
+    /// Taker fee as a fraction of notional. Always non-negative
+    /// at every venue this connector targets.
+    pub taker_fee: rust_decimal::Decimal,
+    /// Optional venue-side label of the current tier
+    /// (`"VIP1"`, `"PRO1"`, etc.). Logged for operator
+    /// visibility; not load-bearing.
+    pub vip_tier: Option<String>,
+    /// When the connector observed these rates from the venue.
+    pub fetched_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Snapshot of a venue's borrow rate for one asset on one
+/// account. Returned by [`ExchangeConnector::get_borrow_rate`]
+/// so the engine can convert the venue-reported APR into an
+/// expected-carry-bps surcharge that strategies bake into the
+/// ask reservation. P1.3 stage-1 only exposes the rate; stage-2
+/// will wire `borrow_asset` / `repay_asset` for actual loan
+/// execution.
+#[derive(Debug, Clone)]
+pub struct BorrowRateInfo {
+    /// The asset being quoted (`"BTC"`, `"ETH"`, …).
+    pub asset: String,
+    /// Annualised borrow rate as a fraction (`0.05` = 5 % APR).
+    /// Always non-negative — venues do not pay you to borrow.
+    pub rate_apr: rust_decimal::Decimal,
+    /// Per-hour borrow rate in basis points, derived from the
+    /// APR. Cached on the struct because most strategies want it
+    /// in this unit and the conversion is the same across all
+    /// venues.
+    pub rate_bps_hourly: rust_decimal::Decimal,
+    /// When the connector observed this rate from the venue.
+    pub fetched_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl BorrowRateInfo {
+    /// Derive the hourly bps from a fraction APR. `apr × 10_000 / 8_760`
+    /// (8 760 hours/year). Pure helper so the conversion stays
+    /// consistent across every venue override.
+    pub fn from_apr(asset: &str, rate_apr: rust_decimal::Decimal) -> Self {
+        use rust_decimal::Decimal;
+        let hours_per_year = Decimal::from(8_760u32);
+        let rate_bps_hourly = rate_apr * Decimal::from(10_000u32) / hours_per_year;
+        Self {
+            asset: asset.to_string(),
+            rate_apr,
+            rate_bps_hourly,
+            fetched_at: chrono::Utc::now(),
+        }
+    }
+}
+
+/// Error when a connector cannot service a `get_borrow_rate` /
+/// `borrow_asset` / `repay_asset` call.
+#[derive(Debug, thiserror::Error)]
+pub enum BorrowError {
+    /// Venue has no margin / borrow product, or this connector
+    /// has not implemented the override yet. The engine treats
+    /// `NotSupported` as "skip the borrow refresh" — no carry
+    /// surcharge is applied to the reservation price.
+    #[error("borrow not supported on this venue")]
+    NotSupported,
+    /// REST/JSON failure surfaced from the venue.
+    #[error("{0}")]
+    Other(#[from] anyhow::Error),
+}
+
+/// Error when a connector cannot service a `fetch_fee_tiers` call.
+#[derive(Debug, thiserror::Error)]
+pub enum FeeTierError {
+    /// Venue has no per-account fee endpoint, or this connector
+    /// has not implemented the override yet. The engine treats
+    /// `NotSupported` as "keep using the rates from the
+    /// `ProductSpec` snapshot at startup" — no refresh happens
+    /// and no Prometheus gauge update fires.
+    #[error("fee tier query not supported on this venue")]
+    NotSupported,
+    /// REST/JSON failure surfaced from the venue. Carries the
+    /// original error string so the engine's audit log can
+    /// distinguish "venue down" from "auth rejected".
+    #[error("{0}")]
+    Other(#[from] anyhow::Error),
+}
+
 /// Venue capabilities — what features this exchange supports.
 #[derive(Debug, Clone)]
 pub struct VenueCapabilities {
@@ -164,6 +262,49 @@ pub trait ExchangeConnector: Send + Sync {
     /// default impl).
     async fn get_funding_rate(&self, _symbol: &str) -> Result<FundingRate, FundingRateError> {
         Err(FundingRateError::NotSupported)
+    }
+
+    /// Effective fee schedule for `symbol` as the venue reports
+    /// it for *this* account right now. Engines call this on a
+    /// periodic refresh (default every 10 min) so a month-end
+    /// VIP tier crossing tightens captured edge immediately
+    /// instead of waiting for a process restart. Connectors
+    /// without a per-account fee endpoint return
+    /// `Err(FeeTierError::NotSupported)` and the engine keeps
+    /// using the rates frozen at startup.
+    async fn fetch_fee_tiers(&self, _symbol: &str) -> Result<FeeTierInfo, FeeTierError> {
+        Err(FeeTierError::NotSupported)
+    }
+
+    /// Current borrow rate for `asset` (P1.3 stage-1). Engines
+    /// poll this on a slow cadence to drive the borrow-cost
+    /// surcharge that the spot ask side bakes into its
+    /// reservation price. Venues without a margin product
+    /// return `Err(BorrowError::NotSupported)` and the engine
+    /// skips the periodic refresh entirely.
+    async fn get_borrow_rate(&self, _asset: &str) -> Result<BorrowRateInfo, BorrowError> {
+        Err(BorrowError::NotSupported)
+    }
+
+    /// Open a margin loan for `qty` of `asset` (P1.3 stage-2).
+    /// Default `NotSupported` — actual loan execution requires
+    /// margin-mode order routing on the venue connector and
+    /// will land in the next stage of the borrow rollout.
+    async fn borrow_asset(
+        &self,
+        _asset: &str,
+        _qty: rust_decimal::Decimal,
+    ) -> Result<(), BorrowError> {
+        Err(BorrowError::NotSupported)
+    }
+
+    /// Repay a margin loan for `qty` of `asset` (P1.3 stage-2).
+    async fn repay_asset(
+        &self,
+        _asset: &str,
+        _qty: rust_decimal::Decimal,
+    ) -> Result<(), BorrowError> {
+        Err(BorrowError::NotSupported)
     }
 
     // --- Market Data ---

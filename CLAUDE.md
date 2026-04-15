@@ -4,7 +4,7 @@ Production-grade market maker for the custom exchange at `../exchange/` with mul
 
 ## Stats
 
-**18 crates, 125 files, ~31.7K lines Rust, 471 tests**
+**18 crates, 136 files, ~43.2K lines Rust, 662 tests**
 
 ## Architecture
 
@@ -12,9 +12,10 @@ Production-grade market maker for the custom exchange at `../exchange/` with mul
 server/                Entry point, config validation, secrets from env, file logging
 engine/                Main event loop — ALL subsystems wired:
   ├── market_maker     Book → Strategy → Risk → Order diff → Exchange
-  ├── order_manager    Cancel/place with order diffing
+  ├── order_manager    Cancel/place with order diffing + amend (P1.1)
   ├── book_keeper      Local orderbook from WS
   ├── order_id_map     UUID ↔ exchange native ID mapping
+  ├── pair_lifecycle   Halt / delisting / tick-lot drift (P2.3 s1)
   └── balance_cache    Pre-check + reservation before placing
 common/                Types (Decimal, never f64), config, orderbook
 exchange/              Venue adapters (one abstraction, many connectors):
@@ -26,7 +27,7 @@ exchange/              Venue adapters (one abstraction, many connectors):
 protocols/             Shared wire/transport layers:
   ├── fix/             FIX 4.4 message codec + session engine
   └── ws_rpc/          Generic id-correlated WS request/response client
-indicators/            Technical indicators (SMA, EMA, RSI, ATR, Bollinger)
+indicators/            Technical indicators (SMA, EMA, HMA/WMA, RSI, ATR, Bollinger, Tick/Volume/MultiTrigger candles, weight gens)
 portfolio/             Multi-currency position tracker + PnL aggregation
 hyperopt/              Random-search hyperparameter optimiser + loss functions
 strategy/              Strategies + signals + execution:
@@ -44,6 +45,7 @@ strategy/              Strategies + signals + execution:
   ├── momentum         Alpha signals (book imbalance, trade flow, micro-price)
   ├── twap             Time-weighted execution for single-leg inventory unwinding
   ├── autotune         Regime detection + toxicity-based parameter adjustment
+  ├── market_resilience Event-driven shock detector + recovery score (MR)
   ├── inventory_skew   Quadratic skew, dynamic sizing, urgency unwinding
   └── volatility       EWMA realized vol estimator
 risk/                  Risk management:
@@ -55,7 +57,10 @@ risk/                  Risk management:
   ├── inventory        Position tracking, PnL, limits
   ├── exposure         Drawdown tracking
   ├── toxicity         VPIN, Kyle's Lambda, adverse selection
-  ├── sla              Exchange obligation compliance tracking
+  ├── inventory_drift  Inventory-vs-wallet drift reconciler (P0.2)
+  ├── borrow           Borrow-cost surcharge state machine (P1.3 s1)
+  ├── otr              Order-to-Trade Ratio (MiCA surveillance metric)
+  ├── sla              Exchange obligation compliance + per-minute presence (P2.2)
   ├── pnl              Attribution (spread/inventory/rebates/fees)
   ├── audit            Append-only JSONL audit trail (MiCA compliant)
   └── reconciliation   Order + balance reconciliation vs exchange

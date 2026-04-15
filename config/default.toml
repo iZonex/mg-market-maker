@@ -55,6 +55,39 @@ max_distance_bps = "100"
 momentum_enabled = true
 momentum_window = 200
 
+# Event-driven Market Resilience detector. Widens the book
+# after a just-happened liquidity shock and trips kill-switch
+# L1 when the score stays under 0.3 for >=3s.
+market_resilience_enabled = true
+# Regulatory Order-to-Trade Ratio counter. MiCA compliance
+# signal — emit periodic snapshots into the audit trail.
+otr_enabled = true
+# Hull Moving Average alpha component on mid-price updates.
+# Adds a 5th input to MomentumSignals::alpha().
+hma_enabled = true
+hma_window = 9
+
+# Binance listen-key user-data stream. Merges out-of-band
+# fills (REST fallback, partial fills after WS-API envelope,
+# manual UI orders, RFQ/OTC) and BalanceUpdate events into
+# the engine's run loop. LEAVE ON for live Binance spot MM
+# — fills would otherwise be silently dropped until the
+# 60 s reconcile cycle.
+user_stream_enabled = true
+
+# Inventory-vs-wallet drift reconciliation. On every reconcile
+# cycle, compares the wallet delta since engine start against
+# `InventoryManager.inventory()` and alerts when the mismatch
+# exceeds the tolerance. Catches missed fills that slip past
+# the listen-key stream. `tolerance` is in base-asset units;
+# widen it if the venue takes fees in the base asset.
+inventory_drift_tolerance = "0.0001"
+# Alert-only by default. Flip to true to auto-reset the
+# tracker to the wallet delta on drift — use only when the
+# drift source is known (listen-key gap, not a fill-routing
+# bug).
+inventory_drift_auto_correct = false
+
 [risk]
 max_inventory = "0.1"
 max_exposure_quote = "10000"

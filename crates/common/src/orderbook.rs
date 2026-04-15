@@ -151,6 +151,34 @@ impl LocalOrderBook {
             .sum()
     }
 
+    /// Top-`n` bid levels as an **ordered vector** (best first).
+    /// Used by feature extractors and the Market Resilience
+    /// detector, which expect a best-first slice rather than
+    /// the internal `BTreeMap`.
+    pub fn top_bids(&self, n: usize) -> Vec<PriceLevel> {
+        self.bids
+            .iter()
+            .rev()
+            .take(n)
+            .map(|(price, qty)| PriceLevel {
+                price: *price,
+                qty: *qty,
+            })
+            .collect()
+    }
+
+    /// Top-`n` ask levels as an **ordered vector** (best first).
+    pub fn top_asks(&self, n: usize) -> Vec<PriceLevel> {
+        self.asks
+            .iter()
+            .take(n)
+            .map(|(price, qty)| PriceLevel {
+                price: *price,
+                qty: *qty,
+            })
+            .collect()
+    }
+
     /// Book imbalance = (bid_depth - ask_depth) / (bid_depth + ask_depth).
     /// Range: -1.0 (all asks) to +1.0 (all bids).
     pub fn imbalance(&self, levels: usize) -> Option<Decimal> {

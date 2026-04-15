@@ -9,6 +9,7 @@ pub mod funding_arb_driver;
 pub mod glft;
 pub mod grid;
 pub mod inventory_skew;
+pub mod market_resilience;
 pub mod momentum;
 pub mod paired_unwind;
 pub mod r#trait;

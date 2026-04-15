@@ -9,5 +9,5 @@ pub mod connector;
 pub mod types;
 pub mod ws_post;
 
-pub use connector::HyperLiquidConnector;
+pub use connector::{parse_hl_event_for_test, HyperLiquidConnector};
 pub use ws_post::{HlPostWire, HlWsTrader};

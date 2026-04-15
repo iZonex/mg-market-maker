@@ -18,12 +18,18 @@
 
 mod atr;
 mod bollinger;
+mod candles;
 mod ema;
+mod hma;
 mod rsi;
 mod sma;
+mod weights;
 
 pub use atr::Atr;
 pub use bollinger::{BollingerBands, BollingerValue};
+pub use candles::{Candle, MultiTriggerCandles, TickCandles, TradeSide, VolumeCandles};
 pub use ema::Ema;
+pub use hma::{Hma, Wma};
 pub use rsi::Rsi;
 pub use sma::Sma;
+pub use weights::{ema_weights, geometric_weights};

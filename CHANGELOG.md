@@ -7,8 +7,783 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-15
+
+**Production-spot-MM gap closure epic.** Closes the eight-item
+ROADMAP audit from April 2026 against how production prop desks
+(Hummingbot, Keyrock, GSR, Flowdesk) actually run spot MM.
+Every P0 / P1 / P2 item from `ROADMAP.md` lands in this release;
+three of them (P1.3, P1.4, P2.3) ship as **stage-1** with the
+heavier stage-2 work (margin-mode order routing, USDC↔USDT FX
+micro-hedge, dynamic engine spawn for new listings) explicitly
+deferred to the next epic and tracked inline in each entry.
+The release also folds in a parallel cluster of microstructure
+cherry-picks landed mid-epic (ISAC γ-policy, Market Resilience,
+OTR surveillance, Tick/Volume/MultiTrigger candles + HMA,
+queue-position fill model, DE optimiser, market-impact walker,
+lead-lag transform, Hurst R/S, BBW + multi-depth imbalance,
+soft spread gate, weighted microprice, event deduplicator).
+
 ### Added
 
+- **P2.3 stage-1 — Pair lifecycle automation: halt detection +
+  tick/lot drift** (ROADMAP production-spot-MM gap closure;
+  partial — stage-1 ships single-symbol lifecycle tracking,
+  stage-2 will add dynamic engine spawn for new listings and
+  the 7-day probation mode for auto-onboard). The pre-P2.3
+  engine fetched `ProductSpec` exactly once at startup, which
+  meant new listings, delistings, trading-status transitions
+  (PRE_TRADING, HALT, BREAK) and tick/lot updates all required
+  a process restart to pick up. Halt handling was particularly
+  dangerous: venues sometimes send fills *after* a halt, and
+  the engine had no state to reject them. Stage-1 closes the
+  halt + tick/lot drift halves of that gap with a
+  per-symbol lifecycle state machine and a periodic refresh
+  task that polls the venue every 5 minutes.
+  - **Type surface.** New `TradingStatus { Trading, Halted,
+    PreTrading, Break, Delisted }` enum in `mm-common`.
+    `ProductSpec` gains a `trading_status: TradingStatus` field
+    (default `Trading` via `#[serde(default)]` so existing
+    fixtures and the funding-arb / strategy struct literals
+    still compile). `ProductSpec` also derives `PartialEq` so
+    the lifecycle diff path can compare snapshots structurally.
+  - **Binance Spot wiring.** `BinanceConnector::get_product_spec`
+    now parses the venue's `status` field
+    (`TRADING` → `Trading`, `HALT` → `Halted`,
+    `BREAK`/`END_OF_DAY`/`POST_TRADING` → `Break`,
+    `PRE_TRADING`/`AUCTION_MATCH` → `PreTrading`). Bybit, HL,
+    and the custom client default to `Trading` — wiring those
+    venues' status fields is a stage-2 follow-up. Binance
+    Spot's "delisted symbols disappear from `exchangeInfo`"
+    behaviour is handled at the engine layer: any
+    `get_product_spec` error during the lifecycle refresh is
+    treated as a delisting candidate and latches the manager
+    via `PairLifecycleManager::on_delisted`.
+  - **State machine.** New `mm-engine::pair_lifecycle` module
+    with `PairLifecycleEvent` enum
+    (`Listed`, `Delisted`, `Halted { from, to }`,
+    `Resumed { from }`, `TickLotChanged`, `MinNotionalChanged`)
+    and `PairLifecycleManager`. The manager owns a single
+    `Option<ProductSpec>` snapshot plus a `delisted_latched: bool`
+    flag — once delisted, subsequent `diff` calls become
+    no-ops so a transient venue glitch cannot un-delist a
+    symbol the operator believes is gone. 8 unit tests pin
+    every branch: first-poll listing, identical-spec no-op,
+    Trading→Halted, Halted→Trading, tick/lot drift,
+    min_notional drift, multi-field drift in priority order
+    (status → tick/lot → min_notional), and delisted-latch
+    semantics.
+  - **Engine wiring.** `MarketMakerEngine` gains
+    `pair_lifecycle: Option<PairLifecycleManager>` (built when
+    `config.market_maker.pair_lifecycle_enabled`) and a
+    `lifecycle_paused: bool` flag. New `refresh_pair_lifecycle`
+    method polls `connector.get_product_spec`, applies tick/lot
+    drift into `self.product` in place, and routes the diff
+    via `handle_lifecycle_event` into the audit trail and the
+    paused flag. `Halted` and `Delisted` events trigger an
+    inline `OrderManager::cancel_all` on the primary leg so
+    the venue book has none of our quotes when it re-opens
+    (or never re-opens). New select arm
+    `pair_lifecycle_interval` runs the refresh on the
+    configured cadence; `refresh_quotes` returns early
+    whenever `lifecycle_paused` is set.
+  - **Audit + config.** Six new `AuditEventType` variants
+    (`PairLifecycleListed/Delisted/Halted/Resumed/TickLotChanged/MinNotionalChanged`).
+    `MarketMakerConfig.pair_lifecycle_enabled` (default `true`
+    so operators get the tick/lot drift detection for free
+    even on venues without a status field) and
+    `pair_lifecycle_refresh_secs` (default `300` = 5 min).
+  - **Stage-2 follow-ups (tracked under ROADMAP P2.3).**
+    Bybit V5 + HL + custom client `trading_status` parsing,
+    dynamic engine spawn for new listings via a
+    `Vec<MarketMakerEngine>` registry on the server, 7-day
+    probation mode for auto-onboarded pairs (wider spreads,
+    smaller size, observation window), `PairLifecycleManager`
+    sharing across multi-symbol deployments via
+    `Arc<Mutex<>>` so the discovery loop runs once per
+    venue rather than once per symbol.
+- **P2.2 — Per-pair per-minute SLA presence buckets** (ROADMAP
+  production-spot-MM gap closure). The pre-P2.2 `SlaTracker`
+  exposed a single lifetime `uptime_pct` aggregate, which is
+  unusable for paid MM agreements that audit "X % presence at
+  Y bps for Z hours per day per pair". A breach in
+  hour 14 is invisible if hour 15 brings the lifetime average
+  back above the floor. P2.2 replaces the single counter with
+  a per-minute bucket array so the rebate-clawback story is
+  reconstructible from the daily report alone.
+  - **State machine.** `SlaTracker` gains a
+    `Box<[PresenceBucket; 1440]>` indexed by
+    `now.hour() * 60 + now.minute()` plus a
+    `presence_day_key: Option<(year, ordinal)>`. Each
+    `tick()` routes the same compliant/two_sided/spread
+    sample into the matching minute bucket, and the array is
+    wiped on the first tick that crosses UTC midnight so each
+    day is independent. `PresenceBucket` carries
+    `total_seconds`, `compliant_seconds`, `two_sided_seconds`
+    and a `min_spread_bps` / `max_spread_bps` envelope.
+  - **Accessors.** New `presence_pct_for_minute(m)`,
+    `presence_pct_for_range(start, end)` (observation-weighted
+    so a 60-sample minute outweighs a 30-sample one), and
+    `daily_presence_summary() -> DailyPresenceSummary`.
+    Empty buckets default to `100 %` so a fresh start at
+    14:00 UTC does not look like 58 % uptime — the engine
+    reports `minutes_with_data` alongside the percentage so
+    operators can spot true gaps.
+  - **Engine + dashboard wiring.** `SymbolState` gains
+    `presence_pct_24h`, `two_sided_pct_24h`,
+    `minutes_with_data_24h`. The engine's `update_dashboard`
+    pushes them on every refresh tick. New Prometheus gauge
+    `mm_sla_presence_pct_24h` fires from
+    `DashboardState::update`. `SymbolDailyReport` exposes the
+    three new fields so `GET /api/v1/report/daily` is now
+    rebate-clawback-grade for paid MM agreements.
+  - **Tests.** Seven new unit tests in `mm-risk::sla` pin
+    (a) every tick lands in exactly one minute bucket,
+    (b) multiple ticks in the same minute aggregate without
+    drifting the spread envelope, (c) empty bucket reports
+    `100 %`, (d) `presence_pct_for_range` is
+    observation-weighted, (e) empty range returns `100 %`,
+    (f) `daily_presence_summary` skips empty minutes and
+    rolls up correctly across multiple non-contiguous
+    minutes, (g) the fresh-start defaults are
+    `100 % / 0 minutes` not `NaN`.
+- **P2.1 — Per-asset-class kill switch with shared escalation
+  state** (ROADMAP production-spot-MM gap closure). The
+  pre-P2.1 `KillSwitch` was a per-engine state machine — when
+  ETH-family pairs needed a coordinated halt (stETH depeg,
+  Ronin bridge incident, single-venue outage on one asset),
+  the only knob was the global per-engine switch on each ETH
+  symbol individually, with no way to escalate them as a group
+  without touching unrelated BTC pairs. P2.1 closes the gap
+  by introducing a parallel asset-class layer.
+  - **State machine sharing.** `MarketMakerEngine` gains an
+    optional `asset_class_switch: Option<Arc<Mutex<KillSwitch>>>`
+    field plus a `with_asset_class_switch(arc)` builder.
+    Engines whose symbols belong to the same class call the
+    builder with the **same** `Arc<Mutex<_>>`, so a
+    coordinated escalation halts every pair in the class
+    simultaneously without touching unrelated symbols. The
+    `Arc<Mutex<_>>` shape mirrors the shared `Portfolio`
+    pattern from Sprint I.
+  - **Hard-vs-soft separation.** A new
+    `MarketMakerEngine::effective_kill_level()` helper
+    returns `global.max(asset_class)` so soft-decision call
+    sites (`ks_spread` / `ks_size` in `refresh_quotes`, the
+    dashboard `kill_level` exposure) honour the asset-class
+    layer immediately. Hard-decision call sites
+    (`CancelAll` / `FlattenAll` / `Disconnect`) keep reading
+    `self.kill_switch.level()` directly so an asset-wide
+    widening cannot accidentally flatten another pair's
+    inventory. `KillLevel` gains free-fn
+    `spread_multiplier()` / `size_multiplier()` helpers so
+    the multipliers can be derived from a level the engine
+    composed itself rather than from any single kill-switch
+    instance.
+  - **Server composition.** `mm-server::main` parses
+    `config.kill_switch.asset_classes` up front, builds one
+    `Arc<Mutex<KillSwitch>>` per class, and looks up each
+    engine's class via the inverted `symbol → class` map. The
+    matching arc is passed via the new builder; engines whose
+    symbol has no class get `None` and run with the global
+    layer only.
+  - **Config.** `KillSwitchCfg` gains an `asset_classes:
+    Vec<AssetClassKillSwitchCfg>` field (default empty). Each
+    entry carries `name`, `symbols`, and a full
+    `limits: KillSwitchCfg` (same shape as the global one).
+    `validate.rs` errors when an asset-class entry references
+    a symbol that does not exist in the top-level
+    `[[symbols]]` array, when a symbol appears in two
+    classes, or when a class has an empty name; warns when a
+    class has zero symbols.
+  - **Tests.** Two new free-fn unit tests in `mm-risk` pin
+    the per-level `spread_multiplier`/`size_multiplier`
+    constants and the `KillLevel: Ord` invariant the
+    effective-level max relies on. Three new engine-level
+    tests prove (a) the no-asset-class path falls through to
+    the global level verbatim, (b) `effective_kill_level`
+    takes `max(global, asset_class)` and respects the
+    "max not replace" semantics in both directions, and
+    (c) two engines pointing at the same `Arc<Mutex<_>>` see
+    each other's escalations instantly — the regression
+    anchor for the "halt all ETH-family pairs" use case.
+- **P1.4 stage-1 — Cross-venue basis with hedge-book staleness
+  gate** (ROADMAP production-spot-MM gap closure; partial —
+  stage-1 ships the strategy upgrade, audit events, and the
+  Prometheus surface, stage-2 will land the USDC↔USDT FX
+  micro-hedge connector and rolling per-venue funding PnL
+  accrual). The existing `BasisStrategy` was already
+  venue-agnostic at the strategy layer (it just consumes
+  `ref_price` + `hedge_book` from the engine), so the
+  primary/hedge ConnectorBundle already supports cross-venue
+  pairs. The actual P1.4 gap was operational: cross-venue WS
+  feeds jitter 200-800 ms in steady state and pause for
+  multi-second windows under load, and a stale hedge mid is a
+  much louder failure mode for cross-venue than for
+  same-venue. Stage-1 closes that gap with a strategy-side
+  staleness gate plus the audit + dashboard surface that
+  cross-venue ops needs to see what the bot is doing.
+  - **Strategy upgrade.** New
+    `BasisStrategy::cross_venue(shift, max_basis_bps,
+    max_staleness_ms)` constructor sits next to the existing
+    same-venue `new`. Adds a `max_hedge_staleness_ms:
+    Option<i64>` field — `None` is the legacy same-venue
+    behaviour, `Some(ms)` is the cross-venue mode. New
+    `StrategyContext.hedge_book_age_ms: Option<i64>` field is
+    threaded by the engine as
+    `now_ms - hedge_book.last_update_ms`. The strategy
+    stands down on every refresh tick where the age exceeds
+    the gate, AND when the age reading is missing entirely
+    (no hedge book yet, or engine forgot to thread it) —
+    cross-venue is opt-in to "fail safe by default". Four
+    new unit tests pin the four branches: fresh book quotes
+    normally, stale book stands down, no-age-reading stands
+    down, same-venue mode (`None` gate) ignores staleness
+    completely. The last test is the regression anchor for
+    the "P1.4 must not break P0/P1.x" invariant.
+  - **Audit + dashboard.** Two new `AuditEventType` variants
+    `CrossVenueBasisEntered` / `CrossVenueBasisExited` fired
+    by the engine the first refresh tick after the basis
+    crosses `config.hedge.pair.basis_threshold_bps` (the
+    same number that gates the strategy). State machine
+    `cross_venue_basis_inside: bool` on
+    `MarketMakerEngine` debounces the events so each
+    round-trip emits exactly one entered + one exited rather
+    than spamming the audit trail every refresh. New
+    Prometheus gauge `mm_cross_venue_basis_bps` is published
+    on every refresh tick whenever both legs have a mid.
+  - **Engine wiring.** `refresh_quotes` reads the cross-venue
+    basis BEFORE building the immutable hedge-book reference
+    that the `StrategyContext` holds — borrow-checker dance
+    so the audit-state mutation does not conflict with the
+    strategy-context borrow. `MarketMakerConfig.cross_venue_basis_max_staleness_ms`
+    (default `1500`, fits cross-venue WS feed jitter) is the
+    new operator knob. New `StrategyType::CrossVenueBasis`
+    variant routes the server's strategy builder into
+    `BasisStrategy::cross_venue(...)`; same-venue pairs still
+    pick `Basis`.
+  - **Stage-2 follow-ups (tracked under ROADMAP P1.4).**
+    USDC↔USDT FX micro-hedge connector (5-10 bps of silent
+    leakage if ignored on cross-stable pairs), per-venue
+    rolling 24h funding PnL accrual, third-connector slot in
+    `ConnectorBundle` for the FX leg, audit events
+    `FxMicroHedgeAdjusted`, and a per-pair settlement-currency
+    selector in `HedgePairConfig`.
+- **P1.3 stage-1 — Borrow-cost surcharge in the spot ask
+  reservation** (ROADMAP production-spot-MM gap closure;
+  partial — stage-1 ships the rate fetch and the strategy
+  shim, stage-2 will land actual loan execution + margin-mode
+  order routing). A spot MM that starts flat in the base asset
+  cannot quote the ask side without borrowing — and the
+  borrow rate the venue charges is a real carry cost the
+  strategy needs to bake into its reservation, otherwise
+  captured spread leaks into interest expense. Stage-1 is the
+  foundation that closes the **pricing** half of that gap.
+  - **Trait surface.** New
+    `ExchangeConnector::get_borrow_rate(asset)`,
+    `borrow_asset(asset, qty)`, and `repay_asset(asset, qty)`
+    methods, all defaulting to `Err(BorrowError::NotSupported)`.
+    New `BorrowRateInfo { asset, rate_apr, rate_bps_hourly,
+    fetched_at }` + `BorrowError { NotSupported, Other }`
+    types. The `BorrowRateInfo::from_apr` helper centralises
+    the APR → hourly-bps conversion (`× 10_000 / 8_760`) so
+    every venue override speaks the same unit.
+  - **Binance Spot rate fetch.** `BinanceConnector::get_borrow_rate`
+    calls `GET /sapi/v1/margin/interestRateHistory?asset=&size=1`
+    and parses the `dailyInterestRate` field; the pure helper
+    `parse_binance_borrow_rate_response` multiplies by 365 to
+    return an APR fraction. Two unit tests pin both the
+    array-shape and the bare-object response forms. Bybit V5
+    and HyperLiquid keep the trait-default `NotSupported` —
+    Bybit UTA borrow is implicit in the unified collateral
+    pool and HL has no margin product. `borrow_asset` /
+    `repay_asset` remain `NotSupported` on every venue
+    pending stage-2 (margin-mode order routing).
+  - **State machine.** New `mm-risk::borrow` module with
+    `BorrowState { asset, rate_apr, rate_bps_hourly,
+    fetched_at }` and `BorrowManager { state,
+    expected_holding_secs, max_borrow, buffer }`. The manager
+    owns an `effective_carry_bps()` accessor that converts the
+    APR into the strategy-side surcharge:
+    `carry_bps = APR × 10_000 × (holding_secs / 31_536_000)`.
+    Returns `Decimal::ZERO` before the first refresh — the
+    "strategy reverts to pre-P1.3 behaviour when borrow data
+    is missing" invariant. 7 unit tests pin the conversion
+    constants, the linear-in-holding-time scaling, and the
+    `max_borrow` / `buffer` accessor contract that stage-2
+    will load against.
+  - **Strategy integration.** New
+    `StrategyContext.borrow_cost_bps: Option<Decimal>` field.
+    `AvellanedaStoikov` and `BasisStrategy` add the surcharge
+    fraction-of-mid to the reservation price *up*, shifting
+    both bid and ask in lockstep — equivalent to widening the
+    ask half-spread by the carry while tightening the bid by
+    the same amount, which makes the strategy less willing
+    to accumulate the short side that pays the loan. New
+    test `borrow_cost_shifts_reservation_up` is the
+    regression anchor.
+  - **Engine refresh task.** `MarketMakerEngine` gains an
+    optional `borrow_manager: Option<BorrowManager>`,
+    initialised when `config.market_maker.borrow_enabled`.
+    A new `refresh_borrow_rate` method sits next to
+    `refresh_fee_tiers` in the periodic-tick pattern and
+    runs on a fresh `borrow_rate_interval` arm. On each
+    successful tick it pushes the APR into `BorrowManager`
+    and updates two new Prometheus gauges
+    (`mm_borrow_rate_bps_hourly`, `mm_borrow_carry_bps`).
+    `refresh_quotes` reads `effective_carry_bps()` and
+    threads it into `StrategyContext.borrow_cost_bps` so
+    the surcharge lands on the very next quote refresh.
+    `NotSupported` is a quiet debug-level fall-through;
+    `Other` warn-logs and keeps the previous APR.
+  - **Config knobs.** `MarketMakerConfig.borrow_enabled`
+    (default `false` — opt-in so existing operators are not
+    silently re-priced into a wider book),
+    `borrow_rate_refresh_secs` (default `1800`),
+    `borrow_holding_secs` (default `3600` — converts APR
+    into the expected-carry bps), `borrow_max_base` and
+    `borrow_buffer_base` (defaults `0`; persisted by
+    stage-1, enforced by stage-2 when the loan execution
+    path lands).
+  - **Stage-2 follow-ups (tracked under ROADMAP P1.3).**
+    Margin-mode connector for Binance Spot
+    (`/sapi/v1/margin/order` routing + `POST /sapi/v1/margin/loan`
+    execution + opposing-fill repay), Bybit UTA borrow
+    accounting via `BalanceCache.borrowed_in(asset)`,
+    audit-trail `BorrowOpened` / `BorrowRepaid` events, and
+    the strategy-side dynamic max-borrow cap.
+- **P1.2 — Dynamic fee-tier refresh + rebate-aware accounting**
+  (ROADMAP production-spot-MM gap closure). Until now
+  `ProductSpec.maker_fee` / `taker_fee` were frozen at startup
+  from the connector defaults — a month-end VIP tier crossing
+  silently shaved 1-2 bps off captured edge until the next
+  process restart. P1.2 closes the gap with a periodic refresh
+  task that reads the venue's authoritative per-account fee
+  schedule and hot-swaps it into the live `PnlTracker`.
+  - **Trait surface.** New
+    `ExchangeConnector::fetch_fee_tiers(symbol)` with default
+    `Err(FeeTierError::NotSupported)`. New `FeeTierInfo {
+    maker_fee, taker_fee, vip_tier, fetched_at }` and
+    `FeeTierError { NotSupported, Other }` types in
+    `mm-exchange-core::connector`. Negative `maker_fee` is the
+    documented rebate convention.
+  - **Venue overrides.**
+    `BybitConnector::fetch_fee_tiers` calls
+    `GET /v5/account/fee-rate?category=&symbol=` and parses the
+    `result.list` row for the queried symbol via the pure
+    helper `parse_bybit_fee_rate_response` (two unit tests pin
+    the wire shape and the multi-symbol row-pick).
+    `BinanceConnector::fetch_fee_tiers` calls
+    `GET /sapi/v1/asset/tradeFee?symbol=` and accepts both the
+    array and the bare-object response shapes via
+    `parse_binance_spot_fee_response` (two tests cover both
+    shapes).
+    `BinanceFuturesConnector::fetch_fee_tiers` calls
+    `GET /fapi/v1/commissionRate?symbol=` and parses
+    `makerCommissionRate` / `takerCommissionRate` via
+    `parse_binance_futures_fee_response` (one wire-shape test).
+    HyperLiquid and the custom `mm-exchange-client` keep the
+    default `NotSupported` and the engine logs the
+    fallthrough at debug level.
+  - **PnL tracker hot-swap.** New `PnlTracker::set_fee_rates(maker, taker)`
+    plus read-only `maker_fee()` / `taker_fee()` accessors.
+    Subsequent `on_fill` calls attribute against the new rates;
+    previously accrued `fees_paid` and `rebate_income` are not
+    retroactively rewritten — that would conflict with the
+    audit trail. New regression test
+    `set_fee_rates_hot_swaps_for_subsequent_fills` is the
+    anchor.
+  - **Engine refresh task.** `MarketMakerEngine::refresh_fee_tiers`
+    is wired into a new `fee_tier_interval` arm in
+    `run_with_hedge`. On each tick it calls
+    `connector.fetch_fee_tiers(symbol)`, updates
+    `self.product.maker_fee` / `taker_fee`, hot-swaps the
+    `PnlTracker` rates, and pushes two new Prometheus gauges
+    (`mm_maker_fee_bps`, `mm_taker_fee_bps` — both
+    venue-reported, in basis points). The first tick fires
+    immediately so the operator sees the authoritative rates
+    before the first quote refresh; subsequent ticks honour
+    the configured cadence. `NotSupported` is a quiet
+    fall-through (HL / custom); `Other` errors warn-log and
+    keep the previous rates.
+  - **Config knobs.** New
+    `MarketMakerConfig.fee_tier_refresh_enabled` (default
+    `true`) and `fee_tier_refresh_secs` (default `600`).
+    Setting `enabled=false` or `secs=0` disables the refresh
+    arm entirely — useful for paper mode and venues with
+    rate-limited account endpoints.
+  - **Honest capability flag bonus.** As a side effect of
+    walking every venue, `BinanceConnector` (Spot)
+    `supports_amend` was already flipped to a honest `false`
+    in P1.1 — same epic, but called out here because the fee
+    helper makes the inconsistency between Spot
+    (`order.cancelReplace` only) and Futures
+    (`PUT /fapi/v1/order` modify) visible.
+- **P1.1 — Queue-priority-preserving amend on the order diff**
+  (ROADMAP production-spot-MM gap closure). Until now every
+  quote refresh hit the venue as a cancel + place pair, even
+  when the new price was a single tick away from the live one
+  — and every cancel costs queue priority. Tardis measured
+  this at 2-5 bps of captured spread on tight pairs. The fix
+  lands in three layers:
+  - **Diff layer.** `OrderManager::diff_orders` now returns a
+    new `OrderDiffPlan { to_cancel, to_amend, to_place }`
+    instead of the legacy `(Vec<OrderId>, Vec<Quote>)` tuple,
+    and takes a fresh `amend_epsilon_ticks: u32` argument.
+    When non-zero, a greedy nearest-pair pass on each side
+    matches stale orders against new quotes whose qty is
+    unchanged and whose price is within
+    `epsilon * tick_size` of the old price; matches collapse
+    into an `AmendPlanEntry` instead of a cancel + place
+    pair. Pure function — testable without a connector.
+    Six new unit tests pin the algorithm: same-side same-qty
+    tweak collapses, qty change defeats pairing, price diff
+    > epsilon defeats pairing, `epsilon = 0` is the legacy
+    cancel + place path (regression anchor for the disabled
+    state), cross-side matching is rejected, and the
+    `reprice_order` post-amend bookkeeping moves the
+    `price_index` slot atomically while keeping the `OrderId`.
+  - **Execution layer.** `OrderManager::execute_diff` reads
+    the connector's `VenueCapabilities::supports_amend` flag
+    and downgrades planned amends back to cancel + place
+    when the venue does not support a real native amend
+    (HyperLiquid, Binance Spot). On success the local state
+    is updated via `reprice_order` so the same `OrderId`
+    keeps its queue position. On amend failure the entry
+    falls back to cancel + place by appending into the
+    next-up buckets — no quote is silently dropped. New
+    `amended` / `amend_failures` counters surface in the
+    `order diff executed` log line.
+  - **Venue layer.** `BybitConnector::amend_order` overrides
+    the trait default to call `POST /v5/order/amend` with the
+    V5-mandatory `category` field, identifying the order via
+    `orderId` to match the existing cancel path. Body
+    construction is factored into a pure
+    `build_amend_body(category, amend)` helper so the wire
+    shape is unit-tested without an HTTP client (two new
+    tests pin the required fields and the "omit unset
+    optional" rule).
+    `BinanceFuturesConnector::amend_order` overrides the
+    default to call `PUT /fapi/v1/order` with `symbol`,
+    `origClientOrderId`, `quantity` and `price`; the same
+    pure-helper pattern (`build_amend_query`) carries two
+    wire-shape tests including a programmer-error bail when
+    `new_price` or `new_qty` is missing.
+    `BinanceConnector` (Spot) flips `supports_amend` to an
+    honest `false` — Binance Spot only has
+    `order.cancelReplace`, which is a cancel+place under the
+    hood and loses queue priority. The `capabilities_match_implementation`
+    test now asserts the false value with an explanatory
+    comment so a future contributor cannot silently flip it
+    back on.
+    HyperLiquid was already honestly `false`. No change to
+    the trait default — venues that don't override it still
+    fall back to cancel+place via the trait body.
+  - **Config.** Already-defined `MarketMakerConfig.amend_enabled`
+    (default `true`) and `amend_max_ticks` (default `2`)
+    were unwired until this change; they are now threaded
+    through `MarketMakerEngine::refresh_quotes` into
+    `OrderManager::execute_diff`. Setting either off
+    degrades to the pre-P1.1 cancel+place behaviour without
+    a code change.
+- **P0.1 — HyperLiquid `webData2` balance pushes wired into the
+  engine** (ROADMAP production-spot-MM gap closure, third
+  venue after Binance and Bybit; **closes the P0.1 cluster**).
+  HL is architecturally different from Binance and Bybit: it
+  multiplexes `userEvents` + `orderUpdates` onto the same WS
+  connection as `l2Book` + `trades`, so `MarketEvent::Fill`
+  events were already reaching the engine through the existing
+  connector subscribe path. The actual gap was that HL has no
+  separate "wallet snapshot" topic — without it, balance state
+  in `BalanceCache` only refreshed via the 60 s reconcile poll
+  even though fills landed instantly. The fix is purely
+  additive in `crates/exchange/hyperliquid/src/connector.rs`:
+  the subscribe loop now also subscribes to
+  `{"type":"webData2","user":"<addr>"}`, and `parse_hl_event`
+  gained a `webData2` branch that emits `BalanceUpdate` events
+  on every push. Two helper parsers,
+  `parse_hl_perp_balance` and `parse_hl_spot_balances`, mirror
+  the field layout of the existing REST `clearinghouseState` /
+  `spotClearinghouseState` readers in `get_balances`, so a
+  schema drift breaks both the test and the live parser
+  symmetrically. `parse_hl_event` now takes an `is_spot` flag
+  and routes `webData2` payloads disjointly: perp connectors
+  emit a single USDC `BalanceUpdate` against
+  `WalletType::UsdMarginedFutures` (`marginSummary.accountValue`
+  → total, `withdrawable` → available, the difference → locked),
+  while spot connectors emit one event per non-zero
+  `spotState.balances[]` entry tagged with `WalletType::Spot`.
+  No `mm-server::spawn_event_merger` changes: HL doesn't need
+  the merger pattern because its private stream rides the
+  public WS — the wiring is a single new subscribe message.
+  New `parse_hl_event_for_test` re-export on the crate root is
+  the test hook downstream crates pin against. New integration
+  test `hl_webdata2_frame_feeds_balance_cache` in
+  `crates/engine/tests/integration.rs` takes a hand-crafted
+  `webData2` perp frame, parses it through the public hook,
+  plugs the emitted `BalanceUpdate` into a fresh
+  `BalanceCache::new_for(UsdMarginedFutures)`, and asserts
+  both `available_in("USDC", _)` and `total_in("USDC", _)`
+  reflect the frame. 6 unit tests on the parser itself
+  (perp happy path, fallback when `accountValue` missing,
+  spot per-coin emission, disjoint spot/perp routing,
+  silent-on-empty, public-hook pass-through). The full P0.1
+  cluster (Binance listen-key, Bybit V5 private WS, HL
+  webData2) is now closed — every venue the bot trades on
+  has a real-time balance push wired into `BalanceCache`,
+  so P0.2's drift reconciler is no longer load-bearing for
+  the steady state.
+- **P0.1 — Bybit V5 private WS user stream wired into the
+  engine** (ROADMAP production-spot-MM gap closure, second
+  venue after Binance). New `crates/exchange/bybit/src/user_stream.rs`
+  module opens Bybit V5's `wss://stream.bybit.com/v5/private`
+  endpoint, signs in with the V5 auth op
+  (`HMAC_SHA256(secret, "GET/realtime" + expires)`), subscribes to
+  `execution` + `wallet` + `order`, and emits
+  `MarketEvent::Fill` / `MarketEvent::BalanceUpdate` events on
+  the same channel the public subscribe task uses. The
+  `wallet` parser is defensive about the V5 UTA wallet
+  schema: it prefers `availableToWithdraw` over the deprecated
+  `free` field, falls back to `walletBalance - locked` when
+  neither is sent, and reads `totalOrderIM` as the locked
+  collateral on Unified accounts. `mm-server::spawn_event_merger`
+  now branches on `ExchangeType::Bybit{,Testnet}` and spawns
+  `mm_exchange_bybit::user_stream::start` against the same
+  merged channel that already feeds the engine, gated behind
+  `user_stream_enabled` and an empty-credentials short-circuit
+  (the auth handshake requires both api_key and api_secret on
+  Bybit, unlike Binance's listen key which only needs the
+  api_key). New integration test
+  `bybit_private_wallet_frame_feeds_balance_cache` in
+  `crates/engine/tests/integration.rs` is the regression
+  anchor: it takes a hand-crafted V5 wallet snapshot, parses
+  it through `parse_user_event_for_test`, plugs both emitted
+  `BalanceUpdate` events into a fresh `BalanceCache::new_for(Unified)`,
+  and asserts `available_in("USDT", Unified)` and
+  `available_in("BTC", Unified)` surface the
+  `availableToWithdraw` values from the frame. 9 unit tests
+  on the parser itself (auth-frame shape, execution
+  Trade/non-Trade, UTA wallet, classic spot wallet, fallback
+  arithmetic, multi-account frames, unknown-topic ignore,
+  config-helper sanity). HyperLiquid `userEvents` remains
+  tracked under ROADMAP P0.1.
+- **P0.2 — Inventory-vs-wallet drift reconciliation** (ROADMAP
+  production-spot-MM gap closure). Closes the second
+  correctness blocker after P0.1: even with the listen-key
+  stream wired, a dropped WS frame or a parser miss can still
+  silently desync `InventoryManager.inventory()` from the
+  wallet. The new `mm_risk::inventory_drift` module
+  (`InventoryDriftReconciler` + `DriftReport`) snapshots the
+  wallet total at first reconcile and compares the wallet
+  delta against the tracked inventory delta on every
+  subsequent cycle. Any mismatch above
+  `inventory_drift_tolerance` (default `0.0001` base-asset
+  units) fires a `DriftReport` that the engine routes into
+  the audit trail as the new `InventoryDriftDetected` event
+  type. `InventoryManager::force_reset_inventory_to` is the
+  opt-in auto-correct hook — gated behind
+  `inventory_drift_auto_correct` (default `false`,
+  alert-only) so operators can investigate before the system
+  rewrites tracker state. `BalanceCache::total_in(asset,
+  wallet)` is the new ground-truth accessor: returns
+  `free + locked` before local reservations, matching how
+  the venue reports the wallet. Wired into
+  `engine::market_maker::reconcile` as
+  `check_inventory_drift()`. Two new E2E integration tests
+  (`baseline_then_missed_buy_surfaces_drift_report`,
+  `auto_correct_drift_force_resets_inventory_manager`) prove
+  the full chain from `BalanceCache` through the reconciler
+  into `InventoryManager::force_reset_inventory_to`. 9 unit
+  tests on the reconciler itself.
+- **P0.1 — Binance listen-key user-data stream wired into the
+  engine** (ROADMAP production-spot-MM gap closure). The
+  `crates/exchange/binance/src/user_stream.rs` module has been
+  feature-complete since the spot epic but was never spawned by
+  any server call site — so fills arriving out-of-band (REST
+  fallback, partial fills after the WS-API response envelope,
+  manual UI orders, RFQ/OTC trades touching the same account)
+  never reached `InventoryManager` until the 60 s reconcile
+  cycle. This closes the gap by introducing
+  `mm-server::spawn_event_merger`, which multiplexes the
+  public ws subscribe feed with an optional Binance user-data
+  stream into a single merged `MarketEvent` channel before
+  passing it to `engine.run_with_hedge`. The engine's
+  `handle_ws_event::BalanceUpdate` branch that was previously
+  dead code is now the canonical path for spot balance updates.
+  Gated behind the new `MarketMakerConfig.user_stream_enabled`
+  flag (default `true`); the merger short-circuits cleanly on
+  non-Binance venues, missing credentials, and the `false`
+  toggle. Bybit V5 and HyperLiquid equivalents remain tracked
+  under ROADMAP P0.1. New integration test
+  `binance_user_stream_frame_feeds_balance_cache` in
+  `crates/engine/tests/integration.rs` takes a hand-crafted
+  `outboundAccountPosition` frame, parses it via the new
+  `parse_user_event_for_test` entry point, plugs both emitted
+  `BalanceUpdate` events into a fresh `BalanceCache`, and
+  asserts the free-balance values surface through
+  `available_in(asset, wallet)` — first regression anchor for
+  the full listen-key → cache path.
+- **Operator surface for the new signals: config toggles, E2E
+  test, dashboard panel, `mm-probe` CLI.**
+  - `MarketMakerConfig` gains four opt-in fields
+    (`market_resilience_enabled`, `otr_enabled`, `hma_enabled`,
+    `hma_window`), all defaulted to `true` / `9`. When a
+    toggle is off, the engine skips the corresponding
+    `on_trade` / `on_book` / `refresh_quotes` feed and the
+    autotuner's MR channel is explicitly cleared so the
+    effective spread multiplier returns to the
+    regime+toxicity baseline.
+  - `config/default.toml` documents the new knobs inline.
+  - New E2E integration test
+    `crates/engine/tests/integration.rs::
+    large_trade_widens_autotuner_spread_mult_and_recovers`
+    — feeds a synthetic trade+book stream through a
+    `MarketResilienceCalculator` paired with an `AutoTuner`,
+    asserts that the effective spread multiplier widens after
+    a large trade and recovers exactly to the baseline past
+    the decay window. First end-to-end check that the MR →
+    autotuner → strategy plumbing isn't broken by future
+    refactors.
+  - New `SignalsPanel.svelte` in the Svelte frontend —
+    three-row panel showing Market Resilience (with
+    kill-switch threshold bar), Order-to-Trade Ratio and
+    HMA-vs-mid delta. Auto-populates from `/api/status`. Demo
+    mode synthesises the three fields so operators can see
+    the panel animated without running the engine.
+  - New `mm-probe` CLI binary (`cargo run -p mm-backtester
+    --bin mm-probe -- --events <path.jsonl>`). Streams a
+    recorded event JSONL through a standalone
+    `MarketResilienceCalculator` + `OrderToTradeRatio` + `Hma`
+    trio and prints a tab-separated time series to stdout.
+    Useful for calibrating thresholds and sanity-checking the
+    signals on real market data without lifting the whole
+    engine. Flags: `--stride N`, `--mr-warmup N`,
+    `--hma-window N`.
+- **Tick / Volume / MultiTrigger candles + Hull Moving
+  Average — mm-toolbox cherry-pick**
+  (`mm_indicators::{candles,hma,weights}`). Port of the three
+  non-trivial building blocks from
+  `github.com/beatzxbt/mm-toolbox` (MIT), adapted to Rust and
+  landed in the `mm-indicators` leaf crate.
+  - `TickCandles`, `VolumeCandles`, `MultiTriggerCandles`:
+    trade-aggregated candle buckets with three independent
+    trigger modes. Tick buckets close after N trades
+    regardless of wall-clock time. Volume buckets close after
+    N base-asset units traded, splitting straddling trades so
+    the bucket fills exactly (a single huge trade can emit
+    several candles in one `update` call). MultiTrigger closes
+    on whichever of `(max_duration_ms, max_ticks, max_volume)`
+    fires first — useful when you want volume-normalised
+    candles but need a hard floor on candle-close latency in
+    a dead market. Ring-buffered into a `VecDeque<Candle>`
+    with capacity eviction. Candle struct carries
+    `open/high/low/close/buy_volume/sell_volume/vwap/total_trades/open_ts/close_ts`
+    in `Decimal` (upstream Numba version uses `f64` — the
+    Rust port is strictly more precise and plays nicely with
+    the rest of the `Decimal`-everywhere invariant).
+  - `Hma` + `Wma`: Hull Moving Average (Alan Hull, 2005) built
+    from three `Wma`s —
+    `HMA(n) = WMA(2·WMA(n/2) − WMA(n), √n)`. Both smoother and
+    **lower-lag** than EMA/SMA of the same window. Wired into
+    `MomentumSignals::with_hma` as an optional 5th alpha
+    component that captures the HMA slope on mid-price
+    updates. When attached, the alpha weights are re-split
+    `book 0.3 / flow 0.3 / micro 0.2 / hma 0.2`; when absent,
+    the legacy `0.4 / 0.4 / 0.2` split is preserved. Engine
+    defaults to `DEFAULT_HMA_WINDOW = 9`, matching the
+    upstream quickstart. Exposed as the Prometheus gauge
+    `mm_hma_value`.
+  - `geometric_weights(n, r)` + `ema_weights(n, alpha)`:
+    standalone kernel-weight generators. Normalised to sum to
+    1.0. Used by alpha-signal code that wants a hand-shaped
+    weight vector without owning a full moving-average state
+    machine. Upstream default `r = 0.75` for geometric,
+    `α = 3 / (window + 1)` for EMA weights.
+  - 36 new tests (14 candles, 9 HMA/WMA, 7 weights, 3
+    MomentumSignals HMA wiring, 3 dashboard/metrics).
+    Workspace test count: 549 → 582.
+- **Market Resilience (MR) score + Order-to-Trade Ratio
+  surveillance — VisualHFT cherry-pick**
+  (`mm_strategy::market_resilience`, `mm_risk::otr`). Port of
+  the two non-trivial analytics plugins from
+  `github.com/visualHFT/VisualHFT` (Apache-2.0), adapted to
+  Rust and wired end-to-end through the engine.
+  - `MarketResilienceCalculator`: event-driven detector that
+    reacts to **just-happened** liquidity shocks. Tracks trade
+    shocks (z-score on rolling trade-size window), spread
+    shocks (robust z on a `P2Quantile` median baseline) and
+    depth depletion (robust z on immediacy-weighted depth,
+    recovery measured against a per-event trough/baseline
+    pair). Emits the VisualHFT weighted score formula
+    `(trade 30 % / spread-recovery 10 % / depth-recovery 50 %
+    / spread-magnitude 10 %)` in `[0, 1]`, decays linearly
+    back toward `1.0` over 5 s after each shock. Wired into
+    `AutoTuner::set_market_resilience` so the effective
+    spread multiplier is divided by `max(mr, 0.2)` — a low
+    score widens the book post-shock, the floor caps widening
+    at 5×. Also wired into `KillSwitch::update_market_resilience`
+    so a sustained dip below `0.3` for ≥3 s escalates to L1
+    (`WidenSpreads`), while harder levels stay driven by PnL
+    / position value alone.
+  - `InventoryGammaPolicy` (stationary state-space widen) and
+    `MarketResilienceCalculator` (event-driven shock
+    reaction) are now complementary inputs to the autotuner:
+    one says *how much* γ should react to inventory load, the
+    other says *when* the spread should react to a
+    just-happened shock.
+  - `OrderToTradeRatio`: regulatory surveillance counter
+    `(adds + 2·updates + cancels) / max(trades, 1) - 1`. A
+    high OTR is the canonical spoofing / layering proxy that
+    regulators (MiCA, ESMA, SEBI, MAS) monitor. Exported
+    through `AuditLog::order_to_trade_ratio_snapshot` every
+    60 ticks so the full time series is reconstructable from
+    the JSONL audit trail — MiCA compliance. Also exposed as
+    the Prometheus gauge `mm_order_to_trade_ratio`.
+  - `MarketResilienceCalculator` is fed from both `on_trade`
+    and `on_book` in `engine::market_maker::handle_ws_event`;
+    the OTR counter increments on every book event
+    (`on_update`) and trade (`on_trade`). Two new
+    `GaugeVec`s in `mm_dashboard::metrics`:
+    `mm_market_resilience` and `mm_order_to_trade_ratio`.
+  - **Supporting primitives** landed alongside the calculator:
+    - `mm_common::P2Quantile` — Jain & Chlamtac 1985 running
+      quantile estimator. O(1) memory, O(1) per-update. Drop-
+      in replacement for a fixed-window rolling median when
+      the goal is a robust baseline for z-score detection.
+    - `mm_strategy::features::immediacy_depth_bid/ask` —
+      rank-churn-invariant depth metric
+      `Σ qty · 1 / (1 + d)²`, `d` in spread units. Unlike a
+      plain top-k qty sum, this metric drops when inner
+      levels are replaced with outer levels, which is the
+      actual behaviour we want to see in a depletion
+      detector.
+  - 36 new tests (5 P², 4 immediacy depth, 11 MR, 6 OTR, 6
+    autotune MR wiring, 4 kill-switch MR). Workspace test
+    count: 513 → 549.
+- **ISAC-inspired closed-form inventory γ policy and risk
+  penalty** (`mm_strategy::autotune`). Port of the analytical
+  backbone from the ISAC SAC-gamma agent
+  (`github.com/im1235/ISAC`), minus the PyTorch training
+  loop. `InventoryGammaPolicy { max_inventory, q_weight,
+  q_exp, t_weight, t_exp, min_mult, max_mult }` computes
+  `γ_mult = clamp(1 + q_weight·(|q|/q_max)^q_exp +
+  t_weight·(1 − t_remaining)^t_exp, [min_mult, max_mult])`,
+  so γ widens smoothly with inventory load and as the
+  session horizon runs out — the same state surface the RL
+  agent learns after 2000 training paths, but in closed
+  form with no GPU dependency. Defaults
+  (`q_weight=1.5, q_exp=2, t_weight=0.5, t_exp=3`) mirror
+  the ISAC policy output on a `q_max=0.1` sim. Attached via
+  `AutoTuner::with_inventory_gamma_policy` and fed state
+  through `update_policy_state(q, t_remaining)` each tick;
+  `effective_gamma_mult()` folds the policy into the
+  regime × toxicity product. Also exports
+  `inventory_risk_penalty(q, σ, dt) = 0.5·|q|·σ·√dt` — the
+  mean-variance risk charge from the original
+  Avellaneda-Stoikov paper, ready for hyperopt loss
+  functions that score on risk-adjusted PnL instead of raw
+  PnL. Wired into `engine::market_maker::refresh_quotes`
+  via `auto_tuner.update_policy_state(inventory,
+  t_remaining)`. 13 tests.
 - **Queue-position-aware backtest fill model**
   (`mm_backtester::queue_model`). Port of the canonical
   `hftbacktest` design. New `Probability` trait with two
