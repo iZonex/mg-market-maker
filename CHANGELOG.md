@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Epic D stage-3 — Cartea AS + per-side ρ for Basis +
+  CrossExchange strategies** (Apr 2026). Closes the
+  coverage gap that the Avellaneda + GLFT per-side wiring
+  surfaced: `BasisStrategy` and `CrossExchangeStrategy`
+  ignored both the symmetric `as_prob` and the per-side
+  `as_prob_bid` / `as_prob_ask` fields, leaving them out
+  of the Cartea closed-form widening menu while the other
+  spot quoters were on. Stage-3 brings them into parity.
+  - **`BasisStrategy::compute_quotes`** — adds the same
+    `match (ctx.as_prob_bid, ctx.as_prob_ask)` shape as
+    Avellaneda. The level-0 `half_min` is widened
+    independently per side via
+    `(1 − 2·ρ_side) · σ · √(T − t)` and safety-clamped at
+    the wave-1 `half_min` floor so informed flow on
+    either side never produces a sub-`min_spread_bps`
+    quote. Each per-level offset stacks the wave-1
+    `level_step` on top of the per-side widened half.
+    Symmetric fallback when per-side fields are absent;
+    no-op when both per-side and symmetric `as_prob` are
+    `None` (byte-identical to wave-1).
+  - **`CrossExchangeStrategy::compute_quotes`** — adds
+    the AS additive shift to the existing `min_ask` /
+    `max_bid` profit-floor edges. Bid widens *down* and
+    ask widens *up* by the per-side or symmetric ρ
+    component. **Safety floor at zero** (not at the
+    wave-1 floor like Basis) — informed flow on
+    cross-exchange must NEVER tighten the profit floor
+    because that would invite an adverse fill below the
+    fee threshold. The `xexch_high_rho_does_not_narrow_profit_floor`
+    test pins this invariant.
+  - **7 new strategy tests** (3 Basis + 4 CrossExchange):
+    None-byte-identity, symmetric-low-ρ-widens-both,
+    per-side-widens-one-side-only on Basis;
+    None-byte-identity, symmetric-low-ρ-widens-floor,
+    high-ρ-clamps-at-zero, per-side-widens-one-side-only
+    on CrossExchange.
+  - **Workspace stats**: 1019 → **1026 tests** (+7),
+    workspace clippy `-D warnings` clean, workspace fmt
+    clean. Zero new dependencies.
+
 - **Epic D stage-3 — per-pair learned MP models keyed by
   symbol** (Apr 2026). Closes the natural follow-up from the
   engine-side learned-MP auto-attach (`momentum_learned_microprice_path`):

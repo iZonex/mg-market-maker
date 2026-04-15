@@ -89,6 +89,39 @@ impl Strategy for CrossExchangeStrategy {
         // So: our_bid < hedge_mid - fee_cost - min_profit.
         let max_bid = hedge_mid - fee_cost - min_profit;
 
+        // Epic D stage-3 — Cartea adverse-selection widening
+        // applied as an additive shift on each side. The
+        // cross-exchange ladder already starts from the
+        // profit-floor edges (`max_bid` for buys,
+        // `min_ask` for sells); AS widens the bid down and
+        // the ask up by `(1 − 2·ρ_side) · σ · √(T − t)`,
+        // safety-clamped at zero so informed flow can never
+        // *narrow* the cross-exchange profit floor (that
+        // would invite an adverse fill below the fee
+        // threshold).
+        let sigma = ctx.volatility;
+        let sqrt_t = crate::volatility::decimal_sqrt(ctx.time_remaining);
+        let (bid_as_widen, ask_as_widen) = match (ctx.as_prob_bid, ctx.as_prob_ask) {
+            (Some(rho_b), Some(rho_a)) => {
+                let bid_w = (dec!(1) - dec!(2) * rho_b) * sigma * sqrt_t;
+                let ask_w = (dec!(1) - dec!(2) * rho_a) * sigma * sqrt_t;
+                (bid_w.max(dec!(0)), ask_w.max(dec!(0)))
+            }
+            _ => {
+                let widen = match ctx.as_prob {
+                    None => dec!(0),
+                    Some(rho) if rho == dec!(0.5) => dec!(0),
+                    Some(rho) => {
+                        let d = (dec!(1) - dec!(2) * rho) * sigma * sqrt_t;
+                        d.max(dec!(0))
+                    }
+                };
+                (widen, widen)
+            }
+        };
+        let max_bid = max_bid - bid_as_widen;
+        let min_ask = min_ask + ask_as_widen;
+
         let order_size = ctx.product.round_qty(ctx.config.order_size);
 
         let mut quotes = Vec::with_capacity(ctx.config.num_levels);
@@ -247,5 +280,210 @@ mod tests {
         // Spread should cover fees + min profit.
         let spread = ask.price - bid.price;
         assert!(spread > dec!(50), "spread should cover fees");
+    }
+
+    // ---- Epic D stage-3 — Cartea AS + per-side ρ on CrossExchange ----
+
+    fn xexch_setup() -> (
+        ProductSpec,
+        MarketMakerConfig,
+        LocalOrderBook,
+        CrossExchangeStrategy,
+    ) {
+        let product = ProductSpec {
+            symbol: "BTCUSDT".into(),
+            base_asset: "BTC".into(),
+            quote_asset: "USDT".into(),
+            tick_size: dec!(0.01),
+            lot_size: dec!(0.001),
+            min_notional: dec!(10),
+            maker_fee: dec!(-0.0005),
+            taker_fee: dec!(0.001),
+            trading_status: Default::default(),
+        };
+        let config = MarketMakerConfig {
+            gamma: dec!(0.1),
+            kappa: dec!(1.5),
+            sigma: dec!(0.02),
+            time_horizon_secs: 300,
+            num_levels: 1,
+            order_size: dec!(0.001),
+            refresh_interval_ms: 500,
+            min_spread_bps: dec!(5),
+            max_distance_bps: dec!(100),
+            strategy: StrategyType::AvellanedaStoikov,
+            momentum_enabled: false,
+            momentum_window: 200,
+            basis_shift: dec!(0.5),
+            market_resilience_enabled: true,
+            otr_enabled: true,
+            hma_enabled: true,
+            hma_window: 9,
+            momentum_ofi_enabled: false,
+            momentum_learned_microprice_path: None,
+            momentum_learned_microprice_pair_paths: std::collections::HashMap::new(),
+            user_stream_enabled: true,
+            inventory_drift_tolerance: dec!(0.0001),
+            inventory_drift_auto_correct: false,
+            amend_enabled: true,
+            amend_max_ticks: 2,
+            fee_tier_refresh_enabled: true,
+            fee_tier_refresh_secs: 600,
+            borrow_enabled: false,
+            borrow_rate_refresh_secs: 1800,
+            borrow_holding_secs: 3600,
+            borrow_max_base: dec!(0),
+            borrow_buffer_base: dec!(0),
+            pair_lifecycle_enabled: true,
+            pair_lifecycle_refresh_secs: 300,
+            var_guard_enabled: false,
+            var_guard_limit_95: None,
+            var_guard_limit_99: None,
+            cross_venue_basis_max_staleness_ms: 1500,
+        };
+        let mut book = LocalOrderBook::new("BTCUSDT".into());
+        book.apply_snapshot(
+            vec![PriceLevel {
+                price: dec!(50000),
+                qty: dec!(1),
+            }],
+            vec![PriceLevel {
+                price: dec!(50001),
+                qty: dec!(1),
+            }],
+            1,
+        );
+        let mut strategy = CrossExchangeStrategy::new(dec!(3));
+        strategy.set_hedge_mid(dec!(50_000));
+        strategy.set_fees(dec!(-0.0005), dec!(0.001));
+        (product, config, book, strategy)
+    }
+
+    fn xexch_ctx<'a>(
+        book: &'a LocalOrderBook,
+        product: &'a ProductSpec,
+        config: &'a MarketMakerConfig,
+        as_prob: Option<Decimal>,
+        as_prob_bid: Option<Decimal>,
+        as_prob_ask: Option<Decimal>,
+    ) -> StrategyContext<'a> {
+        StrategyContext {
+            book,
+            product,
+            config,
+            inventory: dec!(0),
+            // Large sigma so AS perturbation visibly shifts
+            // the cross-exchange profit floor edges.
+            volatility: dec!(50),
+            time_remaining: dec!(1),
+            mid_price: book.mid_price().unwrap(),
+            ref_price: None,
+            hedge_book: None,
+            borrow_cost_bps: None,
+            hedge_book_age_ms: None,
+            as_prob,
+            as_prob_bid,
+            as_prob_ask,
+        }
+    }
+
+    #[test]
+    fn xexch_as_prob_none_is_byte_identical_to_wave1() {
+        let (product, config, book, strategy) = xexch_setup();
+        let baseline = StrategyContext {
+            book: &book,
+            product: &product,
+            config: &config,
+            inventory: dec!(0),
+            volatility: dec!(50),
+            time_remaining: dec!(1),
+            mid_price: book.mid_price().unwrap(),
+            ref_price: None,
+            hedge_book: None,
+            borrow_cost_bps: None,
+            hedge_book_age_ms: None,
+            as_prob: None,
+            as_prob_bid: None,
+            as_prob_ask: None,
+        };
+        let q_base = strategy.compute_quotes(&baseline);
+        // None path should produce identical output to a
+        // hand-constructed identity context.
+        let q_none =
+            strategy.compute_quotes(&xexch_ctx(&book, &product, &config, None, None, None));
+        assert_eq!(
+            q_base[0].bid.as_ref().unwrap().price,
+            q_none[0].bid.as_ref().unwrap().price
+        );
+        assert_eq!(
+            q_base[0].ask.as_ref().unwrap().price,
+            q_none[0].ask.as_ref().unwrap().price
+        );
+    }
+
+    #[test]
+    fn xexch_symmetric_low_rho_widens_profit_floor() {
+        let (product, config, book, strategy) = xexch_setup();
+        let neutral = xexch_ctx(&book, &product, &config, Some(dec!(0.5)), None, None);
+        let widen = xexch_ctx(&book, &product, &config, Some(dec!(0)), None, None);
+        let q_n = strategy.compute_quotes(&neutral);
+        let q_w = strategy.compute_quotes(&widen);
+        let bid_n = q_n[0].bid.as_ref().unwrap().price;
+        let bid_w = q_w[0].bid.as_ref().unwrap().price;
+        let ask_n = q_n[0].ask.as_ref().unwrap().price;
+        let ask_w = q_w[0].ask.as_ref().unwrap().price;
+        assert!(bid_w < bid_n, "low ρ should drop the bid");
+        assert!(ask_w > ask_n, "low ρ should lift the ask");
+    }
+
+    #[test]
+    fn xexch_high_rho_does_not_narrow_profit_floor() {
+        // Per the safety clamp: informed flow (ρ > 0.5) on
+        // cross-exchange should NEVER tighten the profit
+        // floor. The widen-vs-neutral distance must be
+        // exactly zero (clamped) when ρ = 1.
+        let (product, config, book, strategy) = xexch_setup();
+        let neutral = xexch_ctx(&book, &product, &config, Some(dec!(0.5)), None, None);
+        let narrow = xexch_ctx(&book, &product, &config, Some(dec!(1)), None, None);
+        let q_n = strategy.compute_quotes(&neutral);
+        let q_t = strategy.compute_quotes(&narrow);
+        assert_eq!(
+            q_n[0].bid.as_ref().unwrap().price,
+            q_t[0].bid.as_ref().unwrap().price
+        );
+        assert_eq!(
+            q_n[0].ask.as_ref().unwrap().price,
+            q_t[0].ask.as_ref().unwrap().price
+        );
+    }
+
+    #[test]
+    fn xexch_per_side_widens_one_side_independently() {
+        let (product, config, book, strategy) = xexch_setup();
+        let neutral = xexch_ctx(
+            &book,
+            &product,
+            &config,
+            None,
+            Some(dec!(0.5)),
+            Some(dec!(0.5)),
+        );
+        let widen_ask = xexch_ctx(
+            &book,
+            &product,
+            &config,
+            None,
+            Some(dec!(0.5)),
+            Some(dec!(0)),
+        );
+        let q_n = strategy.compute_quotes(&neutral);
+        let q_w = strategy.compute_quotes(&widen_ask);
+        let bid_n = q_n[0].bid.as_ref().unwrap().price;
+        let bid_w = q_w[0].bid.as_ref().unwrap().price;
+        let ask_n = q_n[0].ask.as_ref().unwrap().price;
+        let ask_w = q_w[0].ask.as_ref().unwrap().price;
+        // Ask widens (lifts); bid unchanged.
+        assert!(ask_w > ask_n);
+        assert_eq!(bid_w, bid_n);
     }
 }

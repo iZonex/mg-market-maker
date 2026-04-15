@@ -253,11 +253,45 @@ impl Strategy for BasisStrategy {
         let max_distance = bps_to_frac(ctx.config.max_distance_bps) * spot_mid;
         let order_size = ctx.product.round_qty(ctx.config.order_size);
 
+        // Epic D stage-3 — Cartea adverse-selection widening
+        // applied to the level-0 half. Per-side path uses
+        // independent rho_b / rho_a; symmetric path uses the
+        // single ctx.as_prob; both safety-clamp at the
+        // wave-1 half_min floor so informed flow on either
+        // side never produces a sub-min-spread quote. When
+        // both per-side and symmetric are absent the half
+        // collapses to the wave-1 half_min byte-identically.
+        let sigma = ctx.volatility;
+        let sqrt_t = crate::volatility::decimal_sqrt(ctx.time_remaining);
+        let (bid_half_min, ask_half_min) = match (ctx.as_prob_bid, ctx.as_prob_ask) {
+            (Some(rho_b), Some(rho_a)) => {
+                let bid_widen = (dec!(1) - dec!(2) * rho_b) * sigma * sqrt_t;
+                let ask_widen = (dec!(1) - dec!(2) * rho_a) * sigma * sqrt_t;
+                (
+                    (half_min + bid_widen).max(half_min),
+                    (half_min + ask_widen).max(half_min),
+                )
+            }
+            _ => {
+                let half = match ctx.as_prob {
+                    None => half_min,
+                    Some(rho) if rho == dec!(0.5) => half_min,
+                    Some(rho) => {
+                        let as_delta = (dec!(1) - dec!(2) * rho) * sigma * sqrt_t;
+                        (half_min + as_delta).max(half_min)
+                    }
+                };
+                (half, half)
+            }
+        };
+
         let mut quotes = Vec::with_capacity(ctx.config.num_levels);
         for level in 0..ctx.config.num_levels {
-            let offset = half_min + Decimal::from(level as u64) * level_step;
-            let raw_bid = reservation - offset;
-            let raw_ask = reservation + offset;
+            let level_offset = Decimal::from(level as u64) * level_step;
+            let bid_offset = bid_half_min + level_offset;
+            let ask_offset = ask_half_min + level_offset;
+            let raw_bid = reservation - bid_offset;
+            let raw_ask = reservation + ask_offset;
 
             let bid_price = ctx
                 .product
@@ -757,5 +791,138 @@ mod tests {
             Some(60_000),
         );
         assert!(!s.compute_quotes(&context).is_empty());
+    }
+
+    // ---- Epic D stage-3 — Cartea AS + per-side ρ on Basis ----
+
+    #[allow(clippy::too_many_arguments)]
+    fn ctx_with_as<'a>(
+        book: &'a LocalOrderBook,
+        product: &'a ProductSpec,
+        config: &'a MarketMakerConfig,
+        mid: Price,
+        ref_price: Option<Price>,
+        as_prob: Option<Decimal>,
+        as_prob_bid: Option<Decimal>,
+        as_prob_ask: Option<Decimal>,
+    ) -> StrategyContext<'a> {
+        let mut c = ctx(book, product, config, mid, ref_price);
+        c.as_prob = as_prob;
+        c.as_prob_bid = as_prob_bid;
+        c.as_prob_ask = as_prob_ask;
+        // Use a large sigma so the AS perturbation is
+        // visible above the level-step floor.
+        c.volatility = dec!(50);
+        c
+    }
+
+    #[test]
+    fn basis_as_prob_none_is_byte_identical_to_wave1() {
+        let product = test_product();
+        let config = test_config();
+        let book = book_at(dec!(50_000), dec!(50));
+        let s = BasisStrategy::new(dec!(0.5), dec!(50));
+        let baseline = ctx(&book, &product, &config, dec!(50_000), Some(dec!(50_010)));
+        let with_none = ctx_with_as(
+            &book,
+            &product,
+            &config,
+            dec!(50_000),
+            Some(dec!(50_010)),
+            None,
+            None,
+            None,
+        );
+        // Override the volatility back to baseline so the
+        // identity check is meaningful.
+        let mut with_none = with_none;
+        with_none.volatility = baseline.volatility;
+        let q_base = s.compute_quotes(&baseline);
+        let q_none = s.compute_quotes(&with_none);
+        assert_eq!(q_base.len(), q_none.len());
+        for (a, b) in q_base.iter().zip(q_none.iter()) {
+            assert_eq!(
+                a.bid.as_ref().map(|q| q.price),
+                b.bid.as_ref().map(|q| q.price)
+            );
+            assert_eq!(
+                a.ask.as_ref().map(|q| q.price),
+                b.ask.as_ref().map(|q| q.price)
+            );
+        }
+    }
+
+    #[test]
+    fn basis_symmetric_low_rho_widens_both_sides() {
+        let product = test_product();
+        let config = test_config();
+        let book = book_at(dec!(50_000), dec!(50));
+        let s = BasisStrategy::new(dec!(0.5), dec!(50));
+        let neutral = ctx_with_as(
+            &book,
+            &product,
+            &config,
+            dec!(50_000),
+            Some(dec!(50_010)),
+            Some(dec!(0.5)),
+            None,
+            None,
+        );
+        let widen = ctx_with_as(
+            &book,
+            &product,
+            &config,
+            dec!(50_000),
+            Some(dec!(50_010)),
+            Some(dec!(0)),
+            None,
+            None,
+        );
+        let q_n = s.compute_quotes(&neutral);
+        let q_w = s.compute_quotes(&widen);
+        let bid_n = q_n[0].bid.as_ref().unwrap().price;
+        let bid_w = q_w[0].bid.as_ref().unwrap().price;
+        let ask_n = q_n[0].ask.as_ref().unwrap().price;
+        let ask_w = q_w[0].ask.as_ref().unwrap().price;
+        // Low ρ widens — bid moves down, ask moves up.
+        assert!(bid_w < bid_n, "bid should move down: {bid_w} vs {bid_n}");
+        assert!(ask_w > ask_n, "ask should move up: {ask_w} vs {ask_n}");
+    }
+
+    #[test]
+    fn basis_per_side_widens_one_side_independently() {
+        let product = test_product();
+        let config = test_config();
+        let book = book_at(dec!(50_000), dec!(50));
+        let s = BasisStrategy::new(dec!(0.5), dec!(50));
+        let neutral = ctx_with_as(
+            &book,
+            &product,
+            &config,
+            dec!(50_000),
+            Some(dec!(50_010)),
+            None,
+            Some(dec!(0.5)),
+            Some(dec!(0.5)),
+        );
+        let widen_bid = ctx_with_as(
+            &book,
+            &product,
+            &config,
+            dec!(50_000),
+            Some(dec!(50_010)),
+            None,
+            Some(dec!(0)),
+            Some(dec!(0.5)),
+        );
+        let q_n = s.compute_quotes(&neutral);
+        let q_w = s.compute_quotes(&widen_bid);
+        let bid_n = q_n[0].bid.as_ref().unwrap().price;
+        let bid_w = q_w[0].bid.as_ref().unwrap().price;
+        let ask_n = q_n[0].ask.as_ref().unwrap().price;
+        let ask_w = q_w[0].ask.as_ref().unwrap().price;
+        // Bid widens (moves down); ask unchanged.
+        assert!(bid_w < bid_n);
+        assert_eq!(ask_w, ask_n);
     }
 }
