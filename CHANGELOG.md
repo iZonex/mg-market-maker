@@ -9,6 +9,117 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Epic B — Cointegrated-pair stat-arb driver (stage-1)**
+  (SOTA gap closure epic, third after Epic C then Epic A).
+  Closes the single largest strategy-family gap from the
+  April 2026 research pass: every production prop desk
+  runs cointegrated pairs, and the existing `BasisStrategy`
+  only covered the *same-asset* case. Epic B ships a new
+  `stat_arb` module inside `mm-strategy` composed of four
+  sub-components plus an engine integration layer, landed
+  over four sprints (planning, cointegration+kalman,
+  signal+driver, engine wiring).
+  - **Sub-component #1 — Engle-Granger cointegration test**
+    (`mm-strategy::stat_arb::cointegration`). Pure function
+    `EngleGrangerTest::run(y, x) -> Option<CointegrationResult>`
+    running OLS → residuals → basic ADF (no constant, no
+    lag terms) against a MacKinnon 1991 5% critical-value
+    lookup table with linear interpolation. Source
+    attribution + formulas in
+    `docs/research/stat-arb-pairs-formulas.md`
+    (Engle-Granger 1987 + Cartea-Jaimungal-Penalva ch.11
+    + MacKinnon 1991). Sample-size floor at
+    `MIN_SAMPLES_FOR_TEST = 25`; 14 unit tests covering
+    degenerate inputs, synthetic cointegrated pairs,
+    independent random walks, MacKinnon table clamping,
+    and interpolation.
+  - **Sub-component #2 — Kalman filter for hedge ratio**
+    (`mm-strategy::stat_arb::kalman`). Scalar linear-
+    Gaussian state-space (`β[t] = β[t-1] + w[t]`,
+    `Y[t] = β[t]·X[t] + v[t]`) with tunable `Q`/`R` noise
+    variances. Default crypto-pair tuning `Q=1e-6`,
+    `R=1e-3`. Predict/update fully `Decimal`, degenerate
+    `x=0`-plus-zero-prior guard returns prior β unchanged.
+    `with_initial_beta` warm-start accepts the Engle-
+    Granger OLS β so the filter does not start at the
+    neutral `β=1`. 11 unit tests covering convergence,
+    regime shift, `Q`/`R` ratio effects, numerical
+    stability.
+  - **Sub-component #3 — Z-score signal with hysteresis**
+    (`mm-strategy::stat_arb::signal`). Rolling-window
+    spread → z-score generator maintaining running
+    `sum`/`sum_sq` totals for O(1) updates and sample
+    variance via `var = (Σs² − n·mean²) / (n−1)`. Two-
+    level hysteresis (`entry_threshold` default 2.0,
+    `exit_threshold` default 0.5) prevents oscillation
+    around the band edges. `SignalAction` enum
+    (`Open { direction, z }` / `Close { z }` / `Hold { z }`)
+    and `SpreadDirection { SellY, BuyY }` drive the
+    driver's state machine. Panics on inverted thresholds
+    and `window < 2` (caller mistakes). 14 unit tests
+    covering warmup, numerical stability over 10k updates,
+    naive-recompute parity, hysteresis invariants.
+  - **Sub-component #4 — `StatArbDriver`**
+    (`mm-strategy::stat_arb::driver`). Composes #1 + #2 +
+    #3 into a standalone tokio-task driver mirroring the
+    `FundingArbDriver` pattern from v0.2.0 Sprint H.
+    Holds two `Arc<dyn ExchangeConnector>` references
+    (the two legs, possibly on different venues), one
+    `KalmanHedgeRatio`, one `ZScoreSignal`, cached
+    `Option<CointegrationResult>`, and an optional
+    `StatArbPosition`. `tick_once` fetches both mids via
+    `get_orderbook`, drives the Kalman/signal state
+    machine, and emits a `StatArbEvent { Entered, Exited,
+    Hold, NotCointegrated, Warmup, InputUnavailable }`.
+    `run(shutdown_rx)` owns the async tick loop on
+    `tick_interval`. `recheck_cointegration(y, x)` lets
+    the engine reseed the cached ADF result on a slow
+    cadence (default 60 min), and seeds the Kalman with
+    the OLS β on the first accepted test. Clean
+    `StatArbEventSink` trait + `NullStatArbSink` mirror
+    the funding-arb sink shape without reaching into
+    `mm-engine`. 11 unit tests covering warmup,
+    cointegration gate, entry/exit round-trip on a
+    synthetic spread shock, input-unavailable paths,
+    shutdown semantics.
+  - **Engine integration.**
+    `MarketMakerEngine::with_stat_arb_driver(driver, tick_interval)`
+    builder attaches an optional driver to the engine's
+    select loop. New `stat_arb_interval` arm gated on
+    `self.stat_arb_driver.is_some()` polls the driver on
+    its tick cadence, routes every event through
+    `handle_stat_arb_event`, and fires `StatArbEntered` /
+    `StatArbExited` audit records (new `AuditEventType`
+    variants). Same take/tick/put borrow-check dance as
+    the funding-arb arm. `test_support::MockConnector`
+    gained a `set_mid(Decimal)` helper so driver-level
+    engine tests can feed synthetic mids through the
+    connector trait. Four engine integration tests:
+    silent-variants-no-escalation, entered/exited audit
+    routing, `with_stat_arb_driver` builder smoke test,
+    and a full end-to-end pipeline that drives a
+    synthetic cointegrated pair through Kalman → signal
+    → driver → engine handler and asserts the
+    entered-then-exited transition.
+  - **Stage-1 is advisory-only.** Same call-site pattern
+    as Epic A's SOR: the driver tracks its state machine
+    and emits intent events, but does NOT dispatch leg
+    orders. Operators read the audit trail to sign off
+    what the driver would have done before stage-2 wires
+    inline leg execution through `ExecAlgorithm`
+    (TWAP entry) + `OrderManager::execute_unwind_slice`
+    (market-take exit). No real per-pair PnL bucket
+    routing yet — that lands when real fills flow through
+    stage-2 dispatch. The Portfolio per-strategy labeling
+    infrastructure Epic C shipped already accepts
+    arbitrary `stat_arb_{pair}` class keys, so stage-2 is
+    a pure wiring task.
+  - **Zero new dependencies.** Pure `Decimal` math,
+    `decimal_sqrt` reused from `mm-strategy::volatility`.
+    50 new unit tests in `mm-strategy` + 4 new engine
+    integration tests. Workspace clippy `-D warnings`
+    clean, `cargo fmt --check` clean.
+
 - **Epic A — Cross-venue Smart Order Router (stage-1)**
   (SOTA gap closure epic, second after Epic C). Every
   primitive a cost-aware cross-venue router needs was

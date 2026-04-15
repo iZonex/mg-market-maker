@@ -92,32 +92,57 @@ greedy version and move to a real LP solver later.
 proper cross-venue basis dispatch, multi-venue stat-arb leg
 execution.
 
-### Epic B — Stat-arb / cointegrated pairs strategy (P1, ~1 month)
+### Epic B — Stat-arb / cointegrated pairs ✅ CLOSED stage-1 (Apr 2026)
 
-**Why.** Cointegrated-pair stat-arb is the single largest
-strategy family every production prop desk runs that we
-structurally lack. Hummingbot ships a screening UI for it,
-GSR publishes research on BTC/ETH and stablecoin pairs as
-their bread-and-butter trade. Our `BasisStrategy` covers
-*one* form (same-asset cash-vs-future basis) but not the
-general cointegrated-pair case where the two legs are
-different assets.
+**Status.** All 4 stage-1 sub-components shipped over 4
+one-week sprints (B-1 planning/study, B-2 cointegration +
+Kalman, B-3 z-score signal + driver scaffolding, B-4 engine
+wiring + audit + docs). Full breakdown in CHANGELOG
+`[Unreleased]` and `docs/sprints/epic-b-stat-arb-pairs.md`.
 
-**Scope.** New `mm-strategy::stat_arb` crate module:
-- Johansen cointegration test for pair selection on a rolling
-  30-day window from the backtester event data
-- Kalman filter for adaptive hedge ratio so the ratio adapts
-  to regime change
-- Z-score entry/exit on the residual
-- Reuse the existing `ExecAlgorithm` (TWAP/VWAP/POV) for leg
-  execution
-- First three pairs: BTC/ETH, ETH/SOL, USDC/USDT triangle
+**What shipped.**
+- `mm-strategy::stat_arb::cointegration` — Engle-Granger
+  2-leg test (OLS → residuals → basic ADF → MacKinnon 5%
+  lookup). v1 uses 2-leg Engle-Granger, NOT multivariate
+  Johansen (which is deferred to stage-2 if 3+ asset
+  cointegration vectors surface).
+- `mm-strategy::stat_arb::kalman` — scalar linear-Gaussian
+  Kalman filter for adaptive β, `with_initial_beta` warm
+  start from the Engle-Granger OLS β.
+- `mm-strategy::stat_arb::signal` — rolling-window z-score
+  with Welford-equivalent running sums, two-level
+  hysteresis, `SignalAction { Open, Close, Hold }`.
+- `mm-strategy::stat_arb::driver` — `StatArbDriver` state
+  machine composing the three primitives. Standalone
+  tokio-task pattern mirroring `FundingArbDriver`.
+- `MarketMakerEngine::with_stat_arb_driver` builder +
+  `stat_arb_interval` select-loop arm + `handle_stat_arb_event`
+  routing to new `StatArbEntered` / `StatArbExited` audit
+  event types.
 
-**Effort.** 3-4 weeks.
+**Stage-1 is advisory-only** (same pattern as Epic A's SOR):
+the driver runs its state machine and emits events, but
+does NOT dispatch leg orders. Audit trail records intent;
+operators sign off before stage-2 wires inline dispatch.
 
-**Pre-conditions.** Per-strategy PnL attribution (Epic C
-delivers this) so the stat-arb book has its own PnL view
-and is not commingled with the MM books.
+**Stage-2 follow-ups (tracked as next epic):**
+
+- Real leg-execution dispatch via `ExecAlgorithm::TwapAlgo`
+  on entry + `OrderManager::execute_unwind_slice` on exit.
+- Per-pair PnL bucket wiring once real fills flow through
+  the driver (the Portfolio infra is already in place from
+  Epic C — it's a pure call-site change).
+- Background pair-screener (v1 ships the screener as an
+  offline CLI helper only).
+- Multivariate Johansen cointegration for 3+ asset
+  cointegration vectors.
+- MacKinnon 1991 polynomial fit instead of the v1 lookup
+  table if operators run non-standard sample sizes.
+- ADF with lag selection via AIC (v1 is basic ADF, no
+  lag terms).
+
+**Pre-conditions (satisfied).** Per-strategy PnL attribution
+from Epic C.
 
 ### Epic C — Portfolio-level risk view ✅ CLOSED stage-1 (Apr 2026)
 
@@ -301,9 +326,9 @@ place since v0.2.0 Sprint G).
 
 | Epic | Priority | Effort | Depends on | Unlocks |
 |------|---------|--------|------------|---------|
-| A — Cross-venue SOR | P1 | ~1 mo | none | XEMM, triangular arb, basis dispatch |
-| B — Stat-arb pairs | P1 | ~1 mo | Epic C (per-strat PnL) | new strategy family |
-| C — Portfolio risk view | P1 | ~3 wk | per-strat PnL | risk parity, FX hedge, options |
+| A — Cross-venue SOR | P1 | ~1 mo | none | ✅ stage-1 closed Apr 2026 |
+| B — Stat-arb pairs | P1 | ~1 mo | Epic C (per-strat PnL) | ✅ stage-1 closed Apr 2026 |
+| C — Portfolio risk view | P1 | ~3 wk | per-strat PnL | ✅ stage-1 closed Apr 2026 |
 | D — Signal wave 2 | P1 | ~1 mo | none | tighter spreads on liquid pairs |
 | E — Execution polish | P2 | ~2 wk | none | tail latency, Coinbase Prime |
 | F — Defensive layer | P2 | ~3 wk | cross-venue bundle | adverse-selection survival |

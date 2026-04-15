@@ -4,7 +4,7 @@ Production-grade market maker for the custom exchange at `../exchange/` with mul
 
 ## Stats
 
-**18 crates, 144 files, ~47K lines Rust, 748 tests**
+**18 crates, 149 files, ~48K lines Rust, 800 tests**
 
 ## Architecture
 
@@ -40,6 +40,7 @@ strategy/              Strategies + signals + execution:
   ├── basis            Basis-shifted reservation price (spot + ref_price)
   ├── funding_arb      Atomic pair dispatcher (market-take hedge, maker-post primary)
   ├── funding_arb_driver Periodic FundingArbEngine loop + DriverEventSink
+  ├── stat_arb         Cointegrated pairs (Engle-Granger + Kalman + z-score + driver, Epic B)
   ├── paired_unwind    L4 kill-switch flatten for paired basis/funding positions
   ├── exec_algo        ExecAlgorithm trait + TWAP/VWAP/POV/Iceberg impls
   ├── features         Microstructure feature extractors (imbalance, trade flow, …)
@@ -91,7 +92,7 @@ persistence/         State management:
 
 ```bash
 cargo build                    # build all
-cargo test                     # 471 tests
+cargo test                     # 800 tests
 cargo clippy --all-targets -- -D warnings
 cargo run -p mm-server         # run live
 MM_MODE=paper cargo run -p mm-server   # paper trading

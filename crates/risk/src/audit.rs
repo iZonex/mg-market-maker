@@ -164,6 +164,20 @@ pub enum AuditEventType {
     /// the audit trail, even before stage-2 inline
     /// dispatch lands.
     RouteDecisionEmitted,
+
+    // Epic B — Cointegrated pairs stat-arb driver.
+    /// `StatArbDriver` opened a position. `detail` carries
+    /// direction + per-leg qty + entry z-score + spread.
+    /// Stage-1: advisory only — the driver does not dispatch
+    /// leg orders, so there are no fills on the engine side.
+    /// The event records the intent so operators can replay
+    /// and sign off before stage-2 inline dispatch lands.
+    StatArbEntered,
+    /// `StatArbDriver` closed a position. `detail` carries
+    /// exit z-score + spread + synthetic realised PnL
+    /// estimate. Same advisory-only caveat as
+    /// [`AuditEventType::StatArbEntered`].
+    StatArbExited,
 }
 
 impl AuditLog {

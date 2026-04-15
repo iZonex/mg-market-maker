@@ -12,6 +12,7 @@ pub mod inventory_skew;
 pub mod market_resilience;
 pub mod momentum;
 pub mod paired_unwind;
+pub mod stat_arb;
 pub mod r#trait;
 pub mod twap;
 pub mod volatility;

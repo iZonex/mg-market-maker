@@ -15,6 +15,7 @@ use mm_exchange_core::connector::{
     ExchangeConnector, NewOrder, VenueCapabilities, VenueId, VenueProduct,
 };
 use mm_exchange_core::events::MarketEvent;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tokio::sync::mpsc;
 
@@ -24,6 +25,11 @@ pub struct MockConnector {
     caps: VenueCapabilities,
     wallet: WalletType,
     events_tx: Mutex<Option<mpsc::UnboundedSender<MarketEvent>>>,
+    /// Stubbed top-of-book used by [`MockConnector::get_orderbook`].
+    /// Defaults to empty; call [`MockConnector::set_mid`] to feed
+    /// the stat-arb driver / any other engine code that pulls
+    /// mids through the connector trait.
+    orderbook: Mutex<(Vec<PriceLevel>, Vec<PriceLevel>)>,
     pub placed: Mutex<Vec<NewOrder>>,
     pub cancelled: Mutex<Vec<OrderId>>,
 }
@@ -43,6 +49,7 @@ impl MockConnector {
             },
             wallet: product.default_wallet(),
             events_tx: Mutex::new(None),
+            orderbook: Mutex::new((vec![], vec![])),
             placed: Mutex::new(vec![]),
             cancelled: Mutex::new(vec![]),
         }
@@ -55,6 +62,23 @@ impl MockConnector {
         if let Some(tx) = self.events_tx.lock().unwrap().as_ref() {
             let _ = tx.send(ev);
         }
+    }
+
+    /// Set a synthetic top-of-book derived from `mid`. Used by
+    /// driver-level tests that pull mids through the connector
+    /// trait (stat-arb, funding-arb). Bids sit one unit below,
+    /// asks one unit above; both sides carry qty=10.
+    pub fn set_mid(&self, mid: Decimal) {
+        *self.orderbook.lock().unwrap() = (
+            vec![PriceLevel {
+                price: mid - dec!(1),
+                qty: dec!(10),
+            }],
+            vec![PriceLevel {
+                price: mid + dec!(1),
+                qty: dec!(10),
+            }],
+        );
     }
 }
 
@@ -82,7 +106,8 @@ impl ExchangeConnector for MockConnector {
         _symbol: &str,
         _depth: u32,
     ) -> anyhow::Result<(Vec<PriceLevel>, Vec<PriceLevel>, u64)> {
-        Ok((vec![], vec![], 0))
+        let (bids, asks) = self.orderbook.lock().unwrap().clone();
+        Ok((bids, asks, 0))
     }
     async fn place_order(&self, order: &NewOrder) -> anyhow::Result<OrderId> {
         self.placed.lock().unwrap().push(order.clone());
