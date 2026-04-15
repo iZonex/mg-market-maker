@@ -65,6 +65,40 @@ fn split_symbol_bq(symbol: &str) -> (&str, &str) {
     (symbol, "")
 }
 
+/// Compact audit-string representation of a stat-arb
+/// `LegDispatchReport`. Format:
+/// `"y=<side>@<disp>/<tgt>,x=<side>@<disp>/<tgt>"` on success,
+/// `"y=err:<msg>"` on leg-level errors, `"none"` when there is
+/// no report (non-dispatch event). Kept inline so the engine-
+/// side audit-trail format is a one-liner.
+fn format_leg_report(report: Option<&mm_strategy::stat_arb::LegDispatchReport>) -> String {
+    let Some(r) = report else {
+        return "none".to_string();
+    };
+    let fmt_leg = |label: &str, leg: &mm_strategy::stat_arb::LegOutcome| {
+        if let Some(err) = &leg.error {
+            format!("{label}=err:{}", err.replace(' ', "_"))
+        } else {
+            format!(
+                "{label}={:?}@{}/{}",
+                leg.side, leg.dispatched_qty, leg.target_qty
+            )
+        }
+    };
+    let mut parts = Vec::new();
+    if let Some(y) = &r.y {
+        parts.push(fmt_leg("y", y));
+    }
+    if let Some(x) = &r.x {
+        parts.push(fmt_leg("x", x));
+    }
+    if parts.is_empty() {
+        "empty".to_string()
+    } else {
+        parts.join(",")
+    }
+}
+
 use crate::balance_cache::BalanceCache;
 use crate::book_keeper::BookKeeper;
 use crate::connector_bundle::ConnectorBundle;
@@ -72,6 +106,7 @@ use crate::order_id_map::OrderIdMap;
 use crate::order_manager::OrderManager;
 use crate::pair_lifecycle::{PairLifecycleEvent, PairLifecycleManager};
 use crate::sor::cost::VenueCostModel;
+use crate::sor::dispatch::{self, DispatchOutcome};
 use crate::sor::router::{GreedyRouter, RouteDecision};
 use crate::sor::venue_state::{VenueSeed, VenueStateAggregator};
 
@@ -603,6 +638,63 @@ impl MarketMakerEngine {
         decision
     }
 
+    /// Inline cross-venue dispatch (Epic A Stage-2). Produces
+    /// a fresh [`RouteDecision`] via [`Self::recommend_route`]
+    /// and immediately executes every leg against the matching
+    /// connector in the bundle. Taker legs (`urgency ≥ 0.5`)
+    /// go out as `TimeInForce::Ioc` through
+    /// [`OrderManager::execute_unwind_slice`]; maker legs
+    /// (`urgency < 0.5`) go out as `TimeInForce::PostOnly`
+    /// directly on the connector.
+    ///
+    /// Parallel API to [`Self::recommend_route`] — operators
+    /// pick "advise-only" or "dispatch" at the call site. The
+    /// advisory audit event still fires exactly once from
+    /// `recommend_route` inside the pipeline, and a
+    /// `tracing::info!` line records the dispatch outcome so
+    /// ops can grep "sor dispatch outcome" in the log stream.
+    pub async fn dispatch_route(
+        &mut self,
+        side: mm_common::types::Side,
+        qty: Decimal,
+        urgency: Decimal,
+    ) -> DispatchOutcome {
+        let decision = self.recommend_route(side, qty, urgency).await;
+        let outcome = dispatch::dispatch_route(
+            &decision,
+            &self.connectors,
+            &mut self.order_manager,
+            &self.product,
+            &self.symbol,
+        )
+        .await;
+        info!(
+            side = ?outcome.target_side,
+            target = %outcome.total_target_qty,
+            dispatched = %outcome.total_dispatched_qty,
+            fully = outcome.is_fully_dispatched(),
+            errors = outcome.errors.len(),
+            "sor dispatch outcome"
+        );
+        outcome
+    }
+
+    /// Pick the PnL attribution class for a fill on this
+    /// engine. Stage-2 stat-arb: if the engine has a stat-arb
+    /// driver and no funding-arb driver, use the pair's
+    /// `strategy_class` (e.g. `"stat_arb_BTCUSDT_ETHUSDT"`).
+    /// Otherwise fall back to the current primary strategy
+    /// name — preserves pre-stage-2 semantics for maker /
+    /// funding-arb paths.
+    fn pnl_strategy_class(&self) -> String {
+        if let Some(driver) = self.stat_arb_driver.as_ref() {
+            if self.funding_arb_driver.is_none() {
+                return driver.pair().strategy_class.clone();
+            }
+        }
+        self.strategy.name().to_string()
+    }
+
     /// Effective kill level for soft-decision purposes — the
     /// max of the per-engine global level and the shared
     /// per-asset-class level. Hard-decision call sites
@@ -953,8 +1045,22 @@ impl MarketMakerEngine {
                     // borrow conflict.
                     if let Some(mut driver) = self.stat_arb_driver.take() {
                         let event = driver.tick_once().await;
+                        // Stage-2: fire real dispatch before we
+                        // put the driver back so `try_dispatch_legs_*`
+                        // has exclusive &mut access. The engine's
+                        // audit-trail path then runs off the returned
+                        // event + dispatch report.
+                        let dispatch_report = match &event {
+                            StatArbEvent::Entered { .. } => {
+                                Some(driver.try_dispatch_legs_for_entry(&event).await)
+                            }
+                            StatArbEvent::Exited { .. } => {
+                                Some(driver.try_dispatch_legs_for_exit().await)
+                            }
+                            _ => None,
+                        };
                         self.stat_arb_driver = Some(driver);
-                        self.handle_stat_arb_event(event);
+                        self.handle_stat_arb_event(event, dispatch_report);
                     }
                 }
             }
@@ -1020,14 +1126,23 @@ impl MarketMakerEngine {
     }
 
     /// Handle a [`StatArbEvent`] from the attached
-    /// [`StatArbDriver`]. Stage-1 is advisory-only: every
-    /// `Entered` / `Exited` is written to the audit trail so
-    /// operators can replay what the driver would have done,
-    /// but no leg orders are dispatched. `NotCointegrated`,
-    /// `Warmup`, `Hold`, and `InputUnavailable` are silent
-    /// (debug-logged inside the driver already) to keep the
+    /// [`StatArbDriver`]. Stage-2: `Entered` / `Exited` events
+    /// trigger real leg dispatch via
+    /// [`StatArbDriver::try_dispatch_legs_for_entry`] /
+    /// [`StatArbDriver::try_dispatch_legs_for_exit`] (fired at
+    /// the driver-tick call site before this handler runs).
+    /// This handler receives the resulting
+    /// [`mm_strategy::stat_arb::LegDispatchReport`] (or `None`
+    /// for non-dispatch events) and records both the decision
+    /// and the outcome to the audit trail. `NotCointegrated`,
+    /// `Warmup`, `Hold`, and `InputUnavailable` stay silent
+    /// (already debug-logged inside the driver) to keep the
     /// audit trail focused on state-change events.
-    fn handle_stat_arb_event(&mut self, event: StatArbEvent) {
+    fn handle_stat_arb_event(
+        &mut self,
+        event: StatArbEvent,
+        dispatch_report: Option<mm_strategy::stat_arb::LegDispatchReport>,
+    ) {
         match event {
             StatArbEvent::Entered {
                 direction,
@@ -1040,10 +1155,21 @@ impl MarketMakerEngine {
                     SpreadDirection::SellY => "sell_y",
                     SpreadDirection::BuyY => "buy_y",
                 };
+                let outcome_tag = format_leg_report(dispatch_report.as_ref());
                 self.audit.risk_event(
                     &self.symbol,
                     AuditEventType::StatArbEntered,
-                    &format!("dir={dir_tag} y_qty={y_qty} x_qty={x_qty} z={z} spread={spread}"),
+                    &format!(
+                        "dir={dir_tag} y_qty={y_qty} x_qty={x_qty} z={z} spread={spread} dispatch={outcome_tag}"
+                    ),
+                );
+                info!(
+                    symbol = %self.symbol,
+                    ?direction,
+                    %y_qty,
+                    %x_qty,
+                    dispatch = %outcome_tag,
+                    "stat_arb entry dispatched"
                 );
             }
             StatArbEvent::Exited {
@@ -1051,10 +1177,21 @@ impl MarketMakerEngine {
                 spread,
                 realised_pnl_estimate,
             } => {
+                let outcome_tag = format_leg_report(dispatch_report.as_ref());
                 self.audit.risk_event(
                     &self.symbol,
                     AuditEventType::StatArbExited,
-                    &format!("z={z} spread={spread} pnl_estimate={realised_pnl_estimate}"),
+                    &format!(
+                        "z={z} spread={spread} pnl_estimate={realised_pnl_estimate} dispatch={outcome_tag}"
+                    ),
+                );
+                info!(
+                    symbol = %self.symbol,
+                    %z,
+                    %spread,
+                    %realised_pnl_estimate,
+                    dispatch = %outcome_tag,
+                    "stat_arb exit dispatched"
                 );
             }
             StatArbEvent::NotCointegrated { .. }
@@ -1120,21 +1257,16 @@ impl MarketMakerEngine {
                 // Portfolio gets the hedge fill with the hedge
                 // symbol so per-asset tracking remains symmetric
                 // across the two legs of a pair.
+                //
+                // Stage-2: share the stat-arb PnL class with the
+                // primary-leg path so both legs of a stat-arb
+                // round-trip land in the same bucket. Pair the
+                // funding-arb and stat-arb discriminators here
+                // too.
+                let hedge_class = self.pnl_strategy_class();
                 if let (Some(pf), Some(pair)) = (&self.portfolio, self.connectors.pair.as_ref()) {
                     if let Ok(mut pf) = pf.lock() {
-                        // Hedge-leg fills from the funding-arb or
-                        // cross-venue basis path — tag the PnL
-                        // bucket so per-strategy attribution is
-                        // clean. `Strategy::name()` on the primary
-                        // engine's strategy is the right label
-                        // because the hedge leg is the paired
-                        // counterpart of that strategy.
-                        pf.on_fill(
-                            &pair.hedge_symbol,
-                            signed_qty,
-                            fill.price,
-                            self.strategy.name(),
-                        );
+                        pf.on_fill(&pair.hedge_symbol, signed_qty, fill.price, &hedge_class);
                     }
                 }
 
@@ -1509,13 +1641,21 @@ impl MarketMakerEngine {
                 // qty passed to `on_fill` is signed — positive on
                 // buys, negative on sells — so the portfolio can
                 // correctly flip / close positions.
+                //
+                // Stage-2: when a stat-arb driver is attached
+                // (and funding-arb is not), route the PnL
+                // attribution through `pair.strategy_class`
+                // (e.g. `"stat_arb_BTCUSDT_ETHUSDT"`). Keeps
+                // per-pair PnL buckets separated from the
+                // generic maker-strategy class.
                 if let Some(pf) = &self.portfolio {
                     let signed_qty = match fill.side {
                         mm_common::types::Side::Buy => fill.qty,
                         mm_common::types::Side::Sell => -fill.qty,
                     };
+                    let class = self.pnl_strategy_class();
                     if let Ok(mut pf) = pf.lock() {
-                        pf.on_fill(&self.symbol, signed_qty, fill.price, self.strategy.name());
+                        pf.on_fill(&self.symbol, signed_qty, fill.price, &class);
                     }
                 }
 
@@ -3765,15 +3905,21 @@ mod stat_arb_integration {
     async fn silent_variants_do_not_escalate() {
         let mut engine = single_engine();
         let starting = engine.kill_switch.level();
-        engine.handle_stat_arb_event(StatArbEvent::Hold { z: dec!(0.1) });
-        engine.handle_stat_arb_event(StatArbEvent::Warmup {
-            samples: 3,
-            required: 20,
-        });
-        engine.handle_stat_arb_event(StatArbEvent::NotCointegrated { adf_stat: None });
-        engine.handle_stat_arb_event(StatArbEvent::InputUnavailable {
-            reason: "empty book".to_string(),
-        });
+        engine.handle_stat_arb_event(StatArbEvent::Hold { z: dec!(0.1) }, None);
+        engine.handle_stat_arb_event(
+            StatArbEvent::Warmup {
+                samples: 3,
+                required: 20,
+            },
+            None,
+        );
+        engine.handle_stat_arb_event(StatArbEvent::NotCointegrated { adf_stat: None }, None);
+        engine.handle_stat_arb_event(
+            StatArbEvent::InputUnavailable {
+                reason: "empty book".to_string(),
+            },
+            None,
+        );
         assert_eq!(engine.kill_switch.level(), starting);
     }
 
@@ -3785,18 +3931,24 @@ mod stat_arb_integration {
         let mut engine = single_engine();
         let starting = engine.kill_switch.level();
 
-        engine.handle_stat_arb_event(StatArbEvent::Entered {
-            direction: SpreadDirection::SellY,
-            y_qty: dec!(5),
-            x_qty: dec!(10),
-            z: dec!(2.5),
-            spread: dec!(1.5),
-        });
-        engine.handle_stat_arb_event(StatArbEvent::Exited {
-            z: dec!(0.2),
-            spread: dec!(0.1),
-            realised_pnl_estimate: dec!(42),
-        });
+        engine.handle_stat_arb_event(
+            StatArbEvent::Entered {
+                direction: SpreadDirection::SellY,
+                y_qty: dec!(5),
+                x_qty: dec!(10),
+                z: dec!(2.5),
+                spread: dec!(1.5),
+            },
+            None,
+        );
+        engine.handle_stat_arb_event(
+            StatArbEvent::Exited {
+                z: dec!(0.2),
+                spread: dec!(0.1),
+                realised_pnl_estimate: dec!(42),
+            },
+            None,
+        );
 
         // Stage-1 advisory-only: kill switch untouched.
         assert_eq!(engine.kill_switch.level(), starting);
@@ -3852,14 +4004,14 @@ mod stat_arb_integration {
             y.set_mid(dec!(200));
             x.set_mid(dec!(100));
             let e = driver.tick_once().await;
-            engine.handle_stat_arb_event(e);
+            engine.handle_stat_arb_event(e, None);
         }
 
         // Shock: Y +5 pushes spread far above its rolling mean.
         y.set_mid(dec!(205));
         let shock_event = driver.tick_once().await;
         let got_entered = matches!(shock_event, StatArbEvent::Entered { .. });
-        engine.handle_stat_arb_event(shock_event);
+        engine.handle_stat_arb_event(shock_event, None);
         assert!(got_entered, "expected Entered on spread shock");
 
         // Revert: Y back to 200. Spread shrinks, z returns to
@@ -3870,11 +4022,11 @@ mod stat_arb_integration {
         for _ in 0..60 {
             let e = driver.tick_once().await;
             if matches!(e, StatArbEvent::Exited { .. }) {
-                engine.handle_stat_arb_event(e);
+                engine.handle_stat_arb_event(e, None);
                 saw_exited = true;
                 break;
             }
-            engine.handle_stat_arb_event(e);
+            engine.handle_stat_arb_event(e, None);
         }
         assert!(saw_exited, "expected Exited after revert");
 
@@ -4091,7 +4243,7 @@ mod defensive_layer_integration {
     #[test]
     fn builders_install_both_defensive_controls() {
         let guard = LeadLagGuard::new(LeadLagGuardConfig::default());
-        let news = NewsRetreatStateMachine::new(fixture_news_config());
+        let news = NewsRetreatStateMachine::new(fixture_news_config()).expect("valid news config");
         let engine = make_engine()
             .with_lead_lag_guard(guard)
             .with_news_retreat(news);
@@ -4140,7 +4292,7 @@ mod defensive_layer_integration {
     /// multiplier also fires.
     #[test]
     fn critical_headline_escalates_kill_switch_to_l2() {
-        let news = NewsRetreatStateMachine::new(fixture_news_config());
+        let news = NewsRetreatStateMachine::new(fixture_news_config()).expect("valid news config");
         let mut engine = make_engine().with_news_retreat(news);
         let starting = engine.kill_switch.level();
         assert_eq!(starting, mm_risk::kill_switch::KillLevel::Normal);
@@ -4164,7 +4316,7 @@ mod defensive_layer_integration {
     /// quotes, just wider).
     #[test]
     fn high_headline_widens_but_does_not_stop_orders() {
-        let news = NewsRetreatStateMachine::new(fixture_news_config());
+        let news = NewsRetreatStateMachine::new(fixture_news_config()).expect("valid news config");
         let mut engine = make_engine().with_news_retreat(news);
         let starting = engine.kill_switch.level();
 
@@ -4178,7 +4330,7 @@ mod defensive_layer_integration {
     /// multiplier change, no kill switch escalation.
     #[test]
     fn unmatched_headline_is_silent_noop() {
-        let news = NewsRetreatStateMachine::new(fixture_news_config());
+        let news = NewsRetreatStateMachine::new(fixture_news_config()).expect("valid news config");
         let mut engine = make_engine().with_news_retreat(news);
         let starting = engine.kill_switch.level();
         let baseline = engine.auto_tuner.effective_spread_mult();
@@ -4393,5 +4545,242 @@ mod epic_e_integration {
         assert_eq!(mock.place_batch_calls(), 0);
         assert_eq!(mock.place_single_calls(), 2);
         assert_eq!(engine.order_manager.live_count(), 2);
+    }
+}
+
+// -------------------------------------------------------------
+// Stage-2 Track 1 — Make advisory live (SOR dispatch + stat-arb
+// real leg dispatch)
+// -------------------------------------------------------------
+
+#[cfg(test)]
+mod stage2_track1_integration {
+    use super::*;
+    use crate::connector_bundle::ConnectorBundle;
+    use crate::sor::venue_state::VenueSeed;
+    use crate::test_support::MockConnector;
+    use mm_common::config::AppConfig;
+    use mm_common::types::Side;
+    use mm_exchange_core::connector::{ExchangeConnector, VenueId, VenueProduct};
+    use mm_strategy::avellaneda::AvellanedaStoikov;
+    use mm_strategy::stat_arb::{NullStatArbSink, StatArbDriver, StatArbDriverConfig, StatArbPair};
+
+    fn sample_product(symbol: &str) -> mm_common::types::ProductSpec {
+        mm_common::types::ProductSpec {
+            symbol: symbol.to_string(),
+            base_asset: "BTC".to_string(),
+            quote_asset: "USDT".to_string(),
+            tick_size: dec!(0.01),
+            lot_size: dec!(0.0001),
+            min_notional: dec!(10),
+            maker_fee: dec!(0.0001),
+            taker_fee: dec!(0.0005),
+            trading_status: Default::default(),
+        }
+    }
+
+    fn make_engine_with_bundle(bundle: ConnectorBundle) -> MarketMakerEngine {
+        MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            AppConfig::default(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        )
+    }
+
+    /// End-to-end #1: a multi-leg `RouteDecision` issues real
+    /// per-venue `place_order` calls — one on each connector
+    /// in the bundle. Both venues land in the bundle via
+    /// `ConnectorBundle.extra`, both are registered on the
+    /// SOR aggregator, and `dispatch_route` with a taker
+    /// urgency produces two IOC legs.
+    #[tokio::test]
+    async fn dispatch_route_fires_per_venue_place_orders_on_multi_leg_split() {
+        let binance = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        binance.set_mid(dec!(50_000));
+        let bybit = Arc::new(MockConnector::new(VenueId::Bybit, VenueProduct::Spot));
+        bybit.set_mid(dec!(50_020));
+        let dyn_binance: Arc<dyn ExchangeConnector> = binance.clone();
+        let dyn_bybit: Arc<dyn ExchangeConnector> = bybit.clone();
+        let bundle = ConnectorBundle {
+            primary: dyn_binance,
+            hedge: None,
+            pair: None,
+            extra: vec![dyn_bybit],
+        };
+        let mut engine = make_engine_with_bundle(bundle);
+        // Register Bybit on the aggregator with a different
+        // taker fee so the router prefers it for the first
+        // leg. Binance seed was auto-installed in `new()`.
+        let mut bybit_product = sample_product("BTCUSDT");
+        bybit_product.taker_fee = dec!(0.00001); // 0.1 bps
+        let mut bybit_seed = VenueSeed::new("BTCUSDT", bybit_product, dec!(1));
+        bybit_seed.best_bid = dec!(50_019);
+        bybit_seed.best_ask = dec!(50_021);
+        engine = engine.with_sor_venue(VenueId::Bybit, bybit_seed);
+        // Seed Binance's book on the aggregator too.
+        let mut binance_product = sample_product("BTCUSDT");
+        binance_product.taker_fee = dec!(0.0005); // 5 bps
+        let mut binance_seed = VenueSeed::new("BTCUSDT", binance_product, dec!(1));
+        binance_seed.best_bid = dec!(49_999);
+        binance_seed.best_ask = dec!(50_001);
+        engine = engine.with_sor_venue(VenueId::Binance, binance_seed);
+
+        let outcome = engine.dispatch_route(Side::Buy, dec!(2), dec!(1)).await;
+        // Both venues each contributed qty=1. The dispatcher
+        // fired one place_order per leg.
+        assert_eq!(outcome.legs.len(), 2, "expected two legs, got {outcome:?}");
+        assert_eq!(binance.place_single_calls(), 1);
+        assert_eq!(bybit.place_single_calls(), 1);
+        assert!(
+            outcome.errors.is_empty(),
+            "got errors: {:?}",
+            outcome.errors
+        );
+        assert_eq!(outcome.total_dispatched_qty, dec!(2));
+        assert!(outcome.is_fully_dispatched());
+    }
+
+    /// Single-venue `dispatch_route` path: operators running a
+    /// single venue still get one live place_order even
+    /// though the router had no choice to make. Taker-urgency
+    /// leg lands as an IOC through `execute_unwind_slice`.
+    /// Target qty is capped by the seeded `max_inventory`
+    /// budget on the aggregator — use a qty under the default
+    /// 0.1 cap so the router produces a full-target decision.
+    #[tokio::test]
+    async fn dispatch_route_single_venue_fires_one_place_order() {
+        let mock = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        mock.set_mid(dec!(50_000));
+        let bundle = ConnectorBundle::single(mock.clone() as Arc<dyn ExchangeConnector>);
+        let mut engine = make_engine_with_bundle(bundle);
+        let outcome = engine.dispatch_route(Side::Buy, dec!(0.05), dec!(1)).await;
+        assert!(outcome.errors.is_empty());
+        assert_eq!(outcome.legs.len(), 1);
+        assert_eq!(outcome.total_dispatched_qty, dec!(0.05));
+        assert_eq!(mock.place_single_calls(), 1);
+    }
+
+    /// End-to-end #2: stat-arb driver emits `Entered` → engine
+    /// dispatches both legs → both connectors saw place_order;
+    /// `Exited` → flatten slice on both connectors.
+    #[tokio::test]
+    async fn stat_arb_entered_then_exited_drives_real_leg_dispatch() {
+        let y_conn = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let x_conn = Arc::new(MockConnector::new(VenueId::Bybit, VenueProduct::Spot));
+        y_conn.set_mid(dec!(200));
+        x_conn.set_mid(dec!(100));
+        let y_dyn: Arc<dyn ExchangeConnector> = y_conn.clone();
+        let x_dyn: Arc<dyn ExchangeConnector> = x_conn.clone();
+        // Engine is just a host — primary connector is the y
+        // leg so single-bundle tests work.
+        let bundle = ConnectorBundle::single(y_dyn.clone());
+        let mut engine = make_engine_with_bundle(bundle);
+
+        let pair = StatArbPair {
+            y_symbol: "BTCUSDT".to_string(),
+            x_symbol: "ETHUSDT".to_string(),
+            strategy_class: "stat_arb_BTCUSDT_ETHUSDT".to_string(),
+        };
+        let cfg = StatArbDriverConfig {
+            tick_interval: std::time::Duration::from_millis(10),
+            zscore: mm_strategy::stat_arb::ZScoreConfig {
+                window: 20,
+                entry_threshold: dec!(1.5),
+                exit_threshold: dec!(0.3),
+            },
+            kalman_transition_var: dec!(0.000001),
+            kalman_observation_var: dec!(0.001),
+            leg_notional_usd: dec!(1000),
+        };
+        let mut driver = StatArbDriver::new(y_dyn, x_dyn, pair, cfg, Arc::new(NullStatArbSink));
+        // Seed cointegration so the z-score path can Enter.
+        let x_series: Vec<Decimal> = (0..60)
+            .map(|i| dec!(100) + Decimal::from(i as i64 % 5 - 2))
+            .collect();
+        let y_series: Vec<Decimal> = x_series
+            .iter()
+            .enumerate()
+            .map(|(i, xi)| {
+                let jitter = Decimal::from(i as i64 % 3 - 1) / dec!(10);
+                dec!(2) * xi + jitter
+            })
+            .collect();
+        driver.recheck_cointegration(&y_series, &x_series);
+
+        // Warmup with steady prices so Z stays small.
+        for _ in 0..20 {
+            y_conn.set_mid(dec!(200));
+            x_conn.set_mid(dec!(100));
+            driver.tick_once().await;
+        }
+
+        // Shock Y to force Entered.
+        y_conn.set_mid(dec!(205));
+        let shock = driver.tick_once().await;
+        assert!(matches!(shock, StatArbEvent::Entered { .. }));
+        let entry_report = driver.try_dispatch_legs_for_entry(&shock).await;
+        assert!(!entry_report.is_empty());
+        assert!(entry_report.all_succeeded());
+        // y_conn should see one, x_conn should see one.
+        assert_eq!(y_conn.place_single_calls(), 1);
+        assert_eq!(x_conn.place_single_calls(), 1);
+        // Route through the audit-writing handler too so we
+        // exercise the format_leg_report pathway.
+        engine.handle_stat_arb_event(shock, Some(entry_report));
+
+        // Revert Y to force Exit.
+        y_conn.set_mid(dec!(200));
+        let mut exit_event = None;
+        for _ in 0..60 {
+            let e = driver.tick_once().await;
+            if matches!(e, StatArbEvent::Exited { .. }) {
+                exit_event = Some(e);
+                break;
+            }
+        }
+        let exit_event = exit_event.expect("expected Exited after revert");
+        let exit_report = driver.try_dispatch_legs_for_exit().await;
+        assert!(!exit_report.is_empty());
+        assert!(exit_report.all_succeeded());
+        // Both connectors should now have seen two place_order
+        // calls — one entry, one exit.
+        assert_eq!(y_conn.place_single_calls(), 2);
+        assert_eq!(x_conn.place_single_calls(), 2);
+        engine.handle_stat_arb_event(exit_event, Some(exit_report));
+    }
+
+    /// `pnl_strategy_class`: returns the stat-arb pair's
+    /// strategy_class when the driver is attached and funding
+    /// arb is not, otherwise falls back to the primary
+    /// strategy name.
+    #[tokio::test]
+    async fn pnl_strategy_class_discriminates_stat_arb_vs_default() {
+        let mock = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        mock.set_mid(dec!(50_000));
+        let bundle = ConnectorBundle::single(mock.clone() as Arc<dyn ExchangeConnector>);
+        let engine = make_engine_with_bundle(bundle);
+        assert_eq!(engine.pnl_strategy_class(), engine.strategy.name());
+
+        // Attach a stat-arb driver and assert the class flips
+        // to the pair's `strategy_class` value.
+        let y_conn = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let x_conn = Arc::new(MockConnector::new(VenueId::Bybit, VenueProduct::Spot));
+        let driver = StatArbDriver::new(
+            y_conn as Arc<dyn ExchangeConnector>,
+            x_conn as Arc<dyn ExchangeConnector>,
+            StatArbPair {
+                y_symbol: "BTCUSDT".to_string(),
+                x_symbol: "ETHUSDT".to_string(),
+                strategy_class: "stat_arb_BTCUSDT_ETHUSDT".to_string(),
+            },
+            StatArbDriverConfig::default(),
+            Arc::new(NullStatArbSink),
+        );
+        let engine = engine.with_stat_arb_driver(driver, std::time::Duration::from_millis(50));
+        assert_eq!(engine.pnl_strategy_class(), "stat_arb_BTCUSDT_ETHUSDT");
     }
 }

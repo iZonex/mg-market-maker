@@ -9,6 +9,129 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Stage-2 parallel push — 4 tracks across A/B/D/F epics**
+  (Apr 2026). After all 6 SOTA gap closure epics closed
+  stage-1, the user requested parallel execution of the
+  highest-ROI stage-2 follow-ups via 4 isolated agent
+  tracks running concurrently in-tree with strict file
+  ownership. Each track followed the same 4-sprint
+  discipline (planning + study → impl → impl → wiring +
+  tests + report). All 4 tracks landed clean — workspace
+  jumped from 920 → **1001 tests** (+81 net) with
+  workspace clippy and fmt clean.
+  - **Track 1 — "Make advisory live" (Epic A + B
+    stage-2).** Closes the advisory-only gap that both
+    Epic A's cross-venue SOR and Epic B's stat-arb driver
+    shipped with in stage-1. New
+    `crates/engine/src/sor/dispatch.rs` (~560 LoC) with
+    `DispatchOutcome` + `LegOutcome` types and a
+    `dispatch_route` helper that issues real per-venue
+    `place_order` calls instead of just emitting an
+    advisory `RouteDecision`. New
+    `MarketMakerEngine::dispatch_route(side, qty, urgency)`
+    public method that calls `recommend_route` then
+    dispatches. New `pnl_strategy_class` discriminator on
+    the engine that routes hedge-side fills into the
+    correct per-strategy PnL bucket
+    (`stat_arb_<pair>` vs the funding-arb default).
+    `StatArbDriver` extended with
+    `try_dispatch_legs_for_entry` / `try_dispatch_legs_for_exit`
+    methods that issue real IOC limit orders on both legs
+    via the driver's already-held `Arc<dyn ExchangeConnector>`
+    references. New `pending_exit_legs` field caches the
+    direction/qty at Close time before the position is
+    cleared so the exit dispatch knows which sides to
+    reverse. **22 new tests** (10 SOR dispatch +
+    8 stat-arb driver + 4 e2e in `stage2_track1_integration`).
+  - **Track 2 — "Epic D polish".** Three Epic D stage-2
+    follow-ups: TOML round-trip persistence on
+    `LearnedMicroprice` (`from_toml` / `to_toml` via
+    serde + `#[serde(skip)]` on the transient
+    `spread_samples` accumulator); new offline CLI fit
+    binary `mm-learned-microprice-fit` at
+    `crates/strategy/src/bin/mm_learned_microprice_fit.rs`
+    (~370 LoC) implementing the two-pass quantile-edge
+    fit + JSONL parser; GLFT integration of the Cartea
+    AS spread component (additive `(1 − 2ρ) · σ · √(T−t)`
+    post-clamp, byte-identical when `ctx.as_prob == None`);
+    per-side asymmetric `quoted_half_spread_per_side` pure
+    function in `cartea_spread.rs` (independent `ρ_bid`
+    and `ρ_ask`, both clamped at zero). **19 new tests**
+    (4 lMP TOML + 3 CLI smoke + 5 GLFT AS + 7 per-side
+    `cartea_spread`). The per-side ρ engine integration
+    via `StrategyContext` is deferred to stage-3 because
+    threading new fields through `market_maker.rs`
+    conflicted with Track 1's file ownership; the per-side
+    function is callable directly by any future caller.
+  - **Track 3 — "Listing sniper" (Epic F #1 stage-2).**
+    Closes the deferred Epic F #1 sub-component. New
+    `ExchangeConnector::list_symbols` async trait method
+    with default `Err("not supported")` implementation
+    for backward compat. **5 venue implementations**:
+    Binance spot (`/api/v3/exchangeInfo`), Binance USDⓈ-M
+    futures (`/fapi/v1/exchangeInfo` with
+    `contractStatus → TradingStatus` mapping including
+    delivery contracts), Bybit V5 (per-category
+    `/v5/market/instruments-info`), HyperLiquid (perp +
+    spot via the `meta` action), and the custom
+    `mm-exchange-client` connector inheriting the
+    default-fallback `Err`. Per-venue parser helpers
+    factored out for testability. New
+    `crates/engine/src/listing_sniper.rs` (~490 LoC)
+    with the standalone `ListingSniper` struct, per-venue
+    known-symbol cache, first-scan seeding (so existing
+    listings don't fire spurious `Discovered` events on
+    startup), and `ListingEvent { Discovered, Removed }`
+    diff output. **20 new tests** (12 sniper unit + 8
+    venue parser tests). Engine integration (auto-spawn
+    probation engine on `Discovered`) is a stage-3
+    follow-up tracked in ROADMAP — v1 ships the
+    discovery half, operators wire the orchestration
+    layer.
+  - **Track 4 — "Defensive layer #2" (Epic F #2 +
+    multi-leader).** Two Epic F stage-2 follow-ups.
+    `NewsRetreatStateMachine` upgraded from case-
+    insensitive substring keyword matching to **real
+    regex** via the `regex = "1"` workspace dep
+    (orchestrator added it in pre-flight). Each pattern
+    is wrapped with `(?i)` so case-insensitivity is
+    baked in transparently — operators get word
+    boundaries (`\b`), alternation (`|`), and wildcards
+    (`.*`) for free. `NewsRetreatStateMachine::new` now
+    returns `anyhow::Result<Self>` so malformed patterns
+    surface via `Context`-wrapped errors instead of
+    panicking; engine call sites in `market_maker.rs`
+    test fixtures absorbed `.expect("valid news config")`
+    updates. New `MultiLeaderLeadLagGuard` struct in
+    `lead_lag_guard.rs` with weighted-max aggregation
+    (`M_agg = max over L of (w_L · (M_L − 1) + 1)`,
+    floored at 1.0) — operators register multiple leader
+    venues with per-leader weights, the loudest leader
+    wins. Existing single-leader `LeadLagGuard` stays
+    byte-identical for backward compat. Re-registering
+    a leader preserves its EWMA state so operators can
+    re-weight at runtime without losing warmup. **20 new
+    tests** (6 regex-based news retreat tests + 14
+    multi-leader tests including hand-verified 2-leader
+    fixture).
+  - **Cross-track coordination resolved cleanly.**
+    Track 4's `NewsRetreatStateMachine::new → Result`
+    breaking change required `.expect()` patches in 4
+    test call sites in `market_maker.rs` (Track 1's
+    territory) — Track 1 absorbed the patches as part of
+    its own changes. Track 3's listing sniper extension
+    of `MockConnector::list_symbols` in `test_support.rs`
+    was strictly additive (one new field + 2 setters +
+    1 trait method impl) and didn't conflict with
+    Track 1's existing counter fields. The pre-flight
+    workspace `Cargo.toml` add of `regex = "1"` happened
+    before tracks fired so no concurrent edits.
+  - **Workspace stats**: 920 → **1001 tests** (+81),
+    workspace clippy `-D warnings` clean, workspace
+    fmt clean. Zero new dependencies beyond
+    `regex = "1"` (workspace add) and `toml`/`serde_json`
+    enables on `mm-strategy` (already workspace deps).
+
 - **Epic E — Execution polish (stage-1)** (SOTA gap closure
   epic, sixth and final). User reordered F → E so the
   defensive surface landed first; Epic E closes the

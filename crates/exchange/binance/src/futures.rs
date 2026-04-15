@@ -567,57 +567,22 @@ impl ExchangeConnector for BinanceFuturesConnector {
             .iter()
             .find(|s| s.get("symbol").and_then(|v| v.as_str()) == Some(symbol))
             .ok_or_else(|| anyhow::anyhow!("symbol not found: {symbol}"))?;
-        let base = sym
-            .get("baseAsset")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let quote = sym
-            .get("quoteAsset")
-            .and_then(|v| v.as_str())
-            .unwrap_or("USDT")
-            .to_string();
+        parse_binance_futures_symbol(sym)
+            .ok_or_else(|| anyhow::anyhow!("malformed Binance futures symbol entry for {symbol}"))
+    }
 
-        let filters = sym
-            .get("filters")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let mut tick_size = dec!(0.01);
-        let mut lot_size = dec!(0.001);
-        let mut min_notional = dec!(5);
-        for f in &filters {
-            match f.get("filterType").and_then(|v| v.as_str()) {
-                Some("PRICE_FILTER") => {
-                    if let Some(ts) = f.get("tickSize").and_then(|v| v.as_str()) {
-                        tick_size = ts.parse().unwrap_or(tick_size);
-                    }
-                }
-                Some("LOT_SIZE") => {
-                    if let Some(ss) = f.get("stepSize").and_then(|v| v.as_str()) {
-                        lot_size = ss.parse().unwrap_or(lot_size);
-                    }
-                }
-                Some("MIN_NOTIONAL") => {
-                    if let Some(mn) = f.get("notional").and_then(|v| v.as_str()) {
-                        min_notional = mn.parse().unwrap_or(min_notional);
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(ProductSpec {
-            symbol: symbol.to_string(),
-            base_asset: base,
-            quote_asset: quote,
-            tick_size,
-            lot_size,
-            min_notional,
-            // Binance futures default tier: 0.02% maker / 0.05% taker.
-            maker_fee: dec!(0.0002),
-            taker_fee: dec!(0.0005),
-            trading_status: Default::default(),
-        })
+    /// List every symbol Binance USDⓈ-M futures currently advertises
+    /// via `GET /fapi/v1/exchangeInfo`. Shares the row parser with
+    /// `get_product_spec` so a schema drift on one call site drifts
+    /// the other the same way. `contractStatus` is mapped to
+    /// [`TradingStatus`] so the Epic F listing sniper can filter
+    /// out `SETTLING` / `CLOSE` / `PENDING_TRADING` rows post-hoc
+    /// without re-querying the venue.
+    async fn list_symbols(&self) -> anyhow::Result<Vec<ProductSpec>> {
+        self.rate_limiter.acquire(1).await;
+        let url = format!("{}/fapi/v1/exchangeInfo", self.base_url);
+        let resp: Value = self.client.get(&url).send().await?.json().await?;
+        Ok(parse_binance_futures_symbols_array(&resp))
     }
 
     async fn health_check(&self) -> anyhow::Result<bool> {
@@ -642,6 +607,96 @@ impl ExchangeConnector for BinanceFuturesConnector {
         parse_binance_futures_fee_response(&resp)
             .ok_or_else(|| FeeTierError::Other(anyhow::anyhow!("malformed commissionRate body")))
     }
+}
+
+/// Parse a single `symbols[]` entry from `/fapi/v1/exchangeInfo`
+/// into a [`ProductSpec`]. Shared by `get_product_spec` (single-
+/// symbol path) and `list_symbols` (whole-universe path). Pure
+/// helper so the wire shape is unit-tested without an HTTP client.
+///
+/// Binance USDⓈ-M surfaces a `contractStatus` field per contract
+/// (`TRADING`, `PENDING_TRADING`, `SETTLING`, `PRE_DELIVERING`,
+/// `DELIVERING`, `DELIVERED`, `PRE_SETTLE`, `CLOSE`). Only
+/// `TRADING` is mapped to `TradingStatus::Trading`; all other
+/// values are mapped conservatively so the listing sniper does
+/// not treat a settling contract as a new listing.
+pub(crate) fn parse_binance_futures_symbol(sym: &Value) -> Option<ProductSpec> {
+    let symbol = sym.get("symbol").and_then(|v| v.as_str())?.to_string();
+    let base = sym
+        .get("baseAsset")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let quote = sym
+        .get("quoteAsset")
+        .and_then(|v| v.as_str())
+        .unwrap_or("USDT")
+        .to_string();
+
+    let filters = sym
+        .get("filters")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut tick_size = dec!(0.01);
+    let mut lot_size = dec!(0.001);
+    let mut min_notional = dec!(5);
+    for f in &filters {
+        match f.get("filterType").and_then(|v| v.as_str()) {
+            Some("PRICE_FILTER") => {
+                if let Some(ts) = f.get("tickSize").and_then(|v| v.as_str()) {
+                    tick_size = ts.parse().unwrap_or(tick_size);
+                }
+            }
+            Some("LOT_SIZE") => {
+                if let Some(ss) = f.get("stepSize").and_then(|v| v.as_str()) {
+                    lot_size = ss.parse().unwrap_or(lot_size);
+                }
+            }
+            Some("MIN_NOTIONAL") => {
+                if let Some(mn) = f.get("notional").and_then(|v| v.as_str()) {
+                    min_notional = mn.parse().unwrap_or(min_notional);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let trading_status = match sym.get("contractStatus").and_then(|v| v.as_str()) {
+        Some("TRADING") => TradingStatus::Trading,
+        Some("PENDING_TRADING") => TradingStatus::PreTrading,
+        Some("SETTLING") | Some("PRE_SETTLE") | Some("CLOSE") => TradingStatus::Break,
+        Some("PRE_DELIVERING") | Some("DELIVERING") | Some("DELIVERED") => TradingStatus::Delisted,
+        // Absent / unknown — spot-style fallback.
+        Some(_) | None => TradingStatus::Trading,
+    };
+
+    Some(ProductSpec {
+        symbol,
+        base_asset: base,
+        quote_asset: quote,
+        tick_size,
+        lot_size,
+        min_notional,
+        // Binance futures default tier: 0.02% maker / 0.05% taker.
+        maker_fee: dec!(0.0002),
+        taker_fee: dec!(0.0005),
+        trading_status,
+    })
+}
+
+/// Parse the full `/fapi/v1/exchangeInfo` response body into the
+/// list of [`ProductSpec`] entries used by `list_symbols`. Malformed
+/// rows (missing `symbol`) are dropped silently.
+pub(crate) fn parse_binance_futures_symbols_array(resp: &Value) -> Vec<ProductSpec> {
+    resp.get("symbols")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(parse_binance_futures_symbol)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Parse the response from `GET /fapi/v1/commissionRate` into a
@@ -754,6 +809,52 @@ mod tests {
             new_qty: None,
         };
         assert!(build_amend_query(&amend_no_qty).is_err());
+    }
+
+    /// Listing sniper (Epic F): the futures parser walks the full
+    /// `/fapi/v1/exchangeInfo` response and maps every row,
+    /// including contracts in non-trading states that the sniper
+    /// consumer filters post-hoc.
+    #[test]
+    fn list_symbols_parses_full_futures_exchange_info() {
+        let resp = serde_json::json!({
+            "symbols": [
+                {
+                    "symbol": "BTCUSDT",
+                    "baseAsset": "BTC",
+                    "quoteAsset": "USDT",
+                    "contractStatus": "TRADING",
+                    "filters": [
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
+                        {"filterType": "LOT_SIZE", "stepSize": "0.001"},
+                        {"filterType": "MIN_NOTIONAL", "notional": "5"}
+                    ]
+                },
+                {
+                    "symbol": "DEADUSDT",
+                    "baseAsset": "DEAD",
+                    "quoteAsset": "USDT",
+                    "contractStatus": "SETTLING",
+                    "filters": []
+                },
+                {
+                    "symbol": "NEWUSDT",
+                    "baseAsset": "NEW",
+                    "quoteAsset": "USDT",
+                    "contractStatus": "PENDING_TRADING",
+                    "filters": []
+                }
+            ]
+        });
+        let specs = parse_binance_futures_symbols_array(&resp);
+        assert_eq!(specs.len(), 3);
+        let btc = specs.iter().find(|s| s.symbol == "BTCUSDT").unwrap();
+        assert_eq!(btc.tick_size, dec!(0.10));
+        assert_eq!(btc.trading_status, TradingStatus::Trading);
+        let dead = specs.iter().find(|s| s.symbol == "DEADUSDT").unwrap();
+        assert_eq!(dead.trading_status, TradingStatus::Break);
+        let new = specs.iter().find(|s| s.symbol == "NEWUSDT").unwrap();
+        assert_eq!(new.trading_status, TradingStatus::PreTrading);
     }
 
     #[test]

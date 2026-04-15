@@ -841,6 +841,34 @@ impl ExchangeConnector for HyperLiquidConnector {
         ))
     }
 
+    /// List every asset in the HL universe for **this** connector's
+    /// product (perp vs spot). Queries `/info {type: "meta"}` for
+    /// perp and `/info {type: "spotMeta"}` for spot, then maps each
+    /// asset through [`HyperLiquidConnector::decimals_to_spec`] so
+    /// every spec uses the same precision rule as the single-
+    /// symbol `get_product_spec` path.
+    ///
+    /// HL does not expose a per-asset `min_notional` via `meta`, so
+    /// every spec inherits the default `DEFAULT_MIN_NOTIONAL`
+    /// (`dec!(10)`). Operators can override per-symbol via config
+    /// post-listing; the Epic F sniper only cares about which
+    /// symbols exist, not their min-order size.
+    ///
+    /// HL does surface an `isDelisted` flag on perp assets that
+    /// have been removed from the universe. Those rows get
+    /// `trading_status = Delisted` so the sniper sees a stable
+    /// "known set" even when HL temporarily shows a delisted
+    /// symbol before pruning it.
+    async fn list_symbols(&self) -> Result<Vec<ProductSpec>> {
+        if self.is_spot {
+            let resp = self.info_post(json!({ "type": "spotMeta" })).await?;
+            Ok(parse_hl_spot_meta_into_specs(&resp))
+        } else {
+            let resp = self.info_post(json!({ "type": "meta" })).await?;
+            Ok(parse_hl_perp_meta_into_specs(&resp))
+        }
+    }
+
     async fn health_check(&self) -> Result<bool> {
         match self.info_post(json!({ "type": "meta" })).await {
             Ok(_) => Ok(true),
@@ -854,6 +882,91 @@ impl ExchangeConnector for HyperLiquidConnector {
     async fn rate_limit_remaining(&self) -> u32 {
         self.rate_limiter.remaining().await
     }
+}
+
+/// Parse a `/info {type: "meta"}` response (HL perp) into the list
+/// of [`ProductSpec`] entries the Epic F listing sniper consumes.
+/// Shares the precision rule with
+/// [`HyperLiquidConnector::decimals_to_spec`] so single-symbol and
+/// whole-universe call sites stay in lockstep. Pure helper so the
+/// wire shape is unit-tested without an HTTP client.
+///
+/// Rows missing a `name` field are dropped silently. Rows with
+/// `isDelisted: true` are returned with
+/// `trading_status = TradingStatus::Delisted` so the sniper can
+/// diff a stable set across scans without treating a delisted
+/// asset as "removed".
+pub(crate) fn parse_hl_perp_meta_into_specs(resp: &Value) -> Vec<ProductSpec> {
+    let universe = match resp.get("universe").and_then(|v| v.as_array()) {
+        Some(u) => u,
+        None => return Vec::new(),
+    };
+    universe
+        .iter()
+        .filter_map(|asset| {
+            let name = asset.get("name").and_then(|v| v.as_str())?.to_string();
+            let sz_decimals = asset
+                .get("szDecimals")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            let is_delisted = asset
+                .get("isDelisted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mut spec = HyperLiquidConnector::decimals_to_spec(&name, sz_decimals, false);
+            if is_delisted {
+                spec.trading_status = mm_common::types::TradingStatus::Delisted;
+            }
+            Some(spec)
+        })
+        .collect()
+}
+
+/// Parse a `/info {type: "spotMeta"}` response (HL spot) into the
+/// list of [`ProductSpec`] entries the Epic F listing sniper
+/// consumes. HL spot pairs use a `universe[]` of pair objects that
+/// reference token indices; the per-token `szDecimals` is looked
+/// up from the parallel `tokens[]` array — same rule as
+/// [`HyperLiquidConnector::ensure_asset_map`].
+pub(crate) fn parse_hl_spot_meta_into_specs(resp: &Value) -> Vec<ProductSpec> {
+    let tokens = match resp.get("tokens").and_then(|v| v.as_array()) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+    let pairs = match resp.get("universe").and_then(|v| v.as_array()) {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    let mut token_sz: HashMap<u64, u32> = HashMap::new();
+    for t in tokens {
+        if let (Some(idx), Some(sz)) = (
+            t.get("index").and_then(|v| v.as_u64()),
+            t.get("szDecimals").and_then(|v| v.as_u64()),
+        ) {
+            token_sz.insert(idx, sz as u32);
+        }
+    }
+    pairs
+        .iter()
+        .filter_map(|pair| {
+            let name = pair.get("name").and_then(|v| v.as_str())?.to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let base_token_idx = pair
+                .get("tokens")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let sz_decimals = token_sz.get(&base_token_idx).copied().unwrap_or(0);
+            Some(HyperLiquidConnector::decimals_to_spec(
+                &name,
+                sz_decimals,
+                true,
+            ))
+        })
+        .collect()
 }
 
 fn parse_hl_levels(side: &Value) -> Vec<PriceLevel> {
@@ -1400,5 +1513,65 @@ mod tests {
             }
         });
         assert_eq!(super::parse_hl_event_for_test(&frame, false).len(), 1);
+    }
+
+    /// Listing sniper (Epic F): `/info {type: "meta"}` perp
+    /// universe parses into one [`ProductSpec`] per asset, with
+    /// `szDecimals` driving the tick/lot precision through the
+    /// shared `decimals_to_spec` helper.
+    #[test]
+    fn list_symbols_perp_meta_parses_universe_array() {
+        let resp = serde_json::json!({
+            "universe": [
+                { "name": "BTC", "szDecimals": 5, "maxLeverage": 50 },
+                { "name": "ETH", "szDecimals": 4, "maxLeverage": 50 },
+                { "name": "DEAD", "szDecimals": 2, "isDelisted": true }
+            ]
+        });
+        let specs = parse_hl_perp_meta_into_specs(&resp);
+        assert_eq!(specs.len(), 3);
+        let btc = specs.iter().find(|s| s.symbol == "BTC").unwrap();
+        // szDecimals=5 → tick = 10^-(6-5) = 0.1
+        assert_eq!(btc.tick_size, dec!(0.1));
+        assert_eq!(btc.min_notional, DEFAULT_MIN_NOTIONAL);
+        assert_eq!(btc.trading_status, mm_common::types::TradingStatus::Trading);
+        let dead = specs.iter().find(|s| s.symbol == "DEAD").unwrap();
+        assert_eq!(
+            dead.trading_status,
+            mm_common::types::TradingStatus::Delisted
+        );
+    }
+
+    /// Spot meta flows through the token-index → szDecimals lookup
+    /// identical to `ensure_asset_map`, then maps each pair through
+    /// the shared spec helper.
+    #[test]
+    fn list_symbols_spot_meta_resolves_pair_precision_via_tokens() {
+        let resp = serde_json::json!({
+            "tokens": [
+                { "name": "USDC", "index": 0, "szDecimals": 2, "weiDecimals": 8 },
+                { "name": "PURR", "index": 1, "szDecimals": 5, "weiDecimals": 8 }
+            ],
+            "universe": [
+                { "name": "PURR/USDC", "tokens": [1, 0], "index": 0 }
+            ]
+        });
+        let specs = parse_hl_spot_meta_into_specs(&resp);
+        assert_eq!(specs.len(), 1);
+        let purr = &specs[0];
+        assert_eq!(purr.symbol, "PURR/USDC");
+        assert_eq!(purr.base_asset, "PURR");
+        assert_eq!(purr.quote_asset, "USDC");
+        // Spot precision: 8 - szDecimals(5) = 3 → tick 0.001
+        assert_eq!(purr.tick_size, dec!(0.001));
+    }
+
+    /// Missing universe / tokens arrays yield an empty vec rather
+    /// than panicking — guards against a venue-side schema blip
+    /// taking down the listing sniper.
+    #[test]
+    fn list_symbols_meta_missing_fields_returns_empty() {
+        assert!(parse_hl_perp_meta_into_specs(&serde_json::json!({})).is_empty());
+        assert!(parse_hl_spot_meta_into_specs(&serde_json::json!({})).is_empty());
     }
 }

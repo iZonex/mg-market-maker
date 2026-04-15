@@ -25,7 +25,16 @@
 //! v1 uses the symmetric single-`ρ` variant and clamps the
 //! final output at zero so `ρ > 0.5` with large
 //! `σ · √(T − t)` never produces a negative quoted spread.
-//! Per-side asymmetric `ρ_b` / `ρ_a` is stage-2.
+//!
+//! Stage-2 adds [`quoted_half_spread_per_side`] — a pure
+//! function returning `(δ_b, δ_a)` with independent
+//! `ρ_b` / `ρ_a` per side. The engine still plumbs the
+//! symmetric single-`ρ` through `StrategyContext::as_prob`;
+//! wiring the asymmetric pair through the context is a
+//! stage-3 follow-up coordinated with the Track 1 changes on
+//! `crates/engine/src/market_maker.rs`. Any non-strategy
+//! caller (offline calibration, research notebook) can import
+//! this function directly today.
 //!
 //! # Source attribution
 //!
@@ -61,6 +70,49 @@ pub fn quoted_half_spread(
     let base = decimal_ln(Decimal::ONE + gamma / kappa) / gamma;
     let as_component = (Decimal::ONE - Decimal::TWO * as_prob) * sigma * decimal_sqrt(t_minus_t);
     (base + as_component).max(Decimal::ZERO)
+}
+
+/// Per-side asymmetric variant of [`quoted_half_spread`].
+/// Returns `(δ_b, δ_a)` where each side gets its own additive
+/// Cartea adverse-selection component:
+///
+/// ```text
+/// base = (1/γ) · ln(1 + γ/κ)
+/// δ_b  = max(0, base + (1 − 2·ρ_b) · σ · √(T − t))
+/// δ_a  = max(0, base + (1 − 2·ρ_a) · σ · √(T − t))
+/// ```
+///
+/// When `ρ_b == ρ_a == ρ`, the output collapses to
+/// `(quoted_half_spread(ρ), quoted_half_spread(ρ))` byte-for-byte.
+/// This is the invariant exercised by the
+/// `per_side_symmetric_collapses` test.
+///
+/// Each side is independently clamped at zero so a large
+/// `σ · √(T − t)` combined with `ρ_side > 0.5` never produces
+/// a negative quoted side.
+///
+/// Stage-2 only exposes this as a pure function — wiring it
+/// through `StrategyContext` waits on stage-3 coordination
+/// with the engine-side `market_maker.rs` changes owned by
+/// Track 1.
+pub fn quoted_half_spread_per_side(
+    gamma: Decimal,
+    kappa: Decimal,
+    sigma: Decimal,
+    t_minus_t: Decimal,
+    rho_bid: Decimal,
+    rho_ask: Decimal,
+) -> (Decimal, Decimal) {
+    if gamma.is_zero() || kappa.is_zero() {
+        return (Decimal::ZERO, Decimal::ZERO);
+    }
+    let base = decimal_ln(Decimal::ONE + gamma / kappa) / gamma;
+    let sigma_root_t = sigma * decimal_sqrt(t_minus_t);
+    let delta_bid =
+        (base + (Decimal::ONE - Decimal::TWO * rho_bid) * sigma_root_t).max(Decimal::ZERO);
+    let delta_ask =
+        (base + (Decimal::ONE - Decimal::TWO * rho_ask) * sigma_root_t).max(Decimal::ZERO);
+    (delta_bid, delta_ask)
 }
 
 /// Map an adverse-selection metric in bps to the `ρ` input
@@ -297,6 +349,115 @@ mod tests {
     fn zero_kappa_returns_zero_guard() {
         let output = quoted_half_spread(dec!(0.1), Decimal::ZERO, dec!(0.02), dec!(60), dec!(0.5));
         assert_eq!(output, Decimal::ZERO);
+    }
+
+    // ------------------ quoted_half_spread_per_side ------------------
+
+    fn per_side_fixtures() -> (Decimal, Decimal, Decimal, Decimal) {
+        (dec!(0.1), dec!(1.5), dec!(0.02), dec!(60))
+    }
+
+    #[test]
+    fn per_side_symmetric_collapses_to_scalar_variant() {
+        // When ρ_b == ρ_a, the per-side function must
+        // reproduce `quoted_half_spread` on both sides.
+        let (g, k, s, t) = per_side_fixtures();
+        for rho in [dec!(0), dec!(0.25), dec!(0.5), dec!(0.75), dec!(1)] {
+            let (db, da) = quoted_half_spread_per_side(g, k, s, t, rho, rho);
+            let scalar = quoted_half_spread(g, k, s, t, rho);
+            assert_eq!(db, scalar, "bid mismatch at ρ={rho}");
+            assert_eq!(da, scalar, "ask mismatch at ρ={rho}");
+        }
+    }
+
+    #[test]
+    fn per_side_bid_widen_only_leaves_ask_at_neutral() {
+        // ρ_b = 0 (maximal bid widen), ρ_a = 0.5 (neutral):
+        // the bid side should widen vs the scalar neutral
+        // value while the ask remains at the scalar neutral.
+        let (g, k, s, t) = per_side_fixtures();
+        let neutral = quoted_half_spread(g, k, s, t, dec!(0.5));
+        let (db, da) = quoted_half_spread_per_side(g, k, s, t, dec!(0), dec!(0.5));
+        assert!(db > neutral, "bid should widen: db={db}, neutral={neutral}");
+        assert_eq!(da, neutral, "ask should stay neutral: da={da}");
+    }
+
+    #[test]
+    fn per_side_ask_widen_only_leaves_bid_at_neutral() {
+        // Mirror of the previous test.
+        let (g, k, s, t) = per_side_fixtures();
+        let neutral = quoted_half_spread(g, k, s, t, dec!(0.5));
+        let (db, da) = quoted_half_spread_per_side(g, k, s, t, dec!(0.5), dec!(0));
+        assert_eq!(db, neutral);
+        assert!(da > neutral);
+    }
+
+    #[test]
+    fn per_side_mixed_asymmetry_produces_distinct_outputs() {
+        // ρ_b and ρ_a on opposite sides of 0.5: bid widens,
+        // ask narrows, and the two sides are strictly
+        // different.
+        let (g, k, s, t) = per_side_fixtures();
+        let (db, da) = quoted_half_spread_per_side(g, k, s, t, dec!(0.2), dec!(0.8));
+        assert!(db > da, "bid should be wider than ask: db={db}, da={da}");
+        let neutral = quoted_half_spread(g, k, s, t, dec!(0.5));
+        assert!(db > neutral);
+        assert!(da < neutral);
+    }
+
+    #[test]
+    fn per_side_both_clamped_at_zero_under_extreme_informed_flow() {
+        // ρ_b = ρ_a = 1 with σ·√(T − t) large enough to
+        // overwhelm the wave-1 base → both sides clamp to 0.
+        let g = dec!(0.1);
+        let k = dec!(1.5);
+        let s = dec!(10);
+        let t = dec!(60);
+        let (db, da) = quoted_half_spread_per_side(g, k, s, t, dec!(1), dec!(1));
+        assert_eq!(db, Decimal::ZERO);
+        assert_eq!(da, Decimal::ZERO);
+    }
+
+    #[test]
+    fn per_side_monotone_in_each_side() {
+        // Sweep ρ_b from 0 → 0.5 with ρ_a fixed, the bid side
+        // should monotonically shrink; and symmetrically for
+        // ρ_a.
+        let (g, k, s, t) = per_side_fixtures();
+        let mut prev_bid: Option<Decimal> = None;
+        for rho_b in [dec!(0), dec!(0.1), dec!(0.25), dec!(0.4), dec!(0.5)] {
+            let (db, _da) = quoted_half_spread_per_side(g, k, s, t, rho_b, dec!(0.5));
+            if let Some(prev) = prev_bid {
+                assert!(
+                    db <= prev,
+                    "bid non-monotone at ρ_b={rho_b}: db={db}, prev={prev}"
+                );
+            }
+            prev_bid = Some(db);
+        }
+        let mut prev_ask: Option<Decimal> = None;
+        for rho_a in [dec!(0), dec!(0.1), dec!(0.25), dec!(0.4), dec!(0.5)] {
+            let (_db, da) = quoted_half_spread_per_side(g, k, s, t, dec!(0.5), rho_a);
+            if let Some(prev) = prev_ask {
+                assert!(
+                    da <= prev,
+                    "ask non-monotone at ρ_a={rho_a}: da={da}, prev={prev}"
+                );
+            }
+            prev_ask = Some(da);
+        }
+    }
+
+    #[test]
+    fn per_side_zero_gamma_or_kappa_returns_zero_zero() {
+        let (_, k, s, t) = per_side_fixtures();
+        let (db, da) = quoted_half_spread_per_side(Decimal::ZERO, k, s, t, dec!(0.3), dec!(0.7));
+        assert_eq!(db, Decimal::ZERO);
+        assert_eq!(da, Decimal::ZERO);
+        let (g, _, s, t) = per_side_fixtures();
+        let (db, da) = quoted_half_spread_per_side(g, Decimal::ZERO, s, t, dec!(0.3), dec!(0.7));
+        assert_eq!(db, Decimal::ZERO);
+        assert_eq!(da, Decimal::ZERO);
     }
 
     #[test]

@@ -35,6 +35,8 @@
 //! `docs/research/defensive-layer-formulas.md`
 //! §"Sub-component #1".
 
+use std::collections::HashMap;
+
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -211,6 +213,181 @@ impl LeadLagGuard {
                 self.ewma_var = Some(new_var);
             }
         }
+    }
+}
+
+// ---------------- Multi-leader aggregation (stage-2) ----------------
+
+/// Multi-leader extension of [`LeadLagGuard`]. Operators
+/// register one or more leader venues (e.g.
+/// `"binance_futures"`, `"bybit_perp"`, `"okx_perp"`) with a
+/// per-leader weight, feed each leader's mid into its own
+/// sub-guard via [`Self::on_leader_mid`], and read a single
+/// aggregated multiplier back via [`Self::current_multiplier`].
+///
+/// # Aggregation rule — weight-scaled maximum
+///
+/// The aggregated multiplier is the **weight-scaled maximum**
+/// over all registered leaders:
+///
+/// ```text
+/// M_agg = max over L of ( w[L] · (M[L] − 1) + 1 )
+/// ```
+///
+/// Taking the maximum (rather than an average) is deliberate:
+/// defensive controls should listen to the LOUDEST leader.
+/// Averaging would let N quiet leaders dilute a single shocked
+/// leader's widening signal and delay the retreat.
+///
+/// The `(M − 1)` shift applies the weight to the *additional*
+/// widening above the neutral 1.0 baseline. A leader with
+/// `weight = 0.5` therefore contributes half the widening
+/// headroom (so a per-leader multiplier of `3.0` counts as
+/// `1 + 0.5 · (3 − 1) = 2.0`), not half the raw multiplier.
+/// Weight `0.0` mutes a leader without removing it. The
+/// aggregated multiplier is floored at `1.0`.
+///
+/// # Single-leader compatibility
+///
+/// The original [`LeadLagGuard`] is unchanged. Existing
+/// callers that read a single leader keep using it directly.
+/// `MultiLeaderLeadLagGuard` is an additive sibling for
+/// operators who want to watch multiple leaders at once.
+#[derive(Debug, Clone)]
+pub struct MultiLeaderLeadLagGuard {
+    /// Template config applied to every registered leader's
+    /// sub-guard.
+    config: LeadLagGuardConfig,
+    /// Per-leader state. The `String` key is the operator's
+    /// chosen leader-id (e.g. `"binance_futures"`); the
+    /// tuple stores the per-leader `LeadLagGuard` and its
+    /// weight.
+    leaders: HashMap<String, (LeadLagGuard, Decimal)>,
+    /// Cached aggregated multiplier. Recomputed on each
+    /// `on_leader_mid` / `register_leader` / `unregister_leader`
+    /// / `reset` call so the hot read path is O(1).
+    cached_mult: Decimal,
+    /// Cached max of `|z|` across leaders, for metrics.
+    cached_max_z_abs: Decimal,
+}
+
+impl MultiLeaderLeadLagGuard {
+    /// Build an empty multi-leader guard with the given
+    /// config template. Leaders are added later via
+    /// [`Self::register_leader`]. An empty guard always
+    /// returns multiplier `1.0`.
+    pub fn new(config: LeadLagGuardConfig) -> Self {
+        Self {
+            config,
+            leaders: HashMap::new(),
+            cached_mult: Decimal::ONE,
+            cached_max_z_abs: Decimal::ZERO,
+        }
+    }
+
+    /// Register (or re-register) a leader. If the leader
+    /// already exists, its weight is updated **but the
+    /// existing EWMA state is preserved** — useful for
+    /// operators re-weighting leaders at runtime without
+    /// losing warmup. Weights below zero are clamped to 0.
+    pub fn register_leader(&mut self, id: impl Into<String>, weight: Decimal) {
+        let id = id.into();
+        let weight = if weight < Decimal::ZERO {
+            Decimal::ZERO
+        } else {
+            weight
+        };
+        if let Some(entry) = self.leaders.get_mut(&id) {
+            entry.1 = weight;
+        } else {
+            self.leaders
+                .insert(id, (LeadLagGuard::new(self.config.clone()), weight));
+        }
+        self.recompute_cache();
+    }
+
+    /// Remove a leader and its cached state. No-op if the
+    /// leader was never registered.
+    pub fn unregister_leader(&mut self, id: &str) {
+        self.leaders.remove(id);
+        self.recompute_cache();
+    }
+
+    /// Fold one new mid observation into the named leader's
+    /// sub-guard, then refresh the aggregated multiplier.
+    /// If `leader_id` is not registered the call is a
+    /// silent no-op — operators can stream mids from every
+    /// venue and let the guard ignore leaders it doesn't
+    /// care about.
+    pub fn on_leader_mid(&mut self, leader_id: &str, mid: Decimal) {
+        if let Some(entry) = self.leaders.get_mut(leader_id) {
+            entry.0.on_leader_mid(mid);
+            self.recompute_cache();
+        }
+    }
+
+    /// Aggregated weight-scaled maximum multiplier. Floored
+    /// at `1.0` (no negative widening is possible).
+    pub fn current_multiplier(&self) -> Decimal {
+        self.cached_mult
+    }
+
+    /// Largest `|z|` seen across all registered leaders,
+    /// for metrics / dashboards. `0` if no leaders are
+    /// registered or none have produced a return yet.
+    pub fn current_max_z_abs(&self) -> Decimal {
+        self.cached_max_z_abs
+    }
+
+    /// `true` if ANY registered leader is currently
+    /// producing a multiplier above `1.0`.
+    pub fn is_active(&self) -> bool {
+        self.cached_mult > Decimal::ONE
+    }
+
+    /// Clear every registered leader's internal state
+    /// WITHOUT unregistering them. Useful on kill-switch
+    /// reset: registrations survive, but warmup restarts
+    /// from scratch.
+    pub fn reset(&mut self) {
+        for (_id, (guard, _w)) in self.leaders.iter_mut() {
+            guard.reset();
+        }
+        self.recompute_cache();
+    }
+
+    /// Number of currently registered leaders.
+    pub fn leader_count(&self) -> usize {
+        self.leaders.len()
+    }
+
+    /// Recompute the cached aggregated multiplier + max
+    /// `|z|` from the per-leader states. Called whenever
+    /// the leader set or any leader's state changes.
+    fn recompute_cache(&mut self) {
+        let mut best = Decimal::ONE;
+        let mut best_z = Decimal::ZERO;
+        for (guard, weight) in self.leaders.values() {
+            let per_leader = guard.current_multiplier();
+            // Weight-scaled widening: w · (M − 1) + 1.
+            let scaled = *weight * (per_leader - Decimal::ONE) + Decimal::ONE;
+            if scaled > best {
+                best = scaled;
+            }
+            let z = guard.current_z_abs();
+            if z > best_z {
+                best_z = z;
+            }
+        }
+        // Floor at 1.0 — weight 0 on a quiet guard would
+        // otherwise produce 0·(1−1)+1 = 1 which is fine,
+        // but defensive floor guards against any future
+        // change to the formula.
+        if best < Decimal::ONE {
+            best = Decimal::ONE;
+        }
+        self.cached_mult = best;
+        self.cached_max_z_abs = best_z;
     }
 }
 
@@ -469,5 +646,238 @@ mod tests {
             z_max: dec!(2),
             max_mult: dec!(3),
         });
+    }
+
+    // ---------- MultiLeaderLeadLagGuard (stage-2) ----------
+
+    /// Drive a guard through the standard warmup pattern:
+    /// 30 small alternating ±1 wiggles to build EWMA
+    /// variance. Helper shared across multi-leader tests.
+    fn warmup_with_wiggles(g: &mut LeadLagGuard, mid: Decimal) {
+        for i in 0..30 {
+            let delta = if i % 2 == 0 { dec!(1) } else { dec!(-1) };
+            g.on_leader_mid(mid + delta);
+        }
+    }
+
+    /// Same warmup pattern but applied to a multi-leader
+    /// guard for a specific leader id.
+    fn warmup_multi(g: &mut MultiLeaderLeadLagGuard, id: &str, mid: Decimal) {
+        for i in 0..30 {
+            let delta = if i % 2 == 0 { dec!(1) } else { dec!(-1) };
+            g.on_leader_mid(id, mid + delta);
+        }
+    }
+
+    #[test]
+    fn multi_empty_guard_returns_neutral_multiplier() {
+        let g = MultiLeaderLeadLagGuard::new(fixture_config());
+        assert_eq!(g.leader_count(), 0);
+        assert_eq!(g.current_multiplier(), Decimal::ONE);
+        assert_eq!(g.current_max_z_abs(), Decimal::ZERO);
+        assert!(!g.is_active());
+    }
+
+    #[test]
+    fn multi_single_leader_matches_single_leader_guard() {
+        // A single-leader MultiLeaderLeadLagGuard with
+        // weight=1.0 must produce the same multiplier as a
+        // direct LeadLagGuard fed the same sequence.
+        let mut single = LeadLagGuard::new(fixture_config());
+        let mut multi = MultiLeaderLeadLagGuard::new(fixture_config());
+        multi.register_leader("leader", dec!(1));
+
+        let mid = dec!(50000);
+        for i in 0..30 {
+            let delta = if i % 2 == 0 { dec!(1) } else { dec!(-1) };
+            single.on_leader_mid(mid + delta);
+            multi.on_leader_mid("leader", mid + delta);
+        }
+        // Big shock.
+        single.on_leader_mid(dec!(52500));
+        multi.on_leader_mid("leader", dec!(52500));
+
+        assert_eq!(single.current_multiplier(), multi.current_multiplier());
+        assert_eq!(single.current_z_abs(), multi.current_max_z_abs());
+        assert!(multi.is_active());
+    }
+
+    #[test]
+    fn multi_two_quiet_leaders_stay_neutral() {
+        let mut g = MultiLeaderLeadLagGuard::new(fixture_config());
+        g.register_leader("a", dec!(1));
+        g.register_leader("b", dec!(1));
+        for _ in 0..40 {
+            g.on_leader_mid("a", dec!(50000));
+            g.on_leader_mid("b", dec!(30000));
+        }
+        assert_eq!(g.current_multiplier(), Decimal::ONE);
+        assert!(!g.is_active());
+    }
+
+    #[test]
+    fn multi_one_shocked_leader_drives_aggregate() {
+        // Leader "a" shocks hard, leader "b" stays flat —
+        // aggregate reflects "a" (the loudest).
+        let mut g = MultiLeaderLeadLagGuard::new(fixture_config());
+        g.register_leader("a", dec!(1));
+        g.register_leader("b", dec!(1));
+        warmup_multi(&mut g, "a", dec!(50000));
+        for _ in 0..40 {
+            g.on_leader_mid("b", dec!(30000));
+        }
+        // Big 5% shock on "a".
+        g.on_leader_mid("a", dec!(52500));
+        assert_eq!(g.current_multiplier(), dec!(3));
+        assert!(g.is_active());
+    }
+
+    #[test]
+    fn multi_loudest_of_two_shocked_wins() {
+        // Both leaders shock, but leader "a" saturates to
+        // max_mult=3 while leader "b" only lifts partway.
+        // Aggregate must equal the loudest = 3.
+        let mut g = MultiLeaderLeadLagGuard::new(fixture_config());
+        g.register_leader("a", dec!(1));
+        g.register_leader("b", dec!(1));
+        warmup_multi(&mut g, "a", dec!(50000));
+        warmup_multi(&mut g, "b", dec!(30000));
+        g.on_leader_mid("a", dec!(52500)); // huge shock → sat
+        g.on_leader_mid("b", dec!(30015)); // tiny bump
+        assert_eq!(g.current_multiplier(), dec!(3));
+    }
+
+    #[test]
+    fn multi_weight_half_halves_additional_widening() {
+        // Leader at weight 0.5 with a per-leader multiplier
+        // of 3.0 must contribute 1 + 0.5·(3−1) = 2.0.
+        let mut g = MultiLeaderLeadLagGuard::new(fixture_config());
+        g.register_leader("a", dec!(0.5));
+        warmup_multi(&mut g, "a", dec!(50000));
+        g.on_leader_mid("a", dec!(52500));
+        // Cross-check vs a single-leader guard's raw mult.
+        let mut single = LeadLagGuard::new(fixture_config());
+        warmup_with_wiggles(&mut single, dec!(50000));
+        single.on_leader_mid(dec!(52500));
+        let raw = single.current_multiplier();
+        assert_eq!(raw, dec!(3));
+        assert_eq!(g.current_multiplier(), dec!(2));
+    }
+
+    #[test]
+    fn multi_weight_zero_mutes_leader() {
+        // A muted (weight=0) leader cannot drive widening
+        // no matter how shocked it gets.
+        let mut g = MultiLeaderLeadLagGuard::new(fixture_config());
+        g.register_leader("muted", dec!(0));
+        warmup_multi(&mut g, "muted", dec!(50000));
+        g.on_leader_mid("muted", dec!(52500)); // 5% shock
+        assert_eq!(g.current_multiplier(), Decimal::ONE);
+        assert!(!g.is_active());
+    }
+
+    #[test]
+    fn multi_negative_weight_is_clamped_to_zero() {
+        // Defensive input handling: negative weights are
+        // clamped to 0, not reflected.
+        let mut g = MultiLeaderLeadLagGuard::new(fixture_config());
+        g.register_leader("a", dec!(-1));
+        warmup_multi(&mut g, "a", dec!(50000));
+        g.on_leader_mid("a", dec!(52500));
+        assert_eq!(g.current_multiplier(), Decimal::ONE);
+    }
+
+    #[test]
+    fn multi_unregister_drops_leader_contribution() {
+        let mut g = MultiLeaderLeadLagGuard::new(fixture_config());
+        g.register_leader("shocked", dec!(1));
+        warmup_multi(&mut g, "shocked", dec!(50000));
+        g.on_leader_mid("shocked", dec!(52500));
+        assert!(g.is_active());
+        g.unregister_leader("shocked");
+        assert_eq!(g.leader_count(), 0);
+        assert_eq!(g.current_multiplier(), Decimal::ONE);
+        assert!(!g.is_active());
+    }
+
+    #[test]
+    fn multi_reset_clears_state_keeps_registrations() {
+        let mut g = MultiLeaderLeadLagGuard::new(fixture_config());
+        g.register_leader("a", dec!(1));
+        g.register_leader("b", dec!(1));
+        warmup_multi(&mut g, "a", dec!(50000));
+        g.on_leader_mid("a", dec!(52500));
+        assert!(g.is_active());
+        assert_eq!(g.leader_count(), 2);
+
+        g.reset();
+
+        // Registrations survive, state is cleared.
+        assert_eq!(g.leader_count(), 2);
+        assert_eq!(g.current_multiplier(), Decimal::ONE);
+        assert_eq!(g.current_max_z_abs(), Decimal::ZERO);
+        assert!(!g.is_active());
+    }
+
+    #[test]
+    fn multi_is_active_reflects_any_leader() {
+        // Two leaders, only one shocked — the aggregate is
+        // still "active" because at least one leader is.
+        let mut g = MultiLeaderLeadLagGuard::new(fixture_config());
+        g.register_leader("a", dec!(1));
+        g.register_leader("b", dec!(1));
+        warmup_multi(&mut g, "a", dec!(50000));
+        warmup_multi(&mut g, "b", dec!(30000));
+        g.on_leader_mid("b", dec!(31500)); // 5% on b
+        assert!(g.is_active());
+    }
+
+    #[test]
+    fn multi_unknown_leader_mid_is_silent_noop() {
+        // Feeding a mid for an un-registered leader must
+        // not panic and must not change state.
+        let mut g = MultiLeaderLeadLagGuard::new(fixture_config());
+        g.register_leader("a", dec!(1));
+        g.on_leader_mid("b", dec!(12345));
+        assert_eq!(g.current_multiplier(), Decimal::ONE);
+        assert_eq!(g.leader_count(), 1);
+    }
+
+    #[test]
+    fn multi_reregister_preserves_existing_state() {
+        // Re-registering an existing leader updates the
+        // weight WITHOUT dropping its EWMA state.
+        let mut g = MultiLeaderLeadLagGuard::new(fixture_config());
+        g.register_leader("a", dec!(1));
+        warmup_multi(&mut g, "a", dec!(50000));
+        g.on_leader_mid("a", dec!(52500));
+        let mult_before = g.current_multiplier();
+        assert_eq!(mult_before, dec!(3));
+        // Re-register with weight 0.5 — per-leader state
+        // must survive, only the aggregation weight changes.
+        g.register_leader("a", dec!(0.5));
+        assert_eq!(g.current_multiplier(), dec!(2)); // 1 + 0.5·(3-1)
+    }
+
+    #[test]
+    fn multi_hand_verified_two_leader_fixture() {
+        // Hand-computed end-to-end fixture: two leaders,
+        // leader "a" weight 1.0 gets a huge shock (5%) →
+        // per-leader multiplier 3.0. Leader "b" weight 0.25
+        // gets the same shock → per-leader multiplier 3.0
+        // → weight-scaled widening 1 + 0.25·(3−1) = 1.5.
+        // Aggregate = max(3.0, 1.5) = 3.0.
+        let mut g = MultiLeaderLeadLagGuard::new(fixture_config());
+        g.register_leader("a", dec!(1));
+        g.register_leader("b", dec!(0.25));
+        warmup_multi(&mut g, "a", dec!(50000));
+        warmup_multi(&mut g, "b", dec!(30000));
+        g.on_leader_mid("a", dec!(52500));
+        g.on_leader_mid("b", dec!(31500));
+        assert_eq!(g.current_multiplier(), dec!(3));
+        // If we now unregister "a", the aggregate collapses
+        // to just "b"'s scaled contribution: 1.5.
+        g.unregister_leader("a");
+        assert_eq!(g.current_multiplier(), dec!(1.5));
     }
 }

@@ -53,6 +53,7 @@ prometheus = { version = "0.13", default-features = false }
 
 # Config
 toml = "0.8"
+regex = "1"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }

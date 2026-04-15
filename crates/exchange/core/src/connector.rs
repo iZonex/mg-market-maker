@@ -367,6 +367,27 @@ pub trait ExchangeConnector: Send + Sync {
     /// Get product specification (tick/lot sizes, fees).
     async fn get_product_spec(&self, symbol: &str) -> anyhow::Result<ProductSpec>;
 
+    /// List **all** symbols currently exposed on the venue's public
+    /// exchange-info endpoint, including symbols the engine is not
+    /// currently subscribed to. Used by the Epic F listing sniper
+    /// (`crates/engine/src/listing_sniper.rs`) to detect new listings
+    /// and removed/delisted symbols so operators can spin up a
+    /// probation engine instance for the new pair.
+    ///
+    /// Returned specs carry a `trading_status` populated from the
+    /// venue's per-symbol state field where the venue surfaces one
+    /// (Binance spot, HyperLiquid perps' `isDelisted` flag, etc.);
+    /// consumers that only care about "currently trading" symbols
+    /// should filter on `trading_status == TradingStatus::Trading`.
+    ///
+    /// The default impl returns `Err` so venues that do not expose
+    /// a public symbol-list endpoint (the custom client venue today,
+    /// for example) surface "unsupported" cleanly and the sniper
+    /// skips them on the next scan without polluting its cache.
+    async fn list_symbols(&self) -> anyhow::Result<Vec<ProductSpec>> {
+        Err(anyhow::anyhow!("list_symbols not supported on this venue"))
+    }
+
     // --- Health ---
 
     /// Health check.

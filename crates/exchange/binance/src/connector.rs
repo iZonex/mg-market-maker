@@ -471,74 +471,25 @@ impl ExchangeConnector for BinanceConnector {
             .and_then(|a| a.first())
             .ok_or_else(|| anyhow::anyhow!("symbol not found"))?;
 
-        let base = sym
-            .get("baseAsset")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let quote = sym
-            .get("quoteAsset")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        parse_binance_spot_symbol(sym)
+            .ok_or_else(|| anyhow::anyhow!("malformed Binance spot symbol entry for {symbol}"))
+    }
 
-        // Extract filters.
-        let filters = sym
-            .get("filters")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let mut tick_size = dec!(0.01);
-        let mut lot_size = dec!(0.00001);
-        let mut min_notional = dec!(10);
-
-        for f in &filters {
-            match f.get("filterType").and_then(|v| v.as_str()) {
-                Some("PRICE_FILTER") => {
-                    if let Some(ts) = f.get("tickSize").and_then(|v| v.as_str()) {
-                        tick_size = ts.parse().unwrap_or(tick_size);
-                    }
-                }
-                Some("LOT_SIZE") => {
-                    if let Some(ss) = f.get("stepSize").and_then(|v| v.as_str()) {
-                        lot_size = ss.parse().unwrap_or(lot_size);
-                    }
-                }
-                Some("NOTIONAL" | "MIN_NOTIONAL") => {
-                    if let Some(mn) = f.get("minNotional").and_then(|v| v.as_str()) {
-                        min_notional = mn.parse().unwrap_or(min_notional);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // P2.3: parse the venue's per-symbol trading status so
-        // the lifecycle manager can detect halts/resumes/delistings
-        // on the periodic refresh cadence.
-        let trading_status = match sym.get("status").and_then(|v| v.as_str()) {
-            Some("TRADING") => TradingStatus::Trading,
-            Some("HALT") => TradingStatus::Halted,
-            Some("BREAK") | Some("END_OF_DAY") | Some("POST_TRADING") => TradingStatus::Break,
-            Some("PRE_TRADING") | Some("AUCTION_MATCH") => TradingStatus::PreTrading,
-            // Binance Spot does not surface a `DELISTED` status —
-            // delisted symbols disappear from `exchangeInfo`
-            // entirely and the call returns "symbol not found",
-            // which the lifecycle manager treats as `Delisted`.
-            Some(_) | None => TradingStatus::Trading,
-        };
-
-        Ok(ProductSpec {
-            symbol: symbol.to_string(),
-            base_asset: base,
-            quote_asset: quote,
-            tick_size,
-            lot_size,
-            min_notional,
-            maker_fee: dec!(0.001),
-            taker_fee: dec!(0.001),
-            trading_status,
-        })
+    /// List every symbol Binance spot currently advertises via
+    /// `GET /api/v3/exchangeInfo` (no `symbol=` parameter). Every
+    /// row is mapped through the same helper as `get_product_spec`
+    /// so the two call sites stay in lockstep on filter parsing and
+    /// trading-status mapping. Symbols in non-trading states
+    /// (`BREAK`, `HALT`, `PRE_TRADING`, …) are still returned so
+    /// the Epic F listing sniper sees new listings during their
+    /// auction phase; the consumer filters by `trading_status`.
+    async fn list_symbols(&self) -> anyhow::Result<Vec<ProductSpec>> {
+        // `/api/v3/exchangeInfo` with no symbol is weight 10 on
+        // Binance spot — same cost as the per-symbol path above.
+        self.rate_limiter.acquire(10).await;
+        let url = format!("{}/api/v3/exchangeInfo", self.base_url);
+        let resp: Value = self.client.get(&url).send().await?.json().await?;
+        Ok(parse_binance_spot_symbols_array(&resp))
     }
 
     async fn health_check(&self) -> anyhow::Result<bool> {
@@ -673,6 +624,97 @@ pub(crate) fn parse_binance_event(stream: &str, data: &Value) -> Option<MarketEv
     }
 }
 
+/// Parse a single `symbols[]` entry from `/api/v3/exchangeInfo`
+/// into a [`ProductSpec`]. Shared between `get_product_spec`
+/// (single-symbol path) and `list_symbols` (whole-universe path)
+/// so the two call sites stay in lockstep on filter parsing and
+/// trading-status mapping. Pure helper so the wire shape is
+/// unit-tested without an HTTP client. Returns `None` when a row
+/// lacks the `symbol` field (malformed response).
+pub(crate) fn parse_binance_spot_symbol(sym: &Value) -> Option<ProductSpec> {
+    let symbol = sym.get("symbol").and_then(|v| v.as_str())?.to_string();
+    let base = sym
+        .get("baseAsset")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let quote = sym
+        .get("quoteAsset")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let filters = sym
+        .get("filters")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut tick_size = dec!(0.01);
+    let mut lot_size = dec!(0.00001);
+    let mut min_notional = dec!(10);
+    for f in &filters {
+        match f.get("filterType").and_then(|v| v.as_str()) {
+            Some("PRICE_FILTER") => {
+                if let Some(ts) = f.get("tickSize").and_then(|v| v.as_str()) {
+                    tick_size = ts.parse().unwrap_or(tick_size);
+                }
+            }
+            Some("LOT_SIZE") => {
+                if let Some(ss) = f.get("stepSize").and_then(|v| v.as_str()) {
+                    lot_size = ss.parse().unwrap_or(lot_size);
+                }
+            }
+            Some("NOTIONAL" | "MIN_NOTIONAL") => {
+                if let Some(mn) = f.get("minNotional").and_then(|v| v.as_str()) {
+                    min_notional = mn.parse().unwrap_or(min_notional);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // P2.3: parse the venue's per-symbol trading status so
+    // the lifecycle manager can detect halts/resumes/delistings.
+    // The listing sniper (Epic F) also reads this so it can flag
+    // PRE_TRADING / AUCTION_MATCH symbols during their listing
+    // auction phase without having to re-query the venue.
+    let trading_status = match sym.get("status").and_then(|v| v.as_str()) {
+        Some("TRADING") => TradingStatus::Trading,
+        Some("HALT") => TradingStatus::Halted,
+        Some("BREAK") | Some("END_OF_DAY") | Some("POST_TRADING") => TradingStatus::Break,
+        Some("PRE_TRADING") | Some("AUCTION_MATCH") => TradingStatus::PreTrading,
+        // Binance Spot does not surface a `DELISTED` status —
+        // delisted symbols disappear from `exchangeInfo`
+        // entirely and the call returns "symbol not found".
+        Some(_) | None => TradingStatus::Trading,
+    };
+
+    Some(ProductSpec {
+        symbol,
+        base_asset: base,
+        quote_asset: quote,
+        tick_size,
+        lot_size,
+        min_notional,
+        maker_fee: dec!(0.001),
+        taker_fee: dec!(0.001),
+        trading_status,
+    })
+}
+
+/// Parse the full `/api/v3/exchangeInfo` response body into the
+/// list of [`ProductSpec`] entries used by `list_symbols`. Walks
+/// `resp.symbols[]` and maps every row through
+/// [`parse_binance_spot_symbol`]. Malformed rows are silently
+/// dropped — the consumer sees `Ok(vec)` with the subset the
+/// venue returned cleanly, not a hard error.
+pub(crate) fn parse_binance_spot_symbols_array(resp: &Value) -> Vec<ProductSpec> {
+    resp.get("symbols")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(parse_binance_spot_symbol).collect())
+        .unwrap_or_default()
+}
+
 pub(crate) fn parse_levels(value: Option<&Value>) -> anyhow::Result<Vec<PriceLevel>> {
     let arr = value
         .and_then(|v| v.as_array())
@@ -761,6 +803,83 @@ mod tests {
         });
         let info = parse_binance_spot_fee_response(&resp, "BTCUSDT").unwrap();
         assert_eq!(info.maker_fee, dec!(0.0009));
+    }
+
+    /// Listing sniper (Epic F): `parse_binance_spot_symbols_array`
+    /// maps every `symbols[]` row through the shared helper. Pin
+    /// the whole-universe shape so a schema drift breaks the test
+    /// instead of silently dropping a symbol from the sniper's
+    /// view of the venue.
+    #[test]
+    fn list_symbols_parses_full_exchange_info_response() {
+        let resp = serde_json::json!({
+            "symbols": [
+                {
+                    "symbol": "BTCUSDT",
+                    "baseAsset": "BTC",
+                    "quoteAsset": "USDT",
+                    "status": "TRADING",
+                    "filters": [
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                        {"filterType": "LOT_SIZE", "stepSize": "0.00001"},
+                        {"filterType": "NOTIONAL", "minNotional": "10"}
+                    ]
+                },
+                {
+                    "symbol": "ETHUSDT",
+                    "baseAsset": "ETH",
+                    "quoteAsset": "USDT",
+                    "status": "TRADING",
+                    "filters": [
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
+                        {"filterType": "LOT_SIZE", "stepSize": "0.0001"},
+                        {"filterType": "NOTIONAL", "minNotional": "10"}
+                    ]
+                },
+                {
+                    "symbol": "NEWUSDT",
+                    "baseAsset": "NEW",
+                    "quoteAsset": "USDT",
+                    "status": "PRE_TRADING",
+                    "filters": []
+                }
+            ]
+        });
+        let specs = parse_binance_spot_symbols_array(&resp);
+        assert_eq!(specs.len(), 3);
+        let btc = specs.iter().find(|s| s.symbol == "BTCUSDT").unwrap();
+        assert_eq!(btc.base_asset, "BTC");
+        assert_eq!(btc.quote_asset, "USDT");
+        assert_eq!(btc.tick_size, dec!(0.01));
+        assert_eq!(btc.trading_status, TradingStatus::Trading);
+        let new = specs.iter().find(|s| s.symbol == "NEWUSDT").unwrap();
+        // PRE_TRADING symbols are still returned — the sniper
+        // consumer filters by trading_status post-hoc.
+        assert_eq!(new.trading_status, TradingStatus::PreTrading);
+    }
+
+    /// Malformed rows (missing `symbol` field) are silently
+    /// dropped so the sniper gets the subset the venue returned
+    /// cleanly instead of a hard error.
+    #[test]
+    fn list_symbols_drops_malformed_rows_silently() {
+        let resp = serde_json::json!({
+            "symbols": [
+                {"symbol": "BTCUSDT", "baseAsset": "BTC", "quoteAsset": "USDT", "status": "TRADING", "filters": []},
+                {"baseAsset": "ETH", "quoteAsset": "USDT", "status": "TRADING", "filters": []}
+            ]
+        });
+        let specs = parse_binance_spot_symbols_array(&resp);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].symbol, "BTCUSDT");
+    }
+
+    /// Empty response body (venue returned no `symbols` field)
+    /// yields an empty vec rather than panicking.
+    #[test]
+    fn list_symbols_empty_response_is_empty_vec() {
+        let resp = serde_json::json!({});
+        assert!(parse_binance_spot_symbols_array(&resp).is_empty());
     }
 
     /// Capability audit: `supports_ws_trading` and `supports_fix` must

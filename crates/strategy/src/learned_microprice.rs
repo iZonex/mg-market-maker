@@ -28,21 +28,25 @@
 //! `min_bucket_samples` observations clamp to zero at
 //! `finalize` time to avoid noisy predictions.
 //!
-//! TOML / JSON persistence and the offline CLI fit tool are
-//! deferred to Sprint D-4 where the engine integration is
-//! also landing — the wave-1 core ships alone for D-2.
+//! TOML persistence + the offline CLI fit tool
+//! (`mm-learned-microprice-fit` binary) land in stage-2 polish
+//! alongside the engine integration — see
+//! `docs/sprints/epic-d-stage2-polish.md` §2A.
 //!
 //! Full formula + source attribution in
 //! `docs/research/signal-wave-2-formulas.md`
 //! §"Sub-component #2".
 
+use anyhow::{Context, Result};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// Tuning knobs for the G-function fit. See
 /// `docs/research/signal-wave-2-formulas.md` §"Sub-component #2"
 /// for how each parameter enters the math.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearnedMicropriceConfig {
     /// Number of equal-width bins on the imbalance axis. Must be
     /// ≥ 2. Default 20.
@@ -71,7 +75,14 @@ impl Default for LearnedMicropriceConfig {
 /// [`LearnedMicroprice::accumulate`] calls + one
 /// [`LearnedMicroprice::finalize`], then query via
 /// [`LearnedMicroprice::predict`].
-#[derive(Debug, Clone)]
+///
+/// Serialisable for on-disk persistence via
+/// [`LearnedMicroprice::to_toml`] / [`LearnedMicroprice::from_toml`].
+/// The transient `spread_samples` accumulator is skipped — once a
+/// model is finalised it carries no per-observation state and the
+/// `spread_edges` / `g_matrix` are sufficient to reproduce
+/// predictions byte-for-byte.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearnedMicroprice {
     config: LearnedMicropriceConfig,
     /// Running sum of `Δmid` per bucket, indexed as `[i][s]`.
@@ -79,7 +90,10 @@ pub struct LearnedMicroprice {
     /// Running count per bucket.
     bucket_count: Vec<Vec<usize>>,
     /// Spread samples used to compute the quantile edges at
-    /// finalize time. Dropped after `finalize`.
+    /// finalize time. Dropped after `finalize`. Skipped in
+    /// serialisation — it is always empty by the time a model
+    /// is written to disk.
+    #[serde(skip, default)]
     spread_samples: Vec<Decimal>,
     /// Length `n_spread_buckets - 1` quantile edges on the
     /// spread axis. Populated by [`Self::finalize`]; empty
@@ -287,6 +301,34 @@ impl LearnedMicroprice {
     pub fn bucket_count(&self, i: usize, s: usize) -> usize {
         self.bucket_count[i][s]
     }
+
+    /// Serialise the model to a TOML file at `path`. Persists
+    /// the full finalised state (config, `bucket_sum`,
+    /// `bucket_count`, `spread_edges`, `g_matrix`, `finalized`
+    /// flag). Transient `spread_samples` are not written — they
+    /// are always empty after [`Self::finalize`] and carry no
+    /// value for a reloaded model.
+    ///
+    /// Round-trip property: a model written with `to_toml` and
+    /// re-loaded with [`Self::from_toml`] produces byte-identical
+    /// [`Self::predict`] output for every `(imbalance, spread)`
+    /// input. See `learned_microprice_toml_*` tests.
+    pub fn to_toml(&self, path: &Path) -> Result<()> {
+        let s = toml::to_string_pretty(self)
+            .context("failed to serialise LearnedMicroprice to TOML")?;
+        std::fs::write(path, s)
+            .with_context(|| format!("failed to write TOML to {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Load a previously-persisted model from `path`. The TOML
+    /// file must match the schema produced by [`Self::to_toml`].
+    pub fn from_toml(path: &Path) -> Result<Self> {
+        let s = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read TOML from {}", path.display()))?;
+        let model: Self = toml::from_str(&s).context("failed to parse LearnedMicroprice TOML")?;
+        Ok(model)
+    }
 }
 
 /// Map imbalance ∈ `[-1, 1]` to a bucket index in
@@ -488,6 +530,101 @@ mod tests {
         // (i = 3) on spread bucket 0 since n_spread_buckets = 1.
         assert_eq!(mp.bucket_count(3, 0), 7);
         assert_eq!(mp.bucket_count(0, 0), 0);
+    }
+
+    // ------------------------- TOML persistence -------------------------
+
+    fn tmp_path(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        // Unique-ish suffix so parallel test threads don't stomp.
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        p.push(format!("mm_lmp_{name}_{uniq}.toml"));
+        p
+    }
+
+    #[test]
+    fn learned_microprice_toml_empty_roundtrip() {
+        let mp = LearnedMicroprice::empty(single_bucket_config());
+        let path = tmp_path("empty");
+        mp.to_toml(&path).expect("write empty model");
+        let reloaded = LearnedMicroprice::from_toml(&path).expect("read empty model");
+        assert!(!reloaded.is_finalized());
+        assert_eq!(reloaded.config.n_imbalance_buckets, 4);
+        assert_eq!(reloaded.config.n_spread_buckets, 1);
+        assert_eq!(reloaded.config.min_bucket_samples, 5);
+        assert_eq!(reloaded.g_matrix().len(), 4);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn learned_microprice_toml_finalized_fit_roundtrip() {
+        let mut mp = LearnedMicroprice::empty(single_bucket_config());
+        for _ in 0..8 {
+            mp.accumulate(dec!(0.8), dec!(0.01), dec!(0.5));
+        }
+        mp.finalize();
+        let path = tmp_path("finalized");
+        mp.to_toml(&path).expect("write");
+        let reloaded = LearnedMicroprice::from_toml(&path).expect("read");
+        assert!(reloaded.is_finalized());
+        assert_eq!(reloaded.g_matrix(), mp.g_matrix());
+        assert_eq!(reloaded.bucket_count(3, 0), mp.bucket_count(3, 0));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn learned_microprice_toml_spread_edges_roundtrip() {
+        let config = LearnedMicropriceConfig {
+            n_imbalance_buckets: 2,
+            n_spread_buckets: 3,
+            min_bucket_samples: 1,
+        };
+        let mut mp = LearnedMicroprice::empty(config);
+        mp.with_spread_edges(vec![dec!(0.02), dec!(0.08)]);
+        // A few observations so the g_matrix is non-trivial.
+        mp.accumulate_with_edges(dec!(-0.5), dec!(0.01), dec!(-0.1));
+        mp.accumulate_with_edges(dec!(0.5), dec!(0.05), dec!(0.2));
+        mp.accumulate_with_edges(dec!(0.5), dec!(0.2), dec!(0.4));
+        mp.finalize();
+        let path = tmp_path("edges");
+        mp.to_toml(&path).expect("write");
+        let reloaded = LearnedMicroprice::from_toml(&path).expect("read");
+        assert_eq!(reloaded.spread_edges(), mp.spread_edges());
+        assert_eq!(reloaded.spread_edges().len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn learned_microprice_toml_prediction_parity_post_roundtrip() {
+        let config = LearnedMicropriceConfig {
+            n_imbalance_buckets: 4,
+            n_spread_buckets: 2,
+            min_bucket_samples: 2,
+        };
+        let mut mp = LearnedMicroprice::empty(config);
+        mp.with_spread_edges(vec![dec!(0.05)]);
+        for _ in 0..4 {
+            mp.accumulate_with_edges(dec!(-0.8), dec!(0.01), dec!(-0.2));
+            mp.accumulate_with_edges(dec!(0.8), dec!(0.1), dec!(0.3));
+        }
+        mp.finalize();
+        let path = tmp_path("parity");
+        mp.to_toml(&path).expect("write");
+        let reloaded = LearnedMicroprice::from_toml(&path).expect("read");
+        // Exhaustive prediction parity over a grid of inputs.
+        for im in [dec!(-0.9), dec!(-0.3), dec!(0.3), dec!(0.9)] {
+            for sp in [dec!(0.001), dec!(0.03), dec!(0.06), dec!(0.2)] {
+                assert_eq!(
+                    reloaded.predict(im, sp),
+                    mp.predict(im, sp),
+                    "prediction mismatch at im={im}, sp={sp}"
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

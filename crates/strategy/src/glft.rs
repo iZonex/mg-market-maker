@@ -155,6 +155,31 @@ impl Strategy for GlftStrategy {
         let fair = ctx.mid_price;
         let min_spread = bps_to_frac(ctx.config.min_spread_bps) * fair;
 
+        // Epic D stage-2 sub-component 2B — Cartea
+        // adverse-selection closed-form spread widening
+        // (Cartea-Jaimungal-Penalva 2015 ch.4 §4.3 eq. 4.20).
+        // Mirrors the Avellaneda path in `avellaneda.rs`: when
+        // `ctx.as_prob` is `Some(ρ)`, additively widen the
+        // GLFT half-spread by `(1 − 2ρ) · σ · √(T − t)` and
+        // re-clamp at the `min_spread / 2` floor.
+        //
+        // `ρ > 0.5` narrows toward the floor (MM retreats from
+        // informed flow), `ρ < 0.5` widens. `ctx.as_prob ==
+        // None` OR `ctx.as_prob == Some(0.5)` produce a
+        // *byte-identical* half-spread to the pre-stage-2
+        // wave-1 path — guaranteed by explicitly early-out on
+        // both cases so neither the floor nor the arithmetic
+        // can perturb the output.
+        let half_spread_t = match ctx.as_prob {
+            None => half_spread_t,
+            Some(rho) if rho == dec!(0.5) => half_spread_t,
+            Some(rho) => {
+                let as_delta = (dec!(1) - dec!(2) * rho) * sigma * decimal_sqrt(ctx.time_remaining);
+                let min_half_spread = min_spread / dec!(2);
+                (half_spread_t + as_delta).max(min_half_spread)
+            }
+        };
+
         let mut quotes = Vec::with_capacity(ctx.config.num_levels);
 
         for level in 0..ctx.config.num_levels {
@@ -443,5 +468,226 @@ mod tests {
         // ln(e) ≈ 1
         let ln_e = decimal_ln_positive(e);
         assert!((ln_e - dec!(1)).abs() < dec!(0.01));
+    }
+
+    // -------- Epic D stage-2 sub-component 2B: GLFT + Cartea AS --------
+
+    /// Build a fresh `StrategyContext` with a custom `as_prob`.
+    /// Mirrors the `ctx_with_as_prob` helper from
+    /// `avellaneda.rs::tests`. Uses a large `volatility` and
+    /// `time_remaining` so the AS component
+    /// `(1 − 2ρ)·σ·√(T − t)` is on the order of hundreds of
+    /// dollars — easily visible above the tick floor and above
+    /// the min-spread re-clamp.
+    fn glft_ctx_with_as_prob<'a>(
+        book: &'a LocalOrderBook,
+        product: &'a ProductSpec,
+        config: &'a MarketMakerConfig,
+        as_prob: Option<Decimal>,
+    ) -> StrategyContext<'a> {
+        StrategyContext {
+            book,
+            product,
+            config,
+            inventory: dec!(0),
+            volatility: dec!(100),
+            time_remaining: dec!(1),
+            mid_price: book.mid_price().unwrap(),
+            ref_price: None,
+            hedge_book: None,
+            borrow_cost_bps: None,
+            hedge_book_age_ms: None,
+            as_prob,
+        }
+    }
+
+    fn glft_as_test_fixtures() -> (LocalOrderBook, ProductSpec, MarketMakerConfig) {
+        let product = ProductSpec {
+            symbol: "BTCUSDT".into(),
+            base_asset: "BTC".into(),
+            quote_asset: "USDT".into(),
+            tick_size: dec!(0.01),
+            lot_size: dec!(0.00001),
+            min_notional: dec!(10),
+            maker_fee: dec!(0.001),
+            taker_fee: dec!(0.002),
+            trading_status: Default::default(),
+        };
+        // NOTE on `min_spread_bps`: we deliberately use a tiny
+        // value (0.1 bps ≈ 0.5 on a 50k mid) so the AS component
+        // actually perturbs the output. With the default 5 bps
+        // floor, the raw GLFT `half_spread_t` of ~0.013 is
+        // already far below floor and any ρ perturbation of
+        // `(1 − 2ρ)·σ·√(T − t) ≈ ±0.02` would be eaten by the
+        // post-level floor re-clamp. Tiny floor → raw spread
+        // is above floor → AS additive is visible in the
+        // bid/ask prices.
+        let config = MarketMakerConfig {
+            gamma: dec!(0.1),
+            kappa: dec!(1.5),
+            sigma: dec!(0.02),
+            time_horizon_secs: 300,
+            num_levels: 1,
+            order_size: dec!(0.001),
+            refresh_interval_ms: 500,
+            min_spread_bps: dec!(0.1),
+            max_distance_bps: dec!(100),
+            strategy: mm_common::config::StrategyType::Glft,
+            momentum_enabled: false,
+            momentum_window: 200,
+            basis_shift: dec!(0.5),
+            market_resilience_enabled: true,
+            otr_enabled: true,
+            hma_enabled: true,
+            hma_window: 9,
+            user_stream_enabled: true,
+            inventory_drift_tolerance: dec!(0.0001),
+            inventory_drift_auto_correct: false,
+            amend_enabled: true,
+            amend_max_ticks: 2,
+            fee_tier_refresh_enabled: true,
+            fee_tier_refresh_secs: 600,
+            borrow_enabled: false,
+            borrow_rate_refresh_secs: 1800,
+            borrow_holding_secs: 3600,
+            borrow_max_base: dec!(0),
+            borrow_buffer_base: dec!(0),
+            pair_lifecycle_enabled: true,
+            pair_lifecycle_refresh_secs: 300,
+            var_guard_enabled: false,
+            var_guard_limit_95: None,
+            var_guard_limit_99: None,
+            cross_venue_basis_max_staleness_ms: 1500,
+        };
+        let mut book = LocalOrderBook::new("BTCUSDT".into());
+        book.apply_snapshot(
+            vec![mm_common::PriceLevel {
+                price: dec!(50000),
+                qty: dec!(1),
+            }],
+            vec![mm_common::PriceLevel {
+                price: dec!(50001),
+                qty: dec!(1),
+            }],
+            1,
+        );
+        (book, product, config)
+    }
+
+    #[test]
+    fn glft_as_prob_none_is_byte_identical_to_wave1() {
+        // Baseline: build the strategy twice, once without
+        // `as_prob`, once with `as_prob = None`. Since None is
+        // the default, these should be trivially equal — the
+        // test exists to guard against a future refactor
+        // introducing a side effect.
+        let (book, product, config) = glft_as_test_fixtures();
+        let strategy = GlftStrategy::new();
+        let ctx_a = glft_ctx_with_as_prob(&book, &product, &config, None);
+        let ctx_b = glft_ctx_with_as_prob(&book, &product, &config, None);
+        let q_a = strategy.compute_quotes(&ctx_a);
+        let q_b = strategy.compute_quotes(&ctx_b);
+        assert_eq!(
+            q_a[0].bid.as_ref().map(|q| q.price),
+            q_b[0].bid.as_ref().map(|q| q.price)
+        );
+        assert_eq!(
+            q_a[0].ask.as_ref().map(|q| q.price),
+            q_b[0].ask.as_ref().map(|q| q.price)
+        );
+    }
+
+    #[test]
+    fn glft_as_prob_neutral_half_is_byte_identical_to_none() {
+        // `Some(0.5)` is the "I have no AS signal" value —
+        // the additive component is zero by construction.
+        // Must produce byte-identical output to the `None`
+        // code path.
+        let (book, product, config) = glft_as_test_fixtures();
+        let strategy = GlftStrategy::new();
+        let ctx_none = glft_ctx_with_as_prob(&book, &product, &config, None);
+        let ctx_neutral = glft_ctx_with_as_prob(&book, &product, &config, Some(dec!(0.5)));
+        let q_none = strategy.compute_quotes(&ctx_none);
+        let q_neutral = strategy.compute_quotes(&ctx_neutral);
+        let p_none_bid = q_none[0].bid.as_ref().map(|q| q.price);
+        let p_none_ask = q_none[0].ask.as_ref().map(|q| q.price);
+        let p_neu_bid = q_neutral[0].bid.as_ref().map(|q| q.price);
+        let p_neu_ask = q_neutral[0].ask.as_ref().map(|q| q.price);
+        assert_eq!(p_none_bid, p_neu_bid);
+        assert_eq!(p_none_ask, p_neu_ask);
+    }
+
+    #[test]
+    fn glft_as_prob_zero_widens_spread() {
+        // ρ = 0 means full uninformed flow — AS component is
+        // +σ·√(T − t) and the spread should widen vs the
+        // neutral case.
+        let (book, product, config) = glft_as_test_fixtures();
+        let strategy = GlftStrategy::new();
+        let ctx_neutral = glft_ctx_with_as_prob(&book, &product, &config, Some(dec!(0.5)));
+        let ctx_wide = glft_ctx_with_as_prob(&book, &product, &config, Some(dec!(0)));
+        let q_neutral = strategy.compute_quotes(&ctx_neutral);
+        let q_wide = strategy.compute_quotes(&ctx_wide);
+        let neutral_spread =
+            q_neutral[0].ask.as_ref().unwrap().price - q_neutral[0].bid.as_ref().unwrap().price;
+        let wide_spread =
+            q_wide[0].ask.as_ref().unwrap().price - q_wide[0].bid.as_ref().unwrap().price;
+        assert!(
+            wide_spread > neutral_spread,
+            "ρ=0 should widen the spread: neutral={neutral_spread}, wide={wide_spread}",
+        );
+    }
+
+    #[test]
+    fn glft_as_prob_one_narrows_toward_floor() {
+        // ρ = 1 means full informed flow — the AS component
+        // is −σ·√(T − t). The re-clamp at `min_half_spread`
+        // should keep the output above the floor but strictly
+        // narrower than (or equal to) the neutral case.
+        let (book, product, config) = glft_as_test_fixtures();
+        let strategy = GlftStrategy::new();
+        let ctx_neutral = glft_ctx_with_as_prob(&book, &product, &config, Some(dec!(0.5)));
+        let ctx_narrow = glft_ctx_with_as_prob(&book, &product, &config, Some(dec!(1)));
+        let q_neutral = strategy.compute_quotes(&ctx_neutral);
+        let q_narrow = strategy.compute_quotes(&ctx_narrow);
+        let neutral_spread =
+            q_neutral[0].ask.as_ref().unwrap().price - q_neutral[0].bid.as_ref().unwrap().price;
+        let narrow_spread =
+            q_narrow[0].ask.as_ref().unwrap().price - q_narrow[0].bid.as_ref().unwrap().price;
+        assert!(
+            narrow_spread <= neutral_spread,
+            "ρ=1 should not widen the spread: neutral={neutral_spread}, narrow={narrow_spread}",
+        );
+        // Floor: min_spread = 5 bps on 50000.5 mid ≈ 25.00025.
+        // The narrow spread must still respect that floor.
+        let mid = book.mid_price().unwrap();
+        let min_spread = bps_to_frac(config.min_spread_bps) * mid;
+        assert!(
+            narrow_spread >= min_spread - dec!(0.0001),
+            "narrow spread {narrow_spread} fell below floor {min_spread}",
+        );
+    }
+
+    #[test]
+    fn glft_as_prob_monotone_across_rho() {
+        // Sweep ρ from 0 → 0.25 → 0.5 and verify the spread
+        // monotonically shrinks (or stays equal, never
+        // widens).
+        let (book, product, config) = glft_as_test_fixtures();
+        let strategy = GlftStrategy::new();
+        let rhos = [dec!(0), dec!(0.25), dec!(0.5)];
+        let mut prev: Option<Decimal> = None;
+        for rho in rhos {
+            let ctx = glft_ctx_with_as_prob(&book, &product, &config, Some(rho));
+            let q = strategy.compute_quotes(&ctx);
+            let spread = q[0].ask.as_ref().unwrap().price - q[0].bid.as_ref().unwrap().price;
+            if let Some(p) = prev {
+                assert!(
+                    spread <= p,
+                    "non-monotone at ρ={rho}: spread={spread}, prev={p}"
+                );
+            }
+            prev = Some(spread);
+        }
     }
 }

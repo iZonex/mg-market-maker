@@ -25,5 +25,6 @@
 //! real fills.
 
 pub mod cost;
+pub mod dispatch;
 pub mod router;
 pub mod venue_state;

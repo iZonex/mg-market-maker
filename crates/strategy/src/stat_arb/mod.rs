@@ -19,8 +19,8 @@ pub mod signal;
 
 pub use cointegration::{CointegrationResult, EngleGrangerTest};
 pub use driver::{
-    NullStatArbSink, StatArbDriver, StatArbDriverConfig, StatArbEvent, StatArbEventSink,
-    StatArbPair, StatArbPosition,
+    ExitLegs, LegDispatchReport, LegOutcome, NullStatArbSink, StatArbDriver, StatArbDriverConfig,
+    StatArbEvent, StatArbEventSink, StatArbPair, StatArbPosition,
 };
 pub use kalman::KalmanHedgeRatio;
 pub use signal::{SignalAction, SpreadDirection, ZScoreConfig, ZScoreSignal};

@@ -4,7 +4,7 @@ Production-grade market maker for the custom exchange at `../exchange/` with mul
 
 ## Stats
 
-**18 crates, 154 files, ~49K lines Rust, 920 tests**
+**18 crates, 156 files, ~50K lines Rust, 1001 tests**
 
 ## Architecture
 
@@ -16,7 +16,8 @@ engine/                Main event loop — ALL subsystems wired:
   ├── book_keeper      Local orderbook from WS
   ├── order_id_map     UUID ↔ exchange native ID mapping
   ├── pair_lifecycle   Halt / delisting / tick-lot drift (P2.3 s1)
-  ├── sor              Cross-venue Smart Order Router (Epic A)
+  ├── listing_sniper   New-listing discovery via list_symbols (Epic F #1 s2)
+  ├── sor              Cross-venue Smart Order Router + inline dispatch (Epic A s1+s2)
   └── balance_cache    Pre-check + reservation before placing
 common/                Types (Decimal, never f64), config, orderbook
 exchange/              Venue adapters (one abstraction, many connectors):
@@ -97,7 +98,7 @@ persistence/         State management:
 
 ```bash
 cargo build                    # build all
-cargo test                     # 920 tests
+cargo test                     # 1001 tests
 cargo clippy --all-targets -- -D warnings
 cargo run -p mm-server         # run live
 MM_MODE=paper cargo run -p mm-server   # paper trading

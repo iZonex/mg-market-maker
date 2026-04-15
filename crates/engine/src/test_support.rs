@@ -45,6 +45,13 @@ pub struct MockConnector {
     /// per-order fallback path.
     fail_next_batch_place: Mutex<bool>,
     fail_next_batch_cancel: Mutex<bool>,
+    /// Epic F listing sniper (stage-2): controllable output for
+    /// `list_symbols`. `None` (the default) makes `list_symbols`
+    /// return `Err(unsupported)` — the same shape the trait's
+    /// default impl uses for venues without a public symbol
+    /// endpoint. `Some(Ok(vec))` returns the vec; `Some(Err(_))`
+    /// simulates a connector-side failure.
+    list_symbols_response: Mutex<Option<Result<Vec<ProductSpec>, String>>>,
 }
 
 impl MockConnector {
@@ -71,7 +78,21 @@ impl MockConnector {
             cancel_single_calls: Mutex::new(0),
             fail_next_batch_place: Mutex::new(false),
             fail_next_batch_cancel: Mutex::new(false),
+            list_symbols_response: Mutex::new(None),
         }
+    }
+
+    /// Epic F listing sniper (stage-2): program the next (and
+    /// every subsequent) `list_symbols` call to return `Ok(specs)`.
+    pub fn set_list_symbols_ok(&self, specs: Vec<ProductSpec>) {
+        *self.list_symbols_response.lock().unwrap() = Some(Ok(specs));
+    }
+
+    /// Program `list_symbols` to return a connector-side error.
+    /// Used by the sniper's "connector Err → scan returns Err"
+    /// unit test.
+    pub fn set_list_symbols_err(&self, msg: impl Into<String>) {
+        *self.list_symbols_response.lock().unwrap() = Some(Err(msg.into()));
     }
 
     /// Builder: override `max_batch_size` from the default.
@@ -248,5 +269,20 @@ impl ExchangeConnector for MockConnector {
     }
     async fn health_check(&self) -> anyhow::Result<bool> {
         Ok(true)
+    }
+
+    /// Epic F listing sniper (stage-2): honour the programmed
+    /// response set via `set_list_symbols_ok` /
+    /// `set_list_symbols_err`. If nothing is programmed, fall
+    /// through to the trait default (`Err(unsupported)`) so
+    /// pre-existing tests that never touched the field keep the
+    /// "venue doesn't expose this" semantics.
+    async fn list_symbols(&self) -> anyhow::Result<Vec<ProductSpec>> {
+        let programmed = self.list_symbols_response.lock().unwrap().clone();
+        match programmed {
+            Some(Ok(specs)) => Ok(specs),
+            Some(Err(msg)) => Err(anyhow::anyhow!(msg)),
+            None => Err(anyhow::anyhow!("list_symbols not supported on this venue")),
+        }
     }
 }

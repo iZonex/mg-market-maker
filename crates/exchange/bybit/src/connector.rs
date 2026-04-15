@@ -588,42 +588,29 @@ impl ExchangeConnector for BybitConnector {
             .and_then(|l| l.as_array())
             .and_then(|a| a.first())
             .ok_or_else(|| anyhow::anyhow!("symbol not found"))?;
+        parse_bybit_instrument(item)
+            .ok_or_else(|| anyhow::anyhow!("malformed Bybit instrument row for {symbol}"))
+    }
 
-        let lot_filter = item.get("lotSizeFilter");
-        let price_filter = item.get("priceFilter");
-
-        let tick_size: Decimal = price_filter
-            .and_then(|f| f.get("tickSize"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("0.01")
-            .parse()
-            .unwrap_or(dec!(0.01));
-        let lot_size: Decimal = lot_filter
-            .and_then(|f| f.get("qtyStep"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("0.001")
-            .parse()
-            .unwrap_or(dec!(0.001));
-
-        Ok(ProductSpec {
-            symbol: symbol.to_string(),
-            base_asset: item
-                .get("baseCoin")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            quote_asset: item
-                .get("quoteCoin")
-                .and_then(|v| v.as_str())
-                .unwrap_or("USDT")
-                .to_string(),
-            tick_size,
-            lot_size,
-            min_notional: dec!(5),
-            maker_fee: dec!(0.0002),
-            taker_fee: dec!(0.00055),
-            trading_status: Default::default(),
-        })
+    /// List every instrument currently exposed on the V5
+    /// `/v5/market/instruments-info` endpoint for **this**
+    /// connector's category. The connector is constructed with
+    /// exactly one `BybitCategory` (spot, linear, inverse), so
+    /// `list_symbols` queries only that one category — multi-
+    /// category scanning is a stage-3 follow-up tracked in the
+    /// Epic F closure note. Consumers that want all three build
+    /// three connectors and scan each one.
+    ///
+    /// `category=spot` is a **public** read on V5 (no auth
+    /// required), and the signed helper tolerates the empty
+    /// signature; we route through `signed_get` anyway so the
+    /// existing rate-limiter path is reused.
+    async fn list_symbols(&self) -> anyhow::Result<Vec<ProductSpec>> {
+        let params = format!("category={}", self.category.as_str());
+        let result = self
+            .signed_get("/v5/market/instruments-info", &params)
+            .await?;
+        Ok(parse_bybit_instruments_list(&result))
     }
 
     async fn health_check(&self) -> anyhow::Result<bool> {
@@ -655,6 +642,89 @@ pub(crate) fn parse_bybit_fee_rate_response(result: &Value, symbol: &str) -> Opt
         vip_tier: None,
         fetched_at: chrono::Utc::now(),
     })
+}
+
+/// Parse a single row from the Bybit V5
+/// `/v5/market/instruments-info` `result.list[]` array into a
+/// [`ProductSpec`]. Shared by `get_product_spec` (single-symbol)
+/// and `list_symbols` (whole-category). Pure helper so the wire
+/// shape is unit-tested without an HTTP client.
+///
+/// Bybit surfaces a per-instrument `status` field (`Trading`,
+/// `PreLaunch`, `Settling`, `Delivering`, `Closed`, …). Only
+/// `Trading` maps to [`TradingStatus::Trading`]; everything else
+/// is mapped conservatively so the Epic F listing sniper does not
+/// greenlight a pre-launch contract as "already trading".
+pub(crate) fn parse_bybit_instrument(item: &Value) -> Option<ProductSpec> {
+    let symbol = item.get("symbol").and_then(|v| v.as_str())?.to_string();
+    let lot_filter = item.get("lotSizeFilter");
+    let price_filter = item.get("priceFilter");
+
+    let tick_size: Decimal = price_filter
+        .and_then(|f| f.get("tickSize"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("0.01")
+        .parse()
+        .unwrap_or(dec!(0.01));
+    let lot_size: Decimal = lot_filter
+        .and_then(|f| f.get("qtyStep"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("0.001")
+        .parse()
+        .unwrap_or(dec!(0.001));
+
+    // `minOrderAmt` on spot / `minNotionalValue` on linear —
+    // fall back to dec!(5) when neither is present.
+    let min_notional: Decimal = lot_filter
+        .and_then(|f| {
+            f.get("minOrderAmt")
+                .or_else(|| f.get("minNotionalValue"))
+                .or_else(|| f.get("minOrderAmount"))
+        })
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(dec!(5));
+
+    let trading_status = match item.get("status").and_then(|v| v.as_str()) {
+        Some("Trading") => TradingStatus::Trading,
+        Some("PreLaunch") => TradingStatus::PreTrading,
+        Some("Settling") | Some("Delivering") => TradingStatus::Break,
+        Some("Closed") => TradingStatus::Delisted,
+        // Absent / unknown — assume trading (matches the
+        // old get_product_spec default behaviour).
+        Some(_) | None => TradingStatus::Trading,
+    };
+
+    Some(ProductSpec {
+        symbol,
+        base_asset: item
+            .get("baseCoin")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        quote_asset: item
+            .get("quoteCoin")
+            .and_then(|v| v.as_str())
+            .unwrap_or("USDT")
+            .to_string(),
+        tick_size,
+        lot_size,
+        min_notional,
+        maker_fee: dec!(0.0002),
+        taker_fee: dec!(0.00055),
+        trading_status,
+    })
+}
+
+/// Parse the `result` payload of `/v5/market/instruments-info`
+/// into the list of [`ProductSpec`] entries used by
+/// `list_symbols`. Malformed rows (missing `symbol`) are dropped.
+pub(crate) fn parse_bybit_instruments_list(result: &Value) -> Vec<ProductSpec> {
+    result
+        .get("list")
+        .and_then(|l| l.as_array())
+        .map(|arr| arr.iter().filter_map(parse_bybit_instrument).collect())
+        .unwrap_or_default()
 }
 
 /// Build the JSON body for `POST /v5/order/amend`. Pure function so
@@ -836,6 +906,51 @@ mod tests {
         let body2 = build_amend_body("spot", &amend2);
         assert!(body2.get("qty").is_some());
         assert!(body2.get("price").is_none());
+    }
+
+    /// Listing sniper (Epic F): parse a whole `instruments-info`
+    /// response into `ProductSpec` rows, mapping per-instrument
+    /// `status` to `TradingStatus` so the sniper consumer filters
+    /// out pre-launch / settling contracts post-hoc.
+    #[test]
+    fn list_symbols_parses_v5_instruments_info_payload() {
+        let result = serde_json::json!({
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "baseCoin": "BTC",
+                    "quoteCoin": "USDT",
+                    "status": "Trading",
+                    "priceFilter": {"tickSize": "0.10"},
+                    "lotSizeFilter": {"qtyStep": "0.001", "minOrderAmt": "5"}
+                },
+                {
+                    "symbol": "NEWUSDT",
+                    "baseCoin": "NEW",
+                    "quoteCoin": "USDT",
+                    "status": "PreLaunch",
+                    "priceFilter": {"tickSize": "0.0001"},
+                    "lotSizeFilter": {"qtyStep": "1"}
+                },
+                {
+                    "symbol": "DEADUSDT",
+                    "baseCoin": "DEAD",
+                    "quoteCoin": "USDT",
+                    "status": "Closed",
+                    "priceFilter": {"tickSize": "0.01"},
+                    "lotSizeFilter": {"qtyStep": "0.01"}
+                }
+            ]
+        });
+        let specs = parse_bybit_instruments_list(&result);
+        assert_eq!(specs.len(), 3);
+        let btc = specs.iter().find(|s| s.symbol == "BTCUSDT").unwrap();
+        assert_eq!(btc.tick_size, rd!(0.10));
+        assert_eq!(btc.trading_status, TradingStatus::Trading);
+        let new = specs.iter().find(|s| s.symbol == "NEWUSDT").unwrap();
+        assert_eq!(new.trading_status, TradingStatus::PreTrading);
+        let dead = specs.iter().find(|s| s.symbol == "DEADUSDT").unwrap();
+        assert_eq!(dead.trading_status, TradingStatus::Delisted);
     }
 
     /// Capability audit: declared capabilities must match implementation.

@@ -422,12 +422,12 @@ infrastructure (Epic D wave-1 inheritance).
 
 | Epic | Priority | Effort | Depends on | Unlocks |
 |------|---------|--------|------------|---------|
-| A — Cross-venue SOR | P1 | ~1 mo | none | ✅ stage-1 closed Apr 2026 |
-| B — Stat-arb pairs | P1 | ~1 mo | Epic C (per-strat PnL) | ✅ stage-1 closed Apr 2026 |
+| A — Cross-venue SOR | P1 | ~1 mo | none | ✅ stage-1+2 (inline dispatch) closed Apr 2026 |
+| B — Stat-arb pairs | P1 | ~1 mo | Epic C (per-strat PnL) | ✅ stage-1+2 (real leg dispatch) closed Apr 2026 |
 | C — Portfolio risk view | P1 | ~3 wk | per-strat PnL | ✅ stage-1 closed Apr 2026 |
-| D — Signal wave 2 | P1 | ~1 mo | none | ✅ stage-1 closed Apr 2026 |
+| D — Signal wave 2 | P1 | ~1 mo | none | ✅ stage-1+2 (lMP CLI + GLFT AS + per-side ρ) closed Apr 2026 |
 | E — Execution polish | P2 | ~2 wk | none | ✅ stage-1 closed Apr 2026 (io_uring + Coinbase Prime FIX deferred) |
-| F — Defensive layer | P2 | ~3 wk | cross-venue bundle | ✅ stage-1 closed Apr 2026 (listing sniper deferred) |
+| F — Defensive layer | P2 | ~3 wk | cross-venue bundle | ✅ stage-1+2 (listing sniper + regex news + multi-leader) closed Apr 2026 |
 
 **Total epic effort:** ~14-18 weeks if run sequentially, ~10
 weeks with two engineers parallelizing on independent epics
