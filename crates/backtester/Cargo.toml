@@ -17,8 +17,8 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
-rand = "0.8"
-rand_chacha = "0.3"
+rand = "0.9"
+rand_chacha = "0.9"
 
 [[bin]]
 name = "mm-probe"

@@ -28,7 +28,7 @@ version = "0.3.1"
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 
 # HTTP
@@ -49,10 +49,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Metrics
-prometheus = { version = "0.13", default-features = false }
+prometheus = { version = "0.14", default-features = false }
 
 # Config
-toml = "0.8"
+toml = "1.0"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -68,13 +68,13 @@ uuid = { version = "1", features = ["v4", "serde"] }
 async-trait = "0.1"
 
 # Crypto auth
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 hex = "0.4"
 
 # HyperLiquid signing (EIP-712 over secp256k1)
 k256 = { version = "0.13", features = ["ecdsa"] }
-sha3 = "0.10"
+sha3 = "0.11"
 rmp-serde = "1"
 
 # Internal crates
