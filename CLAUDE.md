@@ -4,7 +4,7 @@ Production-grade market maker for the custom exchange at `../exchange/` with mul
 
 ## Stats
 
-**18 crates, 156 files, ~50K lines Rust, 1014 tests**
+**18 crates, 156 files, ~50K lines Rust, 1016 tests**
 
 ## Architecture
 
@@ -98,7 +98,7 @@ persistence/         State management:
 
 ```bash
 cargo build                    # build all
-cargo test                     # 1014 tests
+cargo test                     # 1016 tests
 cargo clippy --all-targets -- -D warnings
 cargo run -p mm-server         # run live
 MM_MODE=paper cargo run -p mm-server   # paper trading

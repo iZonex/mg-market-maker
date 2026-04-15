@@ -194,6 +194,41 @@ impl BybitConnector {
         self.category
     }
 
+    /// Epic F stage-3 — multi-category symbol scan.
+    ///
+    /// Fans out one HTTP request per category (`spot`,
+    /// `linear`, `inverse`) against
+    /// `/v5/market/instruments-info`, parses each response
+    /// via the shared [`parse_bybit_instruments_list`]
+    /// helper, and returns the merged list.
+    ///
+    /// Operators running the listing sniper across all
+    /// Bybit V5 categories should call this from any single
+    /// connector instance — the connector's own
+    /// `self.category` is irrelevant; each category-specific
+    /// request is routed via the existing rate-limiter and
+    /// the shared `signed_get` path.
+    ///
+    /// Per-category failures are surfaced as `Err` —
+    /// partial-success aggregation is a stage-4 polish if
+    /// operators want it (the listing sniper consumer can
+    /// also catch the error and call per-category instead).
+    pub async fn list_symbols_all_categories(&self) -> anyhow::Result<Vec<ProductSpec>> {
+        let mut merged: Vec<ProductSpec> = Vec::new();
+        for category in [
+            BybitCategory::Spot,
+            BybitCategory::Linear,
+            BybitCategory::Inverse,
+        ] {
+            let params = format!("category={}", category.as_str());
+            let result = self
+                .signed_get("/v5/market/instruments-info", &params)
+                .await?;
+            merged.extend(parse_bybit_instruments_list(&result));
+        }
+        Ok(merged)
+    }
+
     async fn signed_get(&self, path: &str, params: &str) -> anyhow::Result<Value> {
         self.rate_limiter.acquire(1).await;
         let (ts, recv, sig) = auth::auth_headers(&self.api_key, &self.api_secret, params);
@@ -596,10 +631,11 @@ impl ExchangeConnector for BybitConnector {
     /// `/v5/market/instruments-info` endpoint for **this**
     /// connector's category. The connector is constructed with
     /// exactly one `BybitCategory` (spot, linear, inverse), so
-    /// `list_symbols` queries only that one category — multi-
-    /// category scanning is a stage-3 follow-up tracked in the
-    /// Epic F closure note. Consumers that want all three build
-    /// three connectors and scan each one.
+    /// `list_symbols` queries only that one category. To scan
+    /// all three at once use [`Self::list_symbols_all_categories`]
+    /// (Epic F stage-3) which fans out across spot + linear +
+    /// inverse without requiring three separate connector
+    /// instances.
     ///
     /// `category=spot` is a **public** read on V5 (no auth
     /// required), and the signed helper tolerates the empty
@@ -1072,5 +1108,90 @@ mod tests {
             BybitConnector::testnet("k", "s").category,
             BybitCategory::Linear
         );
+    }
+
+    // ---- Epic F stage-3: multi-category list_symbols ----
+
+    /// `parse_bybit_instruments_list` is the shared helper
+    /// that `list_symbols_all_categories` calls per category
+    /// before merging. Verify three independent fixtures
+    /// (one per category shape) parse + merge cleanly without
+    /// collisions across category boundaries.
+    #[test]
+    fn parse_bybit_multi_category_merge_preserves_all_rows() {
+        let spot = serde_json::json!({
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "baseCoin": "BTC",
+                    "quoteCoin": "USDT",
+                    "status": "Trading",
+                    "priceFilter": {"tickSize": "0.10"},
+                    "lotSizeFilter": {"qtyStep": "0.001", "minOrderAmt": "5"}
+                }
+            ]
+        });
+        let linear = serde_json::json!({
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "baseCoin": "BTC",
+                    "quoteCoin": "USDT",
+                    "status": "Trading",
+                    "priceFilter": {"tickSize": "0.5"},
+                    "lotSizeFilter": {"qtyStep": "0.001"}
+                },
+                {
+                    "symbol": "ETHUSDT",
+                    "baseCoin": "ETH",
+                    "quoteCoin": "USDT",
+                    "status": "Trading",
+                    "priceFilter": {"tickSize": "0.05"},
+                    "lotSizeFilter": {"qtyStep": "0.01"}
+                }
+            ]
+        });
+        let inverse = serde_json::json!({
+            "list": [
+                {
+                    "symbol": "BTCUSD",
+                    "baseCoin": "BTC",
+                    "quoteCoin": "USD",
+                    "status": "Trading",
+                    "priceFilter": {"tickSize": "0.5"},
+                    "lotSizeFilter": {"qtyStep": "1"}
+                }
+            ]
+        });
+        let mut merged = parse_bybit_instruments_list(&spot);
+        merged.extend(parse_bybit_instruments_list(&linear));
+        merged.extend(parse_bybit_instruments_list(&inverse));
+        // Both categories list BTCUSDT — listing sniper
+        // consumer dedupes per-(symbol, category) externally;
+        // the parser preserves both rows.
+        assert_eq!(merged.len(), 4);
+        let symbols: Vec<&str> = merged.iter().map(|p| p.symbol.as_str()).collect();
+        assert!(symbols.contains(&"BTCUSDT"));
+        assert!(symbols.contains(&"ETHUSDT"));
+        assert!(symbols.contains(&"BTCUSD"));
+        // Spot BTCUSDT and linear BTCUSDT have distinct
+        // tick sizes — the merge preserves both.
+        let btcusdt_ticks: Vec<rust_decimal::Decimal> = merged
+            .iter()
+            .filter(|p| p.symbol == "BTCUSDT")
+            .map(|p| p.tick_size)
+            .collect();
+        assert_eq!(btcusdt_ticks.len(), 2);
+        assert!(btcusdt_ticks.contains(&dec!(0.10)));
+        assert!(btcusdt_ticks.contains(&dec!(0.5)));
+    }
+
+    #[test]
+    fn parse_bybit_empty_categories_merge_yields_empty() {
+        let empty = serde_json::json!({"list": []});
+        let mut merged = parse_bybit_instruments_list(&empty);
+        merged.extend(parse_bybit_instruments_list(&empty));
+        merged.extend(parse_bybit_instruments_list(&empty));
+        assert!(merged.is_empty());
     }
 }

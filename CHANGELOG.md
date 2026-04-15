@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Epic F stage-3 — multi-category Bybit `list_symbols`**
+  (Apr 2026). Closes the deferral that Track 3 of the
+  stage-2 parallel push documented: the Bybit V5
+  `list_symbols` impl scoped to a single
+  `BybitCategory` (the connector's own
+  `self.category`). Stage-3 ships
+  [`BybitConnector::list_symbols_all_categories`] — a
+  public async helper that fans out one HTTP request per
+  category (`spot`, `linear`, `inverse`) against
+  `/v5/market/instruments-info`, parses each response via
+  the shared `parse_bybit_instruments_list` helper, and
+  returns the merged list. Operators running the listing
+  sniper across all Bybit V5 categories now call this
+  from any single connector instance instead of
+  spinning up three connectors. Per-category failures
+  surface as `Err` (partial-success aggregation is a
+  stage-4 polish; the listing sniper consumer can also
+  fall back to per-category calls). The trait
+  `list_symbols` impl stays per-category for backward
+  compat — operators with a multi-category use case
+  call the new helper directly. **2 new parser-level
+  tests** verifying the merge preserves all rows
+  (including same-symbol rows from different categories
+  with distinct tick sizes) and that an all-empty merge
+  yields an empty vec.
+  - **Workspace stats**: 1014 → **1016 tests** (+2),
+    workspace clippy `-D warnings` clean, workspace fmt
+    clean. Zero new dependencies.
+
 - **Epic D stage-3 — engine-side OFI + learned-MP
   auto-attach** (Apr 2026). Closes the second deferral
   the Epic D stage-1 closure note tracked: "OFI and
