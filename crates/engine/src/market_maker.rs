@@ -20,6 +20,8 @@ use mm_risk::hedge_optimizer::{HedgeBasket, HedgeOptimizer};
 use mm_risk::inventory::InventoryManager;
 use mm_risk::inventory_drift::InventoryDriftReconciler;
 use mm_risk::kill_switch::{KillLevel, KillSwitch, KillSwitchConfig};
+use mm_risk::lead_lag_guard::LeadLagGuard;
+use mm_risk::news_retreat::{NewsRetreatState, NewsRetreatStateMachine, NewsRetreatTransition};
 use mm_risk::otr::OrderToTradeRatio;
 use mm_risk::pnl::PnlTracker;
 use mm_risk::sla::{SlaConfig, SlaTracker};
@@ -254,6 +256,25 @@ pub struct MarketMakerEngine {
     stat_arb_driver: Option<StatArbDriver>,
     stat_arb_tick: std::time::Duration,
 
+    /// Lead-lag guard (Epic F sub-component #1). When attached,
+    /// the engine pushes every hedge-connector book event's mid
+    /// into the guard via `update_lead_lag_from_mid`, and the
+    /// resulting multiplier flows through
+    /// `auto_tuner.set_lead_lag_mult`. Operators can also call
+    /// `update_lead_lag_from_mid` manually from any orchestration
+    /// layer — the guard is a pure push-API state machine.
+    lead_lag_guard: Option<LeadLagGuard>,
+    /// Latched flag so we only emit a `LeadLagTriggered` audit
+    /// record on the `1.0 → > 1.0` transition. Resets when the
+    /// multiplier falls back to 1.0.
+    lead_lag_active: bool,
+    /// News retreat state machine (Epic F sub-component #2).
+    /// Operators feed headlines via the public
+    /// [`MarketMakerEngine::on_news_headline`] method. Critical-
+    /// class transitions escalate the kill switch to L2; all
+    /// transitions write audit records.
+    news_retreat: Option<NewsRetreatStateMachine>,
+
     // Tracking.
     sla_tracker: SlaTracker,
     pnl_tracker: PnlTracker,
@@ -405,6 +426,9 @@ impl MarketMakerEngine {
             funding_arb_tick: std::time::Duration::from_secs(60),
             stat_arb_driver: None,
             stat_arb_tick: std::time::Duration::from_secs(60),
+            lead_lag_guard: None,
+            lead_lag_active: false,
+            news_retreat: None,
             sla_tracker: SlaTracker::new(sla_config),
             pnl_tracker: PnlTracker::new(product.maker_fee, product.taker_fee),
             volume_limiter: mm_risk::VolumeLimitTracker::new(
@@ -629,6 +653,118 @@ impl MarketMakerEngine {
         self
     }
 
+    /// Attach a [`LeadLagGuard`] (Epic F sub-component #1).
+    /// The engine auto-feeds the guard with every hedge-
+    /// connector mid update via [`Self::update_lead_lag_from_mid`].
+    /// Operators with a separate orchestration layer can also
+    /// push leader mids directly via the same public method.
+    pub fn with_lead_lag_guard(mut self, guard: LeadLagGuard) -> Self {
+        self.lead_lag_guard = Some(guard);
+        self.lead_lag_active = false;
+        self
+    }
+
+    /// Attach a [`NewsRetreatStateMachine`] (Epic F sub-component
+    /// #2). Operators feed headlines via the public
+    /// [`Self::on_news_headline`] method. Critical-class
+    /// transitions escalate the kill switch to L2.
+    pub fn with_news_retreat(mut self, sm: NewsRetreatStateMachine) -> Self {
+        self.news_retreat = Some(sm);
+        self
+    }
+
+    /// Public push API for the lead-lag guard. Operators (or
+    /// the engine's own hedge-connector book event handler)
+    /// pipe the latest leader mid here. Updates the guard,
+    /// pushes the new multiplier into the autotuner, and
+    /// fires a `LeadLagTriggered` audit record on the
+    /// `1.0 → > 1.0` transition.
+    pub fn update_lead_lag_from_mid(&mut self, mid: Decimal) {
+        let Some(guard) = self.lead_lag_guard.as_mut() else {
+            return;
+        };
+        guard.on_leader_mid(mid);
+        let mult = guard.current_multiplier();
+        let z_abs = guard.current_z_abs();
+        self.auto_tuner.set_lead_lag_mult(mult);
+        let now_active = mult > dec!(1);
+        if now_active && !self.lead_lag_active {
+            self.audit.risk_event(
+                &self.symbol,
+                AuditEventType::LeadLagTriggered,
+                &format!("z_abs={z_abs} mult={mult}"),
+            );
+        }
+        self.lead_lag_active = now_active;
+    }
+
+    /// Public push API for the news retreat state machine.
+    /// Operators wire any feed source (Telegram bot, file
+    /// tail, paid Tiingo adapter, their own scraper) and call
+    /// this for each headline. Routes the transition to
+    /// audit + alert + autotuner + kill switch.
+    pub fn on_news_headline(&mut self, text: &str) {
+        let Some(sm) = self.news_retreat.as_mut() else {
+            return;
+        };
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let transition = sm.on_headline(text, now_ms);
+        if matches!(transition, NewsRetreatTransition::NoMatch) {
+            return;
+        }
+        // Update the autotuner multiplier on every non-NoMatch
+        // transition so the cooldown window stays in effect
+        // for refreshes / suppressions as well as promotions.
+        let mult = sm.current_multiplier(now_ms);
+        self.auto_tuner.set_news_retreat_mult(mult);
+        if let NewsRetreatTransition::Promoted { from, to } = transition {
+            self.audit.risk_event(
+                &self.symbol,
+                AuditEventType::NewsRetreatActivated,
+                &format!("{from:?} → {to:?}: {text}"),
+            );
+            if matches!(to, NewsRetreatState::Critical) {
+                self.kill_switch.manual_trigger(
+                    mm_risk::kill_switch::KillLevel::StopNewOrders,
+                    "news retreat: Critical headline",
+                );
+                error!(headline = %text, "news retreat Critical → kill switch L2");
+            } else {
+                warn!(headline = %text, ?to, "news retreat activated");
+            }
+        }
+    }
+
+    /// Refresh the news-retreat multiplier from the cooldown
+    /// timer. Called periodically (typically from the engine's
+    /// 30-second summary tick) so a Critical headline that
+    /// has cooled out properly drops the autotuner widening
+    /// without waiting for the next fresh headline. Fires a
+    /// `NewsRetreatExpired` audit record on the cooldown-
+    /// expiry transition.
+    pub fn tick_news_retreat(&mut self) {
+        let Some(sm) = self.news_retreat.as_mut() else {
+            return;
+        };
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let prev_state = sm.current_state(now_ms);
+        let mult = sm.current_multiplier(now_ms);
+        self.auto_tuner.set_news_retreat_mult(mult);
+        // current_state returns the post-expiry value, so a
+        // transition from active → Normal means cooldown
+        // just fired. Re-read after the expiry.
+        if !matches!(prev_state, NewsRetreatState::Normal) {
+            let after = sm.current_state(now_ms);
+            if matches!(after, NewsRetreatState::Normal) {
+                self.audit.risk_event(
+                    &self.symbol,
+                    AuditEventType::NewsRetreatExpired,
+                    &format!("expired from {prev_state:?}"),
+                );
+            }
+        }
+    }
+
     pub async fn run(
         &mut self,
         ws_rx: mpsc::UnboundedReceiver<MarketEvent>,
@@ -774,6 +910,12 @@ impl MarketMakerEngine {
                 _ = summary_interval.tick() => {
                     self.log_periodic_summary();
                     self.update_dashboard();
+                    // Epic F sub-component #2: drive the
+                    // news retreat cooldown forward so an
+                    // expired Critical state drops the
+                    // autotuner widening even without a fresh
+                    // headline arrival.
+                    self.tick_news_retreat();
                     self.audit.flush();
                 }
                 _ = reconcile_interval.tick() => {
@@ -935,6 +1077,21 @@ impl MarketMakerEngine {
             MarketEvent::BookSnapshot { .. } | MarketEvent::BookDelta { .. } => {
                 if let Some(hb) = self.hedge_book.as_mut() {
                     hb.on_event(&event);
+                }
+                // Epic F sub-component #1: feed the latest
+                // hedge-side mid into the lead-lag guard. v1
+                // wires the guard to the hedge connector
+                // because the engine doesn't yet have a
+                // separate "leader" connector subscription —
+                // operators with a distinct leader feed call
+                // `update_lead_lag_from_mid` directly from
+                // their orchestration layer.
+                if self.lead_lag_guard.is_some() {
+                    if let Some(hb) = self.hedge_book.as_ref() {
+                        if let Some(mid) = hb.book.mid_price() {
+                            self.update_lead_lag_from_mid(mid);
+                        }
+                    }
                 }
             }
             MarketEvent::Fill { fill, .. } => {
@@ -3850,5 +4007,178 @@ mod signal_wave_2_integration {
             narrow_spread <= neutral_spread,
             "informed flow should narrow or match: narrow={narrow_spread}, neutral={neutral_spread}"
         );
+    }
+}
+
+// -------------------------------------------------------------
+// Epic F — Defensive layer engine integration
+// -------------------------------------------------------------
+
+#[cfg(test)]
+mod defensive_layer_integration {
+    use super::*;
+    use crate::connector_bundle::ConnectorBundle;
+    use crate::test_support::MockConnector;
+    use mm_common::config::AppConfig;
+    use mm_exchange_core::connector::{VenueId, VenueProduct};
+    use mm_risk::lead_lag_guard::{LeadLagGuard, LeadLagGuardConfig};
+    use mm_risk::news_retreat::{NewsRetreatConfig, NewsRetreatStateMachine};
+    use mm_strategy::avellaneda::AvellanedaStoikov;
+
+    fn sample_product(symbol: &str) -> mm_common::types::ProductSpec {
+        mm_common::types::ProductSpec {
+            symbol: symbol.to_string(),
+            base_asset: "BTC".to_string(),
+            quote_asset: "USDT".to_string(),
+            tick_size: dec!(0.01),
+            lot_size: dec!(0.0001),
+            min_notional: dec!(10),
+            maker_fee: dec!(0.0001),
+            taker_fee: dec!(0.0005),
+            trading_status: Default::default(),
+        }
+    }
+
+    fn make_engine() -> MarketMakerEngine {
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            AppConfig::default(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        )
+    }
+
+    fn fixture_news_config() -> NewsRetreatConfig {
+        NewsRetreatConfig {
+            critical_keywords: vec!["hack".to_string(), "exploit".to_string()],
+            high_keywords: vec!["FOMC".to_string(), "CPI".to_string()],
+            low_keywords: vec!["partnership".to_string()],
+            critical_cooldown_ms: 30 * 60_000,
+            high_cooldown_ms: 5 * 60_000,
+            low_cooldown_ms: 0,
+            high_multiplier: dec!(2),
+            critical_multiplier: dec!(3),
+        }
+    }
+
+    /// Builder smoke test: both defensive controls plug onto
+    /// the engine via the new builder methods.
+    #[test]
+    fn builders_install_both_defensive_controls() {
+        let guard = LeadLagGuard::new(LeadLagGuardConfig::default());
+        let news = NewsRetreatStateMachine::new(fixture_news_config());
+        let engine = make_engine()
+            .with_lead_lag_guard(guard)
+            .with_news_retreat(news);
+        assert!(engine.lead_lag_guard.is_some());
+        assert!(engine.news_retreat.is_some());
+    }
+
+    /// End-to-end #1: a synthetic leader-mid stream with a
+    /// sharp shock pushes the lead-lag guard into ramp
+    /// territory; the autotuner's `lead_lag_mult` updates;
+    /// `effective_spread_mult` widens.
+    #[test]
+    fn lead_lag_pipeline_widens_autotuner_on_shock() {
+        let guard = LeadLagGuard::new(LeadLagGuardConfig {
+            half_life_events: 10,
+            z_min: dec!(2),
+            z_max: dec!(4),
+            max_mult: dec!(3),
+        });
+        let mut engine = make_engine().with_lead_lag_guard(guard);
+
+        let baseline = engine.auto_tuner.effective_spread_mult();
+        // Build up some non-zero variance with small wiggles.
+        let mid = dec!(50000);
+        for i in 0..30 {
+            let delta = if i % 2 == 0 { dec!(1) } else { dec!(-1) };
+            engine.update_lead_lag_from_mid(mid + delta);
+        }
+        // Sharp 5% jump → vastly larger than EWMA std.
+        engine.update_lead_lag_from_mid(dec!(52500));
+        let after = engine.auto_tuner.effective_spread_mult();
+        assert!(
+            after > baseline,
+            "lead-lag shock should widen the autotuner spread mult: baseline={baseline}, after={after}"
+        );
+        assert_eq!(
+            engine.auto_tuner.lead_lag_mult(),
+            dec!(3),
+            "guard should saturate at max_mult on a 5% shock"
+        );
+    }
+
+    /// End-to-end #2: a Critical-class news headline drives
+    /// `on_news_headline` → `NewsRetreatStateMachine` → kill
+    /// switch L2 escalation. The autotuner's news-retreat
+    /// multiplier also fires.
+    #[test]
+    fn critical_headline_escalates_kill_switch_to_l2() {
+        let news = NewsRetreatStateMachine::new(fixture_news_config());
+        let mut engine = make_engine().with_news_retreat(news);
+        let starting = engine.kill_switch.level();
+        assert_eq!(starting, mm_risk::kill_switch::KillLevel::Normal);
+
+        engine.on_news_headline("Major exchange hack reported");
+
+        assert_eq!(
+            engine.kill_switch.level(),
+            mm_risk::kill_switch::KillLevel::StopNewOrders,
+            "Critical news should escalate kill switch to L2"
+        );
+        assert_eq!(
+            engine.auto_tuner.news_retreat_mult(),
+            dec!(3),
+            "autotuner news-retreat multiplier should saturate"
+        );
+    }
+
+    /// High-class headline activates the autotuner widening
+    /// but does NOT escalate the kill switch (the engine still
+    /// quotes, just wider).
+    #[test]
+    fn high_headline_widens_but_does_not_stop_orders() {
+        let news = NewsRetreatStateMachine::new(fixture_news_config());
+        let mut engine = make_engine().with_news_retreat(news);
+        let starting = engine.kill_switch.level();
+
+        engine.on_news_headline("FOMC presser at 2pm");
+
+        assert_eq!(engine.kill_switch.level(), starting);
+        assert_eq!(engine.auto_tuner.news_retreat_mult(), dec!(2));
+    }
+
+    /// No-match headlines are silent — no audit, no
+    /// multiplier change, no kill switch escalation.
+    #[test]
+    fn unmatched_headline_is_silent_noop() {
+        let news = NewsRetreatStateMachine::new(fixture_news_config());
+        let mut engine = make_engine().with_news_retreat(news);
+        let starting = engine.kill_switch.level();
+        let baseline = engine.auto_tuner.effective_spread_mult();
+
+        engine.on_news_headline("Dogecoin price stable amid market chop");
+
+        assert_eq!(engine.kill_switch.level(), starting);
+        assert_eq!(engine.auto_tuner.effective_spread_mult(), baseline);
+        assert_eq!(engine.auto_tuner.news_retreat_mult(), dec!(1));
+    }
+
+    /// Engine without any defensive controls attached: both
+    /// public push APIs are no-ops and never panic.
+    #[test]
+    fn push_apis_are_noop_without_attached_controls() {
+        let mut engine = make_engine();
+        engine.update_lead_lag_from_mid(dec!(50000));
+        engine.on_news_headline("hack");
+        // Baseline state preserved.
+        assert_eq!(engine.auto_tuner.lead_lag_mult(), dec!(1));
+        assert_eq!(engine.auto_tuner.news_retreat_mult(), dec!(1));
     }
 }

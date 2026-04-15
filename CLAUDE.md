@@ -4,7 +4,7 @@ Production-grade market maker for the custom exchange at `../exchange/` with mul
 
 ## Stats
 
-**18 crates, 152 files, ~49K lines Rust, 866 tests**
+**18 crates, 154 files, ~49K lines Rust, 906 tests**
 
 ## Architecture
 
@@ -66,6 +66,8 @@ risk/                  Risk management:
   ├── borrow           Borrow-cost surcharge state machine (P1.3 s1)
   ├── hedge_optimizer  Markowitz mean-variance cross-asset hedge (Epic C)
   ├── var_guard        Parametric Gaussian VaR per strategy class (Epic C)
+  ├── lead_lag_guard   EWMA z-score on leader-venue mid → soft widen (Epic F)
+  ├── news_retreat     3-class headline state machine + cooldowns (Epic F)
   ├── otr              Order-to-Trade Ratio (MiCA surveillance metric)
   ├── sla              Exchange obligation compliance + per-minute presence (P2.2)
   ├── pnl              Attribution (spread/inventory/rebates/fees)
@@ -95,7 +97,7 @@ persistence/         State management:
 
 ```bash
 cargo build                    # build all
-cargo test                     # 866 tests
+cargo test                     # 906 tests
 cargo clippy --all-targets -- -D warnings
 cargo run -p mm-server         # run live
 MM_MODE=paper cargo run -p mm-server   # paper trading

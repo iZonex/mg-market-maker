@@ -7,6 +7,8 @@ pub mod hedge_optimizer;
 pub mod inventory;
 pub mod inventory_drift;
 pub mod kill_switch;
+pub mod lead_lag_guard;
+pub mod news_retreat;
 pub mod order_emulator;
 pub mod otr;
 pub mod performance;

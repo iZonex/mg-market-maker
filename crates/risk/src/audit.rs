@@ -192,6 +192,24 @@ pub enum AuditEventType {
     /// spammed every refresh tick. `detail` carries the
     /// `ρ` value and the new spread multiplier direction.
     AsSpreadWidened,
+
+    // Epic F — Defensive layer (lead-lag + news retreat).
+    /// Lead-lag guard's soft-widen multiplier crossed
+    /// `> 1.0` (a sharp leader-side move was detected).
+    /// Fires only on the `1.0 → > 1.0` transition so the
+    /// audit log is not spammed every leader-mid update.
+    /// `detail` carries the |z-score| and the new multiplier.
+    LeadLagTriggered,
+    /// News retreat state machine entered or escalated to
+    /// a higher-priority class on a fresh headline. `detail`
+    /// carries the matched class plus the headline text.
+    /// Critical-class transitions also escalate the engine's
+    /// kill switch to L2 (`StopNewOrders`).
+    NewsRetreatActivated,
+    /// News retreat state machine reverted to `Normal` after
+    /// the cooldown expired with no fresh same-class headline.
+    /// `detail` carries the previous class.
+    NewsRetreatExpired,
 }
 
 impl AuditLog {

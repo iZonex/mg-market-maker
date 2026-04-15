@@ -311,41 +311,83 @@ Coinbase Prime FIX.
 
 **Pre-conditions.** None.
 
-### Epic F — Defensive strategy layer (P2, ~3 weeks)
+### Epic F — Defensive strategy layer ✅ CLOSED stage-1 (Apr 2026)
 
-**Why.** Three additive defensive features that improve
-adverse-selection performance without touching the alpha
-stack. All three are small, independent, and low-risk.
+**Status.** **2/3 stage-1 sub-components shipped** over 4
+one-week sprints (F-1 planning/study, F-2 lead-lag guard,
+F-3 news retreat state machine, F-4 engine wiring + audit
++ docs). Listing sniper explicitly deferred — see below.
+Full breakdown in CHANGELOG `[Unreleased]` and
+`docs/sprints/epic-f-defensive-layer.md`.
 
-**Scope.**
-- **Lead-lag guard.** New `mm-risk::lead_lag_guard` module.
-  Subscribe to a "leader venue" mid feed (usually Binance
-  Futures for same-asset pairs per the Makarov-Schoar paper),
-  compute the return on a 100-500ms window, and when
-  `|return| > N·σ`, push a soft-widen signal into the
-  quoter's autotune path. The defensive form of latency arb
-  — we cannot race HFTs but we can retreat before they hit
-  us. Effort: 1 week.
-- **News / sentiment retreat state machine.** Background
-  task subscribes to a news feed (Kaiko, Laevitas, or just
-  a Telegram/Twitter scraper for crypto-priority headlines)
-  with a regex priority list. On a high-priority headline,
-  flips a `news_retreat` flag that the quoter consults to
-  widen or pull. Wintermute publicly discusses this as a
-  first-class control. Effort: 1-2 weeks.
-- **Listing sniper / probation onboard** (P2.3 stage-2).
-  Background task parses each venue's "new listing"
-  announcement schedule, spawns a dedicated engine for the
-  new symbol a few seconds after the first trade, runs in
-  probation mode (wide spreads, small size) for the first
-  ~24h to capture the opening liquidity premium. P2.3
-  stage-1 shipped halt + drift detection; this is the
-  auto-onboard half. Effort: 2 weeks.
+**What shipped.**
+- `mm-risk::lead_lag_guard::LeadLagGuard` — Cont-Stoikov-style
+  cross-venue leader-mid guard. EWMA mean + variance on
+  per-update returns, piecewise-linear ramp on |z-score|,
+  default half-life 20 events, z_min=2 / z_max=4 / max_mult=3.
+  Auto-seeds, decays back to neutral after a quiet stream,
+  symmetric on positive/negative shocks.
+- `mm-risk::news_retreat::NewsRetreatStateMachine` — 4-state
+  promotion ladder (`Normal/Low/High/Critical`), case-
+  insensitive substring keyword classification, per-class
+  cooldown (30 / 5 / 0 minutes), promotion-only transitions,
+  refresh resets the cooldown clock, `force_clear` operator
+  override.
+- `mm-strategy::autotune::AutoTuner::set_lead_lag_mult` +
+  `set_news_retreat_mult` — both fold into
+  `effective_spread_mult` multiplicatively, both clamp at 1.0
+  (defensive controls only widen, never narrow).
+- `MarketMakerEngine::with_lead_lag_guard` +
+  `with_news_retreat` builders. Public push APIs
+  `update_lead_lag_from_mid(mid)` and `on_news_headline(text)`.
+  Hedge-connector book event handler auto-feeds the
+  lead-lag guard. `tick_news_retreat()` runs on the periodic
+  30 s summary tick to drive cooldown expiry forward.
+- New `LeadLagTriggered` / `NewsRetreatActivated` /
+  `NewsRetreatExpired` audit event types. Critical news
+  headlines escalate the kill switch to L2 automatically.
 
-**Effort.** 2-3 weeks.
+**What's deferred — listing sniper.** The sniper needs a
+new `ExchangeConnector::list_symbols(&self) -> Vec<ProductSpec>`
+trait method shipped across Binance, Bybit, HyperLiquid,
+and the custom `mm-exchange-client` (per-venue REST endpoints
+`/api/v3/exchangeInfo`, `/v5/market/instruments-info`,
+HyperLiquid `meta` API, custom client). That's a 4-venue
+connector sub-epic on its own — easily another 1.5 weeks of
+work. Tracked here as **Epic F stage-2 follow-up**.
 
-**Pre-conditions.** Cross-venue connector bundle (already in
-place since v0.2.0 Sprint G).
+**v1 simplifications:**
+- News retreat uses **case-insensitive substring keyword
+  matching**, not regex (sprint plan called for regex but
+  workspace lacks the dep). Operationally identical for
+  canonical keywords ("SEC", "fraud", "hack", "FOMC", "CPI",
+  "exploit"). Stage-2 can upgrade to regex if operators
+  need wildcards or word-boundary matching.
+- Lead-lag guard auto-feeds from the **hedge connector**
+  in v1 (no separate "leader" connector subscription path
+  on the engine yet). Operators with a distinct leader
+  feed call `update_lead_lag_from_mid` from their own
+  orchestration layer.
+
+**Stage-2 follow-ups (tracked as next epic):**
+
+- Listing sniper — `ExchangeConnector::list_symbols` trait
+  method + 4 venue adapters + auto-onboard probation engine
+  spawning.
+- Regex priority lists for news retreat (vs current
+  substring matching).
+- Separate "leader" connector subscription path so the
+  lead-lag guard doesn't have to repurpose the hedge
+  connector slot.
+- Multi-leader weighted aggregation in the lead-lag guard.
+- Cartea-Jaimungal Poisson jump-process formulation as
+  an upgrade from the v1 state machine for news retreat.
+- Per-side asymmetric lead-lag widening (currently
+  symmetric `|z|`).
+
+**Pre-conditions (satisfied).** Cross-venue connector bundle
+(v0.2.0 Sprint G) + `AutoTuner` soft-widen multiplier
+infrastructure (Epic D wave-1 inheritance).
 
 ### Epic-level summary
 
@@ -356,7 +398,7 @@ place since v0.2.0 Sprint G).
 | C — Portfolio risk view | P1 | ~3 wk | per-strat PnL | ✅ stage-1 closed Apr 2026 |
 | D — Signal wave 2 | P1 | ~1 mo | none | ✅ stage-1 closed Apr 2026 |
 | E — Execution polish | P2 | ~2 wk | none | tail latency, Coinbase Prime |
-| F — Defensive layer | P2 | ~3 wk | cross-venue bundle | adverse-selection survival |
+| F — Defensive layer | P2 | ~3 wk | cross-venue bundle | ✅ stage-1 closed Apr 2026 (listing sniper deferred) |
 
 **Total epic effort:** ~14-18 weeks if run sequentially, ~10
 weeks with two engineers parallelizing on independent epics

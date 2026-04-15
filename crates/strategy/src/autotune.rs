@@ -480,6 +480,16 @@ pub struct AutoTuner {
     /// depressed score widens the book until the detector
     /// decays back toward 1.0.
     market_resilience: Option<Decimal>,
+    /// Lead-lag soft-widen multiplier (Epic F sub-component
+    /// #1). Default `1.0` (no widening). Engine pushes the
+    /// latest `LeadLagGuard::current_multiplier()` here on
+    /// every leader-side mid update.
+    lead_lag_mult: Decimal,
+    /// News-retreat soft-widen multiplier (Epic F sub-component
+    /// #2). Default `1.0`. Engine pushes the latest
+    /// `NewsRetreatStateMachine::current_multiplier()` on
+    /// every state-machine read.
+    news_retreat_mult: Decimal,
 }
 
 impl AutoTuner {
@@ -491,6 +501,8 @@ impl AutoTuner {
             inventory_snapshot: Decimal::ZERO,
             time_remaining_snapshot: Decimal::ONE,
             market_resilience: None,
+            lead_lag_mult: dec!(1),
+            news_retreat_mult: dec!(1),
         }
     }
 
@@ -561,21 +573,51 @@ impl AutoTuner {
         self.market_resilience = None;
     }
 
-    /// Get effective spread multiplier. When a Market
-    /// Resilience reading is attached the regime+toxicity
-    /// product is further divided by `max(mr, 0.2)` — a low
-    /// score widens the book post-shock, and the floor keeps
-    /// the multiplier bounded at `5×` even when MR is at zero.
+    /// Push a fresh lead-lag-guard multiplier (Epic F #1).
+    /// Engine wires the latest
+    /// `LeadLagGuard::current_multiplier()` after every
+    /// leader-side mid update. Values below `1.0` clamp to
+    /// `1.0` — the lead-lag guard never *narrows* the
+    /// spread, only widens.
+    pub fn set_lead_lag_mult(&mut self, mult: Decimal) {
+        self.lead_lag_mult = mult.max(Decimal::ONE);
+    }
+
+    /// Read the cached lead-lag multiplier. Mainly for tests
+    /// and operator dashboards.
+    pub fn lead_lag_mult(&self) -> Decimal {
+        self.lead_lag_mult
+    }
+
+    /// Push a fresh news-retreat multiplier (Epic F #2).
+    /// Engine wires the latest
+    /// `NewsRetreatStateMachine::current_multiplier()` on
+    /// every state-machine read. Same clamp-at-1.0 invariant
+    /// as [`Self::set_lead_lag_mult`].
+    pub fn set_news_retreat_mult(&mut self, mult: Decimal) {
+        self.news_retreat_mult = mult.max(Decimal::ONE);
+    }
+
+    /// Read the cached news-retreat multiplier.
+    pub fn news_retreat_mult(&self) -> Decimal {
+        self.news_retreat_mult
+    }
+
+    /// Get effective spread multiplier. The product is:
+    /// `regime · toxicity · (1 / max(mr, 0.2)) · lead_lag · news_retreat`.
+    /// When `lead_lag` and `news_retreat` are at their
+    /// defaults (`1.0`) the formula is byte-identical to the
+    /// pre-Epic-F shape.
     pub fn effective_spread_mult(&self) -> Decimal {
         let regime_params = RegimeParams::for_regime(self.regime_detector.regime());
         let base = regime_params.spread_mult * self.toxicity_spread_mult;
-        if let Some(mr) = self.market_resilience {
+        let with_mr = if let Some(mr) = self.market_resilience {
             let floor = dec!(0.2);
-            let denom = mr.max(floor);
-            base / denom
+            base / mr.max(floor)
         } else {
             base
-        }
+        };
+        with_mr * self.lead_lag_mult * self.news_retreat_mult
     }
 
     /// Get effective refresh interval multiplier.
@@ -960,5 +1002,67 @@ mod tests {
         t.clear_market_resilience();
         let after = t.effective_spread_mult();
         assert_eq!(after, base);
+    }
+
+    // ---- Epic F — defensive layer multipliers ----
+
+    #[test]
+    fn lead_lag_default_is_one_and_byte_identical_to_pre_epic_f() {
+        let t = AutoTuner::new(32);
+        assert_eq!(t.lead_lag_mult(), dec!(1));
+        // Spread is the wave-1 baseline since both new
+        // multipliers default to 1.0.
+        let before = t.effective_spread_mult();
+        let mut t2 = AutoTuner::new(32);
+        t2.set_lead_lag_mult(dec!(1));
+        t2.set_news_retreat_mult(dec!(1));
+        assert_eq!(t2.effective_spread_mult(), before);
+    }
+
+    #[test]
+    fn lead_lag_mult_widens_effective_spread() {
+        let mut t = AutoTuner::new(32);
+        let base = t.effective_spread_mult();
+        t.set_lead_lag_mult(dec!(2.5));
+        assert_eq!(t.lead_lag_mult(), dec!(2.5));
+        assert_eq!(t.effective_spread_mult(), base * dec!(2.5));
+    }
+
+    #[test]
+    fn lead_lag_mult_clamps_below_one() {
+        // Defensive: a sub-1.0 multiplier would mean the
+        // guard is *narrowing* the spread. Lead-lag should
+        // only widen, never narrow — clamp at 1.0.
+        let mut t = AutoTuner::new(32);
+        t.set_lead_lag_mult(dec!(0.4));
+        assert_eq!(t.lead_lag_mult(), dec!(1));
+    }
+
+    #[test]
+    fn news_retreat_mult_widens_effective_spread() {
+        let mut t = AutoTuner::new(32);
+        let base = t.effective_spread_mult();
+        t.set_news_retreat_mult(dec!(3));
+        assert_eq!(t.news_retreat_mult(), dec!(3));
+        assert_eq!(t.effective_spread_mult(), base * dec!(3));
+    }
+
+    #[test]
+    fn news_retreat_mult_clamps_below_one() {
+        let mut t = AutoTuner::new(32);
+        t.set_news_retreat_mult(dec!(0.5));
+        assert_eq!(t.news_retreat_mult(), dec!(1));
+    }
+
+    #[test]
+    fn lead_lag_and_news_retreat_compose_multiplicatively() {
+        // Both signals firing at the same time produce a
+        // product widening, not a max() — matches the
+        // existing toxicity × MR composition shape.
+        let mut t = AutoTuner::new(32);
+        let base = t.effective_spread_mult();
+        t.set_lead_lag_mult(dec!(2));
+        t.set_news_retreat_mult(dec!(3));
+        assert_eq!(t.effective_spread_mult(), base * dec!(6));
     }
 }

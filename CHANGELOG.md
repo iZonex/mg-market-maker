@@ -9,6 +9,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Epic F — Defensive layer (stage-1)** (SOTA gap closure
+  epic, fifth — user reordered F before E so the defensive
+  surface lands before execution polish). Closes the
+  predictive-defensive gap from the April 2026 research
+  pass: existing wave-1 controls (kill switch L1-L5, VPIN
+  spread widening, market-resilience score, autotuner
+  regime shifts) all react to **observable** danger.
+  Production prop desks ship two **predictive** controls
+  on top — signals that say "danger is *about to* arrive"
+  so the MM can retreat in the 100-500 ms window before
+  adverse fills land. Epic F adds them as two new risk
+  primitives plus engine wiring, landed over 4 one-week
+  sprints.
+  - **Sub-component #1 — Lead-lag guard**
+    (`mm-risk::lead_lag_guard`). New `LeadLagGuard`
+    holding EWMA mean + variance on a leader-venue mid
+    feed (typically Binance Futures perpetual for crypto)
+    and exposing a piecewise-linear ramp multiplier on
+    the latest |z-score|. Defaults: half-life 20 events,
+    z_min=2, z_max=4, max_mult=3. Pure `Decimal`,
+    auto-seeds on the first `on_leader_mid` call,
+    decay-to-neutral after a quiet stream, symmetric
+    trigger on positive and negative shocks. 14 unit
+    tests including a hand-verified sequence and a
+    saturation-at-max test. Source: Makarov-Schoar 2020,
+    *J. Financial Economics* 135(2) 293–319, §4 on
+    crypto lead-lag.
+  - **Sub-component #2 — News retreat state machine**
+    (`mm-risk::news_retreat`). New `NewsRetreatStateMachine`
+    with a 3-class promotion ladder (`Low / High /
+    Critical`), per-class cooldown (30 / 5 / 0 minutes),
+    case-insensitive substring keyword classification,
+    promotion-only transitions (lower class in higher
+    state is suppressed), refresh resets the cooldown
+    clock, and a `force_clear` operator override. v1
+    ships **no built-in feed source** — operators wire
+    their own (Telegram bot, file tail, paid Tiingo
+    adapter) and call `on_headline(text)`. 14 unit tests.
+    Sources: Cartea-Jaimungal-Penalva 2015 ch.10 §10.4
+    "Trading on News" + Wintermute Trading public
+    material on operational news retreat.
+  - **Sub-component #3 — Listing sniper** ←
+    **deferred to stage-2.** The sniper needs a new
+    `ExchangeConnector::list_symbols` trait method
+    shipped across all 4 venue adapters (Binance, Bybit,
+    HyperLiquid, custom client). That's a multi-venue
+    sub-epic on its own. Stage-1 ships the two
+    predictive defensive signals and tracks the listing
+    sniper as a follow-up in ROADMAP.
+  - **`AutoTuner` extension** (`mm-strategy::autotune`).
+    Two new soft-widen multiplier fields parallel to the
+    existing `toxicity_spread_mult` / `market_resilience`
+    pattern: `lead_lag_mult` and `news_retreat_mult`.
+    `set_lead_lag_mult` and `set_news_retreat_mult`
+    setters clamp at 1.0 (defensive controls never
+    *narrow* the spread). `effective_spread_mult` folds
+    them in multiplicatively; defaults of 1.0 are
+    byte-identical to pre-Epic-F. 6 new unit tests
+    covering identity, widening, clamp, and composition.
+  - **Engine integration.**
+    `MarketMakerEngine::with_lead_lag_guard(guard)` and
+    `with_news_retreat(state_machine)` builders. Two new
+    public push APIs: `update_lead_lag_from_mid(mid)`
+    (idempotent — operators with a separate orchestration
+    layer call it manually) and `on_news_headline(text)`
+    (operators wire any feed source). The hedge-connector
+    book event handler auto-feeds the lead-lag guard
+    when both are attached, so engines with a hedge
+    connector don't need separate orchestration.
+    `tick_news_retreat()` runs on the periodic 30 s
+    summary tick to drive cooldown expiry forward without
+    waiting for a fresh headline. Three new audit event
+    types: `LeadLagTriggered` (fires only on the
+    `1.0 → > 1.0` transition, not on every leader mid),
+    `NewsRetreatActivated` (every promotion), and
+    `NewsRetreatExpired` (cooldown expiry transitions).
+    Critical-class news headlines escalate the kill
+    switch to L2 `StopNewOrders` automatically.
+  - **Six new engine integration tests** in
+    `defensive_layer_integration`: builder smoke test,
+    end-to-end lead-lag pipeline (synthetic shock →
+    autotuner widening + saturation), end-to-end news
+    Critical → kill switch L2, news High → autotuner
+    widening without kill switch, no-match silence,
+    and "no defensive controls attached" no-op behavior.
+  - **v1 simplification — substring keywords, not regex.**
+    The original sprint plan called for regex priority
+    lists; v1 ships case-insensitive substring matching
+    instead. Operationally identical for the canonical
+    examples ("SEC", "fraud", "hack", "FOMC", "CPI",
+    "exploit"). Stage-2 can upgrade to full regex if
+    operators need wildcards.
+  - **Zero new dependencies.** 28 new unit tests in
+    `mm-risk` (14 lead-lag + 14 news retreat) + 6 new
+    `mm-strategy` autotune tests + 6 engine integration
+    tests + 3 new audit event types. Workspace clippy
+    `-D warnings` clean, `cargo fmt --check` clean.
+
 - **Epic D — Signal wave 2 (stage-1)** (SOTA gap closure
   epic, fourth after Epic C, A, B). Closes the largest
   microstructure-signal gap from the April 2026 research
