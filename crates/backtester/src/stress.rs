@@ -349,6 +349,7 @@ impl StressRunConfig {
             var_guard: Some(VarGuardConfig {
                 limit_95: Some(dec!(-5000)),
                 limit_99: Some(dec!(-10000)),
+                ewma_lambda: None,
             }),
             daily_loss_limit: dec!(20000),
             daily_loss_warning: dec!(10000),

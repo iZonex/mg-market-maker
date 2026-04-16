@@ -404,6 +404,7 @@ impl MarketMakerEngine {
                 Some(VarGuard::new(VarGuardConfig {
                     limit_95: config.market_maker.var_guard_limit_95,
                     limit_99: config.market_maker.var_guard_limit_99,
+                    ewma_lambda: config.market_maker.var_guard_ewma_lambda,
                 }))
             } else {
                 None

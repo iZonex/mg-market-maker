@@ -19,7 +19,9 @@ pub mod johansen;
 pub mod kalman;
 pub mod signal;
 
-pub use cointegration::{CointegrationResult, EngleGrangerTest};
+pub use cointegration::{
+    CointegrationResult, EngleGrangerTest, MacKinnonLevel, mackinnon_critical_value,
+};
 pub use driver::{
     ExitLegs, LegDispatchReport, LegOutcome, NullStatArbSink, StatArbDriver, StatArbDriverConfig,
     StatArbEvent, StatArbEventSink, StatArbPair, StatArbPosition,

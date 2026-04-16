@@ -230,6 +230,7 @@ mod tests {
             var_guard_enabled: false,
             var_guard_limit_95: None,
             var_guard_limit_99: None,
+            var_guard_ewma_lambda: None,
             cross_venue_basis_max_staleness_ms: 1500,
         };
         let mut book = LocalOrderBook::new("BTCUSDT".into());
@@ -339,6 +340,7 @@ mod tests {
             var_guard_enabled: false,
             var_guard_limit_95: None,
             var_guard_limit_99: None,
+            var_guard_ewma_lambda: None,
             cross_venue_basis_max_staleness_ms: 1500,
         };
         let mut book = LocalOrderBook::new("BTCUSDT".into());

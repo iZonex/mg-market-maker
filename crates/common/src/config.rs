@@ -507,6 +507,13 @@ pub struct MarketMakerConfig {
     #[serde(default)]
     pub var_guard_limit_99: Option<Decimal>,
 
+    /// EWMA decay factor λ ∈ (0, 1) for the VaR guard's
+    /// variance estimator. RiskMetrics default is 0.94 for
+    /// daily data. `None` disables the EWMA path — the guard
+    /// uses only the equally-weighted sample variance.
+    #[serde(default)]
+    pub var_guard_ewma_lambda: Option<Decimal>,
+
     /// Maximum acceptable hedge-book staleness in milliseconds
     /// for the cross-venue basis strategy (P1.4 stage-1).
     /// Default `1500` — typical cross-venue WS feeds jitter
@@ -850,6 +857,7 @@ impl Default for AppConfig {
                 var_guard_enabled: false,
                 var_guard_limit_95: None,
                 var_guard_limit_99: None,
+                var_guard_ewma_lambda: None,
                 cross_venue_basis_max_staleness_ms: 1500,
             },
             kill_switch: KillSwitchCfg::default(),

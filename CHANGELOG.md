@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Epic C stage-2 — CVaR + EWMA variance in VaR guard**
+  (Apr 2026). Extends the parametric Gaussian VaR guard with
+  two stage-2 enhancements:
+  - **CVaR / Expected Shortfall**: `RiskMetrics` snapshot
+    exposes `cvar_95` and `cvar_99` under the Gaussian
+    assumption (`CVaR_α = μ − σ·φ(z_α)/(1−α)`). Exposed for
+    dashboard / audit — does NOT feed into throttle tiers.
+  - **EWMA variance**: optional exponentially-weighted variance
+    estimator (`ewma_lambda` config knob) that reacts faster
+    to regime changes than equally-weighted sample variance.
+    The guard uses `max(sample_σ, ewma_σ)` for a conservative
+    VaR estimate. 7 new tests.
+
+- **Epic B stage-2 — MacKinnon polynomial fit for ADF critical
+  values** (Apr 2026). Replaces the v1 5-entry lookup table
+  with the MacKinnon (1996) response-surface polynomial
+  `c(p,n) = β_∞ + β_1/n + β_2/n²`. Supports 1–6 variables
+  at 1%/5%/10% significance levels. Continuous function valid
+  for any n ≥ 2, eliminates interpolation and clamping. 6 new
+  tests covering monotonicity, asymptotic convergence,
+  multi-variable ordering, and significance level ordering.
+
 - **Epic F stage-3 — listing sniper engine integration**
   (Apr 2026). Wires the standalone `ListingSniper` discovery
   module into the server's async runtime as a background task.

@@ -24,6 +24,29 @@
 //! normal quantiles at 95 % / 99 %. We freeze them as compile-
 //! time constants so there is no `erf_inv` at runtime.
 //!
+//! ## EWMA variance (stage-2)
+//!
+//! When `ewma_lambda` is set in `VarGuardConfig`, the guard
+//! computes an exponentially-weighted variance alongside the
+//! rolling sample variance. The EWMA variance adapts faster
+//! to regime changes (vol spikes) than the equally-weighted
+//! sample variance. The guard uses `max(sample_σ, ewma_σ)`
+//! for a conservative VaR estimate.
+//!
+//! ## CVaR / Expected Shortfall (stage-2)
+//!
+//! Under the Gaussian assumption:
+//!
+//! ```text
+//! CVaR_α = μ - σ · φ(z_α) / (1 - α)
+//! ```
+//!
+//! where `φ(z)` is the standard normal PDF evaluated at the
+//! z-score corresponding to the α quantile. CVaR is exposed
+//! via `compute_risk_metrics()` for dashboard / audit but does
+//! NOT feed into the throttle tiers — operators monitor it as
+//! a tail-risk gauge.
+//!
 //! # Throttle tiers
 //!
 //! ```text
@@ -91,6 +114,12 @@ pub const THROTTLE_95_TIER: Decimal = dec!(0.5);
 /// Throttle tier at the 99 % VaR breach — full halt.
 pub const THROTTLE_99_TIER: Decimal = dec!(0);
 
+/// Standard normal PDF at z: φ(z) = (1/√(2π)) · exp(-z²/2).
+/// Pre-computed for the two z-scores we care about.
+/// φ(1.645) ≈ 0.10314, φ(2.326) ≈ 0.02656.
+pub const PHI_Z95: Decimal = dec!(0.10314);
+pub const PHI_Z99: Decimal = dec!(0.02656);
+
 /// Configuration knobs for the per-strategy VaR guard.
 #[derive(Debug, Clone, Default)]
 pub struct VarGuardConfig {
@@ -104,6 +133,64 @@ pub struct VarGuardConfig {
     /// disables the 99 % tier (but then a strategy can
     /// never be hard-halted by VaR).
     pub limit_99: Option<Decimal>,
+    /// EWMA decay factor λ ∈ (0, 1). Higher = slower decay,
+    /// more weight on history. RiskMetrics default is 0.94 for
+    /// daily data. `None` disables the EWMA path entirely —
+    /// the guard uses only the equally-weighted sample variance.
+    pub ewma_lambda: Option<Decimal>,
+}
+
+/// Full risk metrics snapshot for a strategy class. Exposed
+/// for the dashboard / audit trail — richer than the scalar
+/// throttle returned by `effective_throttle()`.
+#[derive(Debug, Clone)]
+pub struct RiskMetrics {
+    pub var_95: Decimal,
+    pub var_99: Decimal,
+    /// Conditional Value-at-Risk (Expected Shortfall) at 95 %.
+    /// Under the Gaussian assumption: CVaR_95 = μ − σ·φ(z_95)/0.05.
+    pub cvar_95: Decimal,
+    /// CVaR at 99 %.
+    pub cvar_99: Decimal,
+    /// EWMA variance (if enabled). `None` when `ewma_lambda`
+    /// is not configured.
+    pub ewma_variance: Option<Decimal>,
+    pub mean: Decimal,
+    pub sample_variance: Decimal,
+    pub sample_count: usize,
+}
+
+/// Per-strategy EWMA state. Tracks the running variance
+/// estimate without needing the full sample buffer.
+#[derive(Debug, Clone)]
+struct EwmaState {
+    variance: Decimal,
+    mean: Decimal,
+    initialised: bool,
+}
+
+impl EwmaState {
+    fn new() -> Self {
+        Self {
+            variance: Decimal::ZERO,
+            mean: Decimal::ZERO,
+            initialised: false,
+        }
+    }
+
+    /// Update with a new PnL sample. Uses the RiskMetrics EWMA
+    /// recursion: σ²_t = λ·σ²_{t-1} + (1−λ)·(x_t − μ_{t-1})².
+    fn update(&mut self, sample: Decimal, lambda: Decimal) {
+        if !self.initialised {
+            self.mean = sample;
+            self.variance = Decimal::ZERO;
+            self.initialised = true;
+            return;
+        }
+        let diff = sample - self.mean;
+        self.variance = lambda * self.variance + (Decimal::ONE - lambda) * diff * diff;
+        self.mean = lambda * self.mean + (Decimal::ONE - lambda) * sample;
+    }
 }
 
 /// Per-strategy rolling-window VaR guard.
@@ -114,6 +201,9 @@ pub struct VarGuard {
     /// Key is the owned `String` tag from `Strategy::name()`
     /// (same key convention as `Portfolio::per_strategy_pnl`).
     buffers: HashMap<String, VecDeque<Decimal>>,
+    /// Per-strategy EWMA state. Only populated when
+    /// `config.ewma_lambda` is `Some`.
+    ewma: HashMap<String, EwmaState>,
 }
 
 impl VarGuard {
@@ -121,6 +211,7 @@ impl VarGuard {
         Self {
             config,
             buffers: HashMap::new(),
+            ewma: HashMap::new(),
         }
     }
 
@@ -135,12 +226,23 @@ impl VarGuard {
             buf.pop_front();
         }
         buf.push_back(pnl_delta);
+        // Update EWMA state if configured.
+        if let Some(lambda) = self.config.ewma_lambda {
+            self.ewma
+                .entry(strategy_class.to_string())
+                .or_insert_with(EwmaState::new)
+                .update(pnl_delta, lambda);
+        }
     }
 
     /// Effective size-multiplier for the given strategy class.
     /// Returns `1.0` during warm-up (`< MIN_SAMPLES_FOR_VAR`
     /// samples) and when no VaR limit is configured. The
     /// engine composes this with other multipliers via `min()`.
+    ///
+    /// When `ewma_lambda` is configured, the guard uses
+    /// `max(sample_σ, ewma_σ)` for a conservative VaR estimate
+    /// that reacts faster to regime changes.
     pub fn effective_throttle(&self, strategy_class: &str) -> Decimal {
         let Some(buf) = self.buffers.get(strategy_class) else {
             return Decimal::ONE;
@@ -148,29 +250,51 @@ impl VarGuard {
         if buf.len() < MIN_SAMPLES_FOR_VAR {
             return Decimal::ONE;
         }
-        let (var_95, var_99) = Self::compute_var(buf);
+        let metrics = self.compute_risk_metrics_inner(buf, self.ewma.get(strategy_class));
         // Hard halt tier first — `min` semantics mean the
         // tighter of the two wins if both breach simultaneously.
         if let Some(limit_99) = self.config.limit_99 {
-            if var_99 < limit_99 {
+            if metrics.var_99 < limit_99 {
                 return THROTTLE_99_TIER;
             }
         }
         if let Some(limit_95) = self.config.limit_95 {
-            if var_95 < limit_95 {
+            if metrics.var_95 < limit_95 {
                 return THROTTLE_95_TIER;
             }
         }
         Decimal::ONE
     }
 
+    /// Full risk metrics snapshot for a strategy class.
+    /// Returns `None` if the class has fewer than
+    /// `MIN_SAMPLES_FOR_VAR` samples. Exposed for dashboard
+    /// and audit trail.
+    pub fn risk_metrics(&self, strategy_class: &str) -> Option<RiskMetrics> {
+        let buf = self.buffers.get(strategy_class)?;
+        if buf.len() < MIN_SAMPLES_FOR_VAR {
+            return None;
+        }
+        Some(self.compute_risk_metrics_inner(buf, self.ewma.get(strategy_class)))
+    }
+
     /// Pure computation of (VaR_95, VaR_99) from a sample
-    /// window. Exposed for tests.
+    /// window. Exposed for tests. Legacy interface — prefer
+    /// `risk_metrics()` for the full snapshot.
     pub fn compute_var(samples: &VecDeque<Decimal>) -> (Decimal, Decimal) {
         let n = samples.len();
         if n < 2 {
             return (Decimal::ZERO, Decimal::ZERO);
         }
+        let (mean, variance) = Self::sample_mean_var(samples);
+        let sigma = decimal_sqrt(variance);
+        let var_95 = mean - Z_SCORE_95 * sigma;
+        let var_99 = mean - Z_SCORE_99 * sigma;
+        (var_95, var_99)
+    }
+
+    fn sample_mean_var(samples: &VecDeque<Decimal>) -> (Decimal, Decimal) {
+        let n = samples.len();
         let n_dec = Decimal::from(n as u32);
         let mean = samples.iter().copied().sum::<Decimal>() / n_dec;
         let var_sum: Decimal = samples
@@ -180,11 +304,69 @@ impl VarGuard {
                 diff * diff
             })
             .sum();
-        let variance = var_sum / Decimal::from((n - 1) as u32);
-        let sigma = decimal_sqrt(variance);
-        let var_95 = mean - Z_SCORE_95 * sigma;
-        let var_99 = mean - Z_SCORE_99 * sigma;
-        (var_95, var_99)
+        let variance = if n > 1 {
+            var_sum / Decimal::from((n - 1) as u32)
+        } else {
+            Decimal::ZERO
+        };
+        (mean, variance)
+    }
+
+    fn compute_risk_metrics_inner(
+        &self,
+        samples: &VecDeque<Decimal>,
+        ewma_state: Option<&EwmaState>,
+    ) -> RiskMetrics {
+        let n = samples.len();
+        if n < 2 {
+            return RiskMetrics {
+                var_95: Decimal::ZERO,
+                var_99: Decimal::ZERO,
+                cvar_95: Decimal::ZERO,
+                cvar_99: Decimal::ZERO,
+                ewma_variance: None,
+                mean: Decimal::ZERO,
+                sample_variance: Decimal::ZERO,
+                sample_count: n,
+            };
+        }
+        let (mean, sample_variance) = Self::sample_mean_var(samples);
+        let sample_sigma = decimal_sqrt(sample_variance);
+
+        // Conservative σ: max(sample, ewma) when EWMA is available.
+        let ewma_var = ewma_state
+            .filter(|s| s.initialised)
+            .map(|s| s.variance);
+        let effective_sigma = match ewma_var {
+            Some(ev) => {
+                let ewma_sigma = decimal_sqrt(ev);
+                if ewma_sigma > sample_sigma {
+                    ewma_sigma
+                } else {
+                    sample_sigma
+                }
+            }
+            None => sample_sigma,
+        };
+
+        let var_95 = mean - Z_SCORE_95 * effective_sigma;
+        let var_99 = mean - Z_SCORE_99 * effective_sigma;
+
+        // CVaR (Expected Shortfall) under Gaussian assumption:
+        // CVaR_α = μ − σ · φ(z_α) / (1 − α)
+        let cvar_95 = mean - effective_sigma * PHI_Z95 / dec!(0.05);
+        let cvar_99 = mean - effective_sigma * PHI_Z99 / dec!(0.01);
+
+        RiskMetrics {
+            var_95,
+            var_99,
+            cvar_95,
+            cvar_99,
+            ewma_variance: ewma_var,
+            mean,
+            sample_variance,
+            sample_count: n,
+        }
     }
 
     /// Read-only accessor for a strategy class's current sample
@@ -234,7 +416,11 @@ mod tests {
     use super::*;
 
     fn config(limit_95: Option<Decimal>, limit_99: Option<Decimal>) -> VarGuardConfig {
-        VarGuardConfig { limit_95, limit_99 }
+        VarGuardConfig {
+            limit_95,
+            limit_99,
+            ewma_lambda: None,
+        }
     }
 
     /// Warm-up: fewer than `MIN_SAMPLES_FOR_VAR` samples → the
@@ -391,5 +577,143 @@ mod tests {
         assert!((decimal_sqrt(dec!(2)) - dec!(1.41421)).abs() < dec!(0.001));
         assert_eq!(decimal_sqrt(dec!(0)), dec!(0));
         assert_eq!(decimal_sqrt(dec!(-5)), dec!(0)); // negative guard
+    }
+
+    // ── CVaR / Expected Shortfall tests ─────────────────────
+
+    /// CVaR_95 is strictly more negative than VaR_95 — the
+    /// expected shortfall in the tail is always worse than the
+    /// threshold itself.
+    #[test]
+    fn cvar_is_more_negative_than_var() {
+        let mut g = VarGuard::new(config(Some(dec!(-1000)), Some(dec!(-2000))));
+        for i in 0..100 {
+            let sample = Decimal::from(i % 10) - dec!(5);
+            g.record_pnl_sample("test", sample);
+        }
+        let m = g.risk_metrics("test").unwrap();
+        assert!(
+            m.cvar_95 < m.var_95,
+            "CVaR_95={} should be < VaR_95={}",
+            m.cvar_95,
+            m.var_95
+        );
+        assert!(
+            m.cvar_99 < m.var_99,
+            "CVaR_99={} should be < VaR_99={}",
+            m.cvar_99,
+            m.var_99
+        );
+    }
+
+    /// Zero-variance samples: CVaR = VaR = μ (all tail mass
+    /// concentrates at the single point).
+    #[test]
+    fn cvar_equals_var_when_zero_variance() {
+        let mut g = VarGuard::new(VarGuardConfig::default());
+        for _ in 0..50 {
+            g.record_pnl_sample("flat", dec!(5));
+        }
+        let m = g.risk_metrics("flat").unwrap();
+        assert_eq!(m.var_95, m.cvar_95);
+        assert_eq!(m.var_99, m.cvar_99);
+        assert_eq!(m.mean, dec!(5));
+    }
+
+    /// risk_metrics returns None for unknown or under-sampled
+    /// strategy classes.
+    #[test]
+    fn risk_metrics_none_when_insufficient_samples() {
+        let g = VarGuard::new(VarGuardConfig::default());
+        assert!(g.risk_metrics("unknown").is_none());
+
+        let mut g2 = VarGuard::new(VarGuardConfig::default());
+        for _ in 0..5 {
+            g2.record_pnl_sample("few", dec!(1));
+        }
+        assert!(g2.risk_metrics("few").is_none());
+    }
+
+    // ── EWMA variance tests ────────────────────────────────
+
+    /// EWMA variance reacts faster to a regime change than
+    /// sample variance. Inject 100 calm samples followed by
+    /// 10 volatile ones — the EWMA σ should be higher than
+    /// the sample σ (which is dragged by the calm history).
+    #[test]
+    fn ewma_reacts_faster_to_regime_change() {
+        let mut g = VarGuard::new(VarGuardConfig {
+            limit_95: Some(dec!(-1000)),
+            limit_99: Some(dec!(-2000)),
+            ewma_lambda: Some(dec!(0.94)),
+        });
+        // 100 calm samples.
+        for _ in 0..100 {
+            g.record_pnl_sample("test", dec!(1));
+        }
+        // 10 volatile samples.
+        for i in 0..10 {
+            let v = if i % 2 == 0 { dec!(100) } else { dec!(-100) };
+            g.record_pnl_sample("test", v);
+        }
+        let m = g.risk_metrics("test").unwrap();
+        let ewma_var = m.ewma_variance.unwrap();
+        // EWMA variance should be much higher than sample
+        // variance because the last 10 explosive samples dominate.
+        assert!(
+            ewma_var > m.sample_variance,
+            "EWMA var={} should exceed sample var={} after regime shift",
+            ewma_var,
+            m.sample_variance
+        );
+    }
+
+    /// When EWMA is enabled and its σ exceeds sample σ, the
+    /// VaR uses the EWMA σ (conservative) — so VaR is more
+    /// negative than it would be with sample σ alone.
+    #[test]
+    fn ewma_makes_var_more_conservative() {
+        // Guard WITHOUT EWMA.
+        let mut g_no_ewma = VarGuard::new(VarGuardConfig {
+            limit_95: Some(dec!(-1000)),
+            limit_99: None,
+            ewma_lambda: None,
+        });
+        // Guard WITH EWMA.
+        let mut g_ewma = VarGuard::new(VarGuardConfig {
+            limit_95: Some(dec!(-1000)),
+            limit_99: None,
+            ewma_lambda: Some(dec!(0.94)),
+        });
+        // Same data to both: calm then volatile.
+        for _ in 0..80 {
+            g_no_ewma.record_pnl_sample("s", dec!(1));
+            g_ewma.record_pnl_sample("s", dec!(1));
+        }
+        for i in 0..20 {
+            let v = if i % 2 == 0 { dec!(50) } else { dec!(-50) };
+            g_no_ewma.record_pnl_sample("s", v);
+            g_ewma.record_pnl_sample("s", v);
+        }
+        let m_no = g_no_ewma.risk_metrics("s").unwrap();
+        let m_ew = g_ewma.risk_metrics("s").unwrap();
+        // EWMA guard should produce a more negative (worse) VaR.
+        assert!(
+            m_ew.var_95 <= m_no.var_95,
+            "EWMA VaR_95={} should be ≤ sample-only VaR_95={}",
+            m_ew.var_95,
+            m_no.var_95
+        );
+    }
+
+    /// EWMA state is not populated when ewma_lambda is None.
+    #[test]
+    fn ewma_not_populated_without_config() {
+        let mut g = VarGuard::new(VarGuardConfig::default());
+        for _ in 0..50 {
+            g.record_pnl_sample("test", dec!(1));
+        }
+        let m = g.risk_metrics("test").unwrap();
+        assert!(m.ewma_variance.is_none());
     }
 }

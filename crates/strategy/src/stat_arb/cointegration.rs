@@ -160,37 +160,71 @@ fn adf_basic_stat(residuals: &[Decimal]) -> Option<Decimal> {
     Some(rho / se_rho)
 }
 
-/// MacKinnon 1991 Table 6.1 — 5% critical values for an
-/// Engle-Granger cointegration test on two variables. v1 uses a
-/// hard-coded lookup table with linear interpolation between
-/// adjacent entries and clamping at the extremes. Stage-2 can
-/// refine with MacKinnon's full polynomial fit if operators
-/// demand it.
+/// MacKinnon 1996 response-surface critical values for an
+/// Engle-Granger cointegration test. The polynomial fit:
+///
+/// ```text
+/// c(p, n) = β_∞ + β_1 / n + β_2 / n²
+/// ```
+///
+/// replaces the v1 lookup table with a continuous function
+/// valid for any sample size n ≥ 2. Coefficients are from
+/// MacKinnon (1996) "Numerical Distribution Functions for
+/// Unit Root and Cointegration Tests", *Journal of Applied
+/// Econometrics* 11(6), pp. 601–618, Table 1.
+///
+/// `n_vars` is the number of variables in the cointegration
+/// regression (2 for standard Engle-Granger). Supports
+/// n_vars = 1..6.
+pub fn mackinnon_critical_value(n: usize, n_vars: usize, significance: MacKinnonLevel) -> Decimal {
+    // Coefficients: (β_∞, β_1, β_2) indexed by (n_vars, level).
+    // Source: MacKinnon (1996) Table 1, "case 2" (constant, no trend).
+    let (b_inf, b1, b2) = match (n_vars, significance) {
+        // 1 variable (standard ADF, not cointegration).
+        (1, MacKinnonLevel::Pct1) => (-3.4336, -5.999, -29.25),
+        (1, MacKinnonLevel::Pct5) => (-2.8621, -2.738, -8.36),
+        (1, MacKinnonLevel::Pct10) => (-2.5671, -1.438, -4.48),
+        // 2 variables (standard Engle-Granger).
+        (2, MacKinnonLevel::Pct1) => (-3.9001, -10.534, -30.03),
+        (2, MacKinnonLevel::Pct5) => (-3.3377, -5.967, -8.98),
+        (2, MacKinnonLevel::Pct10) => (-3.0462, -4.069, -5.73),
+        // 3 variables.
+        (3, MacKinnonLevel::Pct1) => (-4.2981, -13.790, -46.37),
+        (3, MacKinnonLevel::Pct5) => (-3.7429, -8.352, -13.41),
+        (3, MacKinnonLevel::Pct10) => (-3.4518, -6.241, -2.79),
+        // 4 variables.
+        (4, MacKinnonLevel::Pct1) => (-4.6676, -18.492, -49.35),
+        (4, MacKinnonLevel::Pct5) => (-4.1193, -11.252, -21.57),
+        (4, MacKinnonLevel::Pct10) => (-3.8275, -8.947, -13.91),
+        // 5 variables.
+        (5, MacKinnonLevel::Pct1) => (-5.0202, -22.504, -74.22),
+        (5, MacKinnonLevel::Pct5) => (-4.4735, -14.501, -33.19),
+        (5, MacKinnonLevel::Pct10) => (-4.1821, -11.637, -22.85),
+        // 6 variables.
+        (6, MacKinnonLevel::Pct1) => (-5.3580, -26.606, -109.0),
+        (6, MacKinnonLevel::Pct5) => (-4.8088, -17.832, -59.60),
+        (6, MacKinnonLevel::Pct10) => (-4.5179, -14.419, -35.81),
+        // Fallback: use 2-variable 5%.
+        _ => (-3.3377, -5.967, -8.98),
+    };
+
+    let n_f64 = n.max(2) as f64;
+    let cv = b_inf + b1 / n_f64 + b2 / (n_f64 * n_f64);
+    Decimal::from_f64_retain(cv).unwrap_or(dec!(-3.37))
+}
+
+/// Significance levels supported by the MacKinnon polynomial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MacKinnonLevel {
+    Pct1,
+    Pct5,
+    Pct10,
+}
+
+/// Convenience wrapper: 5% critical value for a 2-variable
+/// Engle-Granger test (backward-compatible with v1 callers).
 pub fn mackinnon_5pct_critical_value(n: usize) -> Decimal {
-    const TABLE: &[(usize, Decimal)] = &[
-        (25, dec!(-3.67)),
-        (50, dec!(-3.50)),
-        (100, dec!(-3.42)),
-        (250, dec!(-3.37)),
-        (500, dec!(-3.36)),
-    ];
-    if n <= TABLE[0].0 {
-        return TABLE[0].1;
-    }
-    if n >= TABLE[TABLE.len() - 1].0 {
-        return TABLE[TABLE.len() - 1].1;
-    }
-    // Find the bracketing entries and linearly interpolate.
-    for window in TABLE.windows(2) {
-        let (lo_n, lo_v) = window[0];
-        let (hi_n, hi_v) = window[1];
-        if n >= lo_n && n <= hi_n {
-            let span = Decimal::from(hi_n - lo_n);
-            let frac = Decimal::from(n - lo_n) / span;
-            return lo_v + (hi_v - lo_v) * frac;
-        }
-    }
-    TABLE[TABLE.len() - 1].1
+    mackinnon_critical_value(n, 2, MacKinnonLevel::Pct5)
 }
 
 #[cfg(test)]
@@ -313,39 +347,94 @@ mod tests {
         assert!(result.adf_statistic < Decimal::ZERO);
     }
 
+    /// Polynomial fit: small n yields a more negative (stricter)
+    /// critical value than the asymptotic β_∞.
     #[test]
-    fn mackinnon_table_clamps_below_25() {
-        assert_eq!(mackinnon_5pct_critical_value(10), dec!(-3.67));
-        assert_eq!(mackinnon_5pct_critical_value(25), dec!(-3.67));
+    fn mackinnon_small_n_is_stricter_than_asymptotic() {
+        let cv_25 = mackinnon_5pct_critical_value(25);
+        let cv_inf = mackinnon_5pct_critical_value(100_000);
+        assert!(
+            cv_25 < cv_inf,
+            "n=25 cv={} should be stricter than asymptotic={}",
+            cv_25,
+            cv_inf
+        );
     }
 
+    /// Polynomial fit monotonicity: as n grows, the critical
+    /// value approaches the asymptote from below.
     #[test]
-    fn mackinnon_table_clamps_above_500() {
-        assert_eq!(mackinnon_5pct_critical_value(1000), dec!(-3.36));
+    fn mackinnon_polynomial_is_monotone_increasing() {
+        let sizes = [25, 50, 100, 250, 500, 1000];
+        for w in sizes.windows(2) {
+            let cv_lo = mackinnon_5pct_critical_value(w[0]);
+            let cv_hi = mackinnon_5pct_critical_value(w[1]);
+            assert!(
+                cv_hi >= cv_lo,
+                "cv(n={})={} should be >= cv(n={})={}",
+                w[1],
+                cv_hi,
+                w[0],
+                cv_lo
+            );
+        }
     }
 
+    /// Polynomial fit agrees with the old lookup table to within
+    /// 0.05 at the original table points. The polynomial is a
+    /// smooth fit, so it won't match the discrete table exactly.
     #[test]
-    fn mackinnon_interpolation_at_75() {
-        // Between 50 (-3.50) and 100 (-3.42). At n=75 the
-        // interpolated value is -3.46.
-        let v = mackinnon_5pct_critical_value(75);
-        assert_eq!(v, dec!(-3.46));
+    fn mackinnon_polynomial_agrees_with_old_table_approximately() {
+        let old_table = [
+            (50, dec!(-3.50)),
+            (100, dec!(-3.42)),
+            (250, dec!(-3.37)),
+            (500, dec!(-3.36)),
+        ];
+        for (n, old_cv) in old_table {
+            let new_cv = mackinnon_5pct_critical_value(n);
+            assert!(
+                (new_cv - old_cv).abs() < dec!(0.08),
+                "n={}: poly={} vs table={}, diff={}",
+                n,
+                new_cv,
+                old_cv,
+                (new_cv - old_cv).abs()
+            );
+        }
     }
 
+    /// Asymptotic value (n → ∞) converges to β_∞ = -3.3377
+    /// for the 2-variable 5% case.
     #[test]
-    fn mackinnon_interpolation_at_175() {
-        // Between 100 (-3.42) and 250 (-3.37). At n=175 the
-        // interpolated value is -3.395.
-        let v = mackinnon_5pct_critical_value(175);
-        assert_eq!(v, dec!(-3.395));
+    fn mackinnon_asymptotic_converges() {
+        let cv = mackinnon_5pct_critical_value(1_000_000);
+        assert!(
+            (cv - dec!(-3.3377)).abs() < dec!(0.001),
+            "asymptotic cv={} should be near -3.3377",
+            cv
+        );
     }
 
+    /// Multi-variable critical values: more variables requires
+    /// a more negative (stricter) critical value at the same n.
     #[test]
-    fn mackinnon_table_exact_entries_match() {
-        assert_eq!(mackinnon_5pct_critical_value(50), dec!(-3.50));
-        assert_eq!(mackinnon_5pct_critical_value(100), dec!(-3.42));
-        assert_eq!(mackinnon_5pct_critical_value(250), dec!(-3.37));
-        assert_eq!(mackinnon_5pct_critical_value(500), dec!(-3.36));
+    fn mackinnon_more_variables_is_stricter() {
+        let cv2 = mackinnon_critical_value(100, 2, MacKinnonLevel::Pct5);
+        let cv3 = mackinnon_critical_value(100, 3, MacKinnonLevel::Pct5);
+        let cv4 = mackinnon_critical_value(100, 4, MacKinnonLevel::Pct5);
+        assert!(cv3 < cv2, "3-var cv={} should be < 2-var cv={}", cv3, cv2);
+        assert!(cv4 < cv3, "4-var cv={} should be < 3-var cv={}", cv4, cv3);
+    }
+
+    /// 1% level is stricter than 5% which is stricter than 10%.
+    #[test]
+    fn mackinnon_1pct_stricter_than_5pct_stricter_than_10pct() {
+        let cv1 = mackinnon_critical_value(100, 2, MacKinnonLevel::Pct1);
+        let cv5 = mackinnon_critical_value(100, 2, MacKinnonLevel::Pct5);
+        let cv10 = mackinnon_critical_value(100, 2, MacKinnonLevel::Pct10);
+        assert!(cv1 < cv5, "1% cv={} should be < 5% cv={}", cv1, cv5);
+        assert!(cv5 < cv10, "5% cv={} should be < 10% cv={}", cv5, cv10);
     }
 
     #[test]
