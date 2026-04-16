@@ -41,6 +41,10 @@ pub enum ConfigOverride {
     OtrEnabled(bool),
     /// Max inventory (base asset).
     MaxInventory(Decimal),
+    /// Pause quoting for this symbol (lifecycle_paused = true).
+    PauseQuoting,
+    /// Resume quoting for this symbol (lifecycle_paused = false).
+    ResumeQuoting,
 }
 
 #[derive(Debug, Default)]

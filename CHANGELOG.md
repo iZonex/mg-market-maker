@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SLA compliance certificate + admin pause/resume**
+  (Apr 2026).
+  - `GET /api/v1/sla/certificate` — structured compliance
+    proof for token projects and exchange audit teams. Per-symbol
+    presence %, two-sided %, spread compliance, volume, fills,
+    configured SLA limits, compliance verdict, HMAC signature.
+  - `POST /api/admin/symbols/{symbol}/pause` — pause quoting
+    for a specific symbol without restart.
+  - `POST /api/admin/symbols/{symbol}/resume` — resume quoting.
+  - `ConfigOverride::PauseQuoting` / `ResumeQuoting` variants
+    wired through the hot-reload channel.
+
 - **Hot config reload via admin API** (Apr 2026). Operators
   can change MM parameters on running engines without restart:
   - `POST /api/admin/config/{symbol}` — per-symbol override

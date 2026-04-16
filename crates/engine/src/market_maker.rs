@@ -2491,6 +2491,14 @@ impl MarketMakerEngine {
                 info!(symbol = %self.symbol, max_inv = %v, "hot-reload: max_inventory");
                 self.config.risk.max_inventory = v;
             }
+            ConfigOverride::PauseQuoting => {
+                info!(symbol = %self.symbol, "hot-reload: pausing quoting");
+                self.lifecycle_paused = true;
+            }
+            ConfigOverride::ResumeQuoting => {
+                info!(symbol = %self.symbol, "hot-reload: resuming quoting");
+                self.lifecycle_paused = false;
+            }
         }
         self.audit.risk_event(
             &self.symbol,

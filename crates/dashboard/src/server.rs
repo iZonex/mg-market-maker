@@ -52,10 +52,18 @@ pub async fn start(
         .with_state(state.clone());
 
     // Admin config routes — hot-reload config per symbol or
-    // broadcast to all. Auth via API key in header.
+    // broadcast to all.
     let admin_config = Router::new()
         .route("/api/admin/config/{symbol}", post(admin_config_override))
         .route("/api/admin/config", post(admin_config_broadcast))
+        .route(
+            "/api/admin/symbols/{symbol}/pause",
+            post(admin_pause_symbol),
+        )
+        .route(
+            "/api/admin/symbols/{symbol}/resume",
+            post(admin_resume_symbol),
+        )
         .with_state(state.clone());
 
     // WebSocket — auth via query param (?token=...).
@@ -238,5 +246,27 @@ async fn admin_config_broadcast(
     let count = state.broadcast_config_override(ovr);
     Json(ConfigBroadcastResponse {
         engines_updated: count,
+    })
+}
+
+async fn admin_pause_symbol(
+    State(state): State<DashboardState>,
+    Path(symbol): Path<String>,
+) -> Json<ConfigOverrideResponse> {
+    let ok = state.send_config_override(&symbol, ConfigOverride::PauseQuoting);
+    Json(ConfigOverrideResponse {
+        symbol,
+        applied: ok,
+    })
+}
+
+async fn admin_resume_symbol(
+    State(state): State<DashboardState>,
+    Path(symbol): Path<String>,
+) -> Json<ConfigOverrideResponse> {
+    let ok = state.send_config_override(&symbol, ConfigOverride::ResumeQuoting);
+    Json(ConfigOverrideResponse {
+        symbol,
+        applied: ok,
     })
 }
