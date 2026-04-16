@@ -34,6 +34,8 @@ pub fn client_routes() -> Router<DashboardState> {
         .route("/api/v1/report/history/{date}", get(get_historical_report))
         .route("/api/v1/book/analytics", get(get_book_analytics))
         .route("/api/v1/audit/recent", get(get_audit_recent))
+        .route("/api/v1/system/diagnostics", get(get_diagnostics))
+        .route("/api/v1/pnl/timeseries", get(get_pnl_timeseries))
         .route("/api/v1/portfolio", get(get_portfolio))
 }
 
@@ -468,6 +470,57 @@ fn hmac_sha256_hex(key: &str, message: &str) -> String {
     key.hash(&mut hasher);
     message.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+/// System diagnostics — version, uptime, symbol count.
+#[derive(Debug, Serialize)]
+struct DiagnosticsResponse {
+    version: String,
+    uptime_secs: i64,
+    started_at: String,
+    active_symbols: usize,
+    total_fills: u64,
+    total_volume: Decimal,
+    config_channels: usize,
+    webhook_urls: usize,
+    alert_rules: usize,
+}
+
+async fn get_diagnostics(State(state): State<DashboardState>) -> Json<DiagnosticsResponse> {
+    let symbols = state.get_all();
+    let total_fills: u64 = symbols.iter().map(|s| s.pnl.round_trips).sum();
+    let total_volume: Decimal = symbols.iter().map(|s| s.pnl.volume).sum();
+    let started = state.started_at();
+    let uptime = (Utc::now() - started).num_seconds();
+    let wh_urls = state
+        .webhook_dispatcher()
+        .map(|w| w.url_count())
+        .unwrap_or(0);
+
+    Json(DiagnosticsResponse {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        uptime_secs: uptime,
+        started_at: started.to_rfc3339(),
+        active_symbols: symbols.len(),
+        total_fills,
+        total_volume,
+        config_channels: state.config_symbols().len(),
+        webhook_urls: wh_urls,
+        alert_rules: state.get_alert_rules().len(),
+    })
+}
+
+/// PnL time-series for charting.
+#[derive(Debug, Deserialize)]
+struct PnlTimeseriesQuery {
+    symbol: String,
+}
+
+async fn get_pnl_timeseries(
+    State(state): State<DashboardState>,
+    Query(query): Query<PnlTimeseriesQuery>,
+) -> Json<Vec<crate::state::PnlTimePoint>> {
+    Json(state.get_pnl_timeseries(&query.symbol))
 }
 
 /// Order book analytics — depth, imbalance, liquidity score.

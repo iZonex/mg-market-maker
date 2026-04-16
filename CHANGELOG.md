@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **System diagnostics + PnL time-series + alert rules engine**
+  (Apr 2026).
+  - `GET /api/v1/system/diagnostics` — version, uptime, active
+    symbols, total fills/volume, config channels, webhook URLs,
+    alert rule count. K8s/monitoring integration.
+  - `GET /api/v1/pnl/timeseries?symbol=X` — rolling 24h PnL
+    time-series (1440 entries at 1-min cadence). Engine pushes
+    on every summary tick. Powers frontend charts.
+  - Alert rules engine:
+    `POST /api/admin/alerts` — add configurable rules (PnL
+    below, spread above, inventory above, uptime below).
+    `GET /api/admin/alerts` — list rules.
+    `GET /api/admin/alerts/check` — evaluate all rules against
+    current state, return triggered rules.
+  - Total: 22 client + 12 admin endpoints.
+
 - **Automated daily snapshots + audit API + book analytics +
   rate limiter** (Apr 2026).
   - Automated daily report snapshots: engine detects UTC date

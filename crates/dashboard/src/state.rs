@@ -73,9 +73,54 @@ struct StateInner {
     /// Historical daily report snapshots. Keyed by date string
     /// (YYYY-MM-DD). Capped at 90 days.
     daily_reports: HashMap<String, DailyReportSnapshot>,
+    /// Rolling PnL time-series per symbol. Each entry is a
+    /// (timestamp_ms, total_pnl) pair. Capped at 1440 entries
+    /// per symbol (24h at 1-minute cadence).
+    pnl_timeseries: HashMap<String, std::collections::VecDeque<(i64, Decimal)>>,
+    /// Process start time for uptime calculation.
+    started_at: DateTime<Utc>,
+    /// Configurable alert rules.
+    alert_rules: Vec<AlertRule>,
 }
 
 const MAX_DAILY_REPORTS: usize = 90;
+const MAX_PNL_TIMESERIES: usize = 1440;
+
+/// Configurable alert rule — fires when a condition is met.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertRule {
+    /// Unique rule ID.
+    pub id: String,
+    /// Human-readable description.
+    pub description: String,
+    /// What to check.
+    pub condition: AlertCondition,
+    /// Whether this rule is active.
+    pub enabled: bool,
+}
+
+/// Condition that triggers an alert.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum AlertCondition {
+    /// PnL drops below threshold (quote asset).
+    PnlBelow { threshold: Decimal },
+    /// Spread exceeds threshold (bps).
+    SpreadAbove { threshold_bps: Decimal },
+    /// Inventory exceeds threshold (base asset, absolute).
+    InventoryAbove { threshold: Decimal },
+    /// Uptime drops below threshold (%).
+    UptimeBelow { threshold_pct: Decimal },
+    /// Fill rate drops below threshold (fills/minute).
+    FillRateBelow { threshold_per_min: Decimal },
+}
+
+/// PnL time-series entry for charts.
+#[derive(Debug, Clone, Serialize)]
+pub struct PnlTimePoint {
+    pub timestamp_ms: i64,
+    pub total_pnl: Decimal,
+}
 
 /// Stored daily report for historical queries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,7 +284,9 @@ pub struct PnlSnapshot {
 
 impl DashboardState {
     pub fn new() -> Self {
-        Self::default()
+        let s = Self::default();
+        s.inner.write().unwrap().started_at = Utc::now();
+        s
     }
 
     /// Update state for a symbol.
@@ -414,6 +461,97 @@ impl DashboardState {
     /// Get the webhook dispatcher for admin endpoints.
     pub fn webhook_dispatcher(&self) -> Option<crate::webhooks::WebhookDispatcher> {
         self.inner.read().unwrap().webhook_dispatcher.clone()
+    }
+
+    /// Push a PnL sample for a symbol's time-series. Called
+    /// by the engine on every summary tick (30s cadence).
+    pub fn push_pnl_sample(&self, symbol: &str, timestamp_ms: i64, total_pnl: Decimal) {
+        let mut inner = self.inner.write().unwrap();
+        let ts = inner
+            .pnl_timeseries
+            .entry(symbol.to_string())
+            .or_default();
+        ts.push_back((timestamp_ms, total_pnl));
+        while ts.len() > MAX_PNL_TIMESERIES {
+            ts.pop_front();
+        }
+    }
+
+    /// Get PnL time-series for a symbol. Returns newest-first.
+    pub fn get_pnl_timeseries(&self, symbol: &str) -> Vec<PnlTimePoint> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .pnl_timeseries
+            .get(symbol)
+            .map(|ts| {
+                ts.iter()
+                    .map(|(t, p)| PnlTimePoint {
+                        timestamp_ms: *t,
+                        total_pnl: *p,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Add a configurable alert rule.
+    pub fn add_alert_rule(&self, rule: AlertRule) {
+        let mut inner = self.inner.write().unwrap();
+        // Replace if same ID exists.
+        inner.alert_rules.retain(|r| r.id != rule.id);
+        inner.alert_rules.push(rule);
+    }
+
+    /// Remove an alert rule by ID.
+    pub fn remove_alert_rule(&self, id: &str) -> bool {
+        let mut inner = self.inner.write().unwrap();
+        let before = inner.alert_rules.len();
+        inner.alert_rules.retain(|r| r.id != id);
+        inner.alert_rules.len() < before
+    }
+
+    /// List all alert rules.
+    pub fn get_alert_rules(&self) -> Vec<AlertRule> {
+        self.inner.read().unwrap().alert_rules.clone()
+    }
+
+    /// Check all alert rules against current state. Returns
+    /// triggered rule IDs with the triggering value.
+    pub fn check_alert_rules(&self) -> Vec<(String, String)> {
+        let inner = self.inner.read().unwrap();
+        let mut triggered = Vec::new();
+        for rule in &inner.alert_rules {
+            if !rule.enabled {
+                continue;
+            }
+            for sym in inner.symbols.values() {
+                let fires = match &rule.condition {
+                    AlertCondition::PnlBelow { threshold } => sym.pnl.total < *threshold,
+                    AlertCondition::SpreadAbove { threshold_bps } => {
+                        sym.spread_bps > *threshold_bps
+                    }
+                    AlertCondition::InventoryAbove { threshold } => {
+                        sym.inventory.abs() > *threshold
+                    }
+                    AlertCondition::UptimeBelow { threshold_pct } => {
+                        sym.sla_uptime_pct < *threshold_pct
+                    }
+                    AlertCondition::FillRateBelow { .. } => false, // needs fill rate tracking
+                };
+                if fires {
+                    triggered.push((
+                        rule.id.clone(),
+                        format!("{}: {}", sym.symbol, rule.description),
+                    ));
+                }
+            }
+        }
+        triggered
+    }
+
+    /// Process start time.
+    pub fn started_at(&self) -> DateTime<Utc> {
+        self.inner.read().unwrap().started_at
     }
 
     /// Auto-snapshot the current state as a daily report. Called

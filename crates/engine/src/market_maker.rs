@@ -2724,6 +2724,13 @@ impl MarketMakerEngine {
             performance: Some(self.performance.compute(dec!(525600))), // 365.25d × 1440min
         });
 
+        // Push PnL time-series sample for charting.
+        ds.push_pnl_sample(
+            &self.symbol,
+            chrono::Utc::now().timestamp_millis(),
+            self.pnl_tracker.attribution.total_pnl(),
+        );
+
         // Push market impact metrics to Prometheus.
         let impact = self.market_impact.report();
         mm_dashboard::metrics::MARKET_IMPACT_MEAN_BPS

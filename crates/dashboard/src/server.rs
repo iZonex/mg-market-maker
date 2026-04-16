@@ -73,6 +73,9 @@ pub async fn start(
         )
         .route("/api/admin/webhooks", get(admin_list_webhooks))
         .route("/api/admin/webhooks", post(admin_add_webhook))
+        .route("/api/admin/alerts", get(admin_list_alerts))
+        .route("/api/admin/alerts", post(admin_add_alert))
+        .route("/api/admin/alerts/check", get(admin_check_alerts))
         .with_state(state.clone());
 
     // WebSocket — auth via query param (?token=...).
@@ -369,6 +372,33 @@ async fn admin_add_webhook(
             events_failed: 0,
         })
     }
+}
+
+async fn admin_list_alerts(
+    State(state): State<DashboardState>,
+) -> Json<Vec<crate::state::AlertRule>> {
+    Json(state.get_alert_rules())
+}
+
+async fn admin_add_alert(
+    State(state): State<DashboardState>,
+    Json(rule): Json<crate::state::AlertRule>,
+) -> Json<Vec<crate::state::AlertRule>> {
+    state.add_alert_rule(rule);
+    Json(state.get_alert_rules())
+}
+
+#[derive(serde::Serialize)]
+struct AlertCheckResponse {
+    triggered: Vec<(String, String)>,
+}
+
+async fn admin_check_alerts(
+    State(state): State<DashboardState>,
+) -> Json<AlertCheckResponse> {
+    Json(AlertCheckResponse {
+        triggered: state.check_alert_rules(),
+    })
 }
 
 async fn admin_resume_symbol(
