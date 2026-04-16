@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Epic F stage-2 — Cartea-Jaimungal Poisson jump intensity
+  for news retreat** (Apr 2026). `NewsJumpIntensity` models
+  news arrival as a self-exciting point process with per-class
+  weights and exponential decay. Continuous multiplier
+  `M(t) = 1 + (M_max − 1) · min(1, λ(t)/λ_sat)` replaces
+  the binary cooldown tier for smoother retreat profiles.
+  Composable with the existing state machine via `max()`.
+  8 new tests.
+
 - **Hawkes self-exciting point process intensity estimator**
   (Apr 2026). New `HawkesIntensity` (univariate) and
   `BivariateHawkes` (mutually-exciting buy/sell) in the

@@ -296,6 +296,174 @@ impl NewsRetreatStateMachine {
     }
 }
 
+/// Poisson jump-diffusion news intensity model (stage-2).
+///
+/// Instead of the binary cooldown state machine, this model
+/// tracks a continuous intensity that jumps on each headline
+/// and decays exponentially. The spread multiplier is a
+/// continuous function of the intensity rather than a
+/// discrete tier. Composable with the state machine —
+/// operators can run both and take the max.
+///
+/// # Formula (Cartea-Jaimungal-Penalva 2015 §7.2)
+///
+/// ```text
+/// λ(t) = λ_0 + Σ_i w_i · exp(-β · (t - t_i))
+/// M(t) = 1 + (M_max - 1) · min(1, λ(t) / λ_sat)
+/// ```
+///
+/// where `w_i` is the per-headline weight (class-dependent),
+/// `β` is the decay rate, and `λ_sat` is the saturation
+/// intensity.
+#[derive(Debug, Clone)]
+pub struct NewsJumpIntensity {
+    /// Baseline intensity (events per second).
+    lambda_0: Decimal,
+    /// Decay rate β (per millisecond).
+    beta_per_ms: Decimal,
+    /// Saturation intensity — when λ reaches this, the
+    /// multiplier saturates at `max_mult`.
+    lambda_sat: Decimal,
+    /// Maximum spread multiplier at saturation.
+    max_mult: Decimal,
+    /// Per-class jump weight.
+    weight_low: Decimal,
+    weight_high: Decimal,
+    weight_critical: Decimal,
+    /// Accumulated kernel state.
+    kernel: Decimal,
+    /// Last event timestamp (milliseconds).
+    last_event_ms: Option<i64>,
+}
+
+/// Configuration for [`NewsJumpIntensity`].
+#[derive(Debug, Clone)]
+pub struct NewsJumpConfig {
+    /// Baseline intensity λ_0. Default 0.
+    pub lambda_0: Decimal,
+    /// Half-life of the decay in milliseconds. The decay rate
+    /// β = ln(2) / half_life. Default: 5 minutes = 300_000 ms.
+    pub half_life_ms: i64,
+    /// Saturation intensity. Default 5.0.
+    pub lambda_sat: Decimal,
+    /// Maximum spread multiplier at saturation. Default 3.0.
+    pub max_mult: Decimal,
+    /// Jump weight for Low headlines. Default 0.5.
+    pub weight_low: Decimal,
+    /// Jump weight for High headlines. Default 2.0.
+    pub weight_high: Decimal,
+    /// Jump weight for Critical headlines. Default 5.0.
+    pub weight_critical: Decimal,
+}
+
+impl Default for NewsJumpConfig {
+    fn default() -> Self {
+        Self {
+            lambda_0: Decimal::ZERO,
+            half_life_ms: 300_000,
+            lambda_sat: dec!(5),
+            max_mult: dec!(3),
+            weight_low: dec!(0.5),
+            weight_high: dec!(2),
+            weight_critical: dec!(5),
+        }
+    }
+}
+
+impl NewsJumpIntensity {
+    pub fn new(config: NewsJumpConfig) -> Self {
+        // β = ln(2) / half_life ≈ 0.693 / half_life
+        let beta = dec!(0.6931471805599453) / Decimal::from(config.half_life_ms.max(1));
+        Self {
+            lambda_0: config.lambda_0,
+            beta_per_ms: beta,
+            lambda_sat: config.lambda_sat,
+            max_mult: config.max_mult,
+            weight_low: config.weight_low,
+            weight_high: config.weight_high,
+            weight_critical: config.weight_critical,
+            kernel: Decimal::ZERO,
+            last_event_ms: None,
+        }
+    }
+
+    /// Register a news event at time `now_ms` with the given class.
+    pub fn on_event(&mut self, class: NewsClass, now_ms: i64) -> Decimal {
+        self.decay_to(now_ms);
+        let w = match class {
+            NewsClass::Low => self.weight_low,
+            NewsClass::High => self.weight_high,
+            NewsClass::Critical => self.weight_critical,
+        };
+        self.kernel += w;
+        self.last_event_ms = Some(now_ms);
+        self.multiplier_at(now_ms)
+    }
+
+    /// Current intensity at time `now_ms`.
+    pub fn intensity_at(&self, now_ms: i64) -> Decimal {
+        self.lambda_0 + self.decayed_kernel(now_ms)
+    }
+
+    /// Current spread multiplier at time `now_ms` ∈ [1, max_mult].
+    pub fn multiplier_at(&self, now_ms: i64) -> Decimal {
+        let lambda = self.intensity_at(now_ms);
+        if self.lambda_sat.is_zero() {
+            return Decimal::ONE;
+        }
+        let ratio = (lambda / self.lambda_sat).min(Decimal::ONE);
+        Decimal::ONE + (self.max_mult - Decimal::ONE) * ratio
+    }
+
+    /// `true` when the intensity exceeds 80% of saturation.
+    pub fn is_critical(&self, now_ms: i64) -> bool {
+        let lambda = self.intensity_at(now_ms);
+        lambda > self.lambda_sat * dec!(0.8)
+    }
+
+    pub fn reset(&mut self) {
+        self.kernel = Decimal::ZERO;
+        self.last_event_ms = None;
+    }
+
+    fn decay_to(&mut self, now_ms: i64) {
+        if let Some(prev) = self.last_event_ms {
+            let dt = (now_ms - prev).max(0);
+            let decay = exp_neg_decimal(self.beta_per_ms * Decimal::from(dt));
+            self.kernel *= decay;
+        }
+    }
+
+    fn decayed_kernel(&self, now_ms: i64) -> Decimal {
+        match self.last_event_ms {
+            None => Decimal::ZERO,
+            Some(prev) => {
+                let dt = (now_ms - prev).max(0);
+                let decay = exp_neg_decimal(self.beta_per_ms * Decimal::from(dt));
+                decay * self.kernel
+            }
+        }
+    }
+}
+
+/// exp(-x) for Decimal using Taylor series (6 terms).
+fn exp_neg_decimal(x: Decimal) -> Decimal {
+    if x <= Decimal::ZERO {
+        return Decimal::ONE;
+    }
+    if x > dec!(10) {
+        return Decimal::ZERO;
+    }
+    let x2 = x * x;
+    let x3 = x2 * x;
+    let x4 = x3 * x;
+    let x5 = x4 * x;
+    let x6 = x5 * x;
+    let result = Decimal::ONE - x + x2 / dec!(2) - x3 / dec!(6) + x4 / dec!(24)
+        - x5 / dec!(120) + x6 / dec!(720);
+    result.max(Decimal::ZERO)
+}
+
 /// Compile one priority list of raw pattern strings into
 /// regexes. Each pattern is wrapped in `(?i)` so matching is
 /// case-insensitive (operators don't have to normalise case
@@ -666,5 +834,109 @@ mod tests {
                 to: NewsRetreatState::Critical,
             }
         ));
+    }
+
+    // ── Poisson jump intensity tests ────────────────────────
+
+    #[test]
+    fn jump_baseline_multiplier_is_one() {
+        let nj = NewsJumpIntensity::new(NewsJumpConfig::default());
+        assert_eq!(nj.multiplier_at(0), dec!(1));
+    }
+
+    #[test]
+    fn jump_critical_event_raises_multiplier() {
+        let mut nj = NewsJumpIntensity::new(NewsJumpConfig::default());
+        let mult = nj.on_event(NewsClass::Critical, 0);
+        assert!(
+            mult > dec!(1),
+            "critical event should raise multiplier, got {}",
+            mult
+        );
+    }
+
+    #[test]
+    fn jump_multiplier_decays_over_time() {
+        let mut nj = NewsJumpIntensity::new(NewsJumpConfig::default());
+        nj.on_event(NewsClass::Critical, 0);
+        let mult_soon = nj.multiplier_at(1000); // 1 second later
+        let mult_later = nj.multiplier_at(600_000); // 10 minutes later
+        assert!(
+            mult_soon > mult_later,
+            "multiplier should decay: soon={} > later={}",
+            mult_soon,
+            mult_later
+        );
+    }
+
+    #[test]
+    fn jump_multiple_events_accumulate() {
+        let mut nj = NewsJumpIntensity::new(NewsJumpConfig::default());
+        nj.on_event(NewsClass::High, 0);
+        let mult_one = nj.multiplier_at(100);
+        nj.on_event(NewsClass::High, 100);
+        let mult_two = nj.multiplier_at(200);
+        assert!(
+            mult_two > mult_one,
+            "two events should produce higher multiplier: {} > {}",
+            mult_two,
+            mult_one
+        );
+    }
+
+    #[test]
+    fn jump_saturates_at_max_mult() {
+        let cfg = NewsJumpConfig {
+            lambda_sat: dec!(1),
+            max_mult: dec!(3),
+            weight_critical: dec!(10),
+            ..Default::default()
+        };
+        let mut nj = NewsJumpIntensity::new(cfg);
+        // Flood with critical events to saturate.
+        for i in 0..20 {
+            nj.on_event(NewsClass::Critical, i * 100);
+        }
+        let mult = nj.multiplier_at(2000);
+        assert!(
+            mult <= dec!(3),
+            "multiplier should be capped at max_mult=3, got {}",
+            mult
+        );
+    }
+
+    #[test]
+    fn jump_is_critical_threshold() {
+        let mut nj = NewsJumpIntensity::new(NewsJumpConfig {
+            lambda_sat: dec!(5),
+            weight_critical: dec!(5),
+            ..Default::default()
+        });
+        assert!(!nj.is_critical(0));
+        nj.on_event(NewsClass::Critical, 0);
+        // intensity = 5, 80% of sat = 4 → 5 > 4 → critical
+        assert!(nj.is_critical(0));
+    }
+
+    #[test]
+    fn jump_reset_clears_state() {
+        let mut nj = NewsJumpIntensity::new(NewsJumpConfig::default());
+        nj.on_event(NewsClass::Critical, 0);
+        nj.reset();
+        assert_eq!(nj.multiplier_at(0), dec!(1));
+    }
+
+    #[test]
+    fn jump_low_event_has_small_impact() {
+        let mut nj = NewsJumpIntensity::new(NewsJumpConfig::default());
+        let mult_low = nj.on_event(NewsClass::Low, 0);
+        nj.reset();
+        let mult_crit = nj.on_event(NewsClass::Critical, 0);
+        assert!(
+            mult_low < mult_crit,
+            "low should have smaller impact: low={} < critical={}",
+            mult_low,
+            mult_crit
+        );
     }
 }
