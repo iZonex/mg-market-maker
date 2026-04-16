@@ -120,16 +120,9 @@ impl PairedUnwindExecutor {
         aggressiveness_bps: Decimal,
     ) -> Self {
         let hedge_qty = primary_qty * pair.multiplier;
-        let slice_primary = if num_slices > 0 {
-            primary_qty / Decimal::from(num_slices)
-        } else {
-            primary_qty
-        };
-        let slice_hedge = if num_slices > 0 {
-            hedge_qty / Decimal::from(num_slices)
-        } else {
-            hedge_qty
-        };
+        let num_dec = Decimal::from(num_slices.max(1));
+        let slice_primary = primary_qty / num_dec;
+        let slice_hedge = hedge_qty / num_dec;
 
         info!(
             primary_symbol = %pair.primary_symbol,
@@ -292,11 +285,9 @@ impl PairedUnwindExecutor {
 
         // Schedule: slice index is elapsed / (duration / N).
         let elapsed = (chrono::Utc::now() - self.started_at).num_seconds() as u64;
-        let expected_slice = if self.duration_secs > 0 {
-            (elapsed * self.total_slices as u64 / self.duration_secs) as u32
-        } else {
-            self.total_slices
-        };
+        let expected_slice = (elapsed * self.total_slices as u64)
+            .checked_div(self.duration_secs)
+            .unwrap_or(self.total_slices as u64) as u32;
 
         if self.current_slice >= expected_slice {
             return SlicePair::EMPTY;

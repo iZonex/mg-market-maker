@@ -48,11 +48,7 @@ impl TwapExecutor {
         num_slices: u32,
         aggressiveness_bps: Decimal,
     ) -> Self {
-        let slice_qty = if num_slices > 0 {
-            target_qty / Decimal::from(num_slices)
-        } else {
-            target_qty
-        };
+        let slice_qty = target_qty / Decimal::from(num_slices.max(1));
 
         info!(
             %symbol, ?side, %target_qty, duration_secs, num_slices,
@@ -82,11 +78,9 @@ impl TwapExecutor {
         }
 
         let elapsed = (Utc::now() - self.started_at).num_seconds() as u64;
-        let expected_slice = if self.duration_secs > 0 {
-            (elapsed * self.num_slices as u64 / self.duration_secs) as u32
-        } else {
-            self.num_slices
-        };
+        let expected_slice = (elapsed * self.num_slices as u64)
+            .checked_div(self.duration_secs)
+            .unwrap_or(self.num_slices as u64) as u32;
 
         if self.current_slice >= expected_slice {
             return None; // Not time yet.
