@@ -708,9 +708,33 @@ impl OrderManager {
     /// Cancel all live orders (emergency or shutdown).
     pub async fn cancel_all(&mut self, connector: &Arc<dyn ExchangeConnector>, symbol: &str) {
         let ids: Vec<OrderId> = self.live_orders.keys().copied().collect();
-        for order_id in ids {
-            let _ = connector.cancel_order(symbol, order_id).await;
-            self.remove_order(order_id);
+        if ids.is_empty() {
+            return;
+        }
+        let max_batch = connector.capabilities().max_batch_size.max(1);
+        if ids.len() >= MIN_BATCH_SIZE && max_batch >= MIN_BATCH_SIZE {
+            // Use batch cancel for speed on shutdown.
+            for chunk in ids.chunks(max_batch) {
+                match connector.cancel_orders_batch(symbol, chunk).await {
+                    Ok(_) => {
+                        for id in chunk {
+                            self.remove_order(*id);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "batch cancel_all failed — falling back to per-order");
+                        for id in chunk {
+                            let _ = connector.cancel_order(symbol, *id).await;
+                            self.remove_order(*id);
+                        }
+                    }
+                }
+            }
+        } else {
+            for order_id in ids {
+                let _ = connector.cancel_order(symbol, order_id).await;
+                self.remove_order(order_id);
+            }
         }
         info!("all orders cancelled");
     }
