@@ -46,6 +46,11 @@ pub enum TelegramCommand {
     Pause { symbol: String },
     Resume { symbol: String },
     ForceExit { symbol: String },
+    /// Query current positions — responds with per-symbol
+    /// inventory, PnL, and spread. No side effects.
+    Positions,
+    /// Show available commands.
+    Help,
 }
 
 /// Handle returned by `spawn` — the engine pulls commands off its
@@ -199,6 +204,8 @@ pub fn parse_command(text: &str) -> Option<TelegramCommand> {
     match head {
         "/status" => Some(TelegramCommand::Status),
         "/stop" => Some(TelegramCommand::Stop),
+        "/positions" | "/pos" => Some(TelegramCommand::Positions),
+        "/help" => Some(TelegramCommand::Help),
         "/pause" => rest
             .filter(|s| !s.is_empty())
             .map(|s| TelegramCommand::Pause {

@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Client API: fills endpoint + NBBO capture + SLA depth fix
+  + Telegram commands** (Apr 2026). Competitive gap closure
+  for token-project clients:
+  - `GET /api/v1/fills/recent?symbol=X&limit=N` — per-fill
+    records with NBBO snapshot (best bid/ask at fill time) and
+    slippage in bps. `FillRecord` stored in `DashboardState`
+    (capped at 1000, oldest evicted).
+  - SLA endpoint now returns real `bid_depth` / `ask_depth`
+    from book depth levels (was hardcoded zeros), plus
+    `sla_max_spread_bps`, `spread_compliance_pct`,
+    `presence_pct_24h`, `two_sided_pct_24h`.
+  - Engine wires NBBO capture on every fill via the book
+    keeper's best bid/ask at fill time.
+  - Telegram: `/positions` (alias `/pos`) + `/help` commands.
+
 - **HawkesTradeFlow feature extractor** (Apr 2026). Wraps
   `BivariateHawkes` as a microstructure feature: captures
   trade-arrival clustering that EWMA-based `TradeFlow` misses.

@@ -1798,6 +1798,49 @@ impl MarketMakerEngine {
                 if let Some(mid) = self.book_keeper.book.mid_price() {
                     self.pnl_tracker.on_fill(fill, mid);
                     self.adverse_selection.on_fill(fill.price, fill.side, mid);
+
+                    // NBBO capture + dashboard fill recording.
+                    if let Some(ds) = &self.dashboard {
+                        let nbbo_bid = self
+                            .book_keeper
+                            .book
+                            .best_bid()
+                            .unwrap_or(mid);
+                        let nbbo_ask = self
+                            .book_keeper
+                            .book
+                            .best_ask()
+                            .unwrap_or(mid);
+                        let slippage_bps = if mid > Decimal::ZERO {
+                            match fill.side {
+                                mm_common::types::Side::Buy => {
+                                    (fill.price - mid) / mid * dec!(10_000)
+                                }
+                                mm_common::types::Side::Sell => {
+                                    (mid - fill.price) / mid * dec!(10_000)
+                                }
+                            }
+                        } else {
+                            Decimal::ZERO
+                        };
+                        let fee_rate = if fill.is_maker {
+                            self.product.maker_fee
+                        } else {
+                            self.product.taker_fee
+                        };
+                        ds.record_fill(mm_dashboard::state::FillRecord {
+                            timestamp: fill.timestamp,
+                            symbol: self.symbol.clone(),
+                            side: format!("{:?}", fill.side),
+                            price: fill.price,
+                            qty: fill.qty,
+                            is_maker: fill.is_maker,
+                            fee: fill.price * fill.qty * fee_rate,
+                            nbbo_bid,
+                            nbbo_ask,
+                            slippage_bps,
+                        });
+                    }
                 }
 
                 if let Some(twap) = &mut self.twap {

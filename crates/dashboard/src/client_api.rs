@@ -1,12 +1,12 @@
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::Utc;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::state::DashboardState;
+use crate::state::{DashboardState, FillRecord};
 
 /// Client-facing API — what clients and exchanges expect to see.
 ///
@@ -22,6 +22,7 @@ pub fn client_routes() -> Router<DashboardState> {
         .route("/api/v1/positions", get(get_positions))
         .route("/api/v1/pnl", get(get_pnl))
         .route("/api/v1/sla", get(get_sla))
+        .route("/api/v1/fills/recent", get(get_recent_fills))
         .route("/api/v1/report/daily", get(get_daily_report))
         .route("/api/v1/portfolio", get(get_portfolio))
 }
@@ -114,19 +115,34 @@ struct SlaResponse {
     current_spread_bps: Decimal,
     bid_depth: Decimal,
     ask_depth: Decimal,
+    sla_max_spread_bps: Decimal,
+    sla_min_depth_quote: Decimal,
+    spread_compliance_pct: Decimal,
+    presence_pct_24h: Decimal,
+    two_sided_pct_24h: Decimal,
 }
 
 async fn get_sla(State(state): State<DashboardState>) -> Json<Vec<SlaResponse>> {
     let symbols = state.get_all();
     let sla: Vec<SlaResponse> = symbols
         .iter()
-        .map(|s| SlaResponse {
-            symbol: s.symbol.clone(),
-            uptime_pct: s.sla_uptime_pct,
-            is_compliant: s.sla_uptime_pct >= dec!(95),
-            current_spread_bps: s.spread_bps,
-            bid_depth: dec!(0), // Would need depth from state.
-            ask_depth: dec!(0),
+        .map(|s| {
+            // Sum depth across all book levels for a total figure.
+            let bid_depth: Decimal = s.book_depth_levels.iter().map(|l| l.bid_depth_quote).sum();
+            let ask_depth: Decimal = s.book_depth_levels.iter().map(|l| l.ask_depth_quote).sum();
+            SlaResponse {
+                symbol: s.symbol.clone(),
+                uptime_pct: s.sla_uptime_pct,
+                is_compliant: s.sla_uptime_pct >= dec!(95),
+                current_spread_bps: s.spread_bps,
+                bid_depth,
+                ask_depth,
+                sla_max_spread_bps: s.sla_max_spread_bps,
+                sla_min_depth_quote: s.sla_min_depth_quote,
+                spread_compliance_pct: s.spread_compliance_pct,
+                presence_pct_24h: s.presence_pct_24h,
+                two_sided_pct_24h: s.two_sided_pct_24h,
+            }
         })
         .collect();
     Json(sla)
@@ -200,4 +216,21 @@ async fn get_daily_report(State(state): State<DashboardState>) -> Json<DailyRepo
         total_volume,
         total_fills,
     })
+}
+
+/// Query params for fills endpoint.
+#[derive(Debug, Deserialize)]
+struct FillsQuery {
+    symbol: Option<String>,
+    limit: Option<usize>,
+}
+
+/// Recent fills with NBBO snapshot and slippage.
+async fn get_recent_fills(
+    State(state): State<DashboardState>,
+    Query(query): Query<FillsQuery>,
+) -> Json<Vec<FillRecord>> {
+    let limit = query.limit.unwrap_or(100).min(1000);
+    let fills = state.get_recent_fills(query.symbol.as_deref(), limit);
+    Json(fills)
 }

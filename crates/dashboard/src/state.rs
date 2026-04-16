@@ -24,6 +24,33 @@ struct StateInner {
     /// shows per-symbol PnL from `PnlTracker` but the unified
     /// multi-currency view is unavailable.
     portfolio: Option<PortfolioSnapshot>,
+    /// Recent fills for the client API. Capped at
+    /// `MAX_RECENT_FILLS` entries, oldest evicted first.
+    recent_fills: std::collections::VecDeque<FillRecord>,
+}
+
+/// Maximum recent fills retained in dashboard state.
+const MAX_RECENT_FILLS: usize = 1000;
+
+/// A fill record for the client-facing `/api/v1/fills/recent`
+/// endpoint. Captures the fill details plus the NBBO at the
+/// time of execution for quality benchmarking.
+#[derive(Debug, Clone, Serialize)]
+pub struct FillRecord {
+    pub timestamp: DateTime<Utc>,
+    pub symbol: String,
+    pub side: String,
+    pub price: Decimal,
+    pub qty: Decimal,
+    pub is_maker: bool,
+    pub fee: Decimal,
+    /// Best bid at the time of the fill (NBBO capture).
+    pub nbbo_bid: Decimal,
+    /// Best ask at the time of the fill (NBBO capture).
+    pub nbbo_ask: Decimal,
+    /// Slippage vs mid at fill time, in bps. Positive = adverse
+    /// (filled worse than mid). Negative = favorable.
+    pub slippage_bps: Decimal,
 }
 
 /// A recorded incident for the daily report.
@@ -300,6 +327,30 @@ impl DashboardState {
     /// Read the last-published portfolio snapshot.
     pub fn get_portfolio(&self) -> Option<PortfolioSnapshot> {
         self.inner.read().unwrap().portfolio.clone()
+    }
+
+    /// Record a fill with NBBO snapshot for the client API.
+    /// Called by the engine on every fill event.
+    pub fn record_fill(&self, fill: FillRecord) {
+        let mut inner = self.inner.write().unwrap();
+        inner.recent_fills.push_back(fill);
+        while inner.recent_fills.len() > MAX_RECENT_FILLS {
+            inner.recent_fills.pop_front();
+        }
+    }
+
+    /// Get recent fills, optionally filtered by symbol.
+    /// Returns newest-first, capped at `limit`.
+    pub fn get_recent_fills(&self, symbol: Option<&str>, limit: usize) -> Vec<FillRecord> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .recent_fills
+            .iter()
+            .rev()
+            .filter(|f| symbol.is_none_or(|s| f.symbol == s))
+            .take(limit)
+            .cloned()
+            .collect()
     }
 }
 
