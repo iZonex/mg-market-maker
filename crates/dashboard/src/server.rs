@@ -56,6 +56,7 @@ pub async fn start(
     let admin_config = Router::new()
         .route("/api/admin/config/{symbol}", post(admin_config_override))
         .route("/api/admin/config", post(admin_config_broadcast))
+        .route("/api/admin/config/bulk", post(admin_config_bulk))
         .route(
             "/api/admin/symbols/{symbol}/pause",
             post(admin_pause_symbol),
@@ -246,6 +247,45 @@ async fn admin_config_broadcast(
     let count = state.broadcast_config_override(ovr);
     Json(ConfigBroadcastResponse {
         engines_updated: count,
+    })
+}
+
+/// Bulk config override — apply to all symbols matching a
+/// substring pattern. POST /api/admin/config/bulk
+/// Body: `{"pattern": "USDT", "override": {"field": "MinSpreadBps", "value": "10"}}`
+#[derive(serde::Deserialize)]
+struct BulkConfigRequest {
+    /// Substring pattern to match symbol names against.
+    pattern: String,
+    /// Config override to apply to all matching symbols.
+    #[serde(rename = "override")]
+    config_override: ConfigOverride,
+}
+
+#[derive(serde::Serialize)]
+struct BulkConfigResponse {
+    matched_symbols: Vec<String>,
+    applied: usize,
+}
+
+async fn admin_config_bulk(
+    State(state): State<DashboardState>,
+    Json(req): Json<BulkConfigRequest>,
+) -> Json<BulkConfigResponse> {
+    let all_symbols = state.config_symbols();
+    let matched: Vec<String> = all_symbols
+        .into_iter()
+        .filter(|s| s.contains(&req.pattern))
+        .collect();
+    let mut applied = 0;
+    for symbol in &matched {
+        if state.send_config_override(symbol, req.config_override.clone()) {
+            applied += 1;
+        }
+    }
+    Json(BulkConfigResponse {
+        matched_symbols: matched,
+        applied,
     })
 }
 

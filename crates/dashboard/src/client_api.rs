@@ -28,6 +28,7 @@ pub fn client_routes() -> Router<DashboardState> {
         .route("/api/v1/fills/slippage", get(get_slippage_report))
         .route("/api/v1/report/daily", get(get_daily_report))
         .route("/api/v1/report/daily/csv", get(get_daily_report_csv))
+        .route("/api/v1/market-impact", get(get_market_impact))
         .route("/api/v1/portfolio", get(get_portfolio))
 }
 
@@ -220,6 +221,28 @@ async fn get_daily_report(State(state): State<DashboardState>) -> Json<DailyRepo
         total_volume,
         total_fills,
     })
+}
+
+/// Market impact report per symbol.
+#[derive(Debug, Serialize)]
+struct MarketImpactResponse {
+    symbol: String,
+    #[serde(flatten)]
+    report: mm_risk::market_impact::MarketImpactReport,
+}
+
+async fn get_market_impact(State(state): State<DashboardState>) -> Json<Vec<MarketImpactResponse>> {
+    let symbols = state.get_all();
+    let reports: Vec<MarketImpactResponse> = symbols
+        .iter()
+        .filter_map(|s| {
+            s.market_impact.as_ref().map(|r| MarketImpactResponse {
+                symbol: s.symbol.clone(),
+                report: r.clone(),
+            })
+        })
+        .collect();
+    Json(reports)
 }
 
 /// Per-hour SLA breakdown for time-of-day analysis.

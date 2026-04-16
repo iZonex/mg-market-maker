@@ -76,7 +76,7 @@ const MAX_RECENT_FILLS: usize = 1000;
 /// A fill record for the client-facing `/api/v1/fills/recent`
 /// endpoint. Captures the fill details plus the NBBO at the
 /// time of execution for quality benchmarking.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FillRecord {
     pub timestamp: DateTime<Utc>,
     pub symbol: String,
@@ -183,6 +183,8 @@ pub struct SymbolState {
     /// Per-hour SLA breakdown for time-of-day analysis. 24
     /// entries, one per UTC hour.
     pub hourly_presence: Vec<mm_risk::sla::HourlyPresenceSummary>,
+    /// Market impact report for this symbol.
+    pub market_impact: Option<mm_risk::market_impact::MarketImpactReport>,
 }
 
 /// Depth at a specific percentage from mid price.
@@ -373,6 +375,30 @@ impl DashboardState {
         self.inner.read().unwrap().portfolio.clone()
     }
 
+    /// Load fill history from a JSONL file (one FillRecord per
+    /// line). Called at startup to restore recent fills from a
+    /// previous session. Ignores malformed lines.
+    pub fn load_fill_history(&self, path: &std::path::Path) {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let mut inner = self.inner.write().unwrap();
+        let mut loaded = 0usize;
+        for line in content.lines().rev().take(MAX_RECENT_FILLS) {
+            if let Ok(fill) = serde_json::from_str::<FillRecord>(line) {
+                inner.recent_fills.push_front(fill);
+                loaded += 1;
+            }
+        }
+        // Trim to cap.
+        while inner.recent_fills.len() > MAX_RECENT_FILLS {
+            inner.recent_fills.pop_front();
+        }
+        if loaded > 0 {
+            tracing::info!(loaded, "restored fill history from disk");
+        }
+    }
+
     /// Enable persistent fill logging to a JSONL file. Each
     /// fill is appended as one JSON line so the file survives
     /// restarts. Call once at startup.
@@ -515,6 +541,7 @@ mod tests {
             two_sided_pct_24h: dec!(100),
             minutes_with_data_24h: 0,
             hourly_presence: vec![],
+            market_impact: None,
         }
     }
 

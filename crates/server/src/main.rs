@@ -135,7 +135,9 @@ async fn main() -> Result<()> {
     let dashboard_state = DashboardState::new();
     dashboard_state.set_loans(config.loans.clone());
     // Enable persistent fill logging for client API fill history.
-    dashboard_state.enable_fill_log(std::path::Path::new("data/fills.jsonl"));
+    let fills_path = std::path::Path::new("data/fills.jsonl");
+    dashboard_state.load_fill_history(fills_path);
+    dashboard_state.enable_fill_log(fills_path);
     let ws_broadcast = Arc::new(WsBroadcast::new(1024));
     if config.dashboard_port > 0 {
         let ds = dashboard_state.clone();

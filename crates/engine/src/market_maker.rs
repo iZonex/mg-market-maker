@@ -257,6 +257,10 @@ pub struct MarketMakerEngine {
     /// external transfer — the caller routes it into the
     /// audit trail and optionally force-corrects the tracker.
     inventory_drift: InventoryDriftReconciler,
+    /// Market impact estimator — tracks fill-to-mid correlation
+    /// for execution quality reporting. Fed on every fill +
+    /// every mid update.
+    market_impact: mm_risk::market_impact::MarketImpactEstimator,
 
     // Strategy augmentation.
     momentum: MomentumSignals,
@@ -461,6 +465,7 @@ impl MarketMakerEngine {
                 config.market_maker.inventory_drift_tolerance,
                 config.market_maker.inventory_drift_auto_correct,
             ),
+            market_impact: mm_risk::market_impact::MarketImpactEstimator::new(20),
             momentum: {
                 let mut ms = MomentumSignals::new(config.market_maker.momentum_window);
                 if config.market_maker.hma_enabled {
@@ -1717,6 +1722,9 @@ impl MarketMakerEngine {
                     // the alpha() call downstream can pick up
                     // slope information.
                     self.momentum.on_mid(mid);
+                    // Feed the market impact estimator so
+                    // pending fills tick down their horizon.
+                    self.market_impact.on_mid_update(mid);
                     self.last_mid = mid;
                 }
                 // Epic D stage-3 — feed the L1 top-of-book
@@ -1824,6 +1832,13 @@ impl MarketMakerEngine {
                 if let Some(mid) = self.book_keeper.book.mid_price() {
                     self.pnl_tracker.on_fill(fill, mid);
                     self.adverse_selection.on_fill(fill.price, fill.side, mid);
+
+                    // Market impact tracking.
+                    let side_sign = match fill.side {
+                        mm_common::types::Side::Buy => dec!(1),
+                        mm_common::types::Side::Sell => dec!(-1),
+                    };
+                    self.market_impact.on_fill(mid, side_sign);
 
                     // NBBO capture + dashboard fill recording.
                     if let Some(ds) = &self.dashboard {
@@ -2635,6 +2650,7 @@ impl MarketMakerEngine {
             two_sided_pct_24h: self.sla_tracker.daily_presence_summary().two_sided_pct,
             minutes_with_data_24h: self.sla_tracker.daily_presence_summary().minutes_with_data,
             hourly_presence: self.sla_tracker.hourly_presence_summary(),
+            market_impact: Some(self.market_impact.report()),
         });
     }
 

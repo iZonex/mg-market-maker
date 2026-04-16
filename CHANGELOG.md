@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Market impact API + fill reload + admin bulk config**
+  (Apr 2026).
+  - `GET /api/v1/market-impact` — per-symbol market impact
+    report with mean/median/std/P50 impact bps, adverse fill
+    percentage. Engine wires estimator on every fill + mid
+    update.
+  - Fill history reload: `load_fill_history()` restores recent
+    fills from `data/fills.jsonl` on startup. Fills survive
+    process restarts.
+  - `POST /api/admin/config/bulk` — apply a config override to
+    all symbols matching a substring pattern. Body includes
+    `pattern` and `override` fields. Returns matched symbols
+    and applied count.
+
 - **Per-hour SLA breakdown + fill persistence + market impact
   estimator** (Apr 2026).
   - `GET /api/v1/sla/hourly` — 24-entry per-hour SLA breakdown
