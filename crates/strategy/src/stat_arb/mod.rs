@@ -14,6 +14,8 @@
 
 pub mod cointegration;
 pub mod driver;
+#[allow(clippy::needless_range_loop, clippy::manual_range_contains)]
+pub mod johansen;
 pub mod kalman;
 pub mod signal;
 
@@ -22,5 +24,6 @@ pub use driver::{
     ExitLegs, LegDispatchReport, LegOutcome, NullStatArbSink, StatArbDriver, StatArbDriverConfig,
     StatArbEvent, StatArbEventSink, StatArbPair, StatArbPosition,
 };
+pub use johansen::{JohansenResult, JohansenTest};
 pub use kalman::KalmanHedgeRatio;
 pub use signal::{SignalAction, SpreadDirection, ZScoreConfig, ZScoreSignal};

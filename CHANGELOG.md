@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Epic B stage-3 — Johansen multivariate cointegration test**
+  (Apr 2026). Generalises the bivariate Engle-Granger test to
+  N ≥ 2 assets. Implements the full Johansen (1991) procedure:
+  VECM differencing, constant-concentrated moment matrices
+  S00/S01/S10/S11, generalised eigenvalue problem via QR
+  iteration with Wilkinson shifts, trace and max-eigenvalue
+  statistics against Osterwald-Lenum 1992 critical values
+  (5% significance, N = 2..6). Pure function, no external
+  linear algebra deps — uses f64 internally for eigenvalue
+  decomposition, Decimal results for the public API.
+  - `JohansenTest::run(&[&[Decimal]]) -> Option<JohansenResult>`
+  - `JohansenResult`: rank, eigenvalues, eigenvectors
+    (cointegrating vectors), trace/max-eigen stats, critical
+    values, effective sample size.
+  - 16 tests: rank detection (bivariate + trivariate
+    cointegrated pairs, independent walks), eigenvalue bounds,
+    eigenvector dimensions, trace stat monotonicity,
+    determinism, matrix inverse, critical value tables.
+
 - **Epic D stage-3 — wave-2 signal observability on the
   dashboard / Prometheus** (Apr 2026). Closes the
   observability gap that the wave-2 signal rollout left:
