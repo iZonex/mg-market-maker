@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hot config reload via admin API** (Apr 2026). Operators
+  can change MM parameters on running engines without restart:
+  - `POST /api/admin/config/{symbol}` — per-symbol override
+  - `POST /api/admin/config` — broadcast to all engines
+  - `ConfigOverride` enum: Gamma, MinSpreadBps, OrderSize,
+    MaxDistanceBps, NumLevels, MomentumEnabled,
+    MarketResilienceEnabled, AmendEnabled, AmendMaxTicks,
+    OtrEnabled, MaxInventory.
+  - Channel-based architecture: each engine receives overrides
+    via mpsc channel in the select loop, applies to its owned
+    config copy. No shared mutexes, no restarts.
+  - All overrides logged to audit trail.
+
 - **Execution quality reporting + CSV export** (Apr 2026).
   - `GET /api/v1/fills/slippage` — aggregated slippage report
     with P50/P95/P99 percentiles, maker/taker split, total

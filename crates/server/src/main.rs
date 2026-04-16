@@ -413,6 +413,12 @@ async fn run_symbol(
             None
         };
 
+    // Hot config override channel — admin endpoints send
+    // overrides through the dashboard state; the engine polls
+    // the receiver in its select loop.
+    let (config_tx, config_rx) = tokio::sync::mpsc::unbounded_channel();
+    dashboard_state.register_config_channel(&symbol, config_tx);
+
     let mut engine_builder = MarketMakerEngine::new(
         symbol,
         config,
@@ -422,7 +428,8 @@ async fn run_symbol(
         Some(dashboard_state),
         Some(alert_manager),
     )
-    .with_portfolio(portfolio);
+    .with_portfolio(portfolio)
+    .with_config_overrides(config_rx);
     if let Some(arc) = asset_class_switch {
         engine_builder = engine_builder.with_asset_class_switch(arc);
     }

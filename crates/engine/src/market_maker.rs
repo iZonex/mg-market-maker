@@ -332,6 +332,12 @@ pub struct MarketMakerEngine {
     last_mid: Decimal,
     tick_count: u64,
     reconcile_counter: u64,
+
+    /// Hot config override receiver. Admin endpoints send
+    /// overrides through the corresponding sender registered
+    /// in `DashboardState`. The engine applies them on the
+    /// next select-loop iteration.
+    config_override_rx: Option<tokio::sync::mpsc::UnboundedReceiver<mm_dashboard::state::ConfigOverride>>,
 }
 
 impl MarketMakerEngine {
@@ -547,7 +553,19 @@ impl MarketMakerEngine {
             last_mid: dec!(0),
             tick_count: 0,
             reconcile_counter: 0,
+            config_override_rx: None,
         }
+    }
+
+    /// Attach a hot config override channel. The engine will
+    /// poll this receiver in its select loop and apply overrides
+    /// without restart.
+    pub fn with_config_overrides(
+        mut self,
+        rx: tokio::sync::mpsc::UnboundedReceiver<mm_dashboard::state::ConfigOverride>,
+    ) -> Self {
+        self.config_override_rx = Some(rx);
+        self
     }
 
     /// Attach a shared multi-currency portfolio to this engine.
@@ -1127,6 +1145,14 @@ impl MarketMakerEngine {
                         self.stat_arb_driver = Some(driver);
                         self.handle_stat_arb_event(event, dispatch_report);
                     }
+                }
+                Some(ovr) = async {
+                    match self.config_override_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.apply_config_override(ovr);
                 }
             }
         }
@@ -2415,6 +2441,62 @@ impl MarketMakerEngine {
             funding_bps: dec!(1),
             position_cap: self.config.risk.max_inventory,
         }]
+    }
+
+    /// Apply a hot config override from the admin API.
+    fn apply_config_override(&mut self, ovr: mm_dashboard::state::ConfigOverride) {
+        use mm_dashboard::state::ConfigOverride;
+        match ovr {
+            ConfigOverride::Gamma(v) => {
+                info!(symbol = %self.symbol, gamma = %v, "hot-reload: gamma");
+                self.config.market_maker.gamma = v;
+            }
+            ConfigOverride::MinSpreadBps(v) => {
+                info!(symbol = %self.symbol, min_spread_bps = %v, "hot-reload: min_spread_bps");
+                self.config.market_maker.min_spread_bps = v;
+            }
+            ConfigOverride::OrderSize(v) => {
+                info!(symbol = %self.symbol, order_size = %v, "hot-reload: order_size");
+                self.config.market_maker.order_size = v;
+            }
+            ConfigOverride::MaxDistanceBps(v) => {
+                info!(symbol = %self.symbol, max_distance_bps = %v, "hot-reload: max_distance_bps");
+                self.config.market_maker.max_distance_bps = v;
+            }
+            ConfigOverride::NumLevels(v) => {
+                info!(symbol = %self.symbol, num_levels = v, "hot-reload: num_levels");
+                self.config.market_maker.num_levels = v;
+            }
+            ConfigOverride::MomentumEnabled(v) => {
+                info!(symbol = %self.symbol, momentum_enabled = v, "hot-reload: momentum_enabled");
+                self.config.market_maker.momentum_enabled = v;
+            }
+            ConfigOverride::MarketResilienceEnabled(v) => {
+                info!(symbol = %self.symbol, mr = v, "hot-reload: market_resilience_enabled");
+                self.config.market_maker.market_resilience_enabled = v;
+            }
+            ConfigOverride::AmendEnabled(v) => {
+                info!(symbol = %self.symbol, amend = v, "hot-reload: amend_enabled");
+                self.config.market_maker.amend_enabled = v;
+            }
+            ConfigOverride::AmendMaxTicks(v) => {
+                info!(symbol = %self.symbol, ticks = v, "hot-reload: amend_max_ticks");
+                self.config.market_maker.amend_max_ticks = v;
+            }
+            ConfigOverride::OtrEnabled(v) => {
+                info!(symbol = %self.symbol, otr = v, "hot-reload: otr_enabled");
+                self.config.market_maker.otr_enabled = v;
+            }
+            ConfigOverride::MaxInventory(v) => {
+                info!(symbol = %self.symbol, max_inv = %v, "hot-reload: max_inventory");
+                self.config.risk.max_inventory = v;
+            }
+        }
+        self.audit.risk_event(
+            &self.symbol,
+            mm_risk::audit::AuditEventType::ConfigLoaded,
+            "hot-reload config override applied",
+        );
     }
 
     /// Per-factor variance map from the rolling covariance

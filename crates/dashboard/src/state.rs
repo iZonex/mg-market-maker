@@ -3,7 +3,7 @@ use mm_common::config::LoanConfig;
 use mm_portfolio::PortfolioSnapshot;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -11,6 +11,36 @@ use std::sync::{Arc, RwLock};
 #[derive(Debug, Clone, Default)]
 pub struct DashboardState {
     inner: Arc<RwLock<StateInner>>,
+}
+
+/// Hot config override that can be sent to a running engine
+/// without restarting. The engine applies the override to its
+/// owned `AppConfig` copy on the next select-loop tick.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "field", content = "value")]
+pub enum ConfigOverride {
+    /// Risk aversion γ for Avellaneda-Stoikov.
+    Gamma(Decimal),
+    /// Minimum spread floor (bps).
+    MinSpreadBps(Decimal),
+    /// Base order size (base asset units).
+    OrderSize(Decimal),
+    /// Max distance from mid (bps).
+    MaxDistanceBps(Decimal),
+    /// Number of quote levels per side.
+    NumLevels(usize),
+    /// Toggle momentum alpha signal.
+    MomentumEnabled(bool),
+    /// Toggle market resilience widening.
+    MarketResilienceEnabled(bool),
+    /// Toggle amend-in-place (vs cancel+replace).
+    AmendEnabled(bool),
+    /// Amend tick budget.
+    AmendMaxTicks(u32),
+    /// Toggle OTR audit snapshots.
+    OtrEnabled(bool),
+    /// Max inventory (base asset).
+    MaxInventory(Decimal),
 }
 
 #[derive(Debug, Default)]
@@ -27,6 +57,10 @@ struct StateInner {
     /// Recent fills for the client API. Capped at
     /// `MAX_RECENT_FILLS` entries, oldest evicted first.
     recent_fills: std::collections::VecDeque<FillRecord>,
+    /// Per-symbol config override senders. Engines register
+    /// their receiver at startup; admin endpoints send
+    /// overrides through these channels.
+    config_overrides: HashMap<String, tokio::sync::mpsc::UnboundedSender<ConfigOverride>>,
 }
 
 /// Maximum recent fills retained in dashboard state.
@@ -327,6 +361,51 @@ impl DashboardState {
     /// Read the last-published portfolio snapshot.
     pub fn get_portfolio(&self) -> Option<PortfolioSnapshot> {
         self.inner.read().unwrap().portfolio.clone()
+    }
+
+    /// Register a config override channel for a symbol. Called
+    /// by the engine at startup.
+    pub fn register_config_channel(
+        &self,
+        symbol: &str,
+        tx: tokio::sync::mpsc::UnboundedSender<ConfigOverride>,
+    ) {
+        self.inner
+            .write()
+            .unwrap()
+            .config_overrides
+            .insert(symbol.to_string(), tx);
+    }
+
+    /// Send a config override to a specific symbol's engine.
+    /// Returns `false` if the symbol is not registered or the
+    /// channel is closed.
+    pub fn send_config_override(&self, symbol: &str, ovr: ConfigOverride) -> bool {
+        let inner = self.inner.read().unwrap();
+        if let Some(tx) = inner.config_overrides.get(symbol) {
+            tx.send(ovr).is_ok()
+        } else {
+            false
+        }
+    }
+
+    /// Send a config override to ALL registered symbols.
+    /// Returns the number of engines that accepted the override.
+    pub fn broadcast_config_override(&self, ovr: ConfigOverride) -> usize {
+        let inner = self.inner.read().unwrap();
+        inner
+            .config_overrides
+            .values()
+            .filter(|tx| tx.send(ovr.clone()).is_ok())
+            .count()
+    }
+
+    /// List all symbols that have registered config channels.
+    pub fn config_symbols(&self) -> Vec<String> {
+        let inner = self.inner.read().unwrap();
+        let mut v: Vec<String> = inner.config_overrides.keys().cloned().collect();
+        v.sort();
+        v
     }
 
     /// Record a fill with NBBO snapshot for the client API.

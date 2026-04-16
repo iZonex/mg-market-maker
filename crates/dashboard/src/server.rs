@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::middleware;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -10,7 +10,7 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 
 use crate::auth::{auth_middleware, login_handler, ApiUser, AuthState, Role};
-use crate::state::{DashboardState, SymbolState};
+use crate::state::{ConfigOverride, DashboardState, SymbolState};
 use crate::websocket::{ws_handler, WsBroadcast};
 
 /// Start the dashboard HTTP + WebSocket server with authentication.
@@ -51,6 +51,13 @@ pub async fn start(
         ))
         .with_state(state.clone());
 
+    // Admin config routes — hot-reload config per symbol or
+    // broadcast to all. Auth via API key in header.
+    let admin_config = Router::new()
+        .route("/api/admin/config/{symbol}", post(admin_config_override))
+        .route("/api/admin/config", post(admin_config_broadcast))
+        .with_state(state.clone());
+
     // WebSocket — auth via query param (?token=...).
     let ws_routes = Router::new()
         .route("/ws", get(ws_handler))
@@ -71,6 +78,7 @@ pub async fn start(
         .merge(protected_api)
         .merge(ws_routes)
         .merge(admin)
+        .merge(admin_config)
         .layer(CorsLayer::permissive());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -190,4 +198,45 @@ struct CreateUserResponse {
     name: String,
     role: Role,
     api_key: String,
+}
+
+// ── Admin config override endpoints ─────────────────────────
+
+/// Apply a config override to a specific symbol.
+/// POST /api/admin/config/:symbol
+/// Body: `{"field": "Gamma", "value": "0.15"}`
+#[derive(serde::Serialize)]
+struct ConfigOverrideResponse {
+    symbol: String,
+    applied: bool,
+}
+
+#[derive(serde::Serialize)]
+struct ConfigBroadcastResponse {
+    engines_updated: usize,
+}
+
+async fn admin_config_override(
+    State(state): State<DashboardState>,
+    Path(symbol): Path<String>,
+    Json(ovr): Json<ConfigOverride>,
+) -> Json<ConfigOverrideResponse> {
+    let ok = state.send_config_override(&symbol, ovr);
+    Json(ConfigOverrideResponse {
+        symbol,
+        applied: ok,
+    })
+}
+
+/// Broadcast a config override to ALL running engines.
+/// POST /api/admin/config
+/// Body: `{"field": "MinSpreadBps", "value": "10"}`
+async fn admin_config_broadcast(
+    State(state): State<DashboardState>,
+    Json(ovr): Json<ConfigOverride>,
+) -> Json<ConfigBroadcastResponse> {
+    let count = state.broadcast_config_override(ovr);
+    Json(ConfigBroadcastResponse {
+        engines_updated: count,
+    })
 }
