@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Epic B stage-2 — ADF lag selection via AIC** (Apr 2026).
+  Upgrades the Engle-Granger ADF regression from zero-lag to
+  AIC-selected lag order (0..12). The augmented regression
+  `Δε[t] = ρ·ε[t-1] + Σ γ_j·Δε[t-j] + u[t]` is solved via
+  Decimal-domain normal equations with Gauss-Jordan inverse.
+  AIC = T·ln(SSR/T) + 2·(p+1) selects the best lag.
+  `run_with_lag(y, x, p)` exposes fixed-lag for callers that
+  want to bypass AIC. 4 new tests.
+
+- **Epic C stage-2 — historical-simulation VaR cross-check**
+  (Apr 2026). Adds non-parametric VaR alongside the Gaussian
+  estimate: sorts the PnL buffer and picks the empirical
+  quantile (`hist_var_95`, `hist_var_99` in `RiskMetrics`).
+  No distributional assumption. 4 new tests.
+
 - **Epic C stage-2 — CVaR + EWMA variance in VaR guard**
   (Apr 2026). Extends the parametric Gaussian VaR guard with
   two stage-2 enhancements:

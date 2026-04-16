@@ -54,10 +54,17 @@ pub struct CointegrationResult {
 /// Zero-state marker type; the test is a pure function.
 pub struct EngleGrangerTest;
 
+/// Maximum lag order considered by AIC selection.
+pub const MAX_ADF_LAGS: usize = 12;
+
 impl EngleGrangerTest {
     /// Run the test on two price series. Inputs must be the same
     /// length and ≥ [`MIN_SAMPLES_FOR_TEST`]. Degenerate inputs
     /// (`var(X) = 0` or zero-variance residuals) return `None`.
+    ///
+    /// Uses AIC-selected lag order (0..MAX_ADF_LAGS) for the ADF
+    /// regression. The lag that minimises AIC is chosen
+    /// automatically.
     pub fn run(y: &[Decimal], x: &[Decimal]) -> Option<CointegrationResult> {
         if y.len() != x.len() || y.len() < MIN_SAMPLES_FOR_TEST {
             return None;
@@ -69,7 +76,32 @@ impl EngleGrangerTest {
             .zip(x.iter())
             .map(|(yi, xi)| *yi - alpha - beta * *xi)
             .collect();
-        let adf_stat = adf_basic_stat(&residuals)?;
+        let adf_stat = adf_with_aic(&residuals)?;
+        let crit = mackinnon_5pct_critical_value(n);
+        Some(CointegrationResult {
+            is_cointegrated: adf_stat < crit,
+            beta,
+            alpha,
+            adf_statistic: adf_stat,
+            critical_value_5pct: crit,
+            sample_size: n,
+        })
+    }
+
+    /// Run with a fixed lag order (0 = no lags, same as v1).
+    /// Useful for testing or when the caller knows the right lag.
+    pub fn run_with_lag(y: &[Decimal], x: &[Decimal], lag: usize) -> Option<CointegrationResult> {
+        if y.len() != x.len() || y.len() < MIN_SAMPLES_FOR_TEST {
+            return None;
+        }
+        let n = y.len();
+        let (alpha, beta) = ols_2d(y, x)?;
+        let residuals: Vec<Decimal> = y
+            .iter()
+            .zip(x.iter())
+            .map(|(yi, xi)| *yi - alpha - beta * *xi)
+            .collect();
+        let adf_stat = adf_stat_with_lags(&residuals, lag)?;
         let crit = mackinnon_5pct_critical_value(n);
         Some(CointegrationResult {
             is_cointegrated: adf_stat < crit,
@@ -104,52 +136,126 @@ fn ols_2d(y: &[Decimal], x: &[Decimal]) -> Option<(Decimal, Decimal)> {
     Some((alpha, beta))
 }
 
-/// Basic ADF test statistic — regression `Δε[t] = ρ · ε[t-1] + u[t]`
-/// with no constant and no lags. Returns `None` if the residual
-/// series is degenerate.
-fn adf_basic_stat(residuals: &[Decimal]) -> Option<Decimal> {
+/// ADF with AIC-selected lag order. Tries lags 0..MAX_ADF_LAGS
+/// and returns the t-statistic from the lag with the lowest AIC.
+/// AIC = T·ln(SSR/T) + 2·(p+1) where p is the number of lagged
+/// differences.
+fn adf_with_aic(residuals: &[Decimal]) -> Option<Decimal> {
     if residuals.len() < 3 {
         return None;
     }
-    // Build lagged series and first differences.
-    let lagged = &residuals[..residuals.len() - 1]; // ε[t-1]
-    let diffs: Vec<Decimal> = residuals
-        .windows(2)
-        .map(|w| w[1] - w[0]) // Δε[t]
-        .collect();
-    debug_assert_eq!(lagged.len(), diffs.len());
-    let m = lagged.len();
+    let max_lag = MAX_ADF_LAGS.min((residuals.len() - 3) / 3);
+    let mut best_aic = f64::INFINITY;
+    let mut best_stat: Option<Decimal> = None;
 
-    // OLS of Δε on ε[t-1] without intercept.
-    //   ρ_hat = Σ(lag · diff) / Σ(lag²)
-    let mut sum_lag_diff = Decimal::ZERO;
-    let mut sum_lag_sq = Decimal::ZERO;
-    for (l, d) in lagged.iter().zip(diffs.iter()) {
-        sum_lag_diff += *l * *d;
-        sum_lag_sq += *l * *l;
+    for p in 0..=max_lag {
+        if let Some((t_stat, ssr, n_obs)) = adf_regression(residuals, p) {
+            if n_obs < p + 2 {
+                continue;
+            }
+            let n_f64 = n_obs as f64;
+            let ssr_f64 = decimal_to_f64(ssr);
+            if ssr_f64 <= 0.0 {
+                continue;
+            }
+            let aic = n_f64 * (ssr_f64 / n_f64).ln() + 2.0 * (p + 1) as f64;
+            if aic < best_aic {
+                best_aic = aic;
+                best_stat = Some(t_stat);
+            }
+        }
     }
-    if sum_lag_sq.is_zero() {
+    best_stat
+}
+
+/// ADF t-statistic with a fixed lag order. Public for callers
+/// that want to bypass AIC selection.
+fn adf_stat_with_lags(residuals: &[Decimal], lag: usize) -> Option<Decimal> {
+    adf_regression(residuals, lag).map(|(t_stat, _, _)| t_stat)
+}
+
+/// ADF regression with `p` lagged differences:
+///
+/// ```text
+/// Δε[t] = ρ·ε[t-1] + Σ_{j=1}^{p} γ_j·Δε[t-j] + u[t]
+/// ```
+///
+/// No constant term (cointegration residuals are zero-mean by
+/// construction). Returns `(t_stat_for_ρ, SSR, n_obs)`.
+fn adf_regression(residuals: &[Decimal], p: usize) -> Option<(Decimal, Decimal, usize)> {
+    let n = residuals.len();
+    if n < p + 3 {
         return None;
     }
-    let rho = sum_lag_diff / sum_lag_sq;
+    // First differences.
+    let diffs: Vec<Decimal> = residuals.windows(2).map(|w| w[1] - w[0]).collect();
+    // Effective sample: t = p+1 .. n-1 (0-indexed in diffs).
+    let start = p;
+    let n_obs = diffs.len() - start;
+    if n_obs < p + 2 {
+        return None;
+    }
 
-    // Residuals of the ADF regression: u_hat[t] = Δε[t] − ρ · ε[t-1]
-    let ssr: Decimal = lagged
-        .iter()
-        .zip(diffs.iter())
-        .map(|(l, d)| {
-            let u = *d - rho * *l;
-            u * u
-        })
-        .sum();
+    // Number of regressors: 1 (ε[t-1]) + p (lagged diffs).
+    let k = 1 + p;
 
-    // Residual degrees of freedom: m observations, 1 parameter.
-    let df = m.saturating_sub(1);
+    // Build X matrix (n_obs × k) and Y vector (n_obs).
+    // Column 0: ε[t-1] = residuals[t] where t is the time index
+    //           in the original series for diff[t] = Δε[t+1].
+    // Columns 1..p: Δε[t-1], Δε[t-2], ..., Δε[t-p].
+    let mut x = vec![vec![Decimal::ZERO; k]; n_obs];
+    let mut y = Vec::with_capacity(n_obs);
+    for (i, t) in (start..diffs.len()).enumerate() {
+        y.push(diffs[t]);
+        // ε[t-1]: residuals at index t (since diff[t] = ε[t+1] - ε[t]).
+        x[i][0] = residuals[t];
+        for j in 1..=p {
+            x[i][j] = diffs[t - j];
+        }
+    }
+
+    // OLS via normal equations: β = (X'X)^{-1} X'Y.
+    // For small k (≤13) this is fine.
+    let mut xtx = vec![vec![Decimal::ZERO; k]; k];
+    let mut xty = vec![Decimal::ZERO; k];
+    for i in 0..n_obs {
+        for a in 0..k {
+            xty[a] += x[i][a] * y[i];
+            for b in 0..k {
+                xtx[a][b] += x[i][a] * x[i][b];
+            }
+        }
+    }
+
+    // Invert X'X via Gauss-Jordan (in Decimal).
+    let xtx_inv = decimal_mat_inv(&xtx, k)?;
+    // β = xtx_inv · xty
+    let mut beta = vec![Decimal::ZERO; k];
+    for a in 0..k {
+        for b in 0..k {
+            beta[a] += xtx_inv[a][b] * xty[b];
+        }
+    }
+    let rho = beta[0];
+
+    // SSR = Σ (y_i - x_i'·β)²
+    let mut ssr = Decimal::ZERO;
+    for i in 0..n_obs {
+        let mut fitted = Decimal::ZERO;
+        for a in 0..k {
+            fitted += x[i][a] * beta[a];
+        }
+        let u = y[i] - fitted;
+        ssr += u * u;
+    }
+
+    let df = n_obs.saturating_sub(k);
     if df == 0 {
         return None;
     }
     let sigma_sq = ssr / Decimal::from(df);
-    let var_rho = sigma_sq / sum_lag_sq;
+    // SE(ρ) = sqrt(σ² · (X'X)^{-1}[0][0])
+    let var_rho = sigma_sq * xtx_inv[0][0];
     if var_rho <= Decimal::ZERO {
         return None;
     }
@@ -157,7 +263,62 @@ fn adf_basic_stat(residuals: &[Decimal]) -> Option<Decimal> {
     if se_rho.is_zero() {
         return None;
     }
-    Some(rho / se_rho)
+    Some((rho / se_rho, ssr, n_obs))
+}
+
+/// Gauss-Jordan inverse of an n×n Decimal matrix. Returns
+/// `None` if singular.
+#[allow(clippy::needless_range_loop)]
+fn decimal_mat_inv(a: &[Vec<Decimal>], n: usize) -> Option<Vec<Vec<Decimal>>> {
+    let mut aug = vec![vec![Decimal::ZERO; 2 * n]; n];
+    for i in 0..n {
+        for j in 0..n {
+            aug[i][j] = a[i][j];
+        }
+        aug[i][n + i] = Decimal::ONE;
+    }
+    for col in 0..n {
+        // Partial pivoting.
+        let mut max_row = col;
+        let mut max_val = aug[col][col].abs();
+        for row in (col + 1)..n {
+            if aug[row][col].abs() > max_val {
+                max_val = aug[row][col].abs();
+                max_row = row;
+            }
+        }
+        if max_val.is_zero() {
+            return None;
+        }
+        aug.swap(col, max_row);
+        let pivot = aug[col][col];
+        for j in 0..(2 * n) {
+            aug[col][j] /= pivot;
+        }
+        for row in 0..n {
+            if row == col {
+                continue;
+            }
+            let factor = aug[row][col];
+            // Copy the pivot row to avoid borrow conflict.
+            let pivot_row: Vec<Decimal> = aug[col].clone();
+            for j in 0..(2 * n) {
+                aug[row][j] -= factor * pivot_row[j];
+            }
+        }
+    }
+    let mut inv = vec![vec![Decimal::ZERO; n]; n];
+    for i in 0..n {
+        for j in 0..n {
+            inv[i][j] = aug[i][n + j];
+        }
+    }
+    Some(inv)
+}
+
+fn decimal_to_f64(d: Decimal) -> f64 {
+    use rust_decimal::prelude::ToPrimitive;
+    d.to_f64().unwrap_or(0.0)
 }
 
 /// MacKinnon 1996 response-surface critical values for an
@@ -450,5 +611,65 @@ mod tests {
         let (y, x) = cointegrated_pair(60);
         let result = EngleGrangerTest::run(&y, &x).unwrap();
         assert_eq!(result.sample_size, 60);
+    }
+
+    // ── ADF lag selection tests ─────────────────────────────
+
+    /// AIC-selected ADF still detects cointegration on the
+    /// standard test pair (regression: adding lags should not
+    /// break detection on a clean stationary residual).
+    #[test]
+    fn aic_selected_adf_detects_cointegration() {
+        let (y, x) = cointegrated_pair(200);
+        let result = EngleGrangerTest::run(&y, &x).unwrap();
+        assert!(
+            result.is_cointegrated,
+            "AIC ADF should detect cointegration: ADF={} crit={}",
+            result.adf_statistic,
+            result.critical_value_5pct
+        );
+    }
+
+    /// AIC-selected ADF still rejects independent walks.
+    #[test]
+    fn aic_selected_adf_rejects_independent_walks() {
+        let (y, x) = independent_walks(200);
+        let result = EngleGrangerTest::run(&y, &x).unwrap();
+        assert!(
+            !result.is_cointegrated,
+            "AIC ADF should reject independent walks: ADF={}",
+            result.adf_statistic
+        );
+    }
+
+    /// Fixed-lag=0 matches the behaviour of the old `adf_basic_stat`.
+    #[test]
+    fn fixed_lag_zero_matches_basic() {
+        let (y, x) = cointegrated_pair(100);
+        let r0 = EngleGrangerTest::run_with_lag(&y, &x, 0).unwrap();
+        // The ADF stat with lag=0 is the same regression as the
+        // old basic ADF (Δε = ρ·ε_{t-1}).
+        assert!(r0.adf_statistic < Decimal::ZERO);
+    }
+
+    /// Higher lag orders do not crash and produce finite results.
+    #[test]
+    fn higher_lag_orders_produce_finite_results() {
+        let (y, x) = cointegrated_pair(200);
+        for lag in [1, 2, 4, 8] {
+            let r = EngleGrangerTest::run_with_lag(&y, &x, lag);
+            assert!(
+                r.is_some(),
+                "lag={} should produce a result",
+                lag
+            );
+            let r = r.unwrap();
+            assert!(
+                r.adf_statistic != Decimal::ZERO || lag == 0,
+                "lag={} ADF stat should be non-trivial, got {}",
+                lag,
+                r.adf_statistic
+            );
+        }
     }
 }

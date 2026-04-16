@@ -155,6 +155,12 @@ pub struct RiskMetrics {
     /// EWMA variance (if enabled). `None` when `ewma_lambda`
     /// is not configured.
     pub ewma_variance: Option<Decimal>,
+    /// Historical-simulation VaR at 95 % (empirical quantile,
+    /// no Gaussian assumption). Sorts the sample buffer and
+    /// picks the `floor(N * 0.05)`-th worst observation.
+    pub hist_var_95: Decimal,
+    /// Historical-simulation VaR at 99 %.
+    pub hist_var_99: Decimal,
     pub mean: Decimal,
     pub sample_variance: Decimal,
     pub sample_count: usize,
@@ -325,6 +331,8 @@ impl VarGuard {
                 cvar_95: Decimal::ZERO,
                 cvar_99: Decimal::ZERO,
                 ewma_variance: None,
+                hist_var_95: Decimal::ZERO,
+                hist_var_99: Decimal::ZERO,
                 mean: Decimal::ZERO,
                 sample_variance: Decimal::ZERO,
                 sample_count: n,
@@ -357,16 +365,41 @@ impl VarGuard {
         let cvar_95 = mean - effective_sigma * PHI_Z95 / dec!(0.05);
         let cvar_99 = mean - effective_sigma * PHI_Z99 / dec!(0.01);
 
+        // Historical-simulation VaR: sort and pick empirical
+        // quantile. Non-parametric — no distributional assumption.
+        let (hist_var_95, hist_var_99) = Self::historical_var(samples);
+
         RiskMetrics {
             var_95,
             var_99,
             cvar_95,
             cvar_99,
             ewma_variance: ewma_var,
+            hist_var_95,
+            hist_var_99,
             mean,
             sample_variance,
             sample_count: n,
         }
+    }
+
+    /// Empirical quantile VaR: sort samples ascending, pick the
+    /// `floor(N * (1 - α))`-th element as the α-level VaR.
+    /// No distributional assumption.
+    fn historical_var(samples: &VecDeque<Decimal>) -> (Decimal, Decimal) {
+        let n = samples.len();
+        if n < 2 {
+            return (Decimal::ZERO, Decimal::ZERO);
+        }
+        let mut sorted: Vec<Decimal> = samples.iter().copied().collect();
+        sorted.sort();
+        // 5th percentile index (for 95% VaR).
+        let idx_95 = (n as f64 * 0.05).floor() as usize;
+        // 1st percentile index (for 99% VaR).
+        let idx_99 = (n as f64 * 0.01).floor() as usize;
+        let hv_95 = sorted[idx_95.min(n - 1)];
+        let hv_99 = sorted[idx_99.min(n - 1)];
+        (hv_95, hv_99)
     }
 
     /// Read-only accessor for a strategy class's current sample
@@ -715,5 +748,76 @@ mod tests {
         }
         let m = g.risk_metrics("test").unwrap();
         assert!(m.ewma_variance.is_none());
+    }
+
+    // ── Historical-simulation VaR tests ─────────────────────
+
+    /// Historical VaR on a known sorted sequence: 100 samples
+    /// from 0..99. The 5th percentile is at index 5 (value 5),
+    /// 1st percentile at index 1 (value 1).
+    #[test]
+    fn hist_var_on_known_sequence() {
+        let mut g = VarGuard::new(VarGuardConfig::default());
+        for i in 0..100 {
+            g.record_pnl_sample("test", Decimal::from(i));
+        }
+        let m = g.risk_metrics("test").unwrap();
+        assert_eq!(m.hist_var_95, dec!(5));
+        assert_eq!(m.hist_var_99, dec!(1));
+    }
+
+    /// Historical VaR with negative samples: 100 samples from
+    /// -50..49. The 5th percentile should be around -45.
+    #[test]
+    fn hist_var_with_negative_samples() {
+        let mut g = VarGuard::new(VarGuardConfig::default());
+        for i in 0..100 {
+            g.record_pnl_sample("test", Decimal::from(i as i64 - 50));
+        }
+        let m = g.risk_metrics("test").unwrap();
+        assert_eq!(m.hist_var_95, dec!(-45));
+        assert_eq!(m.hist_var_99, dec!(-49));
+    }
+
+    /// Historical VaR is always ≥ parametric VaR for skewed data
+    /// (heavy left tail makes parametric overestimate risk).
+    /// For symmetric data they should be close.
+    #[test]
+    fn hist_var_and_parametric_var_are_comparable() {
+        let mut g = VarGuard::new(VarGuardConfig::default());
+        // Symmetric-ish data: alternating ±1.
+        for i in 0..200 {
+            let v = if i % 2 == 0 { dec!(1) } else { dec!(-1) };
+            g.record_pnl_sample("sym", v);
+        }
+        let m = g.risk_metrics("sym").unwrap();
+        // Both should be negative and roughly similar magnitude.
+        assert!(m.hist_var_95 < Decimal::ZERO);
+        assert!(m.var_95 < Decimal::ZERO);
+        // Within a factor of 3 of each other.
+        let ratio = if m.var_95.abs() > Decimal::ZERO {
+            m.hist_var_95 / m.var_95
+        } else {
+            Decimal::ONE
+        };
+        assert!(
+            ratio > dec!(0.3) && ratio < dec!(3),
+            "hist_var_95={} and var_95={} should be comparable (ratio={})",
+            m.hist_var_95,
+            m.var_95,
+            ratio
+        );
+    }
+
+    /// Zero-variance samples: historical VaR equals the constant.
+    #[test]
+    fn hist_var_constant_samples() {
+        let mut g = VarGuard::new(VarGuardConfig::default());
+        for _ in 0..50 {
+            g.record_pnl_sample("flat", dec!(7));
+        }
+        let m = g.risk_metrics("flat").unwrap();
+        assert_eq!(m.hist_var_95, dec!(7));
+        assert_eq!(m.hist_var_99, dec!(7));
     }
 }
