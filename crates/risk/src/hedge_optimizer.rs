@@ -81,6 +81,7 @@
 use std::collections::HashMap;
 
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 
 /// One candidate hedge instrument. The optimizer loops over a
 /// `universe: &[HedgeInstrument]` so the caller can pass any
@@ -266,6 +267,139 @@ impl HedgeOptimizer {
         }
         HedgeBasket { entries }
     }
+}
+
+/// Rolling factor covariance estimator (stage-2). Maintains a
+/// rolling window of per-factor return samples and computes
+/// the full covariance matrix (including off-diagonal entries)
+/// on demand. Replaces the v1 diagonal-only constant-variance
+/// stub in the engine's `factor_variances()` method.
+#[derive(Debug, Clone)]
+pub struct FactorCovarianceEstimator {
+    /// Factor names in canonical order.
+    factors: Vec<String>,
+    /// Per-factor rolling return buffers.
+    buffers: Vec<std::collections::VecDeque<Decimal>>,
+    /// Maximum samples per factor.
+    max_samples: usize,
+}
+
+impl FactorCovarianceEstimator {
+    pub fn new(factors: Vec<String>, max_samples: usize) -> Self {
+        let n = factors.len();
+        Self {
+            factors,
+            buffers: (0..n).map(|_| std::collections::VecDeque::new()).collect(),
+            max_samples,
+        }
+    }
+
+    /// Push a return observation for a factor.
+    pub fn push_return(&mut self, factor: &str, ret: Decimal) {
+        let Some(idx) = self.factors.iter().position(|f| f == factor) else {
+            return;
+        };
+        let buf = &mut self.buffers[idx];
+        if buf.len() >= self.max_samples {
+            buf.pop_front();
+        }
+        buf.push_back(ret);
+    }
+
+    /// Compute the full variance-covariance matrix. Returns a
+    /// `HashMap<String, Decimal>` for diagonal entries (variance)
+    /// and a `HashMap<(String, String), Decimal>` for off-diagonal
+    /// entries (covariance). Both keyed by factor names.
+    pub fn variances(&self) -> HashMap<String, Decimal> {
+        let mut out = HashMap::new();
+        for (i, factor) in self.factors.iter().enumerate() {
+            let var = self.sample_variance(i);
+            out.insert(factor.clone(), var.unwrap_or(Decimal::ONE));
+        }
+        out
+    }
+
+    /// Off-diagonal covariance between two factors. Returns
+    /// `None` if either factor has too few samples.
+    pub fn covariance(&self, factor_a: &str, factor_b: &str) -> Option<Decimal> {
+        let ia = self.factors.iter().position(|f| f == factor_a)?;
+        let ib = self.factors.iter().position(|f| f == factor_b)?;
+        let buf_a = &self.buffers[ia];
+        let buf_b = &self.buffers[ib];
+        let n = buf_a.len().min(buf_b.len());
+        if n < 2 {
+            return None;
+        }
+        let n_dec = Decimal::from(n as u64);
+        let mean_a: Decimal = buf_a.iter().rev().take(n).sum::<Decimal>() / n_dec;
+        let mean_b: Decimal = buf_b.iter().rev().take(n).sum::<Decimal>() / n_dec;
+        let cov: Decimal = buf_a
+            .iter()
+            .rev()
+            .take(n)
+            .zip(buf_b.iter().rev().take(n))
+            .map(|(a, b)| (*a - mean_a) * (*b - mean_b))
+            .sum::<Decimal>()
+            / Decimal::from((n - 1) as u64);
+        Some(cov)
+    }
+
+    /// Correlation between two factors. `None` if either has
+    /// zero variance or too few samples.
+    pub fn correlation(&self, factor_a: &str, factor_b: &str) -> Option<Decimal> {
+        let cov = self.covariance(factor_a, factor_b)?;
+        let var_a = self.sample_variance(
+            self.factors.iter().position(|f| f == factor_a)?,
+        )?;
+        let var_b = self.sample_variance(
+            self.factors.iter().position(|f| f == factor_b)?,
+        )?;
+        if var_a.is_zero() || var_b.is_zero() {
+            return None;
+        }
+        let denom = decimal_sqrt(var_a) * decimal_sqrt(var_b);
+        if denom.is_zero() {
+            return None;
+        }
+        Some(cov / denom)
+    }
+
+    /// Number of samples for a factor.
+    pub fn sample_count(&self, factor: &str) -> usize {
+        self.factors
+            .iter()
+            .position(|f| f == factor)
+            .map(|i| self.buffers[i].len())
+            .unwrap_or(0)
+    }
+
+    fn sample_variance(&self, idx: usize) -> Option<Decimal> {
+        let buf = &self.buffers[idx];
+        if buf.len() < 2 {
+            return None;
+        }
+        let n = buf.len();
+        let n_dec = Decimal::from(n as u64);
+        let mean: Decimal = buf.iter().sum::<Decimal>() / n_dec;
+        let var: Decimal = buf.iter().map(|x| (*x - mean) * (*x - mean)).sum::<Decimal>()
+            / Decimal::from((n - 1) as u64);
+        Some(var)
+    }
+}
+
+fn decimal_sqrt(x: Decimal) -> Decimal {
+    if x <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    let mut guess = if x > Decimal::ONE { x / dec!(2) } else { x };
+    for _ in 0..20 {
+        let next = (guess + x / guess) / dec!(2);
+        if (next - guess).abs() < dec!(0.0000000001) {
+            return next;
+        }
+        guess = next;
+    }
+    guess
 }
 
 #[cfg(test)]
@@ -599,5 +733,85 @@ mod tests {
         assert_eq!(btc.1, dec!(-1));
         let eth = basket.entries.iter().find(|(s, _)| s == "ETH-PERP").unwrap();
         assert_eq!(eth.1, dec!(2));
+    }
+
+    // ── Factor covariance estimator tests ───────────────────
+
+    #[test]
+    fn covariance_estimator_diagonal_variances() {
+        let mut est = FactorCovarianceEstimator::new(
+            vec!["BTC".into(), "ETH".into()],
+            100,
+        );
+        // Push identical returns → variance should be ~0.
+        for _ in 0..50 {
+            est.push_return("BTC", dec!(0.01));
+            est.push_return("ETH", dec!(0.02));
+        }
+        let vars = est.variances();
+        assert!(vars["BTC"].abs() < dec!(0.0001));
+        assert!(vars["ETH"].abs() < dec!(0.0001));
+    }
+
+    #[test]
+    fn covariance_estimator_positive_correlation() {
+        let mut est = FactorCovarianceEstimator::new(
+            vec!["BTC".into(), "ETH".into()],
+            100,
+        );
+        // Perfectly correlated: BTC and ETH move together.
+        for i in 0..50 {
+            let r = if i % 2 == 0 { dec!(0.01) } else { dec!(-0.01) };
+            est.push_return("BTC", r);
+            est.push_return("ETH", r * dec!(2)); // same direction
+        }
+        let corr = est.correlation("BTC", "ETH").unwrap();
+        assert!(
+            corr > dec!(0.9),
+            "perfectly correlated returns should have corr > 0.9, got {}",
+            corr
+        );
+    }
+
+    #[test]
+    fn covariance_estimator_negative_correlation() {
+        let mut est = FactorCovarianceEstimator::new(
+            vec!["A".into(), "B".into()],
+            100,
+        );
+        // Anti-correlated: A and B move in opposite directions.
+        for i in 0..50 {
+            let r = if i % 2 == 0 { dec!(0.01) } else { dec!(-0.01) };
+            est.push_return("A", r);
+            est.push_return("B", -r);
+        }
+        let corr = est.correlation("A", "B").unwrap();
+        assert!(
+            corr < dec!(-0.9),
+            "anti-correlated returns should have corr < -0.9, got {}",
+            corr
+        );
+    }
+
+    #[test]
+    fn covariance_estimator_unknown_factor_is_noop() {
+        let mut est = FactorCovarianceEstimator::new(
+            vec!["BTC".into()],
+            100,
+        );
+        est.push_return("UNKNOWN", dec!(0.01));
+        assert_eq!(est.sample_count("UNKNOWN"), 0);
+    }
+
+    #[test]
+    fn covariance_estimator_rolling_window_caps() {
+        let mut est = FactorCovarianceEstimator::new(
+            vec!["BTC".into()],
+            50,
+        );
+        for i in 0..100 {
+            est.push_return("BTC", Decimal::from(i));
+        }
+        assert_eq!(est.sample_count("BTC"), 50);
     }
 }

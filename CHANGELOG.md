@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hawkes self-exciting point process intensity estimator**
+  (Apr 2026). New `HawkesIntensity` (univariate) and
+  `BivariateHawkes` (mutually-exciting buy/sell) in the
+  indicators crate. O(1) per-event updates via recursive
+  kernel trick. `intensity_imbalance_at(t)` exposes the
+  buy/sell intensity ratio for alpha signals. Taylor-series
+  exp(-x) approximation, 6 terms. 13 new tests.
+
+- **Epic C stage-2 — off-diagonal factor covariance estimator**
+  (Apr 2026). `FactorCovarianceEstimator` in the hedge
+  optimizer module: rolling-window per-factor return buffers,
+  `variances()` for diagonal, `covariance(a, b)` and
+  `correlation(a, b)` for off-diagonal entries. Replaces the
+  v1 constant-1.0 diagonal stub. 5 new tests.
+
 - **Epic D stage-2 — Stoikov iterative fixed-point for learned
   microprice** (Apr 2026). Adds `finalize_iterative()` to
   `LearnedMicroprice` that fills sparse buckets via
