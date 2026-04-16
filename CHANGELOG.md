@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Execution quality reporting + CSV export** (Apr 2026).
+  - `GET /api/v1/fills/slippage` — aggregated slippage report
+    with P50/P95/P99 percentiles, maker/taker split, total
+    fees/rebates, avg price improvement vs mid.
+  - `GET /api/v1/report/daily/csv` — CSV export of the daily
+    report for auditors and client compliance teams.
+
 - **Client API: fills endpoint + NBBO capture + SLA depth fix
   + Telegram commands** (Apr 2026). Competitive gap closure
   for token-project clients:

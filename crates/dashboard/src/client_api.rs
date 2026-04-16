@@ -23,7 +23,9 @@ pub fn client_routes() -> Router<DashboardState> {
         .route("/api/v1/pnl", get(get_pnl))
         .route("/api/v1/sla", get(get_sla))
         .route("/api/v1/fills/recent", get(get_recent_fills))
+        .route("/api/v1/fills/slippage", get(get_slippage_report))
         .route("/api/v1/report/daily", get(get_daily_report))
+        .route("/api/v1/report/daily/csv", get(get_daily_report_csv))
         .route("/api/v1/portfolio", get(get_portfolio))
 }
 
@@ -233,4 +235,91 @@ async fn get_recent_fills(
     let limit = query.limit.unwrap_or(100).min(1000);
     let fills = state.get_recent_fills(query.symbol.as_deref(), limit);
     Json(fills)
+}
+
+/// Execution quality / slippage summary across all recent fills.
+#[derive(Debug, Serialize)]
+struct SlippageReport {
+    total_fills: usize,
+    maker_fills: usize,
+    taker_fills: usize,
+    avg_slippage_bps: Decimal,
+    p50_slippage_bps: Decimal,
+    p95_slippage_bps: Decimal,
+    p99_slippage_bps: Decimal,
+    total_fees: Decimal,
+    total_rebates: Decimal,
+    /// Average fill price improvement vs mid (negative = we
+    /// beat the mid; positive = we filled worse).
+    avg_price_improvement_bps: Decimal,
+}
+
+async fn get_slippage_report(
+    State(state): State<DashboardState>,
+    Query(query): Query<FillsQuery>,
+) -> Json<SlippageReport> {
+    let fills = state.get_recent_fills(query.symbol.as_deref(), 1000);
+    if fills.is_empty() {
+        return Json(SlippageReport {
+            total_fills: 0,
+            maker_fills: 0,
+            taker_fills: 0,
+            avg_slippage_bps: dec!(0),
+            p50_slippage_bps: dec!(0),
+            p95_slippage_bps: dec!(0),
+            p99_slippage_bps: dec!(0),
+            total_fees: dec!(0),
+            total_rebates: dec!(0),
+            avg_price_improvement_bps: dec!(0),
+        });
+    }
+
+    let total = fills.len();
+    let maker = fills.iter().filter(|f| f.is_maker).count();
+    let taker = total - maker;
+    let total_fees: Decimal = fills.iter().filter(|f| !f.is_maker).map(|f| f.fee).sum();
+    let total_rebates: Decimal = fills.iter().filter(|f| f.is_maker).map(|f| f.fee).sum();
+
+    let mut slippages: Vec<Decimal> = fills.iter().map(|f| f.slippage_bps).collect();
+    slippages.sort();
+    let avg = slippages.iter().sum::<Decimal>() / Decimal::from(total as u64);
+    let p50 = slippages[total / 2];
+    let p95 = slippages[(total as f64 * 0.95) as usize];
+    let p99 = slippages[((total as f64 * 0.99) as usize).min(total - 1)];
+
+    Json(SlippageReport {
+        total_fills: total,
+        maker_fills: maker,
+        taker_fills: taker,
+        avg_slippage_bps: avg,
+        p50_slippage_bps: p50,
+        p95_slippage_bps: p95,
+        p99_slippage_bps: p99,
+        total_fees,
+        total_rebates,
+        avg_price_improvement_bps: -avg, // negative slippage = improvement
+    })
+}
+
+/// Daily report in CSV format for auditors/clients.
+async fn get_daily_report_csv(State(state): State<DashboardState>) -> String {
+    let symbols = state.get_all();
+    let mut csv = String::from(
+        "symbol,pnl,volume,fills,avg_spread_bps,uptime_pct,max_inventory,presence_24h,two_sided_24h\n",
+    );
+    for s in &symbols {
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{}\n",
+            s.symbol,
+            s.pnl.total,
+            s.pnl.volume,
+            s.pnl.round_trips,
+            s.spread_bps,
+            s.sla_uptime_pct,
+            s.inventory.abs(),
+            s.presence_pct_24h,
+            s.two_sided_pct_24h,
+        ));
+    }
+    csv
 }
