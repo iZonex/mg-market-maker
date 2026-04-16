@@ -41,6 +41,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub loans: std::collections::HashMap<String, LoanConfig>,
 
+    /// Listing sniper config (Epic F stage-3).
+    #[serde(default)]
+    pub listing_sniper: ListingSniperConfig,
+
     /// Optional hedge connector for cross-product strategies.
     ///
     /// When set, the engine builds a `ConnectorBundle` with both
@@ -572,6 +576,34 @@ fn default_momentum_window() -> usize {
     200
 }
 
+/// Listing sniper configuration (Epic F stage-3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListingSniperConfig {
+    /// Enable periodic venue scanning for new/removed symbols.
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    /// Scan interval in seconds. Default 300 (5 min).
+    #[serde(default = "default_listing_sniper_scan_secs")]
+    pub scan_interval_secs: u64,
+    /// Send Telegram alerts on discovered/removed symbols.
+    #[serde(default = "default_true")]
+    pub alert_on_discovery: bool,
+}
+
+impl Default for ListingSniperConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            scan_interval_secs: default_listing_sniper_scan_secs(),
+            alert_on_discovery: true,
+        }
+    }
+}
+
+fn default_listing_sniper_scan_secs() -> u64 {
+    300
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskConfig {
     /// Maximum absolute inventory in base asset.
@@ -842,6 +874,7 @@ impl Default for AppConfig {
             mode: "live".into(),
             users: vec![],
             telegram: TelegramAlertConfig::default(),
+            listing_sniper: ListingSniperConfig::default(),
             loans: std::collections::HashMap::new(),
             hedge: None,
             funding_arb: None,

@@ -121,3 +121,8 @@ vpin_threshold = "0.7"
 kyle_window = 100
 adverse_selection_lookback_ms = 3000
 autotune_enabled = true
+
+[listing_sniper]
+enabled = false                 # periodic venue scanning for new listings
+scan_interval_secs = 300        # scan every 5 minutes
+alert_on_discovery = true       # Telegram alert on new/removed symbols

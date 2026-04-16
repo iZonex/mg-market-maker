@@ -233,6 +233,33 @@ async fn main() -> Result<()> {
         handles.push(handle);
     }
 
+    // Listing sniper background task (Epic F stage-3).
+    if config.listing_sniper.enabled {
+        let sniper_connector = connector.clone();
+        let sniper_shutdown = shutdown_tx.subscribe();
+        let sniper_audit = Arc::new(
+            mm_risk::audit::AuditLog::new(std::path::Path::new("data/audit.jsonl"))
+                .expect("audit log for listing sniper"),
+        );
+        let sniper_alerts = Some(alert_manager.clone());
+        let scan_secs = config.listing_sniper.scan_interval_secs;
+        let alert_on_disc = config.listing_sniper.alert_on_discovery;
+        tokio::spawn(async move {
+            let runner = mm_engine::listing_sniper::ListingSniperRunner::new(
+                vec![sniper_connector],
+                sniper_audit,
+                sniper_alerts,
+                scan_secs,
+                alert_on_disc,
+            );
+            runner.run(sniper_shutdown).await;
+        });
+        info!(
+            scan_interval_secs = config.listing_sniper.scan_interval_secs,
+            "listing sniper started"
+        );
+    }
+
     // Wait for Ctrl+C.
     tokio::signal::ctrl_c().await?;
     info!("shutdown signal received — cancelling all orders");

@@ -210,6 +210,14 @@ pub enum AuditEventType {
     /// the cooldown expired with no fresh same-class headline.
     /// `detail` carries the previous class.
     NewsRetreatExpired,
+
+    // Epic F — Listing sniper (stage-3 engine integration).
+    /// Listing sniper discovered a new symbol on a venue.
+    /// `detail` carries venue + symbol + tick/lot/min_notional.
+    ListingDiscovered,
+    /// Listing sniper detected a previously-known symbol was
+    /// removed from a venue. `detail` carries venue + symbol.
+    ListingRemoved,
 }
 
 impl AuditLog {

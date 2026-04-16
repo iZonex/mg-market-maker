@@ -183,6 +183,128 @@ impl ListingSniper {
     }
 }
 
+/// Async runner that periodically scans connectors and routes
+/// discovery/removal events to the audit trail and alert manager.
+///
+/// Spawned once per process in the server's `main()`. Owns the
+/// `ListingSniper` state machine and a list of connectors to scan.
+pub struct ListingSniperRunner {
+    sniper: ListingSniper,
+    connectors: Vec<Arc<dyn ExchangeConnector>>,
+    audit: Arc<mm_risk::audit::AuditLog>,
+    alerts: Option<mm_dashboard::alerts::AlertManager>,
+    scan_interval: std::time::Duration,
+    alert_on_discovery: bool,
+}
+
+impl ListingSniperRunner {
+    pub fn new(
+        connectors: Vec<Arc<dyn ExchangeConnector>>,
+        audit: Arc<mm_risk::audit::AuditLog>,
+        alerts: Option<mm_dashboard::alerts::AlertManager>,
+        scan_interval_secs: u64,
+        alert_on_discovery: bool,
+    ) -> Self {
+        Self {
+            sniper: ListingSniper::new(),
+            connectors,
+            audit,
+            alerts,
+            scan_interval: std::time::Duration::from_secs(scan_interval_secs),
+            alert_on_discovery,
+        }
+    }
+
+    /// Run the scan loop until the shutdown signal fires.
+    pub async fn run(mut self, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
+        use tracing::info;
+
+        let mut interval = tokio::time::interval(self.scan_interval);
+        // Skip immediate first tick to let the process stabilise.
+        interval.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!("listing sniper shutting down");
+                        return;
+                    }
+                }
+                _ = interval.tick() => {
+                    self.scan_all_venues().await;
+                }
+            }
+        }
+    }
+
+    async fn scan_all_venues(&mut self) {
+        use mm_risk::audit::AuditEventType;
+        use tracing::{debug, info};
+
+        for connector in &self.connectors {
+            let venue = connector.venue_id();
+            match self.sniper.scan(connector).await {
+                Ok(events) => {
+                    for event in events {
+                        match &event {
+                            ListingEvent::Discovered {
+                                venue,
+                                symbol,
+                                spec,
+                            } => {
+                                let detail = format!(
+                                    "venue={venue:?} symbol={symbol} tick={} lot={} min_notional={}",
+                                    spec.tick_size, spec.lot_size, spec.min_notional
+                                );
+                                info!(%detail, "new listing discovered");
+                                self.audit.risk_event(
+                                    symbol,
+                                    AuditEventType::ListingDiscovered,
+                                    &detail,
+                                );
+                                if self.alert_on_discovery {
+                                    if let Some(alerts) = &self.alerts {
+                                        alerts.alert(
+                                            mm_dashboard::alerts::AlertSeverity::Info,
+                                            &format!("New listing: {symbol}"),
+                                            &detail,
+                                            Some(symbol),
+                                        );
+                                    }
+                                }
+                            }
+                            ListingEvent::Removed { venue, symbol } => {
+                                let detail =
+                                    format!("venue={venue:?} symbol={symbol}");
+                                info!(%detail, "listing removed");
+                                self.audit.risk_event(
+                                    symbol,
+                                    AuditEventType::ListingRemoved,
+                                    &detail,
+                                );
+                                if self.alert_on_discovery {
+                                    if let Some(alerts) = &self.alerts {
+                                        alerts.alert(
+                                            mm_dashboard::alerts::AlertSeverity::Warning,
+                                            &format!("Listing removed: {symbol}"),
+                                            &detail,
+                                            Some(symbol),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(venue = ?venue, error = %e, "listing sniper scan failed (venue may not support list_symbols)");
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,5 +602,106 @@ mod tests {
             .any(|e| matches!(e, ListingEvent::Removed { symbol, .. } if symbol == "OLD2"));
         assert!(has_discovered);
         assert!(has_removed);
+    }
+
+    /// Runner: `scan_all_venues` routes Discovered events to the
+    /// audit log without panicking.
+    #[tokio::test]
+    async fn runner_scan_routes_discovered_to_audit() {
+        let m = mock(VenueId::Binance);
+        m.set_list_symbols_ok(specs(["BTCUSDT"]));
+        let connector = as_trait(&m);
+
+        let dir = std::env::temp_dir().join(format!("mm_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let audit_path = dir.join("audit_runner.jsonl");
+        let audit = Arc::new(
+            mm_risk::audit::AuditLog::new(&audit_path).unwrap(),
+        );
+
+        let mut runner = ListingSniperRunner::new(
+            vec![connector.clone()],
+            audit.clone(),
+            None,
+            60,
+            true,
+        );
+        // First scan seeds.
+        runner.scan_all_venues().await;
+
+        // Add a new symbol.
+        m.set_list_symbols_ok(specs(["BTCUSDT", "NEWUSDT"]));
+        runner.scan_all_venues().await;
+
+        // Verify the sniper state has both symbols.
+        let known = runner.sniper.known_symbols(VenueId::Binance).unwrap();
+        assert!(known.contains("NEWUSDT"));
+        assert!(known.contains("BTCUSDT"));
+        assert_eq!(known.len(), 2);
+    }
+
+    /// Runner: connector errors don't crash the scan loop.
+    #[tokio::test]
+    async fn runner_tolerates_connector_errors() {
+        let m = mock(VenueId::Binance);
+        m.set_list_symbols_ok(specs(["BTCUSDT"]));
+        let connector = as_trait(&m);
+
+        let dir = std::env::temp_dir().join(format!("mm_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let audit_path = dir.join("audit_runner.jsonl");
+        let audit = Arc::new(
+            mm_risk::audit::AuditLog::new(&audit_path).unwrap(),
+        );
+
+        let mut runner = ListingSniperRunner::new(
+            vec![connector.clone()],
+            audit,
+            None,
+            60,
+            false,
+        );
+        runner.scan_all_venues().await; // seed
+
+        // Now inject an error.
+        m.set_list_symbols_err("venue down");
+        runner.scan_all_venues().await; // should not panic
+
+        // Cache unchanged.
+        let known = runner.sniper.known_symbols(VenueId::Binance).unwrap();
+        assert_eq!(known.len(), 1);
+    }
+
+    /// Runner: removed symbols are detected.
+    #[tokio::test]
+    async fn runner_detects_removed_symbols() {
+        let m = mock(VenueId::Binance);
+        m.set_list_symbols_ok(specs(["BTCUSDT", "ETHUSDT"]));
+        let connector = as_trait(&m);
+
+        let dir = std::env::temp_dir().join(format!("mm_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let audit_path = dir.join("audit_runner.jsonl");
+        let audit = Arc::new(
+            mm_risk::audit::AuditLog::new(&audit_path).unwrap(),
+        );
+
+        let mut runner = ListingSniperRunner::new(
+            vec![connector.clone()],
+            audit,
+            None,
+            60,
+            true,
+        );
+        runner.scan_all_venues().await; // seed
+
+        // Remove ETHUSDT.
+        m.set_list_symbols_ok(specs(["BTCUSDT"]));
+        runner.scan_all_venues().await;
+
+        let known = runner.sniper.known_symbols(VenueId::Binance).unwrap();
+        assert_eq!(known.len(), 1);
+        assert!(known.contains("BTCUSDT"));
+        assert!(!known.contains("ETHUSDT"));
     }
 }

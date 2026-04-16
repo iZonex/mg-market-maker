@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Epic F stage-3 — listing sniper engine integration**
+  (Apr 2026). Wires the standalone `ListingSniper` discovery
+  module into the server's async runtime as a background task.
+  - `ListingSniperRunner`: periodic scan loop over all venue
+    connectors, routes `Discovered`/`Removed` events to the
+    audit trail (`ListingDiscovered`/`ListingRemoved` event
+    types) and Telegram alerts.
+  - Config: `[listing_sniper]` section with `enabled`,
+    `scan_interval_secs`, `alert_on_discovery` knobs.
+  - Server wiring: spawned as a background `tokio::spawn` task
+    alongside per-symbol engines, respects the shutdown signal.
+  - 3 new tests: audit routing, connector error tolerance,
+    removal detection.
+
 - **Epic B stage-3 — Johansen multivariate cointegration test**
   (Apr 2026). Generalises the bivariate Engle-Granger test to
   N ≥ 2 assets. Implements the full Johansen (1991) procedure:
