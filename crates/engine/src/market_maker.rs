@@ -261,6 +261,10 @@ pub struct MarketMakerEngine {
     /// for execution quality reporting. Fed on every fill +
     /// every mid update.
     market_impact: mm_risk::market_impact::MarketImpactEstimator,
+    /// Performance tracker — Sharpe, Sortino, drawdown, fill
+    /// rate, inventory turnover. Fed on every fill + every
+    /// periodic summary tick.
+    performance: mm_risk::performance::PerformanceTracker,
 
     // Strategy augmentation.
     momentum: MomentumSignals,
@@ -466,6 +470,7 @@ impl MarketMakerEngine {
                 config.market_maker.inventory_drift_auto_correct,
             ),
             market_impact: mm_risk::market_impact::MarketImpactEstimator::new(20),
+            performance: mm_risk::performance::PerformanceTracker::new(1440),
             momentum: {
                 let mut ms = MomentumSignals::new(config.market_maker.momentum_window);
                 if config.market_maker.hma_enabled {
@@ -1088,6 +1093,11 @@ impl MarketMakerEngine {
                     self.tick_second().await;
                 }
                 _ = summary_interval.tick() => {
+                    // Feed performance tracker with periodic data.
+                    let pnl_return = self.pnl_tracker.attribution.total_pnl() - self.var_guard_last_total_pnl;
+                    self.performance.record_return(pnl_return);
+                    self.performance.update_equity(self.pnl_tracker.attribution.total_pnl());
+                    self.performance.sample_inventory(self.inventory_manager.inventory().abs());
                     self.log_periodic_summary();
                     self.update_dashboard();
                     // Epic F sub-component #2: drive the
@@ -1839,6 +1849,14 @@ impl MarketMakerEngine {
                         mm_common::types::Side::Sell => dec!(-1),
                     };
                     self.market_impact.on_fill(mid, side_sign);
+
+                    // Performance tracking.
+                    let spread_capture = match fill.side {
+                        mm_common::types::Side::Buy => (mid - fill.price) / mid * dec!(10_000),
+                        mm_common::types::Side::Sell => (fill.price - mid) / mid * dec!(10_000),
+                    };
+                    self.performance
+                        .on_order_filled(fill.price * fill.qty, spread_capture);
 
                     // NBBO capture + dashboard fill recording.
                     if let Some(ds) = &self.dashboard {
@@ -2651,6 +2669,7 @@ impl MarketMakerEngine {
             minutes_with_data_24h: self.sla_tracker.daily_presence_summary().minutes_with_data,
             hourly_presence: self.sla_tracker.hourly_presence_summary(),
             market_impact: Some(self.market_impact.report()),
+            performance: Some(self.performance.compute(dec!(525600))), // 365.25d × 1440min
         });
 
         // Push market impact metrics to Prometheus.

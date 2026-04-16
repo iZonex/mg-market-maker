@@ -29,6 +29,7 @@ pub fn client_routes() -> Router<DashboardState> {
         .route("/api/v1/report/daily", get(get_daily_report))
         .route("/api/v1/report/daily/csv", get(get_daily_report_csv))
         .route("/api/v1/market-impact", get(get_market_impact))
+        .route("/api/v1/performance", get(get_performance))
         .route("/api/v1/portfolio", get(get_portfolio))
 }
 
@@ -221,6 +222,28 @@ async fn get_daily_report(State(state): State<DashboardState>) -> Json<DailyRepo
         total_volume,
         total_fills,
     })
+}
+
+/// Performance metrics per symbol (Sharpe, Sortino, drawdown, etc.).
+#[derive(Debug, Serialize)]
+struct PerformanceResponse {
+    symbol: String,
+    #[serde(flatten)]
+    metrics: mm_risk::performance::PerformanceMetrics,
+}
+
+async fn get_performance(State(state): State<DashboardState>) -> Json<Vec<PerformanceResponse>> {
+    let symbols = state.get_all();
+    let reports: Vec<PerformanceResponse> = symbols
+        .iter()
+        .filter_map(|s| {
+            s.performance.as_ref().map(|m| PerformanceResponse {
+                symbol: s.symbol.clone(),
+                metrics: m.clone(),
+            })
+        })
+        .collect();
+    Json(reports)
 }
 
 /// Market impact report per symbol.

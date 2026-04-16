@@ -6,6 +6,7 @@ pub mod metrics;
 pub mod server;
 pub mod state;
 pub mod telegram_control;
+pub mod webhooks;
 pub mod websocket;
 
 pub use telegram_control::{TelegramCommand, TelegramControl};

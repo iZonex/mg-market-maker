@@ -185,6 +185,8 @@ pub struct SymbolState {
     pub hourly_presence: Vec<mm_risk::sla::HourlyPresenceSummary>,
     /// Market impact report for this symbol.
     pub market_impact: Option<mm_risk::market_impact::MarketImpactReport>,
+    /// Performance metrics (Sharpe, Sortino, drawdown, etc.).
+    pub performance: Option<mm_risk::performance::PerformanceMetrics>,
 }
 
 /// Depth at a specific percentage from mid price.
@@ -542,6 +544,7 @@ mod tests {
             minutes_with_data_24h: 0,
             hourly_presence: vec![],
             market_impact: None,
+            performance: None,
         }
     }
 

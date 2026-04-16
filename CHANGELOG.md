@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Performance API + webhook notifications** (Apr 2026).
+  - `GET /api/v1/performance` — per-symbol Sharpe ratio,
+    Sortino ratio, max drawdown, fill rate, inventory turnover,
+    spread capture, win rate, profit factor. Engine wires
+    `PerformanceTracker` with periodic returns, equity updates,
+    and inventory samples.
+  - `WebhookDispatcher` framework: configure URLs, dispatch
+    JSON payloads on key events (SLA breach, kill switch,
+    large fill, daily report, engine start/stop). Non-blocking
+    async delivery with 5s timeout. 3 new tests.
+  - Total client API: 15 endpoints.
+
 - **Cross-venue fund management: withdraw + transfer + rebalancer**
   (Apr 2026).
   - `ExchangeConnector::withdraw(asset, qty, address, network)`
