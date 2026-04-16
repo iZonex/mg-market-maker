@@ -5,6 +5,93 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-04-16
+
+### Added
+
+- **Roadmap v2 complete: 8 epics, 4 phases.**
+
+#### Epic 1: Multi-Client Isolation
+- `ClientConfig` with per-client symbols, SLA targets, webhook URLs, API keys.
+- `DashboardState` restructured: per-client `ClientState` partitions with `symbol_to_client` reverse index.
+- `client_id` on `AuditEvent`, `FillRecord`, `TokenClaims`, `ApiUser`.
+- Per-client endpoints: `/api/v1/client/{id}/sla`, `/api/v1/client/{id}/sla/certificate`, `/api/v1/client/{id}/pnl`, `/api/v1/client/{id}/fills`.
+- Client onboarding API: `POST /api/admin/clients`.
+- Per-client webhook routing via `dispatch_webhook_for_symbol()`.
+
+#### Epic 2: Token Lending & Loan Management
+- `LoanAgreement` data model with terms, return schedule, installment lifecycle.
+- JSONL persistence via `LoanStore` (append-only, last-write-wins).
+- `LoanUtilizationTracker` with threshold alerts, upcoming/overdue returns.
+- Loan cost amortization in `PnlAttribution.loan_cost_amortized`.
+- Admin loan CRUD: `POST /api/admin/loans`, `GET /api/admin/loans`.
+- Client loan endpoints: `GET /api/v1/loans`, `GET /api/v1/loans/{symbol}`.
+- 6 new `AuditEventType` variants for loan lifecycle.
+
+#### Epic 3: Cross-Symbol Portfolio Risk
+- `PortfolioRiskManager` with per-factor delta limits and global delta guard.
+- `PortfolioVarGuard` — parametric Gaussian VaR on portfolio PnL deltas.
+- Shared `FactorCovarianceEstimator` with `merge_observation()` for auto-registering factors.
+- `correlation_matrix()` for pairwise factor correlations.
+- Background tokio task (30s interval): evaluate risk, broadcast `ConfigOverride::PortfolioRiskMult`.
+- Dashboard: `GET /api/v1/portfolio/risk`, `GET /api/v1/portfolio/correlation`.
+
+#### Epic 4: Cross-Venue Execution
+- `withdraw()` + `internal_transfer()` for Binance and Bybit connectors.
+- `binance_transfer_type()` mapping (MAIN_UMFUTURE, etc.).
+- `TransferRecord` JSONL persistence via `transfer_log.rs`.
+- `RebalancerCfg` with `auto_execute`, cooldown, max transfer per cycle.
+- `sor_inline_enabled` config flag for SOR auto-dispatch.
+- 5 new `AuditEventType` variants for transfers.
+
+#### Epic 5: Compliance & Reporting
+- `Deserialize` on `AuditEvent` + `AuditEventType` (was Serialize-only).
+- `audit_reader.rs`: `read_audit_range()`, `read_audit_filtered()`, `export_signed()` with HMAC-SHA256.
+- `mica_report.rs`: MiCA Article 17 report template.
+- `ReportBranding` on `ClientConfig` for per-client report customization.
+- `WebhookEvent::ReportReady` for scheduled report delivery.
+- `GET /api/v1/audit/export?from=&to=` endpoint.
+
+#### Epic 6: Strategy Optimization & A/B Testing
+- `OptimizationState` in dashboard with admin endpoints.
+- `AbSplitEngine` with time-based / symbol-based split, per-variant performance tracking.
+- A/B multipliers wired into engine `refresh_quotes()`.
+
+#### Epic 7: Disaster Recovery
+- `Checkpoint::validate()` sanity checks (timestamp, inventory, prices).
+- `checkpoint_restore` config flag + `with_checkpoint_restore()` engine builder.
+- `fill_replay.rs`: `replay_fills_from_audit()`, `validate_checkpoint_against_replay()`.
+- `HealthManager` with Normal/Degraded/Critical state machine.
+
+#### Epic 8: Paper Trading Parity
+- `PaperFillCfg` configuration for `ProbabilisticFiller` parameters.
+- `demo_data.rs`: synthetic market event generator (random walk + mean-reversion, deterministic LCG).
+
+#### Pre-Flight Toolkit
+- `preflight.rs`: 8 automated pre-trade checks (venue, symbol, tick/lot, fees, balance, rate limit, config sanity). Wired into main.rs — runs before every startup.
+- Stale book watchdog in engine: auto-pause quoting + cancel orders when book data stale, auto-resume on fresh data.
+- Smoke test mode: `MM_MODE=smoke` validates full connector stack (subscribe, measure latency, place/cancel test order, fetch balances) in 30 seconds.
+- Market data recorder: `record_market_data = true` writes BookSnapshot + Trade events to JSONL for offline backtesting.
+- `CalibrationReport` with GO / NEEDS_MORE_DATA / UNPROFITABLE recommendation.
+- `GET /api/v1/system/preflight` health endpoint.
+
+#### Documentation
+- 6 new guides: quickstart, writing strategies, architecture, operations, adding exchanges, configuration reference.
+- README fully rewritten: badges, comparison table, collapsible features, API reference, architecture diagram, contributing guidelines, disclaimer.
+
+### Changed
+
+- `EventRecorder` uses append mode (survives restarts).
+- `BookKeeper` tracks `last_update_at` for stale detection.
+- Portfolio risk multiplier applied in engine `refresh_quotes()`.
+
+### Stats
+
+- 1128 → 1213 tests (+85)
+- ~55K → ~62K LoC (+7K)
+- 19 new files, ~40 modified files
+- Zero clippy warnings
+
 ## [Unreleased]
 
 ### Added

@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod audit_reader;
 pub mod borrow;
 pub mod circuit_breaker;
 pub mod dca;
@@ -18,6 +19,9 @@ pub mod protections;
 pub mod reconciliation;
 pub mod sla;
 pub mod toxicity;
+pub mod loan_utilization;
+pub mod portfolio_risk;
+pub mod portfolio_var;
 pub mod var_guard;
 pub mod volume_limit;
 

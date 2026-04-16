@@ -44,6 +44,12 @@ pub enum WebhookEvent {
     EngineStarted { symbol: String },
     /// Engine shutdown.
     EngineStopped { symbol: String },
+    /// Scheduled report generated (Epic 5 item 5.3).
+    ReportReady {
+        report_type: String,
+        date: String,
+        download_url: String,
+    },
 }
 
 /// Webhook payload sent to configured URLs.

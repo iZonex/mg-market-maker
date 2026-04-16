@@ -1,5 +1,6 @@
 pub mod data;
 pub mod deduplicator;
+pub mod demo_data;
 pub mod fill_model;
 pub mod latency_model;
 pub mod lookahead;

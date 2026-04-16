@@ -1188,7 +1188,7 @@ dependencies = [
 
 [[package]]
 name = "mm-backtester"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1210,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "mm-common"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "rust_decimal",
@@ -1223,7 +1223,7 @@ dependencies = [
 
 [[package]]
 name = "mm-dashboard"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1233,6 +1233,7 @@ dependencies = [
  "hmac",
  "mm-common",
  "mm-exchange-core",
+ "mm-persistence",
  "mm-portfolio",
  "mm-risk",
  "once_cell",
@@ -1251,11 +1252,12 @@ dependencies = [
 
 [[package]]
 name = "mm-engine"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "mm-backtester",
  "mm-common",
  "mm-dashboard",
  "mm-exchange-binance",
@@ -1263,6 +1265,7 @@ dependencies = [
  "mm-exchange-client",
  "mm-exchange-core",
  "mm-exchange-hyperliquid",
+ "mm-persistence",
  "mm-portfolio",
  "mm-risk",
  "mm-strategy",
@@ -1277,7 +1280,7 @@ dependencies = [
 
 [[package]]
 name = "mm-exchange-binance"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1304,7 +1307,7 @@ dependencies = [
 
 [[package]]
 name = "mm-exchange-bybit"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1330,7 +1333,7 @@ dependencies = [
 
 [[package]]
 name = "mm-exchange-client"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1352,7 +1355,7 @@ dependencies = [
 
 [[package]]
 name = "mm-exchange-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1372,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "mm-exchange-hyperliquid"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1399,11 +1402,13 @@ dependencies = [
 
 [[package]]
 name = "mm-hyperopt"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
+ "rust_decimal",
+ "rust_decimal_macros",
  "serde",
  "serde_json",
  "tracing",
@@ -1411,7 +1416,7 @@ dependencies = [
 
 [[package]]
 name = "mm-indicators"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "rust_decimal",
  "rust_decimal_macros",
@@ -1420,7 +1425,7 @@ dependencies = [
 
 [[package]]
 name = "mm-persistence"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1436,7 +1441,7 @@ dependencies = [
 
 [[package]]
 name = "mm-portfolio"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "mm-common",
  "rust_decimal",
@@ -1446,14 +1451,14 @@ dependencies = [
 
 [[package]]
 name = "mm-protocols-fix"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "mm-protocols-ws-rpc"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -1466,16 +1471,20 @@ dependencies = [
 
 [[package]]
 name = "mm-risk"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "hex",
+ "hmac",
  "mm-common",
+ "mm-persistence",
  "regex",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tracing",
  "uuid",
@@ -1483,7 +1492,7 @@ dependencies = [
 
 [[package]]
 name = "mm-server"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "mm-common",
@@ -1513,7 +1522,7 @@ dependencies = [
 
 [[package]]
 name = "mm-strategy"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",

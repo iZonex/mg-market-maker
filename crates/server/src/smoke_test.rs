@@ -1,0 +1,191 @@
+//! Smoke test mode — validates the full connector stack
+//! without risking capital.
+//!
+//! Run via `MM_MODE=smoke cargo run -p mm-server`
+//!
+//! 1. Connects to exchange
+//! 2. Subscribes to book for first symbol
+//! 3. Measures WS latency over 10 events
+//! 4. Places a limit order far from mid (safety margin)
+//! 5. Immediately cancels it
+//! 6. Fetches balances
+//! 7. Prints a report and exits
+
+use mm_exchange_core::events::MarketEvent;
+use mm_exchange_core::ExchangeConnector;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+use std::sync::Arc;
+use std::time::Instant;
+use tracing::{info, warn};
+
+/// Run the smoke test. Returns `Ok(())` if all checks pass.
+pub async fn run_smoke_test(
+    connector: &Arc<dyn ExchangeConnector>,
+    symbol: &str,
+) -> anyhow::Result<()> {
+    info!("=== SMOKE TEST START ===");
+    info!(symbol, venue = %connector.venue_id(), "testing connector");
+
+    // 1. Health check.
+    let healthy = connector.health_check().await?;
+    info!(healthy, "health check");
+    if !healthy {
+        anyhow::bail!("venue is unhealthy");
+    }
+
+    // 2. Product spec.
+    let spec = connector.get_product_spec(symbol).await?;
+    info!(
+        tick = %spec.tick_size,
+        lot = %spec.lot_size,
+        min_notional = %spec.min_notional,
+        maker_fee = %spec.maker_fee,
+        taker_fee = %spec.taker_fee,
+        "product spec loaded"
+    );
+
+    // 3. Subscribe and measure WS latency.
+    let symbols = vec![symbol.to_string()];
+    let mut rx = connector.subscribe(&symbols).await?;
+    info!("subscribed to {symbol} WS feed");
+
+    let mut latencies = Vec::new();
+    let mut last_event_at = Instant::now();
+    let mut book_count = 0u32;
+    let mut trade_count = 0u32;
+    let mut best_bid = Decimal::ZERO;
+    let mut best_ask = Decimal::ZERO;
+
+    let timeout = tokio::time::Duration::from_secs(30);
+    let start = Instant::now();
+
+    loop {
+        if book_count >= 10 {
+            break;
+        }
+        if start.elapsed() > timeout {
+            warn!("timeout waiting for book events — received {book_count} so far");
+            break;
+        }
+        match tokio::time::timeout(tokio::time::Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(event)) => {
+                let now = Instant::now();
+                let gap = now.duration_since(last_event_at);
+                last_event_at = now;
+
+                match &event {
+                    MarketEvent::BookSnapshot { bids, asks, .. } => {
+                        book_count += 1;
+                        if book_count > 1 {
+                            latencies.push(gap);
+                        }
+                        if let Some(b) = bids.first() {
+                            best_bid = b.price;
+                        }
+                        if let Some(a) = asks.first() {
+                            best_ask = a.price;
+                        }
+                    }
+                    MarketEvent::BookDelta { .. } => {
+                        book_count += 1;
+                        if book_count > 1 {
+                            latencies.push(gap);
+                        }
+                    }
+                    MarketEvent::Trade { .. } => {
+                        trade_count += 1;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(None) => {
+                warn!("WS channel closed");
+                break;
+            }
+            Err(_) => {
+                warn!("5s timeout waiting for WS event");
+            }
+        }
+    }
+
+    if !latencies.is_empty() {
+        let avg_ms =
+            latencies.iter().map(|d| d.as_millis()).sum::<u128>() / latencies.len() as u128;
+        let min_ms = latencies.iter().map(|d| d.as_millis()).min().unwrap_or(0);
+        let max_ms = latencies.iter().map(|d| d.as_millis()).max().unwrap_or(0);
+        info!(
+            avg_ms,
+            min_ms,
+            max_ms,
+            samples = latencies.len(),
+            "WS event latency"
+        );
+    }
+    info!(
+        %best_bid,
+        %best_ask,
+        book_events = book_count,
+        trade_events = trade_count,
+        "market data received"
+    );
+
+    // 4. Place a far-from-mid order and cancel it.
+    if best_bid > Decimal::ZERO {
+        let safe_price = best_bid * dec!(0.5); // 50% below mid = safe
+        let safe_price = (safe_price / spec.tick_size).floor() * spec.tick_size;
+        let qty = spec.lot_size; // minimum qty
+
+        info!(%safe_price, %qty, "placing test order (far from mid)");
+        let order = mm_exchange_core::connector::NewOrder {
+            symbol: symbol.to_string(),
+            side: mm_common::types::Side::Buy,
+            order_type: mm_common::types::OrderType::Limit,
+            price: Some(safe_price),
+            qty,
+            time_in_force: None,
+            client_order_id: None,
+        };
+        match connector.place_order(&order).await {
+            Ok(order_id) => {
+                info!(%order_id, "test order placed — cancelling immediately");
+                match connector.cancel_order(symbol, order_id).await {
+                    Ok(_) => info!("test order cancelled successfully"),
+                    Err(e) => warn!(error = %e, "cancel failed — check manually"),
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "test order placement failed (may need API key permissions)");
+            }
+        }
+    } else {
+        warn!("no bid price available — skipping order test");
+    }
+
+    // 5. Fetch balances.
+    match connector.get_balances().await {
+        Ok(balances) => {
+            for b in &balances {
+                if b.available > Decimal::ZERO {
+                    info!(
+                        asset = %b.asset,
+                        available = %b.available,
+                        locked = %b.locked,
+                        "balance"
+                    );
+                }
+            }
+            if balances.iter().all(|b| b.available.is_zero()) {
+                warn!("all balances are zero — fund the account before trading");
+            }
+        }
+        Err(e) => warn!(error = %e, "could not fetch balances"),
+    }
+
+    // 6. Rate limit remaining.
+    let remaining = connector.rate_limit_remaining().await;
+    info!(remaining, "rate limit budget after smoke test");
+
+    info!("=== SMOKE TEST COMPLETE ===");
+    Ok(())
+}

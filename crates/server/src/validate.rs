@@ -107,8 +107,8 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
     }
 
     // --- Symbols ---
-    if config.symbols.is_empty() {
-        errors.push("at least one symbol is required".to_string());
+    if config.symbols.is_empty() && config.clients.is_empty() {
+        errors.push("at least one symbol is required (via symbols or clients)".to_string());
     }
 
     // --- Cross-product strategies ---
@@ -224,6 +224,48 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
                     lambda
                 ));
             }
+        }
+    }
+
+    // --- Multi-client isolation (Epic 1) ---
+    if !config.clients.is_empty() {
+        let mut client_ids = std::collections::HashSet::new();
+        let mut symbol_owner: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for client in &config.clients {
+            if client.id.trim().is_empty() {
+                errors.push("clients[*].id must be non-empty".to_string());
+            }
+            if !client_ids.insert(client.id.clone()) {
+                errors.push(format!(
+                    "duplicate client id: {}",
+                    client.id
+                ));
+            }
+            if client.symbols.is_empty() {
+                warnings.push(format!(
+                    "client {} has no symbols assigned",
+                    client.id
+                ));
+            }
+            for sym in &client.symbols {
+                if let Some(prev) = symbol_owner.get(sym) {
+                    errors.push(format!(
+                        "symbol {sym} assigned to both client {prev} and {} — each symbol must belong to exactly one client",
+                        client.id
+                    ));
+                } else {
+                    symbol_owner.insert(sym.clone(), client.id.clone());
+                }
+            }
+        }
+        // When clients are configured, warn if top-level symbols is also set.
+        if !config.symbols.is_empty() {
+            warnings.push(
+                "both [clients] and top-level symbols are set — top-level symbols \
+                 are ignored when clients are configured"
+                    .to_string(),
+            );
         }
     }
 
@@ -404,6 +446,108 @@ mod tests {
         validate_config(&cfg).unwrap();
         cfg.market_maker.basis_shift = dec!(1);
         validate_config(&cfg).unwrap();
+    }
+
+    #[test]
+    fn clients_with_duplicate_symbol_is_rejected() {
+        let mut cfg = base_config();
+        cfg.clients = vec![
+            mm_common::config::ClientConfig {
+                id: "alice".into(),
+                name: "Alice".into(),
+                symbols: vec!["BTCUSDT".into()],
+                sla: None,
+                webhook_urls: vec![],
+                api_keys: vec![], report_branding: None,
+            },
+            mm_common::config::ClientConfig {
+                id: "bob".into(),
+                name: "Bob".into(),
+                symbols: vec!["BTCUSDT".into(), "ETHUSDT".into()],
+                sla: None,
+                webhook_urls: vec![],
+                api_keys: vec![], report_branding: None,
+            },
+        ];
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("BTCUSDT"), "{err}");
+        assert!(err.contains("assigned to both"), "{err}");
+    }
+
+    #[test]
+    fn clients_with_duplicate_id_is_rejected() {
+        let mut cfg = base_config();
+        cfg.clients = vec![
+            mm_common::config::ClientConfig {
+                id: "alice".into(),
+                name: "Alice".into(),
+                symbols: vec!["BTCUSDT".into()],
+                sla: None,
+                webhook_urls: vec![],
+                api_keys: vec![], report_branding: None,
+            },
+            mm_common::config::ClientConfig {
+                id: "alice".into(),
+                name: "Alice 2".into(),
+                symbols: vec!["ETHUSDT".into()],
+                sla: None,
+                webhook_urls: vec![],
+                api_keys: vec![], report_branding: None,
+            },
+        ];
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("duplicate client id"), "{err}");
+    }
+
+    #[test]
+    fn clients_disjoint_symbols_accepted() {
+        let mut cfg = base_config();
+        cfg.clients = vec![
+            mm_common::config::ClientConfig {
+                id: "alice".into(),
+                name: "Alice".into(),
+                symbols: vec!["BTCUSDT".into()],
+                sla: None,
+                webhook_urls: vec![],
+                api_keys: vec![], report_branding: None,
+            },
+            mm_common::config::ClientConfig {
+                id: "bob".into(),
+                name: "Bob".into(),
+                symbols: vec!["ETHUSDT".into()],
+                sla: None,
+                webhook_urls: vec![],
+                api_keys: vec![], report_branding: None,
+            },
+        ];
+        // clients mode — top-level symbols is ignored, but warns
+        validate_config(&cfg).unwrap();
+    }
+
+    #[test]
+    fn empty_clients_uses_top_level_symbols() {
+        let cfg = base_config();
+        assert!(cfg.clients.is_empty());
+        let eff = cfg.effective_clients();
+        assert_eq!(eff.len(), 1);
+        assert_eq!(eff[0].id, "default");
+        assert_eq!(eff[0].symbols, cfg.symbols);
+    }
+
+    #[test]
+    fn effective_clients_returns_configured_when_present() {
+        let mut cfg = base_config();
+        cfg.clients = vec![mm_common::config::ClientConfig {
+            id: "acme".into(),
+            name: "Acme".into(),
+            symbols: vec!["SOLUSDT".into()],
+            sla: None,
+            webhook_urls: vec![],
+            api_keys: vec![], report_branding: None,
+        }];
+        let eff = cfg.effective_clients();
+        assert_eq!(eff.len(), 1);
+        assert_eq!(eff[0].id, "acme");
     }
 
     #[test]

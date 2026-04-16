@@ -373,6 +373,39 @@ impl FactorCovarianceEstimator {
             .unwrap_or(0)
     }
 
+    /// Push a return observation for a factor, auto-registering
+    /// unknown factors. Suitable for a shared multi-engine
+    /// estimator where the full factor set is not known at
+    /// construction time.
+    pub fn merge_observation(&mut self, factor: &str, ret: Decimal) {
+        if !self.factors.iter().any(|f| f == factor) {
+            self.factors.push(factor.to_string());
+            self.buffers.push(std::collections::VecDeque::new());
+        }
+        self.push_return(factor, ret);
+    }
+
+    /// Return the list of registered factors.
+    pub fn factors(&self) -> &[String] {
+        &self.factors
+    }
+
+    /// Compute the full pairwise correlation matrix. Returns a
+    /// vec of `(factor_a, factor_b, correlation)` triples for
+    /// all unique pairs where both factors have enough samples.
+    /// Diagonal entries (`factor == factor`) are omitted.
+    pub fn correlation_matrix(&self) -> Vec<(String, String, Decimal)> {
+        let mut out = Vec::new();
+        for (i, fa) in self.factors.iter().enumerate() {
+            for fb in self.factors.iter().skip(i + 1) {
+                if let Some(corr) = self.correlation(fa, fb) {
+                    out.push((fa.clone(), fb.clone(), corr));
+                }
+            }
+        }
+        out
+    }
+
     fn sample_variance(&self, idx: usize) -> Option<Decimal> {
         let buf = &self.buffers[idx];
         if buf.len() < 2 {
@@ -813,5 +846,45 @@ mod tests {
             est.push_return("BTC", Decimal::from(i));
         }
         assert_eq!(est.sample_count("BTC"), 50);
+    }
+
+    // ── Epic 3: merge_observation + correlation_matrix ──────
+
+    #[test]
+    fn merge_observation_auto_registers_unknown_factor() {
+        let mut est = FactorCovarianceEstimator::new(vec![], 100);
+        est.merge_observation("BTC", dec!(0.01));
+        est.merge_observation("ETH", dec!(0.02));
+        assert_eq!(est.factors().len(), 2);
+        assert_eq!(est.sample_count("BTC"), 1);
+        assert_eq!(est.sample_count("ETH"), 1);
+    }
+
+    #[test]
+    fn merge_observation_appends_to_existing_factor() {
+        let mut est = FactorCovarianceEstimator::new(vec!["BTC".into()], 100);
+        est.merge_observation("BTC", dec!(0.01));
+        est.merge_observation("BTC", dec!(0.02));
+        assert_eq!(est.factors().len(), 1);
+        assert_eq!(est.sample_count("BTC"), 2);
+    }
+
+    #[test]
+    fn correlation_matrix_returns_pairwise() {
+        let mut est = FactorCovarianceEstimator::new(vec![], 100);
+        for i in 0..50 {
+            let r = if i % 2 == 0 { dec!(0.01) } else { dec!(-0.01) };
+            est.merge_observation("BTC", r);
+            est.merge_observation("ETH", r * dec!(2));
+            est.merge_observation("SOL", -r);
+        }
+        let matrix = est.correlation_matrix();
+        // 3 factors → 3 unique pairs
+        assert_eq!(matrix.len(), 3);
+        // BTC-ETH should be positive, BTC-SOL should be negative
+        let btc_eth = matrix.iter().find(|(a, b, _)| a == "BTC" && b == "ETH").unwrap();
+        assert!(btc_eth.2 > dec!(0.9));
+        let btc_sol = matrix.iter().find(|(a, b, _)| a == "BTC" && b == "SOL").unwrap();
+        assert!(btc_sol.2 < dec!(-0.9));
     }
 }

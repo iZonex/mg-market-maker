@@ -77,6 +77,11 @@ pub async fn start(
         .route("/api/admin/alerts", post(admin_add_alert))
         .route("/api/admin/alerts/check", get(admin_check_alerts))
         .route("/api/admin/symbols", get(admin_list_symbols))
+        .route("/api/admin/loans", axum::routing::post(admin_create_loan))
+        .route("/api/admin/loans", get(admin_list_loans))
+        .route("/api/admin/optimize/status", get(admin_optimize_status))
+        .route("/api/admin/optimize/results", get(admin_optimize_results))
+        .merge(crate::admin_clients::admin_client_routes())
         .with_state(state.clone());
 
     // WebSocket — auth via query param (?token=...).
@@ -179,6 +184,7 @@ async fn create_user(
         } else {
             Some(req.allowed_symbols)
         },
+        client_id: None, // set via client onboarding API
     };
 
     info!(name = %req.name, role = ?role, "user created");
@@ -439,4 +445,114 @@ async fn admin_resume_symbol(
         symbol,
         applied: ok,
     })
+}
+
+// ── Loan admin endpoints (Epic 2) ───────────────────────────
+
+#[derive(serde::Deserialize)]
+struct CreateLoanRequest {
+    symbol: String,
+    #[serde(default)]
+    client_id: Option<String>,
+    total_qty: rust_decimal::Decimal,
+    #[serde(default)]
+    cost_basis_per_token: rust_decimal::Decimal,
+    #[serde(default)]
+    annual_rate_pct: rust_decimal::Decimal,
+    #[serde(default)]
+    counterparty: String,
+    start_date: String,
+    end_date: String,
+    #[serde(default)]
+    installments: Vec<CreateInstallment>,
+}
+
+#[derive(serde::Deserialize)]
+struct CreateInstallment {
+    due_date: String,
+    qty: rust_decimal::Decimal,
+}
+
+async fn admin_create_loan(
+    State(state): State<DashboardState>,
+    axum::Json(req): axum::Json<CreateLoanRequest>,
+) -> axum::Json<serde_json::Value> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let start = chrono::NaiveDate::parse_from_str(&req.start_date, "%Y-%m-%d")
+        .unwrap_or_else(|_| chrono::Utc::now().date_naive());
+    let end = chrono::NaiveDate::parse_from_str(&req.end_date, "%Y-%m-%d")
+        .unwrap_or_else(|_| chrono::Utc::now().date_naive());
+
+    let installments: Vec<mm_persistence::loan::ReturnInstallment> = req
+        .installments
+        .iter()
+        .map(|i| {
+            let due = chrono::NaiveDate::parse_from_str(&i.due_date, "%Y-%m-%d")
+                .unwrap_or(end);
+            mm_persistence::loan::ReturnInstallment {
+                due_date: due,
+                qty: i.qty,
+                status: mm_persistence::loan::InstallmentStatus::Pending,
+                completed_at: None,
+            }
+        })
+        .collect();
+
+    let agreement = mm_persistence::loan::LoanAgreement {
+        id: id.clone(),
+        symbol: req.symbol.clone(),
+        client_id: req.client_id,
+        terms: mm_persistence::loan::LoanTerms {
+            total_qty: req.total_qty,
+            cost_basis_per_token: req.cost_basis_per_token,
+            annual_rate_pct: req.annual_rate_pct,
+            option_strike: None,
+            option_expiry: None,
+            start_date: start,
+            end_date: end,
+            counterparty: req.counterparty,
+        },
+        schedule: mm_persistence::loan::ReturnSchedule { installments },
+        status: mm_persistence::loan::LoanStatus::Active,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    state.set_loan_agreement(agreement);
+
+    axum::Json(serde_json::json!({
+        "id": id,
+        "symbol": req.symbol,
+        "status": "created"
+    }))
+}
+
+async fn admin_list_loans(
+    State(state): State<DashboardState>,
+) -> axum::Json<Vec<mm_persistence::loan::LoanAgreement>> {
+    axum::Json(state.get_all_loan_agreements())
+}
+
+// ── Optimization admin endpoints (Epic 6) ───────────────────
+
+async fn admin_optimize_status(
+    State(state): State<DashboardState>,
+) -> axum::Json<Option<crate::state::OptimizationState>> {
+    axum::Json(state.get_optimization_state())
+}
+
+async fn admin_optimize_results(
+    State(state): State<DashboardState>,
+) -> axum::Json<serde_json::Value> {
+    let opt = state.get_optimization_state();
+    match opt {
+        Some(o) => axum::Json(serde_json::json!({
+            "status": o.status,
+            "trials_completed": o.trials_completed,
+            "trials_total": o.trials_total,
+            "best_params": o.best_params,
+            "best_loss": o.best_loss,
+        })),
+        None => axum::Json(serde_json::json!({"status": "no optimization run"})),
+    }
 }

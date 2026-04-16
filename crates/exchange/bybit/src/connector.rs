@@ -658,6 +658,57 @@ impl ExchangeConnector for BybitConnector {
     async fn rate_limit_remaining(&self) -> u32 {
         self.rate_limiter.remaining().await
     }
+
+    /// Withdraw to an external address via
+    /// `POST /v5/asset/withdraw`.
+    async fn withdraw(
+        &self,
+        asset: &str,
+        qty: rust_decimal::Decimal,
+        address: &str,
+        network: &str,
+    ) -> anyhow::Result<String> {
+        let body = serde_json::json!({
+            "coin": asset,
+            "amount": qty.to_string(),
+            "address": address,
+            "chain": network,
+            "accountType": "FUND",
+        });
+        let resp = self.signed_post("/v5/asset/withdraw", &body).await?;
+        resp.get("result")
+            .and_then(|r| r.get("id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow::anyhow!("missing withdraw id in response"))
+    }
+
+    /// Internal transfer between Bybit wallets via
+    /// `POST /v5/asset/transfer/inter-transfer`.
+    async fn internal_transfer(
+        &self,
+        asset: &str,
+        qty: rust_decimal::Decimal,
+        from_wallet: &str,
+        to_wallet: &str,
+    ) -> anyhow::Result<String> {
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        let body = serde_json::json!({
+            "coin": asset,
+            "amount": qty.to_string(),
+            "fromAccountType": from_wallet,
+            "toAccountType": to_wallet,
+            "transferId": transfer_id,
+        });
+        let resp = self
+            .signed_post("/v5/asset/transfer/inter-transfer", &body)
+            .await?;
+        resp.get("result")
+            .and_then(|r| r.get("transferId"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow::anyhow!("missing transferId in response"))
+    }
 }
 
 /// Parse the `result` payload of `GET /v5/account/fee-rate` into a

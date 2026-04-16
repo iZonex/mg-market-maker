@@ -10,6 +10,8 @@ mm-exchange-core = { workspace = true }
 mm-strategy = { workspace = true }
 mm-risk = { workspace = true }
 mm-dashboard = { workspace = true }
+mm-backtester = { path = "../backtester" }
+mm-persistence = { path = "../persistence" }
 mm-portfolio = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

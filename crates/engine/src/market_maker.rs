@@ -127,6 +127,9 @@ use crate::sor::venue_state::{VenueSeed, VenueStateAggregator};
 /// - Reconciliation on reconnect
 pub struct MarketMakerEngine {
     symbol: String,
+    /// Owning client ID (Epic 1). `None` in legacy single-client
+    /// mode; threaded into `FillRecord.client_id` and audit events.
+    client_id: Option<String>,
     config: AppConfig,
     product: ProductSpec,
     strategy: Box<dyn Strategy>,
@@ -175,6 +178,9 @@ pub struct MarketMakerEngine {
     /// halted symbol — closes the "venue sends fills after a
     /// halt" hole.
     lifecycle_paused: bool,
+    /// Set when the book hasn't updated for stale_book_timeout_secs.
+    /// Cleared when fresh data arrives.
+    stale_book_paused: bool,
     /// Per-strategy VaR guard (Epic C sub-component #4).
     /// Rolling 24 h ring buffer of PnL samples, parametric
     /// Gaussian VaR, composes into the effective size
@@ -192,6 +198,11 @@ pub struct MarketMakerEngine {
     /// with per-tick mid-price returns from the book keeper;
     /// replaces the v1 constant-1.0 diagonal stub.
     factor_covariance: FactorCovarianceEstimator,
+    /// Shared factor covariance estimator (Epic 3). When set,
+    /// the engine pushes return observations into this shared
+    /// instance in addition to the local one, enabling
+    /// portfolio-level VaR and correlation matrix computation.
+    shared_factor_covariance: Option<Arc<Mutex<FactorCovarianceEstimator>>>,
     /// Latest hedge basket recommendation from
     /// `hedge_optimizer::optimize()`. Refreshed on every
     /// quote tick where the engine has a portfolio snapshot.
@@ -217,6 +228,9 @@ pub struct MarketMakerEngine {
     /// previous sample rather than the cumulative PnL. Reset
     /// on engine start.
     var_guard_last_total_pnl: Decimal,
+    /// Portfolio-level risk spread multiplier (Epic 3). Applied
+    /// as an additional factor in `refresh_quotes`.
+    portfolio_risk_mult: Decimal,
     /// Second `OrderManager` for the hedge leg, built lazily when
     /// `connectors.hedge` is present. Kept strictly separate
     /// from the primary `order_manager` so per-leg diffing,
@@ -348,6 +362,15 @@ pub struct MarketMakerEngine {
     /// double-snapshots on the same day.
     last_daily_snapshot_date: String,
 
+    /// A/B split engine (Epic 6). When set, the engine alternates
+    /// between variant A and B params on each quote refresh tick.
+    ab_split: Option<mm_strategy::ab_split::AbSplitEngine>,
+
+    /// Live market data recorder. When set, every BookSnapshot
+    /// and Trade event is appended to a JSONL file for offline
+    /// backtesting. Enabled via `with_event_recorder()`.
+    event_recorder: Option<mm_backtester::data::EventRecorder>,
+
     /// Hot config override receiver. Admin endpoints send
     /// overrides through the corresponding sender registered
     /// in `DashboardState`. The engine applies them on the
@@ -414,6 +437,7 @@ impl MarketMakerEngine {
             None
         };
         Self {
+            client_id: None,
             book_keeper: BookKeeper::new(&symbol),
             hedge_book,
             borrow_manager,
@@ -425,6 +449,7 @@ impl MarketMakerEngine {
                 None
             },
             lifecycle_paused: false,
+            stale_book_paused: false,
             var_guard: if config.market_maker.var_guard_enabled {
                 Some(VarGuard::new(VarGuardConfig {
                     limit_95: config.market_maker.var_guard_limit_95,
@@ -439,6 +464,7 @@ impl MarketMakerEngine {
                 vec![product.base_asset.clone()],
                 1440,
             ),
+            shared_factor_covariance: None,
             last_hedge_basket: HedgeBasket::default(),
             sor_aggregator: {
                 let mut agg = VenueStateAggregator::new();
@@ -456,6 +482,9 @@ impl MarketMakerEngine {
             sor_router: GreedyRouter::new(VenueCostModel::default_v1()),
             var_guard_last_throttle: None,
             var_guard_last_total_pnl: dec!(0),
+            portfolio_risk_mult: dec!(1),
+            ab_split: None,
+            event_recorder: None,
             hedge_order_manager,
             order_manager: OrderManager::new(),
             inventory_manager: InventoryManager::new(),
@@ -601,6 +630,73 @@ impl MarketMakerEngine {
     /// reporting just skip this call and the engine's existing
     /// `PnlTracker` remains the sole source of truth for dashboard
     /// gauges.
+    /// Set the owning client ID (Epic 1). When set, the engine
+    /// tags every `FillRecord` and audit event with this client.
+    pub fn with_client_id(mut self, client_id: String) -> Self {
+        self.client_id = Some(client_id);
+        self
+    }
+
+    /// Attach an A/B split engine for parameter comparison.
+    pub fn with_ab_split(mut self, split: mm_strategy::ab_split::AbSplitEngine) -> Self {
+        self.ab_split = Some(split);
+        self
+    }
+
+    /// Attach a live market data recorder. Every BookSnapshot
+    /// and Trade event will be appended to the JSONL file at
+    /// `path` for offline backtesting.
+    pub fn with_event_recorder(mut self, path: &std::path::Path) -> Self {
+        match mm_backtester::data::EventRecorder::new(path) {
+            Ok(recorder) => {
+                tracing::info!(path = %path.display(), "market data recording enabled");
+                self.event_recorder = Some(recorder);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to create event recorder, continuing without");
+            }
+        }
+        self
+    }
+
+    /// Restore engine state from a checkpoint (Epic 7 item 7.2).
+    /// Initializes inventory and PnL baseline from the saved
+    /// state instead of starting fresh.
+    pub fn with_checkpoint_restore(
+        mut self,
+        checkpoint: &mm_persistence::checkpoint::SymbolCheckpoint,
+    ) -> Self {
+        self.inventory_manager
+            .force_reset_inventory_to(checkpoint.inventory);
+        self.pnl_tracker.attribution.spread_pnl = checkpoint.realized_pnl;
+        self.audit.risk_event(
+            &self.symbol,
+            mm_risk::audit::AuditEventType::CheckpointSaved,
+            &format!(
+                "restored from checkpoint: inventory={}, pnl={}",
+                checkpoint.inventory, checkpoint.realized_pnl
+            ),
+        );
+        tracing::info!(
+            symbol = %self.symbol,
+            inventory = %checkpoint.inventory,
+            pnl = %checkpoint.realized_pnl,
+            "engine state restored from checkpoint"
+        );
+        self
+    }
+
+    /// Attach a shared factor covariance estimator (Epic 3).
+    /// When set, every mid-price return observation is pushed
+    /// into both the local and shared estimators.
+    pub fn with_shared_factor_covariance(
+        mut self,
+        shared: Arc<Mutex<FactorCovarianceEstimator>>,
+    ) -> Self {
+        self.shared_factor_covariance = Some(shared);
+        self
+    }
+
     pub fn with_portfolio(mut self, portfolio: Arc<Mutex<Portfolio>>) -> Self {
         // Epic C sub-component #1: seed the per-factor delta
         // aggregator with this engine's base/quote asset pair
@@ -1739,6 +1835,29 @@ impl MarketMakerEngine {
     }
 
     fn handle_ws_event(&mut self, event: MarketEvent) {
+        // Record market data for offline backtesting.
+        if let Some(recorder) = &mut self.event_recorder {
+            match &event {
+                MarketEvent::BookSnapshot { bids, asks, sequence, .. } => {
+                    let _ = recorder.record(&mm_backtester::data::RecordedEvent::BookSnapshot {
+                        timestamp: chrono::Utc::now(),
+                        bids: bids.clone(),
+                        asks: asks.clone(),
+                        sequence: *sequence,
+                    });
+                }
+                MarketEvent::Trade { trade, .. } => {
+                    let _ = recorder.record(&mm_backtester::data::RecordedEvent::Trade {
+                        timestamp: trade.timestamp,
+                        price: trade.price,
+                        qty: trade.qty,
+                        taker_side: trade.taker_side,
+                    });
+                }
+                _ => {}
+            }
+        }
+
         match &event {
             MarketEvent::BookSnapshot { .. } | MarketEvent::BookDelta { .. } => {
                 self.book_keeper.on_event(&event);
@@ -1932,6 +2051,7 @@ impl MarketMakerEngine {
                         ds.record_fill(mm_dashboard::state::FillRecord {
                             timestamp: fill.timestamp,
                             symbol: self.symbol.clone(),
+                            client_id: self.client_id.clone(),
                             side: format!("{:?}", fill.side),
                             price: fill.price,
                             qty: fill.qty,
@@ -2018,6 +2138,37 @@ impl MarketMakerEngine {
         // book on the last refresh tick.
         if self.lifecycle_paused {
             return Ok(());
+        }
+
+        // Stale book watchdog — if no book update received for
+        // longer than stale_book_timeout_secs, cancel all orders
+        // and skip quoting. Resumes automatically when fresh
+        // data arrives.
+        if let Some(last) = self.book_keeper.last_update_at() {
+            let stale_secs = self.config.risk.stale_book_timeout_secs;
+            if last.elapsed().as_secs() >= stale_secs {
+                if !self.stale_book_paused {
+                    warn!(
+                        symbol = %self.symbol,
+                        elapsed_secs = last.elapsed().as_secs(),
+                        "book stale — pausing quotes and cancelling orders"
+                    );
+                    self.order_manager
+                        .cancel_all(&self.connectors.primary, &self.symbol)
+                        .await;
+                    self.balance_cache.reset_reservations();
+                    self.stale_book_paused = true;
+                    self.audit.risk_event(
+                        &self.symbol,
+                        AuditEventType::CircuitBreakerTripped,
+                        &format!("stale book: no update for {stale_secs}s"),
+                    );
+                }
+                return Ok(());
+            } else if self.stale_book_paused {
+                info!(symbol = %self.symbol, "book fresh again — resuming quotes");
+                self.stale_book_paused = false;
+            }
         }
 
         // Periodic OTR snapshot into the audit trail — once
@@ -2131,6 +2282,13 @@ impl MarketMakerEngine {
             let ret = (mid - self.last_mid) / self.last_mid;
             self.factor_covariance
                 .push_return(&self.product.base_asset, ret);
+            // Epic 3: also push into the shared estimator for
+            // portfolio-level VaR and correlation matrix.
+            if let Some(shared) = &self.shared_factor_covariance {
+                if let Ok(mut est) = shared.lock() {
+                    est.merge_observation(&self.product.base_asset, ret);
+                }
+            }
         }
 
         // Time remaining.
@@ -2211,23 +2369,38 @@ impl MarketMakerEngine {
         }
 
         // Auto-tune.
-        let (eff_gamma, eff_size, eff_spread) = if self.config.toxicity.autotune_enabled {
-            (
-                self.config.market_maker.gamma * self.auto_tuner.effective_gamma_mult() * ks_spread,
-                self.config.market_maker.order_size
-                    * self.auto_tuner.effective_size_mult()
-                    * ks_size,
-                self.config.market_maker.min_spread_bps
-                    * self.auto_tuner.effective_spread_mult()
-                    * ks_spread,
-            )
-        } else {
-            (
-                self.config.market_maker.gamma * ks_spread,
-                self.config.market_maker.order_size * ks_size,
-                self.config.market_maker.min_spread_bps * ks_spread,
-            )
-        };
+        let (mut eff_gamma, mut eff_size, mut eff_spread) =
+            if self.config.toxicity.autotune_enabled {
+                (
+                    self.config.market_maker.gamma
+                        * self.auto_tuner.effective_gamma_mult()
+                        * ks_spread,
+                    self.config.market_maker.order_size
+                        * self.auto_tuner.effective_size_mult()
+                        * ks_size,
+                    self.config.market_maker.min_spread_bps
+                        * self.auto_tuner.effective_spread_mult()
+                        * ks_spread,
+                )
+            } else {
+                (
+                    self.config.market_maker.gamma * ks_spread,
+                    self.config.market_maker.order_size * ks_size,
+                    self.config.market_maker.min_spread_bps * ks_spread,
+                )
+            };
+
+        // A/B split — apply variant multipliers if active.
+        if let Some(ab) = &mut self.ab_split {
+            let variant = ab.active_variant(&self.symbol);
+            eff_gamma *= variant.gamma_mult;
+            eff_spread *= variant.spread_mult;
+            eff_size *= variant.size_mult;
+            ab.tick();
+        }
+
+        // Portfolio risk multiplier (Epic 3).
+        eff_spread *= self.portfolio_risk_mult;
 
         // Momentum alpha.
         let alpha_mid = if self.config.market_maker.momentum_enabled {
@@ -2583,6 +2756,10 @@ impl MarketMakerEngine {
             ConfigOverride::ResumeQuoting => {
                 info!(symbol = %self.symbol, "hot-reload: resuming quoting");
                 self.lifecycle_paused = false;
+            }
+            ConfigOverride::PortfolioRiskMult(v) => {
+                info!(symbol = %self.symbol, mult = %v, "hot-reload: portfolio risk spread multiplier");
+                self.portfolio_risk_mult = v;
             }
         }
         self.audit.risk_event(

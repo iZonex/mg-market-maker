@@ -21,6 +21,8 @@ pub struct PnlAttribution {
     pub rebate_income: Decimal,
     /// Fees paid (when we're taker).
     pub fees_paid: Decimal,
+    /// Amortized loan cost (Epic 2). Subtracted from total PnL.
+    pub loan_cost_amortized: Decimal,
     /// Number of round-trips completed.
     pub round_trips: u64,
     /// Total volume traded (both sides).
@@ -29,7 +31,8 @@ pub struct PnlAttribution {
 
 impl PnlAttribution {
     pub fn total_pnl(&self) -> Decimal {
-        self.spread_pnl + self.inventory_pnl + self.rebate_income - self.fees_paid
+        self.spread_pnl + self.inventory_pnl + self.rebate_income
+            - self.fees_paid - self.loan_cost_amortized
     }
 
     /// PnL per unit of volume traded (efficiency metric).
@@ -52,6 +55,8 @@ pub struct PnlTracker {
     maker_fee: Decimal,
     /// Taker fee rate.
     taker_fee: Decimal,
+    /// Daily loan cost for amortization (Epic 2).
+    loan_daily_cost: Decimal,
 }
 
 impl PnlTracker {
@@ -62,6 +67,7 @@ impl PnlTracker {
             inventory: dec!(0),
             maker_fee,
             taker_fee,
+            loan_daily_cost: dec!(0),
         }
     }
 
@@ -140,6 +146,20 @@ impl PnlTracker {
             self.attribution.inventory_pnl += inv_pnl_delta;
         }
         self.last_mid = mid_price;
+    }
+
+    /// Set the daily loan cost for amortization (Epic 2).
+    /// Called when a loan agreement is loaded or updated.
+    pub fn set_loan_daily_cost(&mut self, daily_cost: Decimal) {
+        self.loan_daily_cost = daily_cost;
+    }
+
+    /// Amortize loan cost over elapsed time. Called periodically
+    /// (e.g., every summary tick). `elapsed_days` is typically
+    /// a fractional day count (e.g., 30s / 86400s).
+    pub fn amortize_loan_cost(&mut self, elapsed_days: Decimal) {
+        let cost = self.loan_daily_cost * elapsed_days;
+        self.attribution.loan_cost_amortized += cost;
     }
 
     /// Log a periodic PnL summary.

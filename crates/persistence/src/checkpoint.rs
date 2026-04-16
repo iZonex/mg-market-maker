@@ -46,6 +46,36 @@ impl Checkpoint {
             total_realized_pnl: Decimal::ZERO,
         }
     }
+
+    /// Validate checkpoint sanity (Epic 7 item 7.2).
+    /// Returns a list of issues found; empty = valid.
+    pub fn validate(&self) -> Vec<String> {
+        let mut issues = Vec::new();
+        if self.timestamp > Utc::now() {
+            issues.push("checkpoint timestamp is in the future".into());
+        }
+        for (symbol, sc) in &self.symbols {
+            if !sc.inventory.is_zero() && sc.avg_entry_price.is_zero() {
+                issues.push(format!(
+                    "{symbol}: non-zero inventory ({}) with zero avg_entry_price",
+                    sc.inventory
+                ));
+            }
+            if sc.avg_entry_price < Decimal::ZERO {
+                issues.push(format!(
+                    "{symbol}: negative avg_entry_price ({})",
+                    sc.avg_entry_price
+                ));
+            }
+            if sc.total_fills > 0 && sc.total_volume.is_zero() {
+                issues.push(format!(
+                    "{symbol}: {} fills but zero volume",
+                    sc.total_fills
+                ));
+            }
+        }
+        issues
+    }
 }
 
 impl Default for Checkpoint {

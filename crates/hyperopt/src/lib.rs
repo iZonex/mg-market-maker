@@ -36,6 +36,7 @@
 //! println!("best sharpe = {}", best.metrics.sharpe);
 //! ```
 
+pub mod calibration;
 pub mod de;
 mod loss;
 mod metrics;

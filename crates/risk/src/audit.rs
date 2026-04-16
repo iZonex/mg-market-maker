@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use mm_common::types::{OrderId, Price, Qty, Side};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
@@ -21,12 +21,17 @@ pub struct AuditLog {
 }
 
 /// An audit event — every action the MM takes.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
     pub seq: u64,
     pub timestamp: DateTime<Utc>,
     pub event_type: AuditEventType,
     pub symbol: String,
+    /// Owning client ID (Epic 1). `None` in legacy single-client
+    /// mode — existing JSONL files parse cleanly because the
+    /// field is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub order_id: Option<OrderId>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -39,7 +44,7 @@ pub struct AuditEvent {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditEventType {
     // Order lifecycle.
@@ -218,6 +223,42 @@ pub enum AuditEventType {
     /// Listing sniper detected a previously-known symbol was
     /// removed from a venue. `detail` carries venue + symbol.
     ListingRemoved,
+
+    // Epic 2 — Token Lending lifecycle.
+    /// New loan agreement created. `detail` carries symbol +
+    /// total_qty + counterparty + start/end dates.
+    LoanCreated,
+    /// Loan agreement terms updated. `detail` carries the
+    /// changed field(s).
+    LoanUpdated,
+    /// Loan return installment is approaching its due date.
+    /// `detail` carries symbol + due_date + qty.
+    LoanReturnScheduled,
+    /// Loan return installment completed. `detail` carries
+    /// symbol + installment_idx + qty + completion date.
+    LoanReturnCompleted,
+    /// Loan utilization approaching limit. `detail` carries
+    /// symbol + utilization_pct + threshold.
+    LoanUtilizationAlert,
+    /// Loan status changed (Active → PartiallyReturned →
+    /// Returned / Defaulted). `detail` carries old → new status.
+    LoanStatusChanged,
+
+    // Epic 4 — Cross-venue execution.
+    /// Withdraw requested. `detail` carries asset + qty + address + network + venue.
+    WithdrawRequested,
+    /// Withdraw confirmed by venue. `detail` carries venue withdraw ID.
+    WithdrawCompleted,
+    /// Internal transfer requested. `detail` carries asset + qty + from_wallet + to_wallet + venue.
+    InternalTransferRequested,
+    /// Internal transfer confirmed. `detail` carries venue transfer ID.
+    InternalTransferCompleted,
+    /// Auto-rebalancer executed a transfer. `detail` carries from_venue + to_venue + asset + qty.
+    AutoRebalanceExecuted,
+
+    // Epic 5 — Compliance reporting.
+    /// Scheduled report generated. `detail` carries report type + period.
+    ReportGenerated,
 }
 
 impl AuditLog {
@@ -268,6 +309,7 @@ impl AuditLog {
             timestamp: Utc::now(),
             event_type: AuditEventType::OrderPlaced,
             symbol: symbol.to_string(),
+            client_id: None,
             order_id: Some(order_id),
             side: Some(side),
             price: Some(price),
@@ -291,6 +333,7 @@ impl AuditLog {
             timestamp: Utc::now(),
             event_type: AuditEventType::OrderFilled,
             symbol: symbol.to_string(),
+            client_id: None,
             order_id: Some(order_id),
             side: Some(side),
             price: Some(price),
@@ -310,6 +353,7 @@ impl AuditLog {
             timestamp: Utc::now(),
             event_type: AuditEventType::OrderCancelled,
             symbol: symbol.to_string(),
+            client_id: None,
             order_id: Some(order_id),
             side: None,
             price: None,
@@ -339,6 +383,7 @@ impl AuditLog {
             timestamp: Utc::now(),
             event_type: AuditEventType::OrderToTradeRatioSnapshot,
             symbol: symbol.to_string(),
+            client_id: None,
             order_id: None,
             side: None,
             price: None,
@@ -354,6 +399,7 @@ impl AuditLog {
             timestamp: Utc::now(),
             event_type,
             symbol: symbol.to_string(),
+            client_id: None,
             order_id: None,
             side: None,
             price: None,

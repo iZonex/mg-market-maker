@@ -536,6 +536,63 @@ impl ExchangeConnector for BinanceConnector {
         parse_binance_borrow_rate_response(&resp, asset)
             .ok_or_else(|| BorrowError::Other(anyhow::anyhow!("no borrow rate for {asset}")))
     }
+
+    /// Withdraw to an external address via
+    /// `POST /sapi/v1/capital/withdraw/apply`.
+    async fn withdraw(
+        &self,
+        asset: &str,
+        qty: rust_decimal::Decimal,
+        address: &str,
+        network: &str,
+    ) -> anyhow::Result<String> {
+        let params = format!(
+            "coin={asset}&amount={qty}&address={address}&network={network}"
+        );
+        let resp = self
+            .signed_post("/sapi/v1/capital/withdraw/apply", &params)
+            .await?;
+        resp.get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow::anyhow!("missing withdraw id in response"))
+    }
+
+    /// Internal transfer between Binance wallets via
+    /// `POST /sapi/v1/asset/transfer`.
+    async fn internal_transfer(
+        &self,
+        asset: &str,
+        qty: rust_decimal::Decimal,
+        from_wallet: &str,
+        to_wallet: &str,
+    ) -> anyhow::Result<String> {
+        let transfer_type = binance_transfer_type(from_wallet, to_wallet)?;
+        let params = format!(
+            "type={transfer_type}&asset={asset}&amount={qty}"
+        );
+        let resp = self
+            .signed_post("/sapi/v1/asset/transfer", &params)
+            .await?;
+        resp.get("tranId")
+            .map(|v| v.to_string())
+            .ok_or_else(|| anyhow::anyhow!("missing tranId in response"))
+    }
+}
+
+/// Map generic wallet names to Binance transfer type enum.
+fn binance_transfer_type(from: &str, to: &str) -> anyhow::Result<&'static str> {
+    match (from, to) {
+        ("SPOT", "FUTURES") | ("MAIN", "UMFUTURE") => Ok("MAIN_UMFUTURE"),
+        ("FUTURES", "SPOT") | ("UMFUTURE", "MAIN") => Ok("UMFUTURE_MAIN"),
+        ("SPOT", "MARGIN") | ("MAIN", "MARGIN") => Ok("MAIN_MARGIN"),
+        ("MARGIN", "SPOT") | ("MARGIN", "MAIN") => Ok("MARGIN_MAIN"),
+        ("SPOT", "CMFUTURE") | ("MAIN", "CMFUTURE") => Ok("MAIN_CMFUTURE"),
+        ("CMFUTURE", "SPOT") | ("CMFUTURE", "MAIN") => Ok("CMFUTURE_MAIN"),
+        _ => Err(anyhow::anyhow!(
+            "unsupported Binance transfer: {from} → {to}"
+        )),
+    }
 }
 
 /// Parse the response from
@@ -907,5 +964,22 @@ mod tests {
         // it to decide whether to fall back to cancel+place. Real
         // amend lives on `BinanceFuturesConnector`.
         assert!(!caps.supports_amend);
+    }
+
+    #[test]
+    fn binance_transfer_type_mapping() {
+        assert_eq!(
+            super::binance_transfer_type("SPOT", "FUTURES").unwrap(),
+            "MAIN_UMFUTURE"
+        );
+        assert_eq!(
+            super::binance_transfer_type("FUTURES", "SPOT").unwrap(),
+            "UMFUTURE_MAIN"
+        );
+        assert_eq!(
+            super::binance_transfer_type("SPOT", "MARGIN").unwrap(),
+            "MAIN_MARGIN"
+        );
+        assert!(super::binance_transfer_type("SPOT", "UNKNOWN").is_err());
     }
 }

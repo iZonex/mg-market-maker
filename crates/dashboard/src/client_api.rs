@@ -39,6 +39,18 @@ pub fn client_routes() -> Router<DashboardState> {
         .route("/api/v1/risk/summary", get(get_risk_summary))
         .route("/api/v1/trade-flow", get(get_trade_flow))
         .route("/api/v1/portfolio", get(get_portfolio))
+        .route("/api/v1/system/preflight", get(get_system_preflight))
+        .route("/api/v1/loans", get(get_loans))
+        .route("/api/v1/loans/{symbol}", get(get_loan_by_symbol))
+        .route("/api/v1/portfolio/correlation", get(get_portfolio_correlation))
+        .route("/api/v1/portfolio/risk", get(get_portfolio_risk))
+        .route("/api/v1/client/{id}/sla", get(get_client_sla))
+        .route(
+            "/api/v1/client/{id}/sla/certificate",
+            get(get_client_sla_certificate),
+        )
+        .route("/api/v1/client/{id}/fills", get(get_client_fills))
+        .route("/api/v1/client/{id}/pnl", get(get_client_pnl))
 }
 
 /// Unified multi-currency portfolio snapshot in the reporting
@@ -773,4 +785,293 @@ async fn get_daily_report_csv(State(state): State<DashboardState>) -> String {
         ));
     }
     csv
+}
+
+// ── Per-client API endpoints (Epic 1) ────────────────────────
+
+/// Per-client SLA aggregate.
+#[derive(Debug, Serialize)]
+struct ClientSlaSummary {
+    client_id: String,
+    symbols: Vec<ClientSymbolSla>,
+    /// Average presence across all client's symbols.
+    avg_presence_pct: Decimal,
+    /// Average two-sided presence across all client's symbols.
+    avg_two_sided_pct: Decimal,
+    /// Worst-case presence among the client's symbols.
+    min_presence_pct: Decimal,
+    /// Overall compliance: all symbols above 95%.
+    is_compliant: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ClientSymbolSla {
+    symbol: String,
+    presence_pct: Decimal,
+    two_sided_pct: Decimal,
+    spread_compliance_pct: Decimal,
+    minutes_with_data: u32,
+}
+
+async fn get_client_sla(
+    State(state): State<DashboardState>,
+    Path(client_id): Path<String>,
+) -> Json<ClientSlaSummary> {
+    let syms = state.get_client_symbols(&client_id);
+    let symbol_slas: Vec<ClientSymbolSla> = syms
+        .iter()
+        .map(|s| ClientSymbolSla {
+            symbol: s.symbol.clone(),
+            presence_pct: s.presence_pct_24h,
+            two_sided_pct: s.two_sided_pct_24h,
+            spread_compliance_pct: s.spread_compliance_pct,
+            minutes_with_data: s.minutes_with_data_24h,
+        })
+        .collect();
+
+    let count = Decimal::from(symbol_slas.len().max(1));
+    let avg_presence = symbol_slas
+        .iter()
+        .map(|s| s.presence_pct)
+        .sum::<Decimal>()
+        / count;
+    let avg_two_sided = symbol_slas
+        .iter()
+        .map(|s| s.two_sided_pct)
+        .sum::<Decimal>()
+        / count;
+    let min_presence = symbol_slas
+        .iter()
+        .map(|s| s.presence_pct)
+        .min()
+        .unwrap_or(dec!(100));
+    let is_compliant = symbol_slas
+        .iter()
+        .all(|s| s.presence_pct >= dec!(95));
+
+    Json(ClientSlaSummary {
+        client_id,
+        symbols: symbol_slas,
+        avg_presence_pct: avg_presence,
+        avg_two_sided_pct: avg_two_sided,
+        min_presence_pct: min_presence,
+        is_compliant,
+    })
+}
+
+/// Per-client fill query params.
+#[derive(Debug, Deserialize)]
+struct ClientFillsQuery {
+    #[serde(default = "default_fill_limit")]
+    limit: usize,
+}
+
+fn default_fill_limit() -> usize {
+    100
+}
+
+async fn get_client_fills(
+    State(state): State<DashboardState>,
+    Path(client_id): Path<String>,
+    Query(q): Query<ClientFillsQuery>,
+) -> Json<Vec<FillRecord>> {
+    Json(state.get_client_fills(&client_id, q.limit))
+}
+
+/// Per-client PnL aggregate.
+#[derive(Debug, Serialize)]
+struct ClientPnlSummary {
+    client_id: String,
+    total_pnl: Decimal,
+    total_volume: Decimal,
+    total_fills: u64,
+    symbols: Vec<ClientSymbolPnl>,
+}
+
+#[derive(Debug, Serialize)]
+struct ClientSymbolPnl {
+    symbol: String,
+    pnl: Decimal,
+    volume: Decimal,
+    fills: u64,
+}
+
+async fn get_client_pnl(
+    State(state): State<DashboardState>,
+    Path(client_id): Path<String>,
+) -> Json<ClientPnlSummary> {
+    let syms = state.get_client_symbols(&client_id);
+    let mut total_pnl = Decimal::ZERO;
+    let mut total_volume = Decimal::ZERO;
+    let mut total_fills = 0u64;
+    let symbol_pnls: Vec<ClientSymbolPnl> = syms
+        .iter()
+        .map(|s| {
+            total_pnl += s.pnl.total;
+            total_volume += s.pnl.volume;
+            total_fills += s.pnl.round_trips;
+            ClientSymbolPnl {
+                symbol: s.symbol.clone(),
+                pnl: s.pnl.total,
+                volume: s.pnl.volume,
+                fills: s.pnl.round_trips,
+            }
+        })
+        .collect();
+    Json(ClientPnlSummary {
+        client_id,
+        total_pnl,
+        total_volume,
+        total_fills,
+        symbols: symbol_pnls,
+    })
+}
+
+/// Per-client SLA compliance certificate (Epic 1 item 1.5).
+#[derive(Debug, Serialize)]
+struct ClientSlaCertificate {
+    client_id: String,
+    generated_at: String,
+    overall_compliant: bool,
+    symbols: Vec<ClientSymbolSla>,
+    avg_presence_pct: Decimal,
+    min_presence_pct: Decimal,
+    signature: String,
+}
+
+async fn get_client_sla_certificate(
+    State(state): State<DashboardState>,
+    Path(client_id): Path<String>,
+) -> Json<ClientSlaCertificate> {
+    let syms = state.get_client_symbols(&client_id);
+    let now = Utc::now();
+    let symbol_slas: Vec<ClientSymbolSla> = syms
+        .iter()
+        .map(|s| ClientSymbolSla {
+            symbol: s.symbol.clone(),
+            presence_pct: s.presence_pct_24h,
+            two_sided_pct: s.two_sided_pct_24h,
+            spread_compliance_pct: s.spread_compliance_pct,
+            minutes_with_data: s.minutes_with_data_24h,
+        })
+        .collect();
+
+    let count = Decimal::from(symbol_slas.len().max(1));
+    let avg_presence = symbol_slas
+        .iter()
+        .map(|s| s.presence_pct)
+        .sum::<Decimal>()
+        / count;
+    let min_presence = symbol_slas
+        .iter()
+        .map(|s| s.presence_pct)
+        .min()
+        .unwrap_or(dec!(100));
+    let overall_compliant = symbol_slas.iter().all(|s| s.presence_pct >= dec!(95));
+
+    let body = format!(
+        "{}:{}:{}:{}",
+        client_id,
+        now.to_rfc3339(),
+        overall_compliant,
+        symbol_slas.len()
+    );
+    let secret = std::env::var("MM_AUTH_SECRET").unwrap_or_else(|_| "default".to_string());
+    let signature = hmac_sha256_hex(&secret, &body);
+
+    Json(ClientSlaCertificate {
+        client_id,
+        generated_at: now.to_rfc3339(),
+        overall_compliant,
+        symbols: symbol_slas,
+        avg_presence_pct: avg_presence,
+        min_presence_pct: min_presence,
+        signature,
+    })
+}
+
+// ── System preflight health (Pre-Flight Toolkit) ────────────
+
+#[derive(Debug, Serialize)]
+struct PreflightHealth {
+    overall: String,
+    symbols_active: usize,
+    any_kill_switch_active: bool,
+    max_kill_level: u8,
+    uptime_secs: i64,
+    total_pnl: Decimal,
+}
+
+async fn get_system_preflight(
+    State(state): State<DashboardState>,
+) -> Json<PreflightHealth> {
+    let symbols = state.get_all();
+    let max_kill = symbols.iter().map(|s| s.kill_level).max().unwrap_or(0);
+    let any_kill = max_kill > 0;
+    let total_pnl: Decimal = symbols.iter().map(|s| s.pnl.total).sum();
+    let uptime = (Utc::now() - state.started_at()).num_seconds();
+
+    let overall = if any_kill {
+        "DEGRADED"
+    } else if symbols.is_empty() {
+        "NO_DATA"
+    } else {
+        "HEALTHY"
+    };
+
+    Json(PreflightHealth {
+        overall: overall.into(),
+        symbols_active: symbols.len(),
+        any_kill_switch_active: any_kill,
+        max_kill_level: max_kill,
+        uptime_secs: uptime,
+        total_pnl,
+    })
+}
+
+// ── Loan endpoints (Epic 2) ──────────────────────────────────
+
+async fn get_loans(
+    State(state): State<DashboardState>,
+) -> Json<Vec<mm_persistence::loan::LoanAgreement>> {
+    Json(state.get_all_loan_agreements())
+}
+
+async fn get_loan_by_symbol(
+    State(state): State<DashboardState>,
+    Path(symbol): Path<String>,
+) -> Json<Option<mm_persistence::loan::LoanAgreement>> {
+    Json(state.get_loan_agreement_by_symbol(&symbol))
+}
+
+// ── Portfolio risk endpoints (Epic 3) ────────────────────────
+
+/// Cross-symbol correlation matrix.
+#[derive(Debug, Serialize)]
+struct CorrelationEntry {
+    factor_a: String,
+    factor_b: String,
+    correlation: Decimal,
+}
+
+async fn get_portfolio_correlation(
+    State(state): State<DashboardState>,
+) -> Json<Vec<CorrelationEntry>> {
+    let matrix = state.get_correlation_matrix();
+    Json(
+        matrix
+            .into_iter()
+            .map(|(a, b, c)| CorrelationEntry {
+                factor_a: a,
+                factor_b: b,
+                correlation: c,
+            })
+            .collect(),
+    )
+}
+
+async fn get_portfolio_risk(
+    State(state): State<DashboardState>,
+) -> Json<Option<mm_risk::portfolio_risk::PortfolioRiskSummary>> {
+    Json(state.get_portfolio_risk_summary())
 }

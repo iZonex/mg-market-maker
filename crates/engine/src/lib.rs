@@ -1,6 +1,7 @@
 pub mod balance_cache;
 pub mod book_keeper;
 pub mod connector_bundle;
+pub mod health;
 pub mod listing_sniper;
 pub mod market_maker;
 pub mod rebalancer;

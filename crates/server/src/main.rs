@@ -17,6 +17,8 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 mod config;
+mod preflight;
+mod smoke_test;
 mod validate;
 
 #[tokio::main]
@@ -64,16 +66,35 @@ async fn main() -> Result<()> {
         "exchange connector created"
     );
 
-    // Health check.
-    match connector.health_check().await {
-        Ok(true) => info!("exchange health check OK"),
-        Ok(false) => error!("exchange health check failed"),
+    // Smoke test mode — validate connector, place/cancel test
+    // order, fetch balances, print report, exit.
+    if config.mode == "smoke" {
+        info!("SMOKE TEST MODE — validating connector stack");
+        let smoke_symbol = config.symbols.first().cloned().unwrap_or("BTCUSDT".into());
+        smoke_test::run_smoke_test(&connector, &smoke_symbol).await?;
+        return Ok(());
+    }
+
+    // Pre-flight checks — validate venue, symbols, balances,
+    // config sanity before starting engines.
+    let effective_symbols: Vec<String> = config
+        .effective_clients()
+        .iter()
+        .flat_map(|c| c.symbols.clone())
+        .collect();
+    let preflight_symbols = if effective_symbols.is_empty() {
+        config.symbols.clone()
+    } else {
+        effective_symbols
+    };
+    match preflight::run_preflight(&config, &connector, &preflight_symbols).await {
+        Ok(_results) => info!("preflight checks passed"),
         Err(e) => {
             if config.mode == "live" {
-                error!(error = %e, "cannot reach exchange — aborting");
-                anyhow::bail!("exchange unreachable");
+                error!(error = %e, "preflight failed — aborting");
+                anyhow::bail!("preflight failed: {e}");
             } else {
-                warn!(error = %e, "exchange unreachable (paper mode, continuing)");
+                warn!(error = %e, "preflight failed (paper mode, continuing)");
             }
         }
     }
@@ -90,6 +111,12 @@ async fn main() -> Result<()> {
             "operator" => Role::Operator,
             _ => Role::Viewer,
         };
+        // Resolve client_id from ClientConfig.api_keys.
+        let client_id = config
+            .clients
+            .iter()
+            .find(|c| c.api_keys.contains(&u.api_key))
+            .map(|c| c.id.clone());
         auth_state.add_user(ApiUser {
             id: u.id.clone(),
             name: u.name.clone(),
@@ -100,6 +127,7 @@ async fn main() -> Result<()> {
             } else {
                 Some(u.allowed_symbols.clone())
             },
+            client_id,
         });
         info!(name = %u.name, role = %u.role, "user loaded");
     }
@@ -114,6 +142,7 @@ async fn main() -> Result<()> {
             role: Role::Admin,
             api_key: default_key.clone(),
             allowed_symbols: None,
+            client_id: None,
         });
         info!(key_hint = %&default_key[..8], "default admin user created (set MM_ADMIN_KEY to customize)");
     }
@@ -169,6 +198,12 @@ async fn main() -> Result<()> {
     // quote in a different quote asset.
     let portfolio = Arc::new(std::sync::Mutex::new(mm_portfolio::Portfolio::new("USDT")));
 
+    // Shared factor covariance estimator (Epic 3). All engines
+    // push returns; portfolio risk task reads correlation matrix.
+    let shared_factor_cov = Arc::new(std::sync::Mutex::new(
+        mm_risk::hedge_optimizer::FactorCovarianceEstimator::new(vec![], 1440),
+    ));
+
     // P2.1 — build the shared per-asset-class kill switches
     // up-front so every engine that maps to the same class
     // receives the SAME `Arc<Mutex<KillSwitch>>` and a
@@ -221,6 +256,7 @@ async fn main() -> Result<()> {
             .get(&symbol)
             .and_then(|c| asset_class_switches.get(c).cloned());
         let wh = webhook_dispatcher.clone();
+        let shared_cov = shared_factor_cov.clone();
 
         let handle = tokio::spawn(async move {
             if let Err(e) = run_symbol(
@@ -234,6 +270,7 @@ async fn main() -> Result<()> {
                 portfolio,
                 asset_class_switch,
                 wh,
+                shared_cov,
             )
             .await
             {
@@ -270,6 +307,67 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Portfolio risk background task (Epic 3). Evaluates factor
+    // deltas every 30s and broadcasts spread multipliers.
+    if let Some(ref pr_cfg) = config.portfolio_risk {
+        let pr_portfolio = portfolio.clone();
+        let pr_dashboard = dashboard_state.clone();
+        let pr_factor_cov = shared_factor_cov.clone();
+        let mut pr_shutdown = shutdown_tx.subscribe();
+        let pr_config = mm_risk::portfolio_risk::PortfolioRiskConfig {
+            max_total_delta_usd: pr_cfg.max_total_delta_usd,
+            factor_limits: pr_cfg
+                .factor_limits
+                .iter()
+                .map(|f| mm_risk::portfolio_risk::FactorLimitConfig {
+                    factor: f.factor.clone(),
+                    max_net_delta: f.max_net_delta,
+                    widen_mult: f.widen_mult,
+                    warn_pct: f.warn_pct,
+                })
+                .collect(),
+        };
+        let pr_manager = mm_risk::portfolio_risk::PortfolioRiskManager::new(pr_config);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Ok(port) = pr_portfolio.lock() {
+                            let snap = port.snapshot();
+                            let factor_map: std::collections::HashMap<String, rust_decimal::Decimal> =
+                                snap.per_factor.into_iter().collect();
+                            let summary = pr_manager.evaluate(&factor_map);
+                            // Broadcast spread multiplier if needed.
+                            for action in &summary.actions {
+                                match action {
+                                    mm_risk::portfolio_risk::PortfolioRiskAction::WidenAll { mult, .. } => {
+                                        pr_dashboard.broadcast_config_override(
+                                            mm_dashboard::state::ConfigOverride::PortfolioRiskMult(*mult),
+                                        );
+                                    }
+                                    mm_risk::portfolio_risk::PortfolioRiskAction::HaltFactor { .. } => {
+                                        pr_dashboard.broadcast_config_override(
+                                            mm_dashboard::state::ConfigOverride::PauseQuoting,
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            pr_dashboard.set_portfolio_risk_summary(summary);
+                            // Push correlation matrix from shared estimator.
+                            if let Ok(cov) = pr_factor_cov.lock() {
+                                pr_dashboard.set_correlation_matrix(cov.correlation_matrix());
+                            }
+                        }
+                    }
+                    _ = pr_shutdown.changed() => break,
+                }
+            }
+        });
+        info!("portfolio risk monitor started (30s interval)");
+    }
+
     // Wait for Ctrl+C.
     tokio::signal::ctrl_c().await?;
     info!("shutdown signal received — cancelling all orders");
@@ -300,6 +398,7 @@ async fn run_symbol(
     portfolio: Arc<std::sync::Mutex<mm_portfolio::Portfolio>>,
     asset_class_switch: Option<Arc<std::sync::Mutex<mm_risk::KillSwitch>>>,
     webhook_dispatcher: mm_dashboard::webhooks::WebhookDispatcher,
+    shared_factor_cov: Arc<std::sync::Mutex<mm_risk::hedge_optimizer::FactorCovarianceEstimator>>,
 ) -> Result<()> {
     let product = product_for_symbol(&symbol, &connector).await;
 
@@ -430,6 +529,12 @@ async fn run_symbol(
     let (config_tx, config_rx) = tokio::sync::mpsc::unbounded_channel();
     dashboard_state.register_config_channel(&symbol, config_tx);
 
+    let record_path = if config.record_market_data {
+        Some(format!("data/recorded/{}.jsonl", symbol.to_lowercase()))
+    } else {
+        None
+    };
+
     let mut engine_builder = MarketMakerEngine::new(
         symbol,
         config,
@@ -441,9 +546,13 @@ async fn run_symbol(
     )
     .with_portfolio(portfolio)
     .with_config_overrides(config_rx)
-    .with_webhooks(webhook_dispatcher);
+    .with_webhooks(webhook_dispatcher)
+    .with_shared_factor_covariance(shared_factor_cov);
     if let Some(arc) = asset_class_switch {
         engine_builder = engine_builder.with_asset_class_switch(arc);
+    }
+    if let Some(ref path) = record_path {
+        engine_builder = engine_builder.with_event_recorder(std::path::Path::new(path));
     }
 
     let mut engine = match funding_arb_wiring {

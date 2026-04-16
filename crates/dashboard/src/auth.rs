@@ -44,6 +44,11 @@ pub struct ApiUser {
     pub api_key: String,
     /// Optional: restrict to specific symbols.
     pub allowed_symbols: Option<Vec<String>>,
+    /// Owning client ID (Epic 1). When set, the user can only
+    /// access symbols belonging to this client. `None` for
+    /// admin/operator users who see everything.
+    #[serde(default)]
+    pub client_id: Option<String>,
 }
 
 /// JWT-like token claims (simplified, HMAC-signed).
@@ -51,6 +56,10 @@ pub struct ApiUser {
 pub struct TokenClaims {
     pub user_id: String,
     pub role: Role,
+    /// Owning client ID (Epic 1). When set, API requests are
+    /// scoped to this client's symbols. `None` for admin users.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
     pub exp: i64,
 }
 
@@ -88,6 +97,7 @@ impl AuthState {
         let claims = TokenClaims {
             user_id: user.id.clone(),
             role: user.role,
+            client_id: user.client_id.clone(),
             exp: (Utc::now() + Duration::hours(24)).timestamp(),
         };
         let payload = serde_json::to_string(&claims).unwrap_or_default();
@@ -263,6 +273,7 @@ pub async fn auth_middleware(
                 let claims = TokenClaims {
                     user_id: user.id.clone(),
                     role: user.role,
+                    client_id: user.client_id.clone(),
                     exp: Utc::now().timestamp() + 3600,
                 };
                 req.extensions_mut().insert(claims);

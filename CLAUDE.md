@@ -4,7 +4,7 @@ Production-grade market maker for the custom exchange at `../exchange/` with mul
 
 ## Stats
 
-**18 crates, 156 files, ~50K lines Rust, 1128 tests**
+**18 crates, ~180 files, ~62K lines Rust, 1213 tests**
 
 ## Architecture
 
@@ -55,6 +55,10 @@ strategy/              Strategies + signals + execution:
   ├── inventory_skew   Quadratic skew, dynamic sizing, urgency unwinding
   └── volatility       EWMA realized vol estimator
 risk/                  Risk management:
+  ├── portfolio_risk   Portfolio-level factor limits + global delta guard
+  ├── portfolio_var    Portfolio-level parametric Gaussian VaR guard
+  ├── audit_reader     Date-range filtered audit log reading + signed export
+  ├── loan_utilization Loan utilization tracking + return schedule
   ├── kill_switch      5-level emergency (widen→stop→cancel→flatten→disconnect)
   ├── protections      StoplossGuard / CooldownPeriod / MaxDrawdown / LowProfitPairs
   ├── circuit_breaker  Stale book, wide spread detection
@@ -75,6 +79,9 @@ risk/                  Risk management:
   ├── audit            Append-only JSONL audit trail (MiCA compliant)
   └── reconciliation   Order + balance reconciliation vs exchange
 dashboard/             HTTP dashboard:
+  ├── admin_clients    Client onboarding CRUD (POST/GET /api/admin/clients)
+  ├── health           Engine health degradation modes (Normal/Degraded/Critical)
+  ├── mica_report      MiCA Article 17 algorithmic trading report
   ├── server           /health, /api/status, /metrics, /api/v1/*
   ├── metrics          28 Prometheus gauges/counters/histograms
   ├── alerts           Telegram bot + 3-level severity + dedup
@@ -90,8 +97,23 @@ backtester/            Backtesting + paper trading:
   ├── stress           Synthetic stress scenarios + runner + report (Epic C)
   └── report           Performance report with PnL attribution
 persistence/         State management:
-  ├── checkpoint     Atomic JSON checkpoint with auto-flush
-  └── funding        Funding rate arbitrage engine
+  ├── checkpoint     Atomic JSON checkpoint with auto-flush + restore validation
+  ├── fill_replay    Audit log fill replay for crash recovery
+  ├── funding        Funding rate arbitrage engine
+  ├── loan           LoanAgreement lifecycle + JSONL persistence
+  └── transfer_log   Cross-venue transfer JSONL persistence
+```
+
+## Documentation
+
+```
+docs/guides/
+├── quickstart.md              # First run: build → smoke → paper → live
+├── writing-strategies.md      # Strategy trait, context, examples, testing
+├── architecture.md            # System overview, data flow, crate graph
+├── operations.md              # Modes, troubleshooting, daily checklist
+├── adding-exchange.md         # New connector step-by-step
+└── configuration-reference.md # Every config field documented
 ```
 
 ## Commands
@@ -131,6 +153,17 @@ Secrets via environment (NEVER in config files):
 - TWAP executor for kill switch L4 (flatten all)
 - Dashboard state pushed every 30s to Prometheus + HTTP API
 - Graceful shutdown: Ctrl+C → cancel all → final reports → checkpoint flush
+- Multi-client isolation: `ClientConfig` per client, DashboardState partitioned by client_id
+- Portfolio-level risk: `PortfolioRiskManager` + `PortfolioVarGuard` + shared `FactorCovarianceEstimator`
+- Per-client API scoping: `client_id` on `TokenClaims`, per-client SLA/PnL/fills/certificate endpoints
+- Token lending: `LoanAgreement` lifecycle, utilization alerts, return schedule, PnL cost amortization
+- Crash recovery: checkpoint restore (opt-in), fill replay from audit log, orphaned order cancel on restart
+- Health degradation: `Normal→Degraded→Critical` state machine, auto spread widening on venue errors
+- Cross-venue execution: `withdraw()` + `internal_transfer()` on Binance/Bybit, auto-rebalancer config, SOR inline dispatch flag
+- MiCA compliance: Article 17 report template, audit log date-range export with HMAC signature, webhook report delivery
+- A/B testing: `AbSplitEngine` with time-based/symbol-based split, per-variant performance tracking
+- Demo data: synthetic market event generator with configurable volatility + mean-reversion
+- Paper fill simulation: `PaperFillCfg` config for `ProbabilisticFiller` (queue pos, slippage, latency)
 
 ## Protocol architecture rule
 

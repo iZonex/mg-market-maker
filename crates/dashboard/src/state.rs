@@ -45,31 +45,37 @@ pub enum ConfigOverride {
     PauseQuoting,
     /// Resume quoting for this symbol (lifecycle_paused = false).
     ResumeQuoting,
+    /// Portfolio-level risk spread multiplier (Epic 3). The
+    /// engine applies this as an additional factor on the
+    /// effective spread, composable with existing kill switch
+    /// and market resilience multipliers.
+    PortfolioRiskMult(Decimal),
+}
+
+/// Per-client state partition (Epic 1: Multi-Client Isolation).
+/// Each client owns a disjoint set of symbols with separate fills,
+/// webhooks, and config override channels.
+#[derive(Debug, Default)]
+pub struct ClientState {
+    pub symbols: HashMap<String, SymbolState>,
+    pub recent_fills: std::collections::VecDeque<FillRecord>,
+    pub webhook_dispatcher: Option<crate::webhooks::WebhookDispatcher>,
+    pub config_overrides: HashMap<String, tokio::sync::mpsc::UnboundedSender<ConfigOverride>>,
 }
 
 #[derive(Debug, Default)]
 struct StateInner {
-    symbols: HashMap<String, SymbolState>,
+    /// Per-client state partitions. In legacy mode (no clients
+    /// configured), a single `"default"` client owns everything.
+    clients: HashMap<String, ClientState>,
+    /// Reverse index: symbol → client_id for O(1) routing.
+    symbol_to_client: HashMap<String, String>,
     loans: HashMap<String, LoanConfig>,
     incidents: Vec<IncidentRecord>,
-    /// Last-seen portfolio snapshot, aggregated across all
-    /// symbols/engines. `None` when the operator runs without
-    /// `mm-portfolio` wired — in that case the dashboard still
-    /// shows per-symbol PnL from `PnlTracker` but the unified
-    /// multi-currency view is unavailable.
     portfolio: Option<PortfolioSnapshot>,
-    /// Recent fills for the client API. Capped at
-    /// `MAX_RECENT_FILLS` entries, oldest evicted first.
-    recent_fills: std::collections::VecDeque<FillRecord>,
-    /// Per-symbol config override senders. Engines register
-    /// their receiver at startup; admin endpoints send
-    /// overrides through these channels.
-    config_overrides: HashMap<String, tokio::sync::mpsc::UnboundedSender<ConfigOverride>>,
     /// Append-only fill log writer for persistence across
     /// restarts. Set via `DashboardState::enable_fill_log`.
     fill_log_writer: Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
-    /// Shared webhook dispatcher for client event delivery.
-    webhook_dispatcher: Option<crate::webhooks::WebhookDispatcher>,
     /// Historical daily report snapshots. Keyed by date string
     /// (YYYY-MM-DD). Capped at 90 days.
     daily_reports: HashMap<String, DailyReportSnapshot>,
@@ -81,10 +87,38 @@ struct StateInner {
     started_at: DateTime<Utc>,
     /// Configurable alert rules.
     alert_rules: Vec<AlertRule>,
+    /// Loan agreements (Epic 2). Keyed by loan ID.
+    loan_agreements: HashMap<String, mm_persistence::loan::LoanAgreement>,
+    /// Optimization state (Epic 6). Tracks hyperopt runs.
+    optimization: Option<OptimizationState>,
+    /// Cross-symbol correlation matrix (Epic 3). Updated by the
+    /// portfolio risk background task. Each entry is
+    /// `(factor_a, factor_b, correlation)`.
+    correlation_matrix: Vec<(String, String, Decimal)>,
+    /// Portfolio risk summary (Epic 3). Updated by the
+    /// portfolio risk background task.
+    portfolio_risk_summary: Option<mm_risk::portfolio_risk::PortfolioRiskSummary>,
 }
 
 const MAX_DAILY_REPORTS: usize = 90;
 const MAX_PNL_TIMESERIES: usize = 1440;
+
+/// Optimization run state (Epic 6).
+#[derive(Debug, Clone, Serialize)]
+pub struct OptimizationState {
+    /// Current status: "idle", "running", "completed", "failed".
+    pub status: String,
+    /// Number of trials completed.
+    pub trials_completed: u64,
+    /// Total trials requested.
+    pub trials_total: u64,
+    /// Best parameters found (JSON map).
+    pub best_params: Option<serde_json::Value>,
+    /// Best loss value.
+    pub best_loss: Option<Decimal>,
+    /// When the run started.
+    pub started_at: Option<DateTime<Utc>>,
+}
 
 /// Configurable alert rule — fires when a condition is met.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +188,9 @@ const MAX_RECENT_FILLS: usize = 1000;
 pub struct FillRecord {
     pub timestamp: DateTime<Utc>,
     pub symbol: String,
+    /// Owning client ID (Epic 1). `None` in legacy mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
     pub side: String,
     pub price: Decimal,
     pub qty: Decimal,
@@ -289,6 +326,44 @@ impl DashboardState {
         s
     }
 
+    // ── Client registration ──────────────────────────────────
+
+    /// Register a client with its symbols. Called at startup
+    /// from the resolved `effective_clients()` list.
+    pub fn register_client(&self, client_id: &str, symbols: &[String]) {
+        let mut inner = self.inner.write().unwrap();
+        inner
+            .clients
+            .entry(client_id.to_string())
+            .or_default();
+        for sym in symbols {
+            inner
+                .symbol_to_client
+                .insert(sym.clone(), client_id.to_string());
+        }
+    }
+
+    /// List registered client IDs.
+    pub fn client_ids(&self) -> Vec<String> {
+        let inner = self.inner.read().unwrap();
+        let mut ids: Vec<String> = inner.clients.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    /// Resolve the owning client for a symbol via the reverse
+    /// index. Returns `"default"` if the symbol is unknown
+    /// (backward compatibility for unregistered symbols).
+    fn client_for_symbol(inner: &StateInner, symbol: &str) -> String {
+        inner
+            .symbol_to_client
+            .get(symbol)
+            .cloned()
+            .unwrap_or_else(|| "default".to_string())
+    }
+
+    // ── Symbol state ─────────────────────────────────────────
+
     /// Update state for a symbol.
     pub fn update(&self, state: SymbolState) {
         let mut inner = self.inner.write().unwrap();
@@ -332,12 +407,6 @@ impl DashboardState {
         crate::metrics::ADVERSE_BPS
             .with_label_values(&[&state.symbol])
             .set(decimal_to_f64(state.adverse_bps));
-        // Epic D stage-3 — per-side ρ + wave-2 momentum
-        // observability. Per-side gauges baseline at 0.5
-        // (neutral) when the per-side tracker has fewer than
-        // 5 completed fills on a side; OFI EWMA + learned MP
-        // drift gauges baseline at 0.0 when the corresponding
-        // optional signal is not attached.
         crate::metrics::AS_PROB_BID
             .with_label_values(&[&state.symbol])
             .set(decimal_to_f64(state.as_prob_bid.unwrap_or(dec!(0.5))));
@@ -373,20 +442,42 @@ impl DashboardState {
             .with_label_values(&[&state.symbol])
             .set(decimal_to_f64(state.presence_pct_24h));
 
-        inner.symbols.insert(state.symbol.clone(), state);
+        let client_id = Self::client_for_symbol(&inner, &state.symbol);
+        let client = inner.clients.entry(client_id).or_default();
+        client.symbols.insert(state.symbol.clone(), state);
     }
 
-    /// Get all symbol states for the HTTP JSON endpoint.
+    /// Get all symbol states across all clients.
     pub fn get_all(&self) -> Vec<SymbolState> {
         let inner = self.inner.read().unwrap();
-        inner.symbols.values().cloned().collect()
+        inner
+            .clients
+            .values()
+            .flat_map(|c| c.symbols.values().cloned())
+            .collect()
     }
 
-    /// Get state for a single symbol.
+    /// Get all symbol states for a specific client.
+    pub fn get_client_symbols(&self, client_id: &str) -> Vec<SymbolState> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .clients
+            .get(client_id)
+            .map(|c| c.symbols.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Get state for a single symbol (searches all clients).
     pub fn get_symbol(&self, symbol: &str) -> Option<SymbolState> {
         let inner = self.inner.read().unwrap();
-        inner.symbols.get(symbol).cloned()
+        let client_id = Self::client_for_symbol(&inner, symbol);
+        inner
+            .clients
+            .get(&client_id)
+            .and_then(|c| c.symbols.get(symbol).cloned())
     }
+
+    // ── Loans ────────────────────────────────────────────────
 
     /// Set loan configs (from AppConfig).
     pub fn set_loans(&self, loans: HashMap<String, LoanConfig>) {
@@ -400,6 +491,8 @@ impl DashboardState {
         inner.loans.get(symbol).cloned()
     }
 
+    // ── Incidents ────────────────────────────────────────────
+
     /// Record an incident.
     pub fn add_incident(&self, incident: IncidentRecord) {
         let mut inner = self.inner.write().unwrap();
@@ -412,9 +505,9 @@ impl DashboardState {
         inner.incidents.clone()
     }
 
+    // ── Portfolio ────────────────────────────────────────────
+
     /// Publish a portfolio snapshot + its Prometheus gauges.
-    /// The engine calls this every summary tick with a snapshot
-    /// taken under the shared portfolio mutex.
     pub fn update_portfolio(&self, snap: PortfolioSnapshot) {
         crate::metrics::PORTFOLIO_TOTAL_EQUITY
             .with_label_values(&[&snap.reporting_currency])
@@ -433,13 +526,11 @@ impl DashboardState {
                 .with_label_values(&[symbol])
                 .set(decimal_to_f64(asset.unrealised_pnl_reporting));
         }
-        // P2.3 Epic C sub-component #1: per-factor delta gauges.
         for (factor, delta) in &snap.per_factor {
             crate::metrics::PORTFOLIO_FACTOR_DELTA
                 .with_label_values(&[factor])
                 .set(decimal_to_f64(*delta));
         }
-        // P2.3 Epic C sub-component #2: per-strategy PnL gauges.
         for (strategy, pnl) in &snap.per_strategy {
             crate::metrics::PORTFOLIO_STRATEGY_PNL
                 .with_label_values(&[strategy])
@@ -453,18 +544,69 @@ impl DashboardState {
         self.inner.read().unwrap().portfolio.clone()
     }
 
-    /// Set the webhook dispatcher (shared across all engines).
+    // ── Webhooks ─────────────────────────────────────────────
+
+    /// Set the webhook dispatcher for a specific client.
+    pub fn set_client_webhook_dispatcher(
+        &self,
+        client_id: &str,
+        wh: crate::webhooks::WebhookDispatcher,
+    ) {
+        let mut inner = self.inner.write().unwrap();
+        inner
+            .clients
+            .entry(client_id.to_string())
+            .or_default()
+            .webhook_dispatcher = Some(wh);
+    }
+
+    /// Set the webhook dispatcher (legacy — sets on "default" client).
     pub fn set_webhook_dispatcher(&self, wh: crate::webhooks::WebhookDispatcher) {
-        self.inner.write().unwrap().webhook_dispatcher = Some(wh);
+        self.set_client_webhook_dispatcher("default", wh);
     }
 
-    /// Get the webhook dispatcher for admin endpoints.
+    /// Get the webhook dispatcher for a specific client.
+    pub fn get_client_webhook_dispatcher(
+        &self,
+        client_id: &str,
+    ) -> Option<crate::webhooks::WebhookDispatcher> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .clients
+            .get(client_id)
+            .and_then(|c| c.webhook_dispatcher.clone())
+    }
+
+    /// Get the webhook dispatcher (legacy — returns first found).
     pub fn webhook_dispatcher(&self) -> Option<crate::webhooks::WebhookDispatcher> {
-        self.inner.read().unwrap().webhook_dispatcher.clone()
+        let inner = self.inner.read().unwrap();
+        for client in inner.clients.values() {
+            if let Some(wh) = &client.webhook_dispatcher {
+                return Some(wh.clone());
+            }
+        }
+        None
     }
 
-    /// Push a PnL sample for a symbol's time-series. Called
-    /// by the engine on every summary tick (30s cadence).
+    /// Dispatch a webhook event, routing to the correct client
+    /// based on the symbol in the event.
+    pub fn dispatch_webhook_for_symbol(
+        &self,
+        symbol: &str,
+        event: crate::webhooks::WebhookEvent,
+    ) {
+        let inner = self.inner.read().unwrap();
+        let client_id = Self::client_for_symbol(&inner, symbol);
+        if let Some(client) = inner.clients.get(&client_id) {
+            if let Some(wh) = &client.webhook_dispatcher {
+                wh.dispatch(event);
+            }
+        }
+    }
+
+    // ── PnL time-series ──────────────────────────────────────
+
+    /// Push a PnL sample for a symbol's time-series.
     pub fn push_pnl_sample(&self, symbol: &str, timestamp_ms: i64, total_pnl: Decimal) {
         let mut inner = self.inner.write().unwrap();
         let ts = inner
@@ -477,7 +619,7 @@ impl DashboardState {
         }
     }
 
-    /// Get PnL time-series for a symbol. Returns newest-first.
+    /// Get PnL time-series for a symbol.
     pub fn get_pnl_timeseries(&self, symbol: &str) -> Vec<PnlTimePoint> {
         let inner = self.inner.read().unwrap();
         inner
@@ -494,10 +636,11 @@ impl DashboardState {
             .unwrap_or_default()
     }
 
+    // ── Alert rules ──────────────────────────────────────────
+
     /// Add a configurable alert rule.
     pub fn add_alert_rule(&self, rule: AlertRule) {
         let mut inner = self.inner.write().unwrap();
-        // Replace if same ID exists.
         inner.alert_rules.retain(|r| r.id != rule.id);
         inner.alert_rules.push(rule);
     }
@@ -515,8 +658,7 @@ impl DashboardState {
         self.inner.read().unwrap().alert_rules.clone()
     }
 
-    /// Check all alert rules against current state. Returns
-    /// triggered rule IDs with the triggering value.
+    /// Check all alert rules against current state.
     pub fn check_alert_rules(&self) -> Vec<(String, String)> {
         let inner = self.inner.read().unwrap();
         let mut triggered = Vec::new();
@@ -524,39 +666,120 @@ impl DashboardState {
             if !rule.enabled {
                 continue;
             }
-            for sym in inner.symbols.values() {
-                let fires = match &rule.condition {
-                    AlertCondition::PnlBelow { threshold } => sym.pnl.total < *threshold,
-                    AlertCondition::SpreadAbove { threshold_bps } => {
-                        sym.spread_bps > *threshold_bps
+            for client in inner.clients.values() {
+                for sym in client.symbols.values() {
+                    let fires = match &rule.condition {
+                        AlertCondition::PnlBelow { threshold } => sym.pnl.total < *threshold,
+                        AlertCondition::SpreadAbove { threshold_bps } => {
+                            sym.spread_bps > *threshold_bps
+                        }
+                        AlertCondition::InventoryAbove { threshold } => {
+                            sym.inventory.abs() > *threshold
+                        }
+                        AlertCondition::UptimeBelow { threshold_pct } => {
+                            sym.sla_uptime_pct < *threshold_pct
+                        }
+                        AlertCondition::FillRateBelow { .. } => false,
+                    };
+                    if fires {
+                        triggered.push((
+                            rule.id.clone(),
+                            format!("{}: {}", sym.symbol, rule.description),
+                        ));
                     }
-                    AlertCondition::InventoryAbove { threshold } => {
-                        sym.inventory.abs() > *threshold
-                    }
-                    AlertCondition::UptimeBelow { threshold_pct } => {
-                        sym.sla_uptime_pct < *threshold_pct
-                    }
-                    AlertCondition::FillRateBelow { .. } => false, // needs fill rate tracking
-                };
-                if fires {
-                    triggered.push((
-                        rule.id.clone(),
-                        format!("{}: {}", sym.symbol, rule.description),
-                    ));
                 }
             }
         }
         triggered
     }
 
+    // ── Optimization state (Epic 6) ────────────────────────────
+
+    /// Update optimization state.
+    pub fn set_optimization_state(&self, state: OptimizationState) {
+        self.inner.write().unwrap().optimization = Some(state);
+    }
+
+    /// Get current optimization state.
+    pub fn get_optimization_state(&self) -> Option<OptimizationState> {
+        self.inner.read().unwrap().optimization.clone()
+    }
+
+    // ── Loan agreements (Epic 2) ───────────────────────────────
+
+    /// Store a loan agreement.
+    pub fn set_loan_agreement(&self, agreement: mm_persistence::loan::LoanAgreement) {
+        let mut inner = self.inner.write().unwrap();
+        inner
+            .loan_agreements
+            .insert(agreement.id.clone(), agreement);
+    }
+
+    /// Get a loan agreement by ID.
+    pub fn get_loan_agreement(&self, loan_id: &str) -> Option<mm_persistence::loan::LoanAgreement> {
+        self.inner.read().unwrap().loan_agreements.get(loan_id).cloned()
+    }
+
+    /// Get loan agreement for a symbol.
+    pub fn get_loan_agreement_by_symbol(
+        &self,
+        symbol: &str,
+    ) -> Option<mm_persistence::loan::LoanAgreement> {
+        self.inner
+            .read()
+            .unwrap()
+            .loan_agreements
+            .values()
+            .find(|a| a.symbol == symbol)
+            .cloned()
+    }
+
+    /// Get all loan agreements.
+    pub fn get_all_loan_agreements(&self) -> Vec<mm_persistence::loan::LoanAgreement> {
+        self.inner
+            .read()
+            .unwrap()
+            .loan_agreements
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    // ── Portfolio risk (Epic 3) ────────────────────────────────
+
+    /// Update the correlation matrix snapshot.
+    pub fn set_correlation_matrix(&self, matrix: Vec<(String, String, Decimal)>) {
+        self.inner.write().unwrap().correlation_matrix = matrix;
+    }
+
+    /// Get the correlation matrix snapshot.
+    pub fn get_correlation_matrix(&self) -> Vec<(String, String, Decimal)> {
+        self.inner.read().unwrap().correlation_matrix.clone()
+    }
+
+    /// Update the portfolio risk summary.
+    pub fn set_portfolio_risk_summary(
+        &self,
+        summary: mm_risk::portfolio_risk::PortfolioRiskSummary,
+    ) {
+        self.inner.write().unwrap().portfolio_risk_summary = Some(summary);
+    }
+
+    /// Get the portfolio risk summary.
+    pub fn get_portfolio_risk_summary(
+        &self,
+    ) -> Option<mm_risk::portfolio_risk::PortfolioRiskSummary> {
+        self.inner.read().unwrap().portfolio_risk_summary.clone()
+    }
+
+    // ── Misc ─────────────────────────────────────────────────
+
     /// Process start time.
     pub fn started_at(&self) -> DateTime<Utc> {
         self.inner.read().unwrap().started_at
     }
 
-    /// Auto-snapshot the current state as a daily report. Called
-    /// by the midnight UTC tick in the engine. Builds the
-    /// snapshot from the current SymbolState data.
+    /// Auto-snapshot the current state as a daily report.
     pub fn snapshot_daily_report(&self) {
         let symbols = self.get_all();
         if symbols.is_empty() {
@@ -593,12 +816,10 @@ impl DashboardState {
     }
 
     /// Store a daily report snapshot for historical queries.
-    /// Automatically trims to 90 days.
     pub fn store_daily_report(&self, report: DailyReportSnapshot) {
         let mut inner = self.inner.write().unwrap();
         let date = report.date.clone();
         inner.daily_reports.insert(date, report);
-        // Trim oldest if over limit.
         if inner.daily_reports.len() > MAX_DAILY_REPORTS {
             let mut dates: Vec<String> = inner.daily_reports.keys().cloned().collect();
             dates.sort();
@@ -626,9 +847,10 @@ impl DashboardState {
         dates
     }
 
-    /// Load fill history from a JSONL file (one FillRecord per
-    /// line). Called at startup to restore recent fills from a
-    /// previous session. Ignores malformed lines.
+    // ── Fill history ─────────────────────────────────────────
+
+    /// Load fill history from a JSONL file. Called at startup to
+    /// restore recent fills from a previous session.
     pub fn load_fill_history(&self, path: &std::path::Path) {
         let Ok(content) = std::fs::read_to_string(path) else {
             return;
@@ -637,22 +859,24 @@ impl DashboardState {
         let mut loaded = 0usize;
         for line in content.lines().rev().take(MAX_RECENT_FILLS) {
             if let Ok(fill) = serde_json::from_str::<FillRecord>(line) {
-                inner.recent_fills.push_front(fill);
+                let client_id = Self::client_for_symbol(&inner, &fill.symbol);
+                let client = inner.clients.entry(client_id).or_default();
+                client.recent_fills.push_front(fill);
                 loaded += 1;
             }
         }
-        // Trim to cap.
-        while inner.recent_fills.len() > MAX_RECENT_FILLS {
-            inner.recent_fills.pop_front();
+        // Trim per-client fill buffers.
+        for client in inner.clients.values_mut() {
+            while client.recent_fills.len() > MAX_RECENT_FILLS {
+                client.recent_fills.pop_front();
+            }
         }
         if loaded > 0 {
             tracing::info!(loaded, "restored fill history from disk");
         }
     }
 
-    /// Enable persistent fill logging to a JSONL file. Each
-    /// fill is appended as one JSON line so the file survives
-    /// restarts. Call once at startup.
+    /// Enable persistent fill logging to a JSONL file.
     pub fn enable_fill_log(&self, path: &std::path::Path) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
@@ -667,39 +891,41 @@ impl DashboardState {
         }
     }
 
-    /// Register a config override channel for a symbol. Called
-    /// by the engine at startup.
+    // ── Config overrides ─────────────────────────────────────
+
+    /// Register a config override channel for a symbol.
     pub fn register_config_channel(
         &self,
         symbol: &str,
         tx: tokio::sync::mpsc::UnboundedSender<ConfigOverride>,
     ) {
-        self.inner
-            .write()
-            .unwrap()
+        let mut inner = self.inner.write().unwrap();
+        let client_id = Self::client_for_symbol(&inner, symbol);
+        let client = inner.clients.entry(client_id).or_default();
+        client
             .config_overrides
             .insert(symbol.to_string(), tx);
     }
 
     /// Send a config override to a specific symbol's engine.
-    /// Returns `false` if the symbol is not registered or the
-    /// channel is closed.
     pub fn send_config_override(&self, symbol: &str, ovr: ConfigOverride) -> bool {
         let inner = self.inner.read().unwrap();
-        if let Some(tx) = inner.config_overrides.get(symbol) {
-            tx.send(ovr).is_ok()
-        } else {
-            false
+        let client_id = Self::client_for_symbol(&inner, symbol);
+        if let Some(client) = inner.clients.get(&client_id) {
+            if let Some(tx) = client.config_overrides.get(symbol) {
+                return tx.send(ovr).is_ok();
+            }
         }
+        false
     }
 
     /// Send a config override to ALL registered symbols.
-    /// Returns the number of engines that accepted the override.
     pub fn broadcast_config_override(&self, ovr: ConfigOverride) -> usize {
         let inner = self.inner.read().unwrap();
         inner
-            .config_overrides
+            .clients
             .values()
+            .flat_map(|c| c.config_overrides.values())
             .filter(|tx| tx.send(ovr.clone()).is_ok())
             .count()
     }
@@ -707,16 +933,19 @@ impl DashboardState {
     /// List all symbols that have registered config channels.
     pub fn config_symbols(&self) -> Vec<String> {
         let inner = self.inner.read().unwrap();
-        let mut v: Vec<String> = inner.config_overrides.keys().cloned().collect();
+        let mut v: Vec<String> = inner
+            .clients
+            .values()
+            .flat_map(|c| c.config_overrides.keys().cloned())
+            .collect();
         v.sort();
         v
     }
 
     /// Record a fill with NBBO snapshot for the client API.
-    /// Called by the engine on every fill event. Persists to
-    /// disk if a fill log path is set.
+    /// Routes to the correct client based on fill symbol.
     pub fn record_fill(&self, fill: FillRecord) {
-        // Persist to disk for fill history across restarts.
+        // Persist to disk.
         if let Ok(inner) = self.inner.read() {
             if let Some(writer) = &inner.fill_log_writer {
                 if let Ok(mut w) = writer.lock() {
@@ -729,24 +958,40 @@ impl DashboardState {
             }
         }
         let mut inner = self.inner.write().unwrap();
-        inner.recent_fills.push_back(fill);
-        while inner.recent_fills.len() > MAX_RECENT_FILLS {
-            inner.recent_fills.pop_front();
+        let client_id = Self::client_for_symbol(&inner, &fill.symbol);
+        let client = inner.clients.entry(client_id).or_default();
+        client.recent_fills.push_back(fill);
+        while client.recent_fills.len() > MAX_RECENT_FILLS {
+            client.recent_fills.pop_front();
         }
     }
 
-    /// Get recent fills, optionally filtered by symbol.
-    /// Returns newest-first, capped at `limit`.
+    /// Get recent fills across all clients, optionally filtered
+    /// by symbol. Returns newest-first, capped at `limit`.
     pub fn get_recent_fills(&self, symbol: Option<&str>, limit: usize) -> Vec<FillRecord> {
         let inner = self.inner.read().unwrap();
         inner
-            .recent_fills
-            .iter()
-            .rev()
+            .clients
+            .values()
+            .flat_map(|c| c.recent_fills.iter().rev())
             .filter(|f| symbol.is_none_or(|s| f.symbol == s))
             .take(limit)
             .cloned()
             .collect()
+    }
+
+    /// Get recent fills for a specific client.
+    pub fn get_client_fills(
+        &self,
+        client_id: &str,
+        limit: usize,
+    ) -> Vec<FillRecord> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .clients
+            .get(client_id)
+            .map(|c| c.recent_fills.iter().rev().take(limit).cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -822,10 +1067,6 @@ mod tests {
         assert_eq!(got.momentum_learned_mp_drift, Some(dec!(0.0001)));
     }
 
-    /// `None` per-side ρ flows through cleanly — the
-    /// dashboard publishes the 0.5 baseline to Prometheus
-    /// but the original `Option<None>` is preserved in the
-    /// in-memory state for the JSON API.
     #[test]
     fn state_update_preserves_none_in_json_api() {
         crate::metrics::init();
@@ -837,5 +1078,143 @@ mod tests {
         assert_eq!(got.as_prob_ask, None);
         assert_eq!(got.momentum_ofi_ewma, None);
         assert_eq!(got.momentum_learned_mp_drift, None);
+    }
+
+    // ── Multi-client isolation tests ─────────────────────────
+
+    #[test]
+    fn register_client_and_get_symbols() {
+        crate::metrics::init();
+        let ds = DashboardState::new();
+        ds.register_client("alice", &["BTCUSDT".into(), "ETHUSDT".into()]);
+        ds.register_client("bob", &["SOLUSDT".into()]);
+
+        ds.update(empty_state("BTCUSDT"));
+        ds.update(empty_state("ETHUSDT"));
+        ds.update(empty_state("SOLUSDT"));
+
+        let alice_syms = ds.get_client_symbols("alice");
+        assert_eq!(alice_syms.len(), 2);
+        let bob_syms = ds.get_client_symbols("bob");
+        assert_eq!(bob_syms.len(), 1);
+        assert_eq!(bob_syms[0].symbol, "SOLUSDT");
+
+        // get_all returns all across clients
+        assert_eq!(ds.get_all().len(), 3);
+    }
+
+    #[test]
+    fn fill_routes_to_correct_client() {
+        crate::metrics::init();
+        let ds = DashboardState::new();
+        ds.register_client("alice", &["BTCUSDT".into()]);
+        ds.register_client("bob", &["ETHUSDT".into()]);
+
+        let fill = FillRecord {
+            timestamp: Utc::now(),
+            symbol: "BTCUSDT".into(),
+            client_id: Some("alice".into()),
+            side: "buy".into(),
+            price: dec!(50000),
+            qty: dec!(0.01),
+            is_maker: true,
+            fee: dec!(0.1),
+            nbbo_bid: dec!(49999),
+            nbbo_ask: dec!(50001),
+            slippage_bps: dec!(0),
+        };
+        ds.record_fill(fill);
+
+        // Alice has the fill
+        let alice_fills = ds.get_client_fills("alice", 10);
+        assert_eq!(alice_fills.len(), 1);
+        assert_eq!(alice_fills[0].symbol, "BTCUSDT");
+
+        // Bob has no fills
+        let bob_fills = ds.get_client_fills("bob", 10);
+        assert_eq!(bob_fills.len(), 0);
+
+        // Global view still works
+        let all_fills = ds.get_recent_fills(None, 10);
+        assert_eq!(all_fills.len(), 1);
+    }
+
+    #[test]
+    fn config_override_routes_through_client() {
+        let ds = DashboardState::new();
+        ds.register_client("alice", &["BTCUSDT".into()]);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        ds.register_config_channel("BTCUSDT", tx);
+
+        assert!(ds.send_config_override("BTCUSDT", ConfigOverride::Gamma(dec!(0.5))));
+        assert!(!ds.send_config_override("UNKNOWN", ConfigOverride::Gamma(dec!(0.5))));
+
+        let ovr = rx.try_recv().unwrap();
+        assert!(matches!(ovr, ConfigOverride::Gamma(_)));
+    }
+
+    #[test]
+    fn broadcast_reaches_all_clients() {
+        let ds = DashboardState::new();
+        ds.register_client("alice", &["BTCUSDT".into()]);
+        ds.register_client("bob", &["ETHUSDT".into()]);
+
+        let (tx1, mut rx1) = tokio::sync::mpsc::unbounded_channel();
+        let (tx2, mut rx2) = tokio::sync::mpsc::unbounded_channel();
+        ds.register_config_channel("BTCUSDT", tx1);
+        ds.register_config_channel("ETHUSDT", tx2);
+
+        let count = ds.broadcast_config_override(ConfigOverride::PauseQuoting);
+        assert_eq!(count, 2);
+        assert!(rx1.try_recv().is_ok());
+        assert!(rx2.try_recv().is_ok());
+    }
+
+    #[test]
+    fn client_ids_returns_registered() {
+        let ds = DashboardState::new();
+        ds.register_client("bob", &["ETHUSDT".into()]);
+        ds.register_client("alice", &["BTCUSDT".into()]);
+        let ids = ds.client_ids();
+        assert_eq!(ids, vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn webhook_dispatcher_per_client() {
+        let ds = DashboardState::new();
+        ds.register_client("alice", &["BTCUSDT".into()]);
+        ds.register_client("bob", &["ETHUSDT".into()]);
+
+        let wh_alice = crate::webhooks::WebhookDispatcher::new();
+        wh_alice.add_url("https://alice.com/hook".into());
+        ds.set_client_webhook_dispatcher("alice", wh_alice);
+
+        let wh_bob = crate::webhooks::WebhookDispatcher::new();
+        wh_bob.add_url("https://bob.com/hook".into());
+        ds.set_client_webhook_dispatcher("bob", wh_bob);
+
+        let got_alice = ds.get_client_webhook_dispatcher("alice").unwrap();
+        assert_eq!(got_alice.url_count(), 1);
+        let got_bob = ds.get_client_webhook_dispatcher("bob").unwrap();
+        assert_eq!(got_bob.url_count(), 1);
+    }
+
+    #[test]
+    fn legacy_mode_works_without_registration() {
+        crate::metrics::init();
+        let ds = DashboardState::new();
+        // No register_client call — legacy mode
+        ds.update(empty_state("BTCUSDT"));
+        let got = ds.get_symbol("BTCUSDT");
+        assert!(got.is_some());
+        assert_eq!(ds.get_all().len(), 1);
+    }
+
+    #[test]
+    fn unknown_client_returns_empty() {
+        let ds = DashboardState::new();
+        assert!(ds.get_client_symbols("nonexistent").is_empty());
+        assert!(ds.get_client_fills("nonexistent", 10).is_empty());
     }
 }

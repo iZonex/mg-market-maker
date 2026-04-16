@@ -43,7 +43,13 @@ pub struct EventRecorder {
 
 impl EventRecorder {
     pub fn new(path: &Path) -> anyhow::Result<Self> {
-        let file = std::fs::File::create(path)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
         Ok(Self {
             writer: std::io::BufWriter::new(file),
         })

@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 mm-common = { workspace = true }
+mm-persistence = { path = "../persistence" }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 tracing = { workspace = true }
@@ -15,3 +16,6 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
 regex = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

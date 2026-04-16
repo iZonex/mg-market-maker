@@ -21,6 +21,13 @@ pub struct AppConfig {
     #[serde(default = "default_checkpoint_path")]
     pub checkpoint_path: String,
 
+    /// Restore engine state from checkpoint on startup (Epic 7).
+    /// When `true`, `InventoryManager` is initialized from the
+    /// last saved checkpoint. When `false` (default), engines
+    /// start fresh and rely on reconciliation to detect drift.
+    #[serde(default)]
+    pub checkpoint_restore: bool,
+
     /// Log file path (empty = stdout only).
     #[serde(default)]
     pub log_file: String,
@@ -59,6 +66,39 @@ pub struct AppConfig {
     /// `StrategyType::FundingArb` is selected; ignored otherwise.
     #[serde(default)]
     pub funding_arb: Option<FundingArbCfg>,
+
+    /// Record live market data to JSONL for offline backtesting.
+    /// When `true`, each engine writes BookSnapshot + Trade events
+    /// to `data/recorded/{symbol}.jsonl`. Data accumulates across
+    /// restarts (append mode).
+    #[serde(default)]
+    pub record_market_data: bool,
+
+    /// Paper mode fill simulation configuration (Epic 8).
+    /// When set and `mode == "paper"`, fills are simulated
+    /// using the `ProbabilisticFiller` with these parameters.
+    #[serde(default)]
+    pub paper_fill: Option<PaperFillCfg>,
+
+    /// Cross-venue rebalancer configuration (Epic 4).
+    #[serde(default)]
+    pub rebalancer: Option<RebalancerCfg>,
+
+    /// Portfolio-level risk configuration (Epic 3).
+    /// When `Some`, the server spawns a background task that
+    /// evaluates portfolio risk on a 30-second interval and
+    /// broadcasts spread multipliers or halt signals.
+    #[serde(default)]
+    pub portfolio_risk: Option<PortfolioRiskCfg>,
+
+    /// Per-client configuration (Epic 1: Multi-Client Isolation).
+    /// When non-empty, each client owns a disjoint set of symbols
+    /// with separate SLA, webhooks, and API auth scoping. When
+    /// empty, the system runs in legacy single-client mode — a
+    /// synthetic `"default"` client is created owning all
+    /// `config.symbols`.
+    #[serde(default)]
+    pub clients: Vec<ClientConfig>,
 }
 
 /// Serializable shape of `FundingArbDriverConfig` — same fields,
@@ -345,6 +385,13 @@ pub struct MarketMakerConfig {
     /// continues without the signal. Default empty map.
     #[serde(default)]
     pub momentum_learned_microprice_pair_paths: std::collections::HashMap<String, String>,
+
+    /// Enable SOR inline dispatch (Epic 4 item 4.6). When
+    /// `true`, `dispatch_route()` executes route decisions
+    /// automatically. When `false` (default), SOR is
+    /// advisory-only via `recommend_route()`.
+    #[serde(default)]
+    pub sor_inline_enabled: bool,
 
     /// Enable the Binance listen-key user-data stream. When
     /// `true` (the default), the server spawns a background
@@ -798,6 +845,142 @@ impl TelegramAlertConfig {
     }
 }
 
+/// Paper mode fill simulation configuration (Epic 8).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaperFillCfg {
+    /// Probability of fill when price touches order level.
+    #[serde(default = "default_paper_fill_prob")]
+    pub prob_fill_on_touch: Decimal,
+    /// Probability of adverse slippage on fill.
+    #[serde(default = "default_paper_slip_prob")]
+    pub prob_slippage: Decimal,
+    /// Slippage magnitude in bps.
+    #[serde(default = "default_paper_slip_bps")]
+    pub slippage_bps: Decimal,
+    /// Simulated round-trip latency in ms.
+    #[serde(default = "default_paper_latency")]
+    pub latency_ms: u64,
+}
+
+fn default_paper_fill_prob() -> Decimal {
+    dec!(0.6)
+}
+fn default_paper_slip_prob() -> Decimal {
+    dec!(0.05)
+}
+fn default_paper_slip_bps() -> Decimal {
+    dec!(1)
+}
+fn default_paper_latency() -> u64 {
+    5
+}
+
+/// Cross-venue rebalancer configuration (Epic 4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebalancerCfg {
+    /// Auto-execute transfers when thresholds are breached.
+    #[serde(default)]
+    pub auto_execute: bool,
+    /// Check interval in seconds. Default 300.
+    #[serde(default = "default_rebalancer_interval")]
+    pub check_interval_secs: u64,
+    /// Minimum cooldown between transfers per asset. Default 600.
+    #[serde(default = "default_rebalancer_cooldown")]
+    pub cooldown_secs: u64,
+    /// Minimum balance per venue per asset. Default 0.
+    #[serde(default)]
+    pub min_balance_per_venue: Decimal,
+    /// Target balance per venue per asset. Default 0.
+    #[serde(default)]
+    pub target_balance_per_venue: Decimal,
+    /// Max transfer amount per cycle. Default 0 (unlimited).
+    #[serde(default)]
+    pub max_transfer_per_cycle: Decimal,
+}
+
+fn default_rebalancer_interval() -> u64 {
+    300
+}
+fn default_rebalancer_cooldown() -> u64 {
+    600
+}
+
+/// Per-client report branding (Epic 5 item 5.6).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReportBranding {
+    #[serde(default)]
+    pub company_name: String,
+    #[serde(default)]
+    pub logo_url: Option<String>,
+    #[serde(default)]
+    pub footer_text: Option<String>,
+    #[serde(default)]
+    pub contact_email: Option<String>,
+}
+
+/// Portfolio-level risk configuration (Epic 3). Serializable
+/// TOML-friendly mirror of `mm_risk::portfolio_risk::PortfolioRiskConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortfolioRiskCfg {
+    /// Maximum total absolute delta across all factors in USD.
+    #[serde(default = "default_portfolio_max_delta")]
+    pub max_total_delta_usd: Decimal,
+    /// Per-factor limits.
+    #[serde(default)]
+    pub factor_limits: Vec<PortfolioFactorLimitCfg>,
+}
+
+/// Per-factor limit entry for portfolio risk config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortfolioFactorLimitCfg {
+    pub factor: String,
+    pub max_net_delta: Decimal,
+    #[serde(default = "default_portfolio_widen_mult")]
+    pub widen_mult: Decimal,
+    #[serde(default = "default_portfolio_warn_pct")]
+    pub warn_pct: Decimal,
+}
+
+fn default_portfolio_max_delta() -> Decimal {
+    dec!(100_000)
+}
+fn default_portfolio_widen_mult() -> Decimal {
+    dec!(2)
+}
+fn default_portfolio_warn_pct() -> Decimal {
+    dec!(0.8)
+}
+
+/// Per-client configuration for multi-client isolation (Epic 1).
+///
+/// Each client owns a set of symbols and has its own SLA targets,
+/// webhook URLs, and API keys. The engine spawns per-symbol tasks
+/// tagged with the owning `client_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientConfig {
+    /// Unique client identifier (e.g., "acme-capital").
+    pub id: String,
+    /// Human-readable display name.
+    pub name: String,
+    /// Symbols this client owns. Each symbol must appear in
+    /// exactly one client; validated at startup.
+    pub symbols: Vec<String>,
+    /// Per-client SLA targets. Falls back to the global
+    /// `AppConfig.sla` when `None`.
+    #[serde(default)]
+    pub sla: Option<SlaObligationConfig>,
+    /// Per-client webhook URLs for event delivery.
+    #[serde(default)]
+    pub webhook_urls: Vec<String>,
+    /// API keys scoped to this client. Users authenticating
+    /// with one of these keys see only this client's symbols.
+    #[serde(default)]
+    pub api_keys: Vec<String>,
+    /// Per-client report branding (Epic 5 item 5.6).
+    #[serde(default)]
+    pub report_branding: Option<ReportBranding>,
+}
+
 /// Loan configuration for token loan tracking (optional).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoanConfig {
@@ -859,6 +1042,7 @@ impl Default for AppConfig {
                 var_guard_limit_99: None,
                 var_guard_ewma_lambda: None,
                 cross_venue_basis_max_staleness_ms: 1500,
+                sor_inline_enabled: false,
             },
             kill_switch: KillSwitchCfg::default(),
             risk: RiskConfig {
@@ -878,6 +1062,7 @@ impl Default for AppConfig {
             symbols: vec!["BTCUSDT".into()],
             dashboard_port: 9090,
             checkpoint_path: "data/checkpoint.json".into(),
+            checkpoint_restore: false,
             log_file: String::new(),
             mode: "live".into(),
             users: vec![],
@@ -886,7 +1071,33 @@ impl Default for AppConfig {
             loans: std::collections::HashMap::new(),
             hedge: None,
             funding_arb: None,
+            record_market_data: false,
+            paper_fill: None,
+            rebalancer: None,
+            portfolio_risk: None,
+            clients: Vec::new(),
         }
+    }
+}
+
+impl AppConfig {
+    /// Resolve the effective client list. When `clients` is
+    /// non-empty, returns it as-is. When empty (legacy mode),
+    /// synthesises a single `"default"` client owning all
+    /// `self.symbols`.
+    pub fn effective_clients(&self) -> Vec<ClientConfig> {
+        if !self.clients.is_empty() {
+            return self.clients.clone();
+        }
+        vec![ClientConfig {
+            id: "default".to_string(),
+            name: "Default".to_string(),
+            symbols: self.symbols.clone(),
+            sla: None,
+            webhook_urls: Vec::new(),
+            api_keys: Vec::new(),
+            report_branding: None,
+        }]
     }
 }
 
