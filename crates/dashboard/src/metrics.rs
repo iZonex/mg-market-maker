@@ -107,6 +107,60 @@ pub static HMA_VALUE: Lazy<GaugeVec> = Lazy::new(|| {
     .unwrap()
 });
 
+// Epic D wave-2 + stage-3 — wave-2 signal observability
+//
+// `mm_momentum_ofi_ewma` and `mm_momentum_learned_mp_drift`
+// expose the Cont-Kukanov-Stoikov order flow imbalance EWMA
+// and the Stoikov 2018 learned-microprice drift inside
+// `MomentumSignals`. Operators see these on the dashboard /
+// Grafana to A/B compare wave-1 vs wave-2 alpha contribution.
+// Default zero before the corresponding optional builder is
+// attached at engine construction time
+// (`momentum_ofi_enabled` / `momentum_learned_microprice_path`).
+pub static MOMENTUM_OFI_EWMA: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_momentum_ofi_ewma",
+        "Cont-Kukanov-Stoikov L1 order flow imbalance EWMA from MomentumSignals (Epic D wave-2)",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
+pub static MOMENTUM_LEARNED_MP_DRIFT: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_momentum_learned_mp_drift",
+        "Stoikov 2018 learned micro-price drift from current mid (fraction; multiply by mid for absolute)",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
+// Epic D stage-3 — per-side adverse-selection probabilities.
+// `mm_as_prob_bid` / `mm_as_prob_ask` expose the per-side ρ
+// values the engine derives from
+// `AdverseSelectionTracker::adverse_selection_bps_{bid,ask}`
+// via `cartea_spread::as_prob_from_bps`. Both sit at 0.5
+// (neutral) until the per-side tracker has ≥5 completed
+// fills on that side, at which point they diverge from the
+// symmetric `mm_adverse_selection_bps`.
+pub static AS_PROB_BID: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_as_prob_bid",
+        "Per-side adverse-selection probability ρ_bid (0.5 = neutral, >0.5 informed buys)",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
+pub static AS_PROB_ASK: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_as_prob_ask",
+        "Per-side adverse-selection probability ρ_ask (0.5 = neutral, >0.5 informed sells)",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
 // Fee schedule (refreshed by the periodic fee-tier task — P1.2)
 pub static MAKER_FEE_BPS: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge_vec!(
@@ -322,4 +376,8 @@ pub fn init() {
     let _ = &*PORTFOLIO_STRATEGY_PNL;
     let _ = &*PORTFOLIO_ASSET_UNREALISED;
     let _ = &*ORDER_ENTRY_LATENCY;
+    let _ = &*MOMENTUM_OFI_EWMA;
+    let _ = &*MOMENTUM_LEARNED_MP_DRIFT;
+    let _ = &*AS_PROB_BID;
+    let _ = &*AS_PROB_ASK;
 }

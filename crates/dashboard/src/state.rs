@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use mm_common::config::LoanConfig;
 use mm_portfolio::PortfolioSnapshot;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -50,6 +51,26 @@ pub struct SymbolState {
     pub vpin: Decimal,
     pub kyle_lambda: Decimal,
     pub adverse_bps: Decimal,
+    /// Epic D stage-3 — per-side adverse-selection probabilities
+    /// derived from
+    /// `AdverseSelectionTracker::adverse_selection_bps_{bid,ask}`
+    /// via `cartea_spread::as_prob_from_bps`. Both sit at 0.5
+    /// (neutral) until the per-side tracker has ≥5 completed
+    /// fills on that side. `None` is published as 0.5 to the
+    /// gauge so dashboards see a stable baseline before the
+    /// per-side path activates.
+    pub as_prob_bid: Option<Decimal>,
+    pub as_prob_ask: Option<Decimal>,
+    /// Epic D wave-2 — Cont-Kukanov-Stoikov L1 OFI EWMA from
+    /// `MomentumSignals`. `None` when the OFI tracker has not
+    /// been attached (`momentum_ofi_enabled = false`) or has
+    /// not yet seen its first observation.
+    pub momentum_ofi_ewma: Option<Decimal>,
+    /// Epic D wave-2 — Stoikov 2018 learned-microprice drift
+    /// expressed as a fraction of the current mid. `None`
+    /// when no learned MP model is attached or the current
+    /// (imbalance, spread) bucket is under-sampled.
+    pub momentum_learned_mp_drift: Option<Decimal>,
     /// Latest Market Resilience score in `[0, 1]`. `1.0` is
     /// "fully recovered / steady state", anything lower means
     /// the book has just been hit by a shock that hasn't fully
@@ -160,6 +181,26 @@ impl DashboardState {
         crate::metrics::ADVERSE_BPS
             .with_label_values(&[&state.symbol])
             .set(decimal_to_f64(state.adverse_bps));
+        // Epic D stage-3 — per-side ρ + wave-2 momentum
+        // observability. Per-side gauges baseline at 0.5
+        // (neutral) when the per-side tracker has fewer than
+        // 5 completed fills on a side; OFI EWMA + learned MP
+        // drift gauges baseline at 0.0 when the corresponding
+        // optional signal is not attached.
+        crate::metrics::AS_PROB_BID
+            .with_label_values(&[&state.symbol])
+            .set(decimal_to_f64(state.as_prob_bid.unwrap_or(dec!(0.5))));
+        crate::metrics::AS_PROB_ASK
+            .with_label_values(&[&state.symbol])
+            .set(decimal_to_f64(state.as_prob_ask.unwrap_or(dec!(0.5))));
+        crate::metrics::MOMENTUM_OFI_EWMA
+            .with_label_values(&[&state.symbol])
+            .set(decimal_to_f64(state.momentum_ofi_ewma.unwrap_or(dec!(0))));
+        crate::metrics::MOMENTUM_LEARNED_MP_DRIFT
+            .with_label_values(&[&state.symbol])
+            .set(decimal_to_f64(
+                state.momentum_learned_mp_drift.unwrap_or(dec!(0)),
+            ));
         crate::metrics::MARKET_RESILIENCE
             .with_label_values(&[&state.symbol])
             .set(decimal_to_f64(state.market_resilience));
@@ -265,4 +306,86 @@ impl DashboardState {
 fn decimal_to_f64(d: Decimal) -> f64 {
     use rust_decimal::prelude::ToPrimitive;
     d.to_f64().unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_state(symbol: &str) -> SymbolState {
+        SymbolState {
+            symbol: symbol.to_string(),
+            mid_price: dec!(50_000),
+            spread_bps: dec!(2),
+            inventory: dec!(0),
+            inventory_value: dec!(0),
+            live_orders: 0,
+            total_fills: 0,
+            pnl: PnlSnapshot::default(),
+            volatility: dec!(0.02),
+            vpin: dec!(0),
+            kyle_lambda: dec!(0),
+            adverse_bps: dec!(0),
+            as_prob_bid: None,
+            as_prob_ask: None,
+            momentum_ofi_ewma: None,
+            momentum_learned_mp_drift: None,
+            market_resilience: dec!(1),
+            order_to_trade_ratio: dec!(0),
+            hma_value: None,
+            kill_level: 0,
+            sla_uptime_pct: dec!(100),
+            regime: "Quiet".to_string(),
+            spread_compliance_pct: dec!(100),
+            book_depth_levels: vec![],
+            locked_in_orders_quote: dec!(0),
+            sla_max_spread_bps: dec!(50),
+            sla_min_depth_quote: dec!(0),
+            presence_pct_24h: dec!(100),
+            two_sided_pct_24h: dec!(100),
+            minutes_with_data_24h: 0,
+        }
+    }
+
+    /// Epic D stage-3 — pin that `state.update` accepts the
+    /// new wave-2 / per-side fields without regressing the
+    /// existing publish path. The actual gauge values are a
+    /// side effect of the prometheus crate and are not
+    /// trivially observable from a unit test, so we assert
+    /// only that a default-`None` `SymbolState` flows through
+    /// cleanly and that the per-pair entry is retrievable
+    /// post-update.
+    #[test]
+    fn state_update_accepts_new_wave2_fields() {
+        crate::metrics::init();
+        let ds = DashboardState::new();
+        let mut s = empty_state("BTCUSDT");
+        s.as_prob_bid = Some(dec!(0.7));
+        s.as_prob_ask = Some(dec!(0.4));
+        s.momentum_ofi_ewma = Some(dec!(0.123));
+        s.momentum_learned_mp_drift = Some(dec!(0.0001));
+        ds.update(s);
+        let got = ds.get_symbol("BTCUSDT").unwrap();
+        assert_eq!(got.as_prob_bid, Some(dec!(0.7)));
+        assert_eq!(got.as_prob_ask, Some(dec!(0.4)));
+        assert_eq!(got.momentum_ofi_ewma, Some(dec!(0.123)));
+        assert_eq!(got.momentum_learned_mp_drift, Some(dec!(0.0001)));
+    }
+
+    /// `None` per-side ρ flows through cleanly — the
+    /// dashboard publishes the 0.5 baseline to Prometheus
+    /// but the original `Option<None>` is preserved in the
+    /// in-memory state for the JSON API.
+    #[test]
+    fn state_update_preserves_none_in_json_api() {
+        crate::metrics::init();
+        let ds = DashboardState::new();
+        let s = empty_state("ETHUSDT");
+        ds.update(s);
+        let got = ds.get_symbol("ETHUSDT").unwrap();
+        assert_eq!(got.as_prob_bid, None);
+        assert_eq!(got.as_prob_ask, None);
+        assert_eq!(got.momentum_ofi_ewma, None);
+        assert_eq!(got.momentum_learned_mp_drift, None);
+    }
 }

@@ -2383,6 +2383,30 @@ impl MarketMakerEngine {
                 .adverse_selection
                 .adverse_selection_bps()
                 .unwrap_or(dec!(0)),
+            // Epic D stage-3 — per-side ρ + wave-2 momentum
+            // observability. Per-side ρ is derived from the
+            // existing `AdverseSelectionTracker` per-side
+            // bps accessors via the same
+            // `cartea_spread::as_prob_from_bps` map the
+            // strategy uses inside `refresh_quotes`. OFI
+            // EWMA + learned-MP drift come straight off
+            // `MomentumSignals` accessors that already exist
+            // (no-op when the optional signals are not
+            // attached). Dashboard publishes `None` as a
+            // baseline value so Grafana sees a stable
+            // pre-warmup gauge.
+            as_prob_bid: self
+                .adverse_selection
+                .adverse_selection_bps_bid()
+                .map(mm_strategy::cartea_spread::as_prob_from_bps),
+            as_prob_ask: self
+                .adverse_selection
+                .adverse_selection_bps_ask()
+                .map(mm_strategy::cartea_spread::as_prob_from_bps),
+            momentum_ofi_ewma: self.momentum.ofi_ewma(),
+            momentum_learned_mp_drift: self
+                .momentum
+                .learned_microprice_drift(&self.book_keeper.book, self.last_mid),
             market_resilience: self
                 .market_resilience
                 .score(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)),

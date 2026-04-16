@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Epic D stage-3 — wave-2 signal observability on the
+  dashboard / Prometheus** (Apr 2026). Closes the
+  observability gap that the wave-2 signal rollout left:
+  `momentum.ofi_ewma()`, `momentum.learned_microprice_drift()`,
+  and the per-side `as_prob_bid` / `as_prob_ask` derived in
+  `refresh_quotes` were all live in the strategy → engine
+  pipeline but had no operator visibility. Stage-3 wires
+  them through the existing dashboard publish path.
+  - **4 new Prometheus gauges** in `mm_dashboard::metrics`:
+    - `mm_momentum_ofi_ewma{symbol}` — the CKS L1 OFI EWMA
+      from `MomentumSignals`. Defaults to 0.0 before the
+      OFI tracker is attached or sees its first observation.
+    - `mm_momentum_learned_mp_drift{symbol}` — the Stoikov
+      2018 learned-microprice drift expressed as a fraction
+      of the current mid. Defaults to 0.0 when no learned
+      MP model is attached or the current `(imbalance, spread)`
+      bucket is under-sampled.
+    - `mm_as_prob_bid{symbol}` / `mm_as_prob_ask{symbol}` —
+      per-side adverse-selection probabilities derived from
+      `AdverseSelectionTracker::adverse_selection_bps_{bid,ask}`
+      via `cartea_spread::as_prob_from_bps`. Both default
+      to 0.5 (neutral) until the per-side tracker has ≥5
+      completed fills on that side.
+  - **`SymbolState`** in `mm-dashboard::state` gains 4 new
+    optional fields: `as_prob_bid`, `as_prob_ask`,
+    `momentum_ofi_ewma`, `momentum_learned_mp_drift`. The
+    JSON API preserves `None` for under-sampled / not-attached
+    states; the Prometheus gauges baseline at 0.5 / 0.0
+    so Grafana sees a stable pre-warmup baseline.
+  - **`MarketMakerEngine::update_dashboard`** now populates
+    the new fields by reading the existing accessors:
+    `adverse_selection.adverse_selection_bps_bid()` /
+    `_ask()` (via `cartea_spread::as_prob_from_bps`),
+    `momentum.ofi_ewma()`, and the newly-promoted
+    `momentum.learned_microprice_drift()` (was private
+    before stage-3).
+  - **`MomentumSignals::learned_microprice_drift`** is
+    promoted from private to `pub` so the engine can call
+    it from the dashboard publish path without re-deriving
+    the `(imbalance, spread)` lookup. No semantic change.
+  - **2 new dashboard tests** in `mm-dashboard::state::tests`:
+    - `state_update_accepts_new_wave2_fields` — pin the
+      end-to-end flow: `state.update(SymbolState{...})`
+      with populated wave-2 fields → JSON API readback
+      preserves them
+    - `state_update_preserves_none_in_json_api` — pin the
+      `None`-flow-through invariant for under-sampled /
+      not-attached states
+  - **Workspace stats**: 1026 → **1028 tests** (+2),
+    workspace clippy `-D warnings` clean, workspace fmt
+    clean. Zero new dependencies.
+
 - **Epic D stage-3 — Cartea AS + per-side ρ for Basis +
   CrossExchange strategies** (Apr 2026). Closes the
   coverage gap that the Avellaneda + GLFT per-side wiring

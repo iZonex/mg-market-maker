@@ -291,7 +291,11 @@ impl MomentumSignals {
     /// Learned-microprice drift relative to the current mid,
     /// as a fraction of mid. Returns `None` when no model is
     /// attached or the model hasn't been finalized yet.
-    fn learned_microprice_drift(&self, book: &LocalOrderBook, mid: Price) -> Option<Decimal> {
+    ///
+    /// Promoted to `pub` in Epic D stage-3 so the engine's
+    /// dashboard publication path can read the latest drift
+    /// without re-deriving the (imbalance, spread) lookup.
+    pub fn learned_microprice_drift(&self, book: &LocalOrderBook, mid: Price) -> Option<Decimal> {
         let model = self.learned_mp.as_ref()?;
         if !model.is_finalized() || mid.is_zero() {
             return None;
