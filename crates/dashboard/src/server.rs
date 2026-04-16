@@ -65,6 +65,8 @@ pub async fn start(
             "/api/admin/symbols/{symbol}/resume",
             post(admin_resume_symbol),
         )
+        .route("/api/admin/webhooks", get(admin_list_webhooks))
+        .route("/api/admin/webhooks", post(admin_add_webhook))
         .with_state(state.clone());
 
     // WebSocket — auth via query param (?token=...).
@@ -298,6 +300,56 @@ async fn admin_pause_symbol(
         symbol,
         applied: ok,
     })
+}
+
+#[derive(serde::Serialize)]
+struct WebhookListResponse {
+    url_count: usize,
+    events_sent: u64,
+    events_failed: u64,
+}
+
+async fn admin_list_webhooks(
+    State(state): State<DashboardState>,
+) -> Json<WebhookListResponse> {
+    let wh = state.webhook_dispatcher();
+    Json(match wh {
+        Some(w) => WebhookListResponse {
+            url_count: w.url_count(),
+            events_sent: w.events_sent(),
+            events_failed: w.events_failed(),
+        },
+        None => WebhookListResponse {
+            url_count: 0,
+            events_sent: 0,
+            events_failed: 0,
+        },
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct AddWebhookRequest {
+    url: String,
+}
+
+async fn admin_add_webhook(
+    State(state): State<DashboardState>,
+    Json(req): Json<AddWebhookRequest>,
+) -> Json<WebhookListResponse> {
+    if let Some(wh) = state.webhook_dispatcher() {
+        wh.add_url(req.url);
+        Json(WebhookListResponse {
+            url_count: wh.url_count(),
+            events_sent: wh.events_sent(),
+            events_failed: wh.events_failed(),
+        })
+    } else {
+        Json(WebhookListResponse {
+            url_count: 0,
+            events_sent: 0,
+            events_failed: 0,
+        })
+    }
 }
 
 async fn admin_resume_symbol(

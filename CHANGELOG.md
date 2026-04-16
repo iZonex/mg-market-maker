@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Webhook wiring + admin management + engine integration**
+  (Apr 2026).
+  - Engine dispatches webhooks on: engine start, kill switch
+    escalation (critical incidents), large fills (>$10k
+    notional).
+  - `GET /api/admin/webhooks` — list configured URLs, delivery
+    stats (sent/failed counts).
+  - `POST /api/admin/webhooks` — register a new webhook URL
+    at runtime without restart.
+  - Webhook dispatcher shared across all engines via server
+    startup, registered in DashboardState.
+
 - **Performance API + webhook notifications** (Apr 2026).
   - `GET /api/v1/performance` — per-symbol Sharpe ratio,
     Sortino ratio, max drawdown, fill rate, inventory turnover,

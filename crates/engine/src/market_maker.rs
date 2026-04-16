@@ -265,6 +265,10 @@ pub struct MarketMakerEngine {
     /// rate, inventory turnover. Fed on every fill + every
     /// periodic summary tick.
     performance: mm_risk::performance::PerformanceTracker,
+    /// Webhook dispatcher for client event delivery. Shared
+    /// across all engines via `Arc` so a single set of URLs
+    /// covers every symbol.
+    webhooks: Option<mm_dashboard::webhooks::WebhookDispatcher>,
 
     // Strategy augmentation.
     momentum: MomentumSignals,
@@ -471,6 +475,7 @@ impl MarketMakerEngine {
             ),
             market_impact: mm_risk::market_impact::MarketImpactEstimator::new(20),
             performance: mm_risk::performance::PerformanceTracker::new(1440),
+            webhooks: None,
             momentum: {
                 let mut ms = MomentumSignals::new(config.market_maker.momentum_window);
                 if config.market_maker.hma_enabled {
@@ -565,6 +570,12 @@ impl MarketMakerEngine {
             reconcile_counter: 0,
             config_override_rx: None,
         }
+    }
+
+    /// Attach a webhook dispatcher for client event delivery.
+    pub fn with_webhooks(mut self, wh: mm_dashboard::webhooks::WebhookDispatcher) -> Self {
+        self.webhooks = Some(wh);
+        self
     }
 
     /// Attach a hot config override channel. The engine will
@@ -980,6 +991,11 @@ impl MarketMakerEngine {
             AuditEventType::EngineStarted,
             self.strategy.name(),
         );
+        if let Some(wh) = &self.webhooks {
+            wh.dispatch(mm_dashboard::webhooks::WebhookEvent::EngineStarted {
+                symbol: self.symbol.clone(),
+            });
+        }
 
         // Initial balance fetch.
         self.refresh_balances().await;
@@ -1850,6 +1866,20 @@ impl MarketMakerEngine {
                     };
                     self.market_impact.on_fill(mid, side_sign);
 
+                    // Webhook: large fill notification (> $10k notional).
+                    let fill_value = fill.price * fill.qty;
+                    if fill_value > dec!(10_000) {
+                        if let Some(wh) = &self.webhooks {
+                            wh.dispatch(mm_dashboard::webhooks::WebhookEvent::LargeFill {
+                                symbol: self.symbol.clone(),
+                                side: format!("{:?}", fill.side),
+                                price: fill.price,
+                                qty: fill.qty,
+                                value_quote: fill_value,
+                            });
+                        }
+                    }
+
                     // Performance tracking.
                     let spread_capture = match fill.side {
                         mm_common::types::Side::Buy => (mid - fill.price) / mid * dec!(10_000),
@@ -2443,6 +2473,16 @@ impl MarketMakerEngine {
                 &format!("Symbol: {}", self.symbol),
                 Some(&self.symbol),
             );
+        }
+        // Webhook dispatch for client event delivery.
+        if severity == "critical" {
+            if let Some(wh) = &self.webhooks {
+                wh.dispatch(mm_dashboard::webhooks::WebhookEvent::KillSwitchEscalated {
+                    symbol: self.symbol.clone(),
+                    level: self.kill_switch.level() as u8,
+                    reason: description.to_string(),
+                });
+            }
         }
     }
 

@@ -134,6 +134,10 @@ async fn main() -> Result<()> {
     // Start dashboard.
     let dashboard_state = DashboardState::new();
     dashboard_state.set_loans(config.loans.clone());
+    // Webhook dispatcher — shared across all engines.
+    let webhook_dispatcher = mm_dashboard::webhooks::WebhookDispatcher::new();
+    dashboard_state.set_webhook_dispatcher(webhook_dispatcher.clone());
+
     // Enable persistent fill logging for client API fill history.
     let fills_path = std::path::Path::new("data/fills.jsonl");
     dashboard_state.load_fill_history(fills_path);
@@ -216,6 +220,7 @@ async fn main() -> Result<()> {
         let asset_class_switch = symbol_to_class
             .get(&symbol)
             .and_then(|c| asset_class_switches.get(c).cloned());
+        let wh = webhook_dispatcher.clone();
 
         let handle = tokio::spawn(async move {
             if let Err(e) = run_symbol(
@@ -228,6 +233,7 @@ async fn main() -> Result<()> {
                 alerts,
                 portfolio,
                 asset_class_switch,
+                wh,
             )
             .await
             {
@@ -293,6 +299,7 @@ async fn run_symbol(
     alert_manager: AlertManager,
     portfolio: Arc<std::sync::Mutex<mm_portfolio::Portfolio>>,
     asset_class_switch: Option<Arc<std::sync::Mutex<mm_risk::KillSwitch>>>,
+    webhook_dispatcher: mm_dashboard::webhooks::WebhookDispatcher,
 ) -> Result<()> {
     let product = product_for_symbol(&symbol, &connector).await;
 
@@ -433,7 +440,8 @@ async fn run_symbol(
         Some(alert_manager),
     )
     .with_portfolio(portfolio)
-    .with_config_overrides(config_rx);
+    .with_config_overrides(config_rx)
+    .with_webhooks(webhook_dispatcher);
     if let Some(arc) = asset_class_switch {
         engine_builder = engine_builder.with_asset_class_switch(arc);
     }

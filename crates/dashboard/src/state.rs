@@ -68,6 +68,8 @@ struct StateInner {
     /// Append-only fill log writer for persistence across
     /// restarts. Set via `DashboardState::enable_fill_log`.
     fill_log_writer: Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
+    /// Shared webhook dispatcher for client event delivery.
+    webhook_dispatcher: Option<crate::webhooks::WebhookDispatcher>,
 }
 
 /// Maximum recent fills retained in dashboard state.
@@ -375,6 +377,16 @@ impl DashboardState {
     /// Read the last-published portfolio snapshot.
     pub fn get_portfolio(&self) -> Option<PortfolioSnapshot> {
         self.inner.read().unwrap().portfolio.clone()
+    }
+
+    /// Set the webhook dispatcher (shared across all engines).
+    pub fn set_webhook_dispatcher(&self, wh: crate::webhooks::WebhookDispatcher) {
+        self.inner.write().unwrap().webhook_dispatcher = Some(wh);
+    }
+
+    /// Get the webhook dispatcher for admin endpoints.
+    pub fn webhook_dispatcher(&self) -> Option<crate::webhooks::WebhookDispatcher> {
+        self.inner.read().unwrap().webhook_dispatcher.clone()
     }
 
     /// Load fill history from a JSONL file (one FillRecord per
