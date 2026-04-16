@@ -66,15 +66,15 @@ impl Param {
 
     pub fn sample<R: Rng>(&self, rng: &mut R) -> f64 {
         match self {
-            Self::Uniform { min, max, .. } => rng.gen_range(*min..=*max),
+            Self::Uniform { min, max, .. } => rng.random_range(*min..=*max),
             Self::LogUniform { min, max, .. } => {
                 let log_min = min.ln();
                 let log_max = max.ln();
-                rng.gen_range(log_min..=log_max).exp()
+                rng.random_range(log_min..=log_max).exp()
             }
-            Self::IntUniform { min, max, .. } => rng.gen_range(*min..=*max) as f64,
+            Self::IntUniform { min, max, .. } => rng.random_range(*min..=*max) as f64,
             Self::Choice { values, .. } => {
-                let idx = rng.gen_range(0..values.len());
+                let idx = rng.random_range(0..values.len());
                 values[idx]
             }
         }
@@ -188,7 +188,7 @@ mod tests {
     /// `sqrt(min × max)` — this is the defining property of the
     /// log-uniform distribution (e.g. Bengio & Bergstra 2012,
     /// "Random Search for Hyper-Parameter Optimization", §3.2). A
-    /// linearly-uniform `rng.gen_range(min..=max)` would converge
+    /// linearly-uniform `rng.random_range(min..=max)` would converge
     /// toward the arithmetic mean `(min + max)/2` instead, failing
     /// this test decisively.
     ///

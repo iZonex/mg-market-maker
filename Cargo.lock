@@ -1197,8 +1197,8 @@ dependencies = [
  "mm-portfolio",
  "mm-risk",
  "mm-strategy",
- "rand 0.8.5",
- "rand_chacha 0.3.1",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
@@ -1405,8 +1405,8 @@ name = "mm-hyperopt"
 version = "0.4.0"
 dependencies = [
  "anyhow",
- "rand 0.8.5",
- "rand_chacha 0.3.1",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",

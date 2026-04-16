@@ -142,14 +142,14 @@ impl ProbabilisticFiller {
         }
 
         // Step 2: queue luck — do we get to the front in time?
-        let roll: f64 = self.rng.gen();
+        let roll: f64 = self.rng.random();
         if roll > self.config.prob_fill_on_touch {
             return FillOutcome::no_fill();
         }
 
         // Step 3: slippage — did the fill come at a worse price?
         let mut fill_price = quote.price;
-        let slip_roll: f64 = self.rng.gen();
+        let slip_roll: f64 = self.rng.random();
         if slip_roll < self.config.prob_slippage {
             let adjust = quote.price * self.config.slippage_bps / dec!(10000);
             match quote.side {

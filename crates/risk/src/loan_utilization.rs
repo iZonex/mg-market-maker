@@ -171,7 +171,7 @@ impl LoanUtilizationTracker {
                 }
             }
         }
-        results.sort_by(|a, b| b.days_overdue.cmp(&a.days_overdue));
+        results.sort_by_key(|r| std::cmp::Reverse(r.days_overdue));
         results
     }
 

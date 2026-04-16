@@ -304,10 +304,10 @@ impl<L: LossFn> DifferentialEvolution<L> {
         // Crossover: take mutant component with probability CR,
         // and always take at least one mutant component at
         // `j_rand` (classic guard against identical copies).
-        let j_rand = self.rng.gen_range(0..n_params);
+        let j_rand = self.rng.random_range(0..n_params);
         let mut trial = self.population[self.cursor].clone();
         for j in 0..n_params {
-            if j == j_rand || self.rng.gen::<f64>() < self.config.cr {
+            if j == j_rand || self.rng.random::<f64>() < self.config.cr {
                 trial[j] = mutant[j];
             }
         }
@@ -317,17 +317,17 @@ impl<L: LossFn> DifferentialEvolution<L> {
     fn pick_three_distinct(&mut self, exclude: usize, pop_size: usize) -> (usize, usize, usize) {
         // Rejection sampling — population is small (≤ a few
         // hundred) so the expected retries are negligible.
-        let mut a = self.rng.gen_range(0..pop_size);
+        let mut a = self.rng.random_range(0..pop_size);
         while a == exclude {
-            a = self.rng.gen_range(0..pop_size);
+            a = self.rng.random_range(0..pop_size);
         }
-        let mut b = self.rng.gen_range(0..pop_size);
+        let mut b = self.rng.random_range(0..pop_size);
         while b == exclude || b == a {
-            b = self.rng.gen_range(0..pop_size);
+            b = self.rng.random_range(0..pop_size);
         }
-        let mut c = self.rng.gen_range(0..pop_size);
+        let mut c = self.rng.random_range(0..pop_size);
         while c == exclude || c == a || c == b {
-            c = self.rng.gen_range(0..pop_size);
+            c = self.rng.random_range(0..pop_size);
         }
         (a, b, c)
     }
