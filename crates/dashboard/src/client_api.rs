@@ -23,6 +23,7 @@ pub fn client_routes() -> Router<DashboardState> {
         .route("/api/v1/pnl", get(get_pnl))
         .route("/api/v1/sla", get(get_sla))
         .route("/api/v1/sla/certificate", get(get_sla_certificate))
+        .route("/api/v1/sla/hourly", get(get_sla_hourly))
         .route("/api/v1/fills/recent", get(get_recent_fills))
         .route("/api/v1/fills/slippage", get(get_slippage_report))
         .route("/api/v1/report/daily", get(get_daily_report))
@@ -219,6 +220,25 @@ async fn get_daily_report(State(state): State<DashboardState>) -> Json<DailyRepo
         total_volume,
         total_fills,
     })
+}
+
+/// Per-hour SLA breakdown for time-of-day analysis.
+#[derive(Debug, Serialize)]
+struct HourlySlaReport {
+    symbol: String,
+    hours: Vec<mm_risk::sla::HourlyPresenceSummary>,
+}
+
+async fn get_sla_hourly(State(state): State<DashboardState>) -> Json<Vec<HourlySlaReport>> {
+    let symbols = state.get_all();
+    let reports: Vec<HourlySlaReport> = symbols
+        .iter()
+        .map(|s| HourlySlaReport {
+            symbol: s.symbol.clone(),
+            hours: s.hourly_presence.clone(),
+        })
+        .collect();
+    Json(reports)
 }
 
 /// Query params for fills endpoint.

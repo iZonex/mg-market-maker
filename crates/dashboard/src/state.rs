@@ -65,6 +65,9 @@ struct StateInner {
     /// their receiver at startup; admin endpoints send
     /// overrides through these channels.
     config_overrides: HashMap<String, tokio::sync::mpsc::UnboundedSender<ConfigOverride>>,
+    /// Append-only fill log writer for persistence across
+    /// restarts. Set via `DashboardState::enable_fill_log`.
+    fill_log_writer: Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
 }
 
 /// Maximum recent fills retained in dashboard state.
@@ -177,6 +180,9 @@ pub struct SymbolState {
     /// samples. Useful to distinguish a fresh start
     /// ("100 % over 0 minutes") from a steady-state day.
     pub minutes_with_data_24h: u32,
+    /// Per-hour SLA breakdown for time-of-day analysis. 24
+    /// entries, one per UTC hour.
+    pub hourly_presence: Vec<mm_risk::sla::HourlyPresenceSummary>,
 }
 
 /// Depth at a specific percentage from mid price.
@@ -367,6 +373,23 @@ impl DashboardState {
         self.inner.read().unwrap().portfolio.clone()
     }
 
+    /// Enable persistent fill logging to a JSONL file. Each
+    /// fill is appended as one JSON line so the file survives
+    /// restarts. Call once at startup.
+    pub fn enable_fill_log(&self, path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            self.inner.write().unwrap().fill_log_writer =
+                Some(std::sync::Mutex::new(std::io::BufWriter::new(file)));
+        }
+    }
+
     /// Register a config override channel for a symbol. Called
     /// by the engine at startup.
     pub fn register_config_channel(
@@ -413,8 +436,21 @@ impl DashboardState {
     }
 
     /// Record a fill with NBBO snapshot for the client API.
-    /// Called by the engine on every fill event.
+    /// Called by the engine on every fill event. Persists to
+    /// disk if a fill log path is set.
     pub fn record_fill(&self, fill: FillRecord) {
+        // Persist to disk for fill history across restarts.
+        if let Ok(inner) = self.inner.read() {
+            if let Some(writer) = &inner.fill_log_writer {
+                if let Ok(mut w) = writer.lock() {
+                    if let Ok(line) = serde_json::to_string(&fill) {
+                        use std::io::Write;
+                        let _ = writeln!(w, "{}", line);
+                        let _ = w.flush();
+                    }
+                }
+            }
+        }
         let mut inner = self.inner.write().unwrap();
         inner.recent_fills.push_back(fill);
         while inner.recent_fills.len() > MAX_RECENT_FILLS {
@@ -478,6 +514,7 @@ mod tests {
             presence_pct_24h: dec!(100),
             two_sided_pct_24h: dec!(100),
             minutes_with_data_24h: 0,
+            hourly_presence: vec![],
         }
     }
 

@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-hour SLA breakdown + fill persistence + market impact
+  estimator** (Apr 2026).
+  - `GET /api/v1/sla/hourly` — 24-entry per-hour SLA breakdown
+    (compliance %, two-sided %, worst spread, minutes with data
+    per UTC hour). Clients verify performance during specific
+    trading windows.
+  - `SlaTracker::hourly_presence_summary()` aggregates the
+    per-minute buckets into hourly summaries.
+  - Fill persistence: `DashboardState::enable_fill_log(path)`
+    writes every fill to a JSONL file for history across
+    restarts. Wired in server startup to `data/fills.jsonl`.
+  - `MarketImpactEstimator`: tracks how fills correlate with
+    subsequent mid-price moves over a configurable tick horizon.
+    `MarketImpactReport` with mean/median/std impact in bps,
+    adverse fill percentage. 7 new tests.
+
 - **SLA compliance certificate + admin pause/resume**
   (Apr 2026).
   - `GET /api/v1/sla/certificate` — structured compliance

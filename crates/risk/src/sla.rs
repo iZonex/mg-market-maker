@@ -63,6 +63,22 @@ impl PresenceBucket {
     }
 }
 
+/// Per-hour SLA summary for time-of-day breakdown. Clients
+/// use this to verify compliance during specific trading windows.
+#[derive(Debug, Clone, Serialize)]
+pub struct HourlyPresenceSummary {
+    /// Hour of day in UTC (0..23).
+    pub hour: u8,
+    /// Compliance % for this hour.
+    pub presence_pct: Decimal,
+    /// Two-sided presence % for this hour.
+    pub two_sided_pct: Decimal,
+    /// Minutes with data in this hour (0..60).
+    pub minutes_with_data: u32,
+    /// Worst spread observed in this hour (bps).
+    pub worst_spread_bps: Option<Decimal>,
+}
+
 /// Roll-up of the day's presence buckets — what the dashboard's
 /// daily report exposes to operators and what paid MM agreements
 /// audit against.
@@ -336,6 +352,52 @@ impl SlaTracker {
             minutes_with_data,
             worst_spread_bps,
         }
+    }
+
+    /// Per-hour breakdown of the day's presence buckets. Returns
+    /// 24 entries (one per UTC hour). Clients use this to verify
+    /// compliance during specific trading windows.
+    pub fn hourly_presence_summary(&self) -> Vec<HourlyPresenceSummary> {
+        (0..24u8)
+            .map(|hour| {
+                let start = hour as usize * 60;
+                let end = start + 60;
+                let mut total_secs: u64 = 0;
+                let mut compliant_secs: u64 = 0;
+                let mut two_sided_secs: u64 = 0;
+                let mut mins_with_data: u32 = 0;
+                let mut worst: Option<Decimal> = None;
+                for bucket in &self.presence_buckets[start..end] {
+                    if bucket.total_seconds == 0 {
+                        continue;
+                    }
+                    mins_with_data += 1;
+                    total_secs += bucket.total_seconds as u64;
+                    compliant_secs += bucket.compliant_seconds as u64;
+                    two_sided_secs += bucket.two_sided_seconds as u64;
+                    if let Some(max) = bucket.max_spread_bps {
+                        worst = Some(worst.map_or(max, |prev| prev.max(max)));
+                    }
+                }
+                let presence_pct = if total_secs == 0 {
+                    dec!(100)
+                } else {
+                    Decimal::from(compliant_secs) / Decimal::from(total_secs) * dec!(100)
+                };
+                let two_sided_pct = if total_secs == 0 {
+                    dec!(100)
+                } else {
+                    Decimal::from(two_sided_secs) / Decimal::from(total_secs) * dec!(100)
+                };
+                HourlyPresenceSummary {
+                    hour,
+                    presence_pct,
+                    two_sided_pct,
+                    minutes_with_data: mins_with_data,
+                    worst_spread_bps: worst,
+                }
+            })
+            .collect()
     }
 
     /// Update current quoting state.

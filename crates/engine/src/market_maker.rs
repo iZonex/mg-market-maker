@@ -2634,6 +2634,7 @@ impl MarketMakerEngine {
             },
             two_sided_pct_24h: self.sla_tracker.daily_presence_summary().two_sided_pct,
             minutes_with_data_24h: self.sla_tracker.daily_presence_summary().minutes_with_data,
+            hourly_presence: self.sla_tracker.hourly_presence_summary(),
         });
     }
 

@@ -4,6 +4,7 @@ pub mod circuit_breaker;
 pub mod dca;
 pub mod exposure;
 pub mod hedge_optimizer;
+pub mod market_impact;
 pub mod inventory;
 pub mod inventory_drift;
 pub mod kill_switch;
