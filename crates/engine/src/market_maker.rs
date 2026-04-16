@@ -1366,17 +1366,67 @@ impl MarketMakerEngine {
         // Refresh balances every reconciliation.
         self.refresh_balances().await;
 
-        // Query open orders from exchange and reconcile.
-        // Note: this uses the custom exchange client; for Binance/Bybit use their connector.
-        // For now, log that reconciliation ran.
+        // Query open orders from exchange and reconcile against
+        // the internal OrderManager state. Detects phantom orders
+        // (live on venue but unknown locally) and ghost orders
+        // (tracked locally but gone from venue).
         let internal_ids: std::collections::HashSet<_> =
             self.order_manager.live_order_ids().into_iter().collect();
 
-        info!(
-            internal_orders = internal_ids.len(),
-            reconcile_cycle = self.reconcile_counter,
-            "reconciliation cycle"
-        );
+        match self
+            .connectors
+            .primary
+            .get_open_orders(&self.symbol)
+            .await
+        {
+            Ok(venue_orders) => {
+                let venue_ids: std::collections::HashSet<_> =
+                    venue_orders.iter().map(|o| o.order_id).collect();
+                // Ghost orders: tracked locally but gone from venue.
+                let ghosts: Vec<_> = internal_ids.difference(&venue_ids).copied().collect();
+                // Phantom orders: live on venue but unknown locally.
+                let phantoms: Vec<_> = venue_ids.difference(&internal_ids).copied().collect();
+
+                if !ghosts.is_empty() {
+                    warn!(
+                        count = ghosts.len(),
+                        "reconciliation: removing ghost orders (tracked locally but absent on venue)"
+                    );
+                    for id in &ghosts {
+                        self.order_manager.remove_order(*id);
+                    }
+                }
+                if !phantoms.is_empty() {
+                    warn!(
+                        count = phantoms.len(),
+                        "reconciliation: detected phantom orders (live on venue but not tracked)"
+                    );
+                    // Track phantom orders so the next diff can
+                    // cancel them if they're not in the desired set.
+                    for vo in &venue_orders {
+                        if phantoms.contains(&vo.order_id) {
+                            self.order_manager.track_order(vo.clone());
+                        }
+                    }
+                }
+
+                info!(
+                    internal_orders = internal_ids.len(),
+                    venue_orders = venue_ids.len(),
+                    ghosts = ghosts.len(),
+                    phantoms = phantoms.len(),
+                    reconcile_cycle = self.reconcile_counter,
+                    "reconciliation cycle"
+                );
+            }
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    internal_orders = internal_ids.len(),
+                    "reconciliation: get_open_orders failed — skipping order reconciliation"
+                );
+            }
+        }
 
         self.audit.risk_event(
             &self.symbol,

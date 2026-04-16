@@ -715,13 +715,13 @@ impl OrderManager {
         info!("all orders cancelled");
     }
 
-    fn track_order(&mut self, order: LiveOrder) {
+    pub(crate) fn track_order(&mut self, order: LiveOrder) {
         self.price_index
             .insert((order.side, order.price), order.order_id);
         self.live_orders.insert(order.order_id, order);
     }
 
-    fn remove_order(&mut self, order_id: OrderId) {
+    pub(crate) fn remove_order(&mut self, order_id: OrderId) {
         if let Some(order) = self.live_orders.remove(&order_id) {
             self.price_index.remove(&(order.side, order.price));
         }

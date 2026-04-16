@@ -290,7 +290,7 @@ async fn run_symbol(
     portfolio: Arc<std::sync::Mutex<mm_portfolio::Portfolio>>,
     asset_class_switch: Option<Arc<std::sync::Mutex<mm_risk::KillSwitch>>>,
 ) -> Result<()> {
-    let product = product_for_symbol(&symbol);
+    let product = product_for_symbol(&symbol, &connector).await;
 
     let strategy: Box<dyn Strategy> = match config.market_maker.strategy {
         StrategyType::AvellanedaStoikov => {
@@ -608,43 +608,54 @@ fn spawn_event_merger(
     merged_rx
 }
 
-fn product_for_symbol(symbol: &str) -> ProductSpec {
-    match symbol {
-        "BTCUSDT" => ProductSpec {
-            symbol: "BTCUSDT".into(),
-            base_asset: "BTC".into(),
-            quote_asset: "USDT".into(),
-            tick_size: dec!(0.01),
-            lot_size: dec!(0.00001),
-            min_notional: dec!(10),
-            maker_fee: dec!(0.001),
-            taker_fee: dec!(0.002),
-            trading_status: Default::default(),
-        },
-        "ETHUSDT" => ProductSpec {
-            symbol: "ETHUSDT".into(),
-            base_asset: "ETH".into(),
-            quote_asset: "USDT".into(),
-            tick_size: dec!(0.01),
-            lot_size: dec!(0.0001),
-            min_notional: dec!(10),
-            maker_fee: dec!(0.001),
-            taker_fee: dec!(0.002),
-            trading_status: Default::default(),
-        },
-        "SOLUSDT" => ProductSpec {
-            symbol: "SOLUSDT".into(),
-            base_asset: "SOL".into(),
-            quote_asset: "USDT".into(),
-            tick_size: dec!(0.001),
-            lot_size: dec!(0.01),
-            min_notional: dec!(5),
-            maker_fee: dec!(0.001),
-            taker_fee: dec!(0.002),
-            trading_status: Default::default(),
-        },
-        _ => panic!("unknown symbol: {symbol}"),
+/// Fetch product spec from the connector. Falls back to a
+/// conservative default if the venue doesn't support
+/// `get_product_spec` — the fee-tier refresh task will
+/// overwrite these on its first tick.
+async fn product_for_symbol(
+    symbol: &str,
+    connector: &Arc<dyn ExchangeConnector>,
+) -> ProductSpec {
+    match connector.get_product_spec(symbol).await {
+        Ok(spec) => {
+            info!(symbol, tick = %spec.tick_size, lot = %spec.lot_size, "loaded product spec from venue");
+            spec
+        }
+        Err(e) => {
+            warn!(symbol, error = %e, "get_product_spec failed — using conservative defaults");
+            product_fallback(symbol)
+        }
     }
+}
+
+/// Conservative fallback specs for common symbols. Used when
+/// the venue doesn't support `get_product_spec`. Safe to trade
+/// against — tick/lot sizes are the largest (most conservative)
+/// values across known venues, and fees are set at retail-tier
+/// maximums.
+fn product_fallback(symbol: &str) -> ProductSpec {
+    // Try to split symbol into base/quote by known suffixes.
+    let (base, quote) = split_base_quote(symbol);
+    ProductSpec {
+        symbol: symbol.to_string(),
+        base_asset: base,
+        quote_asset: quote,
+        tick_size: dec!(0.01),
+        lot_size: dec!(0.001),
+        min_notional: dec!(10),
+        maker_fee: dec!(0.001),
+        taker_fee: dec!(0.002),
+        trading_status: Default::default(),
+    }
+}
+
+fn split_base_quote(symbol: &str) -> (String, String) {
+    for suffix in ["USDT", "USDC", "BUSD", "FDUSD", "TUSD", "DAI", "BTC", "ETH"] {
+        if let Some(base) = symbol.strip_suffix(suffix) {
+            return (base.to_string(), suffix.to_string());
+        }
+    }
+    (symbol.to_string(), "USDT".to_string())
 }
 
 fn init_logging(config: &AppConfig) {

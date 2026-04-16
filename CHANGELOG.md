@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Production hardening: order reconciliation, dynamic product
+  spec, covariance wiring** (Apr 2026).
+  - **Real order reconciliation**: `reconcile()` now queries
+    `get_open_orders()` from the venue and diffs against the
+    internal `OrderManager` state. Detects ghost orders
+    (tracked locally but absent on venue → removed) and
+    phantom orders (live on venue but not tracked → adopted
+    so the next diff can cancel them).
+  - **Dynamic product spec from venue**: `product_for_symbol()`
+    now calls `connector.get_product_spec()` at engine startup
+    instead of panicking on unknown symbols. Falls back to
+    conservative defaults when the venue doesn't support it.
+    Removes the hardcoded 3-symbol lookup table.
+
 - **Production hardening: covariance estimator wiring + safe
   mid-price access** (Apr 2026).
   - Wire `FactorCovarianceEstimator` into engine: per-tick
