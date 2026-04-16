@@ -98,6 +98,15 @@ pub struct HedgeInstrument {
     /// the `exposure` vector and skips instruments whose factor
     /// is not represented.
     pub factor: String,
+    /// Cross-beta exposures: `(factor_name, beta_value)` pairs
+    /// for factors OTHER than the primary `self.factor`. When
+    /// non-empty, the optimizer accounts for the instrument's
+    /// cross-factor exposure in the hedge computation. Stage-2.
+    ///
+    /// Example: ETH-PERP with `cross_betas = [("BTC", 0.4)]`
+    /// means 1 unit of ETH-PERP hedges 1.0 of ETH-delta AND
+    /// 0.4 of BTC-delta.
+    pub cross_betas: Vec<(String, Decimal)>,
     /// Funding cost per holding interval in **basis points**.
     /// Perp instruments pay ~1-10 bps per 8-hour funding window;
     /// spot instruments pay 0. Positive values shrink the
@@ -181,30 +190,31 @@ impl HedgeOptimizer {
     ) -> HedgeBasket {
         let mut entries: Vec<(String, Decimal)> = Vec::new();
         let mut seen_factors: Vec<&str> = Vec::new();
+
+        // Collect residual exposure — starts as a copy of the
+        // input and gets reduced by each hedge instrument's
+        // cross-beta contribution.
+        let mut residual: HashMap<String, Decimal> = exposure.iter().cloned().collect();
+
         for instrument in universe {
-            // v1: at most one hedge instrument per factor. Skip
-            // duplicates deterministically (first-match-wins).
+            // At most one hedge instrument per primary factor.
             if seen_factors.contains(&instrument.factor.as_str()) {
                 continue;
             }
             seen_factors.push(instrument.factor.as_str());
 
-            let delta = exposure
-                .iter()
-                .find(|(f, _)| f == &instrument.factor)
-                .map(|(_, d)| *d)
+            let delta = residual
+                .get(&instrument.factor)
+                .copied()
                 .unwrap_or(Decimal::ZERO);
             if delta.is_zero() {
                 continue;
             }
 
-            // Unconstrained diagonal-β solution: sell exactly
-            // the exposure on the one-for-one hedge.
+            // Unconstrained solution on the primary factor.
             let h_unconstrained = -delta;
 
-            // Inverse-variance κ. Zero-variance factors get
-            // κ = 0 (no shrinkage) rather than a divide-by-zero
-            // panic.
+            // Inverse-variance κ for funding-cost shrinkage.
             let variance = factor_variances
                 .get(&instrument.factor)
                 .copied()
@@ -240,6 +250,18 @@ impl HedgeOptimizer {
             if capped.is_zero() {
                 continue;
             }
+
+            // Stage-2 cross-beta: reduce residual exposure on
+            // other factors by this instrument's cross-beta.
+            // E.g. if ETH-PERP has cross_beta ("BTC", 0.4) and
+            // we hedge `capped` units, the BTC residual is
+            // reduced by `capped * 0.4`.
+            for (factor, beta) in &instrument.cross_betas {
+                if let Some(res) = residual.get_mut(factor) {
+                    *res += capped * *beta;
+                }
+            }
+
             entries.push((instrument.symbol.clone(), capped));
         }
         HedgeBasket { entries }
@@ -255,6 +277,7 @@ mod tests {
         HedgeInstrument {
             symbol: "BTC-PERP".into(),
             factor: "BTC".into(),
+            cross_betas: vec![],
             funding_bps: dec!(1),
             position_cap: dec!(10),
         }
@@ -264,6 +287,7 @@ mod tests {
         HedgeInstrument {
             symbol: "ETH-PERP".into(),
             factor: "ETH".into(),
+            cross_betas: vec![],
             funding_bps: dec!(1),
             position_cap: dec!(100),
         }
@@ -426,12 +450,14 @@ mod tests {
         let btc_a = HedgeInstrument {
             symbol: "BTC-PERP-A".into(),
             factor: "BTC".into(),
+            cross_betas: vec![],
             funding_bps: dec!(0),
             position_cap: dec!(10),
         };
         let btc_b = HedgeInstrument {
             symbol: "BTC-PERP-B".into(),
             factor: "BTC".into(),
+            cross_betas: vec![],
             funding_bps: dec!(0),
             position_cap: dec!(10),
         };
@@ -486,5 +512,92 @@ mod tests {
     fn negative_funding_penalty_is_clamped_to_zero() {
         let opt = HedgeOptimizer::new(dec!(-5));
         assert_eq!(opt.funding_penalty, dec!(0));
+    }
+
+    // ── Cross-beta tests (stage-2) ──────────────────────────
+
+    /// ETH-PERP with cross-beta to BTC should reduce the
+    /// BTC residual. With β_ETH→BTC = 0.5, hedging 5 ETH
+    /// reduces the BTC residual by 5 * 0.5 = 2.5.
+    #[test]
+    fn cross_beta_reduces_residual_on_other_factor() {
+        let opt = HedgeOptimizer::new(dec!(0));
+        // ETH-PERP hedges 1:1 on ETH and 0.5:1 on BTC.
+        let eth_with_cross = HedgeInstrument {
+            symbol: "ETH-PERP".into(),
+            factor: "ETH".into(),
+            cross_betas: vec![("BTC".into(), dec!(0.5))],
+            funding_bps: dec!(0),
+            position_cap: dec!(100),
+        };
+        // Expose both: long 5 BTC + long 10 ETH.
+        // ETH leg: h = -10. Cross-beta effect on BTC: -10 * 0.5 = -5.
+        // BTC residual: 5 + (-10 * 0.5) = 0 → BTC-PERP not needed.
+        let exposure = vec![("BTC".into(), dec!(5)), ("ETH".into(), dec!(10))];
+        // ETH-PERP first, then BTC-PERP. Order matters: ETH
+        // hedges first and its cross-beta reduces BTC residual.
+        let basket = opt.optimize(
+            &exposure,
+            &[eth_with_cross, btc_perp()],
+            &default_variances(),
+        );
+        // ETH-PERP should hedge -10. BTC residual is
+        // 5 + (-10 * 0.5) = 0, so BTC-PERP should be absent.
+        let eth = basket
+            .entries
+            .iter()
+            .find(|(s, _)| s == "ETH-PERP")
+            .unwrap();
+        assert_eq!(eth.1, dec!(-10));
+        let btc = basket.entries.iter().find(|(s, _)| s == "BTC-PERP");
+        assert!(
+            btc.is_none(),
+            "BTC-PERP should be absent, cross-beta zeroed the residual"
+        );
+    }
+
+    /// Without cross-beta, both factors need their own hedges.
+    /// With cross-beta, the second hedge is smaller because
+    /// the first instrument partially covers it.
+    #[test]
+    fn cross_beta_reduces_second_hedge_size() {
+        let opt = HedgeOptimizer::new(dec!(0));
+        let eth_cross = HedgeInstrument {
+            symbol: "ETH-PERP".into(),
+            factor: "ETH".into(),
+            cross_betas: vec![("BTC".into(), dec!(0.3))],
+            funding_bps: dec!(0),
+            position_cap: dec!(100),
+        };
+        let exposure = vec![("BTC".into(), dec!(10)), ("ETH".into(), dec!(5))];
+        // ETH hedge: -5. Cross-beta: -5 * 0.3 = -1.5 on BTC.
+        // BTC residual: 10 + (-5 * 0.3) = 8.5 → BTC-PERP = -8.5.
+        let basket = opt.optimize(
+            &exposure,
+            &[eth_cross, btc_perp()],
+            &default_variances(),
+        );
+        let btc = basket
+            .entries
+            .iter()
+            .find(|(s, _)| s == "BTC-PERP")
+            .unwrap();
+        assert_eq!(btc.1, dec!(-8.5));
+    }
+
+    /// Empty cross_betas behaves identically to v1 diagonal.
+    #[test]
+    fn empty_cross_betas_matches_diagonal() {
+        let opt = HedgeOptimizer::new(dec!(0));
+        let exposure = vec![("BTC".into(), dec!(1)), ("ETH".into(), dec!(-2))];
+        let basket = opt.optimize(
+            &exposure,
+            &[btc_perp(), eth_perp()],
+            &default_variances(),
+        );
+        let btc = basket.entries.iter().find(|(s, _)| s == "BTC-PERP").unwrap();
+        assert_eq!(btc.1, dec!(-1));
+        let eth = basket.entries.iter().find(|(s, _)| s == "ETH-PERP").unwrap();
+        assert_eq!(eth.1, dec!(2));
     }
 }

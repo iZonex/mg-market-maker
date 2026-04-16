@@ -2297,6 +2297,7 @@ impl MarketMakerEngine {
         vec![HedgeInstrument {
             symbol: format!("{base}-PERP"),
             factor: base,
+            cross_betas: vec![],
             funding_bps: dec!(1),
             position_cap: self.config.risk.max_inventory,
         }]
@@ -2462,12 +2463,21 @@ impl MarketMakerEngine {
                 mm_dashboard::metrics::TAKER_FEE_BPS
                     .with_label_values(&[&self.symbol])
                     .set(decimal_to_f64(taker_bps));
+                // Stage-2: push updated fees into the SOR
+                // venue-state aggregator so the cost model
+                // reflects the live fee tier on subsequent
+                // route recommendations.
+                self.sor_aggregator.update_fees(
+                    self.connectors.primary.venue_id(),
+                    info.maker_fee,
+                    info.taker_fee,
+                );
                 debug!(
                     symbol = %self.symbol,
                     maker_bps = %maker_bps,
                     taker_bps = %taker_bps,
                     vip_tier = ?info.vip_tier,
-                    "refreshed fee tier from venue"
+                    "refreshed fee tier from venue (SOR seed updated)"
                 );
             }
             Err(FeeTierError::NotSupported) => {

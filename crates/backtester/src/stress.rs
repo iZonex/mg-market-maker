@@ -482,6 +482,7 @@ pub fn run_stress(scenario: &StressScenario, config: &StressRunConfig) -> Stress
     let hedge_universe = vec![HedgeInstrument {
         symbol: format!("{}-PERP", config.base_asset),
         factor: config.base_asset.clone(),
+        cross_betas: vec![],
         funding_bps: dec!(0.01),
         position_cap: config.position_size * dec!(2),
     }];

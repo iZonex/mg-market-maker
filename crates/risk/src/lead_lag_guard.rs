@@ -90,6 +90,10 @@ pub struct LeadLagGuard {
     last_multiplier: Decimal,
     /// `|z|` from the most recent observation, for metrics.
     last_z_abs: Decimal,
+    /// Signed z from the most recent observation. Positive z
+    /// means leader moved up (bid side more exposed); negative
+    /// z means leader moved down (ask side more exposed).
+    last_z_signed: Decimal,
     /// Number of return observations folded in. Used only
     /// for the warmup gate on the variance estimator.
     obs_count: usize,
@@ -113,6 +117,7 @@ impl LeadLagGuard {
             ewma_var: None,
             last_multiplier: Decimal::ONE,
             last_z_abs: Decimal::ZERO,
+            last_z_signed: Decimal::ZERO,
             obs_count: 0,
         }
     }
@@ -138,10 +143,12 @@ impl LeadLagGuard {
         // the test is "is this return surprising relative
         // to what we knew BEFORE seeing it" (the canonical
         // unbiased estimator).
-        let z_abs = self.compute_z_abs(r);
+        let z_signed = self.compute_z_signed(r);
+        let z_abs = z_signed.abs();
         self.fold_ewma(r);
         self.last_mid = Some(mid);
         self.last_z_abs = z_abs;
+        self.last_z_signed = z_signed;
         self.last_multiplier = ramp(
             z_abs,
             self.config.z_min,
@@ -167,6 +174,44 @@ impl LeadLagGuard {
         self.last_multiplier > Decimal::ONE
     }
 
+    /// Per-side asymmetric multiplier for the **bid** side.
+    /// When the leader moves UP (positive z), the follower's
+    /// bid is the stale side that informed flow hits first →
+    /// bid gets the full multiplier. When the leader moves DOWN,
+    /// the bid is the safe side → bid gets a reduced widening
+    /// (square root of the symmetric multiplier, floored at 1).
+    pub fn bid_multiplier(&self) -> Decimal {
+        if self.last_multiplier <= Decimal::ONE {
+            return Decimal::ONE;
+        }
+        if self.last_z_signed > Decimal::ZERO {
+            // Leader moved up → bid is the stale side.
+            self.last_multiplier
+        } else {
+            // Leader moved down → bid is safer, partial widen.
+            let excess = self.last_multiplier - Decimal::ONE;
+            Decimal::ONE + excess / dec!(2)
+        }
+    }
+
+    /// Per-side asymmetric multiplier for the **ask** side.
+    /// Mirror of `bid_multiplier()`: when the leader moves
+    /// DOWN, the ask is stale → full multiplier; when UP, the
+    /// ask is safer → partial widen.
+    pub fn ask_multiplier(&self) -> Decimal {
+        if self.last_multiplier <= Decimal::ONE {
+            return Decimal::ONE;
+        }
+        if self.last_z_signed < Decimal::ZERO {
+            // Leader moved down → ask is the stale side.
+            self.last_multiplier
+        } else {
+            // Leader moved up → ask is safer, partial widen.
+            let excess = self.last_multiplier - Decimal::ONE;
+            Decimal::ONE + excess / dec!(2)
+        }
+    }
+
     /// Drop all cached state. Next `on_leader_mid` call
     /// behaves like the very first one.
     pub fn reset(&mut self) {
@@ -175,6 +220,7 @@ impl LeadLagGuard {
         self.ewma_var = None;
         self.last_multiplier = Decimal::ONE;
         self.last_z_abs = Decimal::ZERO;
+        self.last_z_signed = Decimal::ZERO;
         self.obs_count = 0;
     }
 
@@ -183,7 +229,7 @@ impl LeadLagGuard {
         self.obs_count
     }
 
-    fn compute_z_abs(&self, r: Decimal) -> Decimal {
+    fn compute_z_signed(&self, r: Decimal) -> Decimal {
         let (Some(mean), Some(var)) = (self.ewma_mean, self.ewma_var) else {
             return Decimal::ZERO;
         };
@@ -194,7 +240,7 @@ impl LeadLagGuard {
         if std.is_zero() {
             return Decimal::ZERO;
         }
-        ((r - mean) / std).abs()
+        (r - mean) / std
     }
 
     fn fold_ewma(&mut self, r: Decimal) {
@@ -879,5 +925,83 @@ mod tests {
         // to just "b"'s scaled contribution: 1.5.
         g.unregister_leader("a");
         assert_eq!(g.current_multiplier(), dec!(1.5));
+    }
+
+    // ── Per-side asymmetric multiplier tests ─────────────────
+
+    /// Warm up a single-leader guard with enough observations
+    /// to build an EWMA state.
+    fn warmup_single(g: &mut LeadLagGuard, mid: Decimal) {
+        for i in 0..30 {
+            // Small oscillation to build variance.
+            let offset = if i % 2 == 0 { dec!(0.01) } else { dec!(-0.01) };
+            g.on_leader_mid(mid + mid * offset / dec!(100));
+        }
+    }
+
+    /// When the leader moves UP, the bid side (stale) gets the
+    /// full multiplier and the ask side (safe) gets partial.
+    #[test]
+    fn per_side_bid_stale_on_up_move() {
+        let mut g = LeadLagGuard::new(fixture_config());
+        warmup_single(&mut g, dec!(50000));
+        // Large upward move → positive z → bid is stale.
+        g.on_leader_mid(dec!(52500)); // +5%
+        assert!(g.is_active());
+        assert_eq!(g.bid_multiplier(), g.current_multiplier());
+        assert!(
+            g.ask_multiplier() < g.bid_multiplier(),
+            "ask={} should be < bid={}",
+            g.ask_multiplier(),
+            g.bid_multiplier()
+        );
+        assert!(g.ask_multiplier() > Decimal::ONE);
+    }
+
+    /// When the leader moves DOWN, the ask side (stale) gets
+    /// the full multiplier and the bid side gets partial.
+    #[test]
+    fn per_side_ask_stale_on_down_move() {
+        let mut g = LeadLagGuard::new(fixture_config());
+        warmup_single(&mut g, dec!(50000));
+        // Large downward move → negative z → ask is stale.
+        g.on_leader_mid(dec!(47500)); // -5%
+        assert!(g.is_active());
+        assert_eq!(g.ask_multiplier(), g.current_multiplier());
+        assert!(
+            g.bid_multiplier() < g.ask_multiplier(),
+            "bid={} should be < ask={}",
+            g.bid_multiplier(),
+            g.ask_multiplier()
+        );
+        assert!(g.bid_multiplier() > Decimal::ONE);
+    }
+
+    /// When the guard is not active, both sides return 1.0.
+    #[test]
+    fn per_side_both_one_when_inactive() {
+        let mut g = LeadLagGuard::new(fixture_config());
+        warmup_single(&mut g, dec!(50000));
+        // Tiny move — under z_min threshold.
+        g.on_leader_mid(dec!(50001));
+        assert!(!g.is_active());
+        assert_eq!(g.bid_multiplier(), Decimal::ONE);
+        assert_eq!(g.ask_multiplier(), Decimal::ONE);
+    }
+
+    /// The stale-side multiplier equals the symmetric
+    /// multiplier — the per-side split is only asymmetric
+    /// on the SAFE side.
+    #[test]
+    fn stale_side_equals_symmetric() {
+        let mut g = LeadLagGuard::new(fixture_config());
+        warmup_single(&mut g, dec!(50000));
+        g.on_leader_mid(dec!(52500)); // up
+        assert_eq!(g.bid_multiplier(), g.current_multiplier());
+
+        g.reset();
+        warmup_single(&mut g, dec!(50000));
+        g.on_leader_mid(dec!(47500)); // down
+        assert_eq!(g.ask_multiplier(), g.current_multiplier());
     }
 }

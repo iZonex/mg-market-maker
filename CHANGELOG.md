@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Epic C stage-2 — cross-beta hedge optimizer** (Apr 2026).
+  Extends the diagonal-only Markowitz hedge optimizer with
+  off-diagonal β support. `HedgeInstrument.cross_betas` carries
+  `(factor, beta)` pairs for cross-factor exposure. When ETH-PERP
+  has `cross_betas = [("BTC", 0.4)]`, hedging ETH also reduces
+  BTC residual exposure by `hedge_qty * 0.4`. The optimizer
+  processes instruments in order and reduces the residual vector
+  as it goes. 3 new tests.
+
+- **Epic F stage-2 — per-side asymmetric lead-lag widening**
+  (Apr 2026). When the leader moves UP, the follower's bid
+  (stale side) gets the full multiplier; the ask (safe side)
+  gets `1 + excess/2`. Mirror for DOWN moves. New methods
+  `bid_multiplier()` / `ask_multiplier()` on `LeadLagGuard`.
+  4 new tests.
+
+- **Epic A stage-2 — auto-refresh SOR venue seeds from
+  fee-tier** (Apr 2026). `VenueStateAggregator::update_fees()`
+  method + wiring in `refresh_fee_tiers()` pushes live
+  maker/taker rates into the SOR cost model so route
+  recommendations reflect the latest fee tier.
+
 - **Epic E stage-2 — per-order batch failure outcomes**
   (Apr 2026). Replaces the all-or-nothing batch error handling
   with per-order outcome tracking:
