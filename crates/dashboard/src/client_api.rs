@@ -1,4 +1,4 @@
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::Utc;
@@ -30,6 +30,8 @@ pub fn client_routes() -> Router<DashboardState> {
         .route("/api/v1/report/daily/csv", get(get_daily_report_csv))
         .route("/api/v1/market-impact", get(get_market_impact))
         .route("/api/v1/performance", get(get_performance))
+        .route("/api/v1/report/history", get(get_report_history))
+        .route("/api/v1/report/history/{date}", get(get_historical_report))
         .route("/api/v1/portfolio", get(get_portfolio))
 }
 
@@ -464,6 +466,21 @@ fn hmac_sha256_hex(key: &str, message: &str) -> String {
     key.hash(&mut hasher);
     message.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+/// List available historical report dates.
+async fn get_report_history(
+    State(state): State<DashboardState>,
+) -> Json<Vec<String>> {
+    Json(state.available_report_dates())
+}
+
+/// Get a historical daily report by date.
+async fn get_historical_report(
+    State(state): State<DashboardState>,
+    Path(date): Path<String>,
+) -> Json<Option<crate::state::DailyReportSnapshot>> {
+    Json(state.get_daily_report(&date))
 }
 
 /// Daily report in CSV format for auditors/clients.

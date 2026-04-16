@@ -70,6 +70,33 @@ struct StateInner {
     fill_log_writer: Option<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
     /// Shared webhook dispatcher for client event delivery.
     webhook_dispatcher: Option<crate::webhooks::WebhookDispatcher>,
+    /// Historical daily report snapshots. Keyed by date string
+    /// (YYYY-MM-DD). Capped at 90 days.
+    daily_reports: HashMap<String, DailyReportSnapshot>,
+}
+
+const MAX_DAILY_REPORTS: usize = 90;
+
+/// Stored daily report for historical queries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyReportSnapshot {
+    pub date: String,
+    pub total_pnl: Decimal,
+    pub total_volume: Decimal,
+    pub total_fills: u64,
+    pub symbols: Vec<DailySymbolSnapshot>,
+}
+
+/// Per-symbol snapshot within a daily report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailySymbolSnapshot {
+    pub symbol: String,
+    pub pnl: Decimal,
+    pub volume: Decimal,
+    pub fills: u64,
+    pub avg_spread_bps: Decimal,
+    pub uptime_pct: Decimal,
+    pub presence_pct: Decimal,
 }
 
 /// Maximum recent fills retained in dashboard state.
@@ -387,6 +414,40 @@ impl DashboardState {
     /// Get the webhook dispatcher for admin endpoints.
     pub fn webhook_dispatcher(&self) -> Option<crate::webhooks::WebhookDispatcher> {
         self.inner.read().unwrap().webhook_dispatcher.clone()
+    }
+
+    /// Store a daily report snapshot for historical queries.
+    /// Automatically trims to 90 days.
+    pub fn store_daily_report(&self, report: DailyReportSnapshot) {
+        let mut inner = self.inner.write().unwrap();
+        let date = report.date.clone();
+        inner.daily_reports.insert(date, report);
+        // Trim oldest if over limit.
+        if inner.daily_reports.len() > MAX_DAILY_REPORTS {
+            let mut dates: Vec<String> = inner.daily_reports.keys().cloned().collect();
+            dates.sort();
+            while inner.daily_reports.len() > MAX_DAILY_REPORTS {
+                if let Some(oldest) = dates.first() {
+                    inner.daily_reports.remove(oldest);
+                    dates.remove(0);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Get a historical daily report by date (YYYY-MM-DD).
+    pub fn get_daily_report(&self, date: &str) -> Option<DailyReportSnapshot> {
+        self.inner.read().unwrap().daily_reports.get(date).cloned()
+    }
+
+    /// List available historical report dates.
+    pub fn available_report_dates(&self) -> Vec<String> {
+        let inner = self.inner.read().unwrap();
+        let mut dates: Vec<String> = inner.daily_reports.keys().cloned().collect();
+        dates.sort();
+        dates
     }
 
     /// Load fill history from a JSONL file (one FillRecord per

@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Config validation + K8s probes + historical reports**
+  (Apr 2026).
+  - Config validation: VaR guard EWMA lambda range check,
+    listing sniper scan interval warning, toxicity param
+    validation.
+  - K8s readiness/liveness probes: `/ready` returns 503
+    until at least one symbol has market data (mid > 0).
+    `/health` always 200 (liveness).
+  - Historical daily report storage: 90-day rolling buffer
+    in DashboardState. `GET /api/v1/report/history` lists
+    available dates. `GET /api/v1/report/history/{date}`
+    retrieves a specific day's report.
+
 - **Webhook wiring + admin management + engine integration**
   (Apr 2026).
   - Engine dispatches webhooks on: engine start, kill switch

@@ -208,6 +208,42 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
         }
     }
 
+    // --- VaR guard ---
+    if mm.var_guard_enabled {
+        if mm.var_guard_limit_95.is_none() && mm.var_guard_limit_99.is_none() {
+            warnings.push(
+                "var_guard_enabled=true but both limit_95 and limit_99 are None — \
+                 VaR guard will never throttle"
+                    .to_string(),
+            );
+        }
+        if let Some(lambda) = mm.var_guard_ewma_lambda {
+            if lambda <= dec!(0) || lambda >= dec!(1) {
+                errors.push(format!(
+                    "var_guard_ewma_lambda={} must be in (0, 1)",
+                    lambda
+                ));
+            }
+        }
+    }
+
+    // --- Listing sniper ---
+    if config.listing_sniper.enabled && config.listing_sniper.scan_interval_secs < 10 {
+        warnings.push(format!(
+            "listing_sniper.scan_interval_secs={} is very aggressive, may hit rate limits",
+            config.listing_sniper.scan_interval_secs
+        ));
+    }
+
+    // --- Toxicity ---
+    let tox = &config.toxicity;
+    if tox.vpin_bucket_size <= dec!(0) {
+        errors.push("toxicity.vpin_bucket_size must be > 0".to_string());
+    }
+    if tox.vpin_num_buckets == 0 {
+        errors.push("toxicity.vpin_num_buckets must be > 0".to_string());
+    }
+
     // P2.1 — per-asset-class kill switch sanity. Each symbol
     // listed in `kill_switch.asset_classes[*].symbols` must
     // exist in the top-level `symbols` array, and no symbol

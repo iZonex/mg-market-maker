@@ -39,6 +39,12 @@ pub async fn start(
         .route("/api/auth/login", post(login_handler))
         .with_state(auth_state.clone());
 
+    // K8s probes (no auth, need DashboardState).
+    let probes = Router::new()
+        .route("/ready", get(readiness))
+        .route("/startup", get(readiness))
+        .with_state(state.clone());
+
     // Protected API routes — require auth.
     let protected_api = Router::new()
         .route("/api/status", get(get_status))
@@ -86,6 +92,7 @@ pub async fn start(
 
     let app = Router::new()
         .merge(public)
+        .merge(probes)
         .merge(protected_api)
         .merge(ws_routes)
         .merge(admin)
@@ -102,6 +109,18 @@ pub async fn start(
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// K8s readiness probe — 200 when at least one symbol has
+/// received market data (mid_price > 0). Returns 503 during
+/// startup before the first book snapshot lands.
+async fn readiness(State(state): State<DashboardState>) -> axum::http::StatusCode {
+    let symbols = state.get_all();
+    if symbols.iter().any(|s| s.mid_price > rust_decimal::Decimal::ZERO) {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 async fn get_status(State(state): State<DashboardState>) -> Json<Vec<SymbolState>> {
