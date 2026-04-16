@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Epic E stage-2 — per-order batch failure outcomes**
+  (Apr 2026). Replaces the all-or-nothing batch error handling
+  with per-order outcome tracking:
+  - `BatchPlaceOutcome` enum: `Placed`, `PlacedFallback`,
+    `Failed`, `Unacknowledged` — gives the engine full
+    visibility into which orders succeeded via batch vs
+    per-order fallback vs failed entirely.
+  - `BatchCancelOutcome` enum: `Cancelled`, `CancelledFallback`,
+    `Failed`.
+  - ID-count mismatch now retries unacknowledged orders
+    individually instead of silently dropping them.
+  - `execute_diff` logs per-order failure/fallback counts.
+  - Existing batch tests updated with outcome assertions.
+
 - **Epic B stage-2 — ADF lag selection via AIC** (Apr 2026).
   Upgrades the Engle-Granger ADF regression from zero-lag to
   AIC-selected lag order (0..12). The augmented regression

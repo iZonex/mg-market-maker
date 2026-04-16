@@ -16,6 +16,33 @@ use tracing::{debug, info, warn};
 /// batch path.
 const MIN_BATCH_SIZE: usize = 2;
 
+/// Per-order outcome from a batch placement attempt. Gives the
+/// engine visibility into which orders succeeded and which
+/// failed, instead of the all-or-nothing semantics of the v1
+/// batch API. Epic E stage-2.
+#[derive(Debug, Clone)]
+pub enum BatchPlaceOutcome {
+    /// Order placed successfully via the batch API.
+    Placed { order_id: OrderId },
+    /// Order placed successfully via per-order fallback after
+    /// a batch-level failure.
+    PlacedFallback { order_id: OrderId },
+    /// Order failed both batch and per-order paths.
+    Failed { reason: String },
+    /// Venue did not acknowledge this order in the batch
+    /// response (ID count mismatch) and the per-order retry
+    /// also failed.
+    Unacknowledged { reason: String },
+}
+
+/// Per-order outcome from a batch cancellation attempt.
+#[derive(Debug, Clone)]
+pub enum BatchCancelOutcome {
+    Cancelled,
+    CancelledFallback,
+    Failed { reason: String },
+}
+
 /// One side of an in-place price tweak that preserves queue
 /// priority. `OrderDiffPlan::to_amend` holds these instead of a
 /// matched (cancel, place) pair when the live order can be
@@ -275,19 +302,48 @@ impl OrderManager {
         }
 
         // Cancel stale orders (batch when supported).
-        self.cancel_orders_batched(symbol, &plan.to_cancel, connector)
+        let cancel_outcomes = self
+            .cancel_orders_batched(symbol, &plan.to_cancel, connector)
             .await;
 
         // Place new orders (batch when supported).
-        self.place_quotes_batched(symbol, &plan.to_place, connector)
+        let place_outcomes = self
+            .place_quotes_batched(symbol, &plan.to_place, connector)
             .await;
+
+        // Summarise per-order outcomes.
+        let cancel_failures = cancel_outcomes
+            .iter()
+            .filter(|o| matches!(o, BatchCancelOutcome::Failed { .. }))
+            .count();
+        let cancel_fallbacks = cancel_outcomes
+            .iter()
+            .filter(|o| matches!(o, BatchCancelOutcome::CancelledFallback))
+            .count();
+        let place_failures = place_outcomes
+            .iter()
+            .filter(|o| {
+                matches!(
+                    o,
+                    BatchPlaceOutcome::Failed { .. } | BatchPlaceOutcome::Unacknowledged { .. }
+                )
+            })
+            .count();
+        let place_fallbacks = place_outcomes
+            .iter()
+            .filter(|o| matches!(o, BatchPlaceOutcome::PlacedFallback { .. }))
+            .count();
 
         if !plan.to_cancel.is_empty() || !plan.to_place.is_empty() || amends_planned > 0 {
             info!(
                 amended = amends_planned - amend_failures,
                 amend_failures,
                 cancelled = plan.to_cancel.len(),
+                cancel_failures,
+                cancel_fallbacks,
                 placed = plan.to_place.len(),
+                place_failures,
+                place_fallbacks,
                 live = self.live_count(),
                 "order diff executed"
             );
@@ -296,33 +352,35 @@ impl OrderManager {
         Ok(())
     }
 
-    /// Epic E sub-component #1 — place a slice of quotes
-    /// using the venue's `place_orders_batch` when ≥
+    /// Epic E sub-component #1 (stage-2) — place a slice of
+    /// quotes using the venue's `place_orders_batch` when ≥
     /// `MIN_BATCH_SIZE` quotes are pending and the connector
     /// advertises a non-trivial `max_batch_size`.
     ///
-    /// Chunks the input by `max_batch_size`, calls the batch
-    /// method per chunk, tracks the returned `LiveOrder`s,
-    /// and falls back to `place_order` per-quote on any
-    /// batch error or returned-id-count mismatch. Single-
-    /// order placements stay on the per-order path entirely.
+    /// Returns per-order outcomes so the engine has visibility
+    /// into partial failures. On ID-count mismatch the
+    /// unacknowledged orders are retried individually. On
+    /// full batch error every order in the chunk falls back to
+    /// per-order placement.
     async fn place_quotes_batched(
         &mut self,
         symbol: &str,
         quotes: &[Quote],
         connector: &Arc<dyn ExchangeConnector>,
-    ) {
+    ) -> Vec<BatchPlaceOutcome> {
         if quotes.is_empty() {
-            return;
+            return Vec::new();
         }
         let max_batch = connector.capabilities().max_batch_size.max(1);
         // Single-order or small slice → stay on per-order path.
         if quotes.len() < MIN_BATCH_SIZE || max_batch < MIN_BATCH_SIZE {
+            let mut outcomes = Vec::with_capacity(quotes.len());
             for quote in quotes {
-                self.place_one_quote(symbol, quote, connector).await;
+                outcomes.push(self.place_one_quote_outcome(symbol, quote, connector).await);
             }
-            return;
+            return outcomes;
         }
+        let mut outcomes = Vec::with_capacity(quotes.len());
         for chunk in quotes.chunks(max_batch) {
             let orders: Vec<NewOrder> = chunk
                 .iter()
@@ -356,19 +414,17 @@ impl OrderManager {
                             status: mm_common::types::OrderStatus::Open,
                             created_at: chrono::Utc::now(),
                         });
+                        outcomes.push(BatchPlaceOutcome::Placed { order_id });
                     }
                 }
                 Ok(ids) => {
-                    // Returned-id count mismatch: track what the
-                    // venue acknowledged (assume the first
-                    // `ids.len()` slots succeeded) and skip the
-                    // remainder. Emitting both halves of a
-                    // double-place is the worse failure mode, so
-                    // we err toward under-placement.
+                    // ID-count mismatch: track acknowledged, retry
+                    // the unacknowledged individually.
+                    let ack_count = ids.len();
                     warn!(
-                        returned = ids.len(),
+                        returned = ack_count,
                         expected = chunk.len(),
-                        "batch place returned fewer ids than inputs — under-tracking remainder"
+                        "batch place returned fewer ids — retrying remainder individually"
                     );
                     for (order_id, quote) in ids.into_iter().zip(chunk.iter()) {
                         self.track_order(LiveOrder {
@@ -381,6 +437,13 @@ impl OrderManager {
                             status: mm_common::types::OrderStatus::Open,
                             created_at: chrono::Utc::now(),
                         });
+                        outcomes.push(BatchPlaceOutcome::Placed { order_id });
+                    }
+                    // Retry unacknowledged orders individually.
+                    for quote in &chunk[ack_count..] {
+                        let outcome =
+                            self.place_one_quote_unack(symbol, quote, connector).await;
+                        outcomes.push(outcome);
                     }
                 }
                 Err(e) => {
@@ -390,23 +453,25 @@ impl OrderManager {
                         "batch place failed — falling back to per-order placement"
                     );
                     for quote in chunk {
-                        self.place_one_quote(symbol, quote, connector).await;
+                        let outcome =
+                            self.place_one_quote_fallback(symbol, quote, connector).await;
+                        outcomes.push(outcome);
                     }
                 }
             }
         }
+        outcomes
     }
 
-    /// Per-quote placement helper used by both the per-order
-    /// path (for small diffs and single-order specials) and
-    /// the batch fallback. Tracks the new `LiveOrder` on
-    /// success.
-    async fn place_one_quote(
+    /// Per-quote placement returning a per-order outcome. Used
+    /// by both the per-order path (small diffs) and batch
+    /// fallback. Tracks the new `LiveOrder` on success.
+    async fn place_one_quote_outcome(
         &mut self,
         symbol: &str,
         quote: &Quote,
         connector: &Arc<dyn ExchangeConnector>,
-    ) {
+    ) -> BatchPlaceOutcome {
         let order = NewOrder {
             symbol: symbol.to_string(),
             side: quote.side,
@@ -435,6 +500,7 @@ impl OrderManager {
                     status: mm_common::types::OrderStatus::Open,
                     created_at: chrono::Utc::now(),
                 });
+                BatchPlaceOutcome::Placed { order_id }
             }
             Err(e) => {
                 warn!(
@@ -443,39 +509,78 @@ impl OrderManager {
                     error = %e,
                     "failed to place order"
                 );
+                BatchPlaceOutcome::Failed {
+                    reason: e.to_string(),
+                }
             }
         }
     }
 
-    /// Epic E sub-component #1 — cancel a slice of order ids
-    /// using the venue's `cancel_orders_batch` when ≥
-    /// `MIN_BATCH_SIZE` cancels are pending. On any batch
+    /// Fallback placement after a batch error — same as
+    /// `place_one_quote_outcome` but tagged as `PlacedFallback`.
+    async fn place_one_quote_fallback(
+        &mut self,
+        symbol: &str,
+        quote: &Quote,
+        connector: &Arc<dyn ExchangeConnector>,
+    ) -> BatchPlaceOutcome {
+        match self.place_one_quote_outcome(symbol, quote, connector).await {
+            BatchPlaceOutcome::Placed { order_id } => {
+                BatchPlaceOutcome::PlacedFallback { order_id }
+            }
+            other => other,
+        }
+    }
+
+    /// Retry for an unacknowledged order from a partial batch
+    /// response.
+    async fn place_one_quote_unack(
+        &mut self,
+        symbol: &str,
+        quote: &Quote,
+        connector: &Arc<dyn ExchangeConnector>,
+    ) -> BatchPlaceOutcome {
+        match self.place_one_quote_outcome(symbol, quote, connector).await {
+            BatchPlaceOutcome::Placed { order_id } => {
+                BatchPlaceOutcome::PlacedFallback { order_id }
+            }
+            BatchPlaceOutcome::Failed { reason } => {
+                BatchPlaceOutcome::Unacknowledged { reason }
+            }
+            other => other,
+        }
+    }
+
+    /// Epic E sub-component #1 (stage-2) — cancel a slice of
+    /// order ids with per-order outcome visibility. On batch
     /// error, falls back to per-order `cancel_order` for the
-    /// entire chunk (the trait's batch-cancel API has no
-    /// per-order outcome, so partial-success is invisible to
-    /// the caller).
+    /// entire chunk and reports per-order outcomes.
     async fn cancel_orders_batched(
         &mut self,
         symbol: &str,
         order_ids: &[OrderId],
         connector: &Arc<dyn ExchangeConnector>,
-    ) {
+    ) -> Vec<BatchCancelOutcome> {
         if order_ids.is_empty() {
-            return;
+            return Vec::new();
         }
         let max_batch = connector.capabilities().max_batch_size.max(1);
         if order_ids.len() < MIN_BATCH_SIZE || max_batch < MIN_BATCH_SIZE {
+            let mut outcomes = Vec::with_capacity(order_ids.len());
             for order_id in order_ids {
-                self.cancel_one(symbol, *order_id, connector).await;
+                let outcome = self.cancel_one_outcome(symbol, *order_id, connector).await;
+                outcomes.push(outcome);
             }
-            return;
+            return outcomes;
         }
+        let mut outcomes = Vec::with_capacity(order_ids.len());
         for chunk in order_ids.chunks(max_batch) {
             match connector.cancel_orders_batch(symbol, chunk).await {
                 Ok(_) => {
                     for order_id in chunk {
                         debug!(%order_id, "cancelled stale order (batch)");
                         self.remove_order(*order_id);
+                        outcomes.push(BatchCancelOutcome::Cancelled);
                     }
                 }
                 Err(e) => {
@@ -485,32 +590,43 @@ impl OrderManager {
                         "batch cancel failed — falling back to per-order cancellation"
                     );
                     for order_id in chunk {
-                        self.cancel_one(symbol, *order_id, connector).await;
+                        let outcome =
+                            self.cancel_one_outcome(symbol, *order_id, connector).await;
+                        let outcome = match outcome {
+                            BatchCancelOutcome::Cancelled => BatchCancelOutcome::CancelledFallback,
+                            other => other,
+                        };
+                        outcomes.push(outcome);
                     }
                 }
             }
         }
+        outcomes
     }
 
-    /// Per-cancel helper. Removes the local tracking entry
-    /// regardless of venue outcome — a failed cancel still
-    /// drops the local state because the next diff will
-    /// reconcile against the venue's actual open orders via
-    /// `get_open_orders` reconciliation.
-    async fn cancel_one(
+    /// Per-cancel helper with outcome reporting. Removes the
+    /// local tracking entry regardless of venue outcome — a
+    /// failed cancel still drops the local state because the
+    /// next diff will reconcile against the venue's actual
+    /// open orders via `get_open_orders` reconciliation.
+    async fn cancel_one_outcome(
         &mut self,
         symbol: &str,
         order_id: OrderId,
         connector: &Arc<dyn ExchangeConnector>,
-    ) {
+    ) -> BatchCancelOutcome {
         match connector.cancel_order(symbol, order_id).await {
             Ok(_) => {
                 debug!(%order_id, "cancelled stale order");
                 self.remove_order(order_id);
+                BatchCancelOutcome::Cancelled
             }
             Err(e) => {
                 warn!(%order_id, error = %e, "failed to cancel order");
                 self.remove_order(order_id);
+                BatchCancelOutcome::Failed {
+                    reason: e.to_string(),
+                }
             }
         }
     }
@@ -957,7 +1073,7 @@ mod tests {
         let conn = mock_connector(20);
         as_mock(&conn).arm_batch_place_failure();
         let quotes = make_quotes(3);
-        mgr.place_quotes_batched("BTCUSDT", &quotes, &conn).await;
+        let outcomes = mgr.place_quotes_batched("BTCUSDT", &quotes, &conn).await;
         // Batch call attempted once and failed; fallback
         // hit place_order three times.
         assert_eq!(as_mock(&conn).place_batch_calls(), 1);
@@ -965,16 +1081,26 @@ mod tests {
         // All three orders ended up tracked despite the
         // batch-side failure.
         assert_eq!(mgr.live_count(), 3);
+        // All outcomes should be PlacedFallback.
+        assert_eq!(outcomes.len(), 3);
+        for o in &outcomes {
+            assert!(
+                matches!(o, BatchPlaceOutcome::PlacedFallback { .. }),
+                "expected PlacedFallback, got {:?}",
+                o
+            );
+        }
     }
 
     #[tokio::test]
     async fn batch_place_empty_input_is_noop() {
         let mut mgr = OrderManager::new();
         let conn = mock_connector(20);
-        mgr.place_quotes_batched("BTCUSDT", &[], &conn).await;
+        let outcomes = mgr.place_quotes_batched("BTCUSDT", &[], &conn).await;
         assert_eq!(as_mock(&conn).place_batch_calls(), 0);
         assert_eq!(as_mock(&conn).place_single_calls(), 0);
         assert_eq!(mgr.live_count(), 0);
+        assert!(outcomes.is_empty());
     }
 
     #[tokio::test]
@@ -984,9 +1110,17 @@ mod tests {
         let mut mgr = OrderManager::new();
         let conn = mock_connector(1);
         let quotes = make_quotes(5);
-        mgr.place_quotes_batched("BTCUSDT", &quotes, &conn).await;
+        let outcomes = mgr.place_quotes_batched("BTCUSDT", &quotes, &conn).await;
         assert_eq!(as_mock(&conn).place_batch_calls(), 0);
         assert_eq!(as_mock(&conn).place_single_calls(), 5);
+        // All should be Placed (per-order path, not fallback).
+        for o in &outcomes {
+            assert!(
+                matches!(o, BatchPlaceOutcome::Placed { .. }),
+                "expected Placed, got {:?}",
+                o
+            );
+        }
     }
 
     #[tokio::test]
