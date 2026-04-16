@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cross-venue fund management: withdraw + transfer + rebalancer**
+  (Apr 2026).
+  - `ExchangeConnector::withdraw(asset, qty, address, network)`
+    trait method with default `NotSupported`. Venue connectors
+    override when programmatic withdrawals are available.
+  - `ExchangeConnector::internal_transfer(asset, qty, from, to)`
+    for intra-venue wallet transfers (spot→futures, etc).
+  - `Rebalancer` module: monitors per-venue balances, recommends
+    transfers from surplus to deficit venues based on configurable
+    thresholds. Advisory-only in v1; auto-execution is stage-2.
+    4 new tests.
+
 - **Prometheus metrics fix + market impact gauges + client
   portal spread compliance fix** (Apr 2026).
   - Fix 3 uninitialized Prometheus metrics: `MARKET_RESILIENCE`,

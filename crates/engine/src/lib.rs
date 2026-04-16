@@ -3,6 +3,7 @@ pub mod book_keeper;
 pub mod connector_bundle;
 pub mod listing_sniper;
 pub mod market_maker;
+pub mod rebalancer;
 pub mod order_id_map;
 pub mod order_manager;
 pub mod pair_lifecycle;

@@ -364,6 +364,40 @@ pub trait ExchangeConnector: Send + Sync {
     /// Get balances.
     async fn get_balances(&self) -> anyhow::Result<Vec<Balance>>;
 
+    /// Withdraw `qty` of `asset` to an external `address` on the
+    /// given `network` (e.g. "ETH", "TRX", "SOL"). Returns the
+    /// venue's withdrawal ID for tracking.
+    ///
+    /// Default returns `Err` — venue connectors that support
+    /// programmatic withdrawals override this.
+    async fn withdraw(
+        &self,
+        _asset: &str,
+        _qty: rust_decimal::Decimal,
+        _address: &str,
+        _network: &str,
+    ) -> anyhow::Result<String> {
+        Err(anyhow::anyhow!("withdraw not supported on this venue"))
+    }
+
+    /// Internal transfer between wallets on the same venue
+    /// (e.g. spot → futures, main → trading). Returns the
+    /// venue's transfer ID.
+    ///
+    /// `from_wallet` and `to_wallet` are venue-specific strings
+    /// (e.g. "SPOT", "LINEAR", "FUNDING" for Bybit).
+    async fn internal_transfer(
+        &self,
+        _asset: &str,
+        _qty: rust_decimal::Decimal,
+        _from_wallet: &str,
+        _to_wallet: &str,
+    ) -> anyhow::Result<String> {
+        Err(anyhow::anyhow!(
+            "internal_transfer not supported on this venue"
+        ))
+    }
+
     /// Get product specification (tick/lot sizes, fees).
     async fn get_product_spec(&self, symbol: &str) -> anyhow::Result<ProductSpec>;
 
