@@ -9,8 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **HawkesTradeFlow feature extractor** (Apr 2026). Wraps
+  `BivariateHawkes` as a microstructure feature: captures
+  trade-arrival clustering that EWMA-based `TradeFlow` misses.
+  `default_crypto()` constructor with tuned parameters.
+  4 new tests.
+
 - **Production hardening: order reconciliation, dynamic product
-  spec, covariance wiring** (Apr 2026).
+  spec, covariance wiring, batch cancel_all** (Apr 2026).
   - **Real order reconciliation**: `reconcile()` now queries
     `get_open_orders()` from the venue and diffs against the
     internal `OrderManager` state. Detects ghost orders

@@ -727,6 +727,69 @@ impl WindowedTradeFlow {
 }
 
 // ---------------------------------------------------------------------------
+// Hawkes trade flow
+// ---------------------------------------------------------------------------
+
+/// Hawkes-intensity-weighted trade flow feature. Wraps
+/// `BivariateHawkes` to track self-exciting buy/sell arrival
+/// intensities and exposes the intensity imbalance as a
+/// feature in `[-1, +1]`.
+///
+/// Unlike `TradeFlow` (EWMA of signed volume) this captures
+/// **clustering** — a burst of 10 buys in 100 ms scores
+/// much higher than 10 buys spread over 10 seconds, because
+/// the self-excitation kernel amplifies clustered arrivals.
+pub struct HawkesTradeFlow {
+    hawkes: mm_indicators::BivariateHawkes,
+}
+
+impl HawkesTradeFlow {
+    /// Construct with parameters for the bivariate Hawkes
+    /// process. `alpha_self + alpha_cross < beta` is required
+    /// for stationarity.
+    pub fn new(mu: Decimal, alpha_self: Decimal, alpha_cross: Decimal, beta: Decimal) -> Self {
+        Self {
+            hawkes: mm_indicators::BivariateHawkes::new(mu, alpha_self, alpha_cross, beta),
+        }
+    }
+
+    /// Default parameters tuned for crypto MM: μ=1, α_self=0.5,
+    /// α_cross=0.2, β=2.0 (half-life ~0.35s).
+    pub fn default_crypto() -> Self {
+        Self::new(dec!(1), dec!(0.5), dec!(0.2), dec!(2))
+    }
+
+    /// Register a trade. `t_secs` is the trade timestamp in
+    /// seconds (monotonic, e.g. from `Instant`).
+    pub fn on_trade(&mut self, side: Side, t_secs: Decimal) {
+        match side {
+            Side::Buy => { self.hawkes.on_buy(t_secs); }
+            Side::Sell => { self.hawkes.on_sell(t_secs); }
+        }
+    }
+
+    /// Intensity imbalance at time `t_secs` in `[-1, +1]`.
+    /// Positive = buy pressure dominates. `None` before any
+    /// trade has been registered.
+    pub fn value(&self, t_secs: Decimal) -> Option<Decimal> {
+        if self.hawkes.event_count() == 0 {
+            return None;
+        }
+        Some(self.hawkes.intensity_imbalance_at(t_secs))
+    }
+
+    /// Total events observed.
+    pub fn event_count(&self) -> u64 {
+        self.hawkes.event_count()
+    }
+
+    /// Reset all state.
+    pub fn reset(&mut self) {
+        self.hawkes.reset();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Micro-price drift
 // ---------------------------------------------------------------------------
 
@@ -1697,5 +1760,55 @@ mod tests {
         let db = immediacy_depth_bid(&bids, spread);
         let da = immediacy_depth_ask(&asks, spread);
         assert_eq!(db, da);
+    }
+
+    // ── Hawkes trade flow tests ─────────────────────────────
+
+    #[test]
+    fn hawkes_flow_none_before_any_trade() {
+        let h = HawkesTradeFlow::default_crypto();
+        assert!(h.value(dec!(0)).is_none());
+    }
+
+    #[test]
+    fn hawkes_flow_buy_cluster_positive() {
+        let mut h = HawkesTradeFlow::default_crypto();
+        h.on_trade(Side::Buy, dec!(0));
+        h.on_trade(Side::Buy, dec!(0.1));
+        h.on_trade(Side::Buy, dec!(0.2));
+        let v = h.value(dec!(0.3)).unwrap();
+        assert!(
+            v > Decimal::ZERO,
+            "buy cluster should produce positive imbalance, got {}",
+            v
+        );
+    }
+
+    #[test]
+    fn hawkes_flow_sell_cluster_negative() {
+        let mut h = HawkesTradeFlow::default_crypto();
+        h.on_trade(Side::Sell, dec!(0));
+        h.on_trade(Side::Sell, dec!(0.1));
+        h.on_trade(Side::Sell, dec!(0.2));
+        let v = h.value(dec!(0.3)).unwrap();
+        assert!(
+            v < Decimal::ZERO,
+            "sell cluster should produce negative imbalance, got {}",
+            v
+        );
+    }
+
+    #[test]
+    fn hawkes_flow_decays_to_neutral() {
+        let mut h = HawkesTradeFlow::default_crypto();
+        h.on_trade(Side::Buy, dec!(0));
+        let v_soon = h.value(dec!(1)).unwrap();
+        let v_later = h.value(dec!(100)).unwrap();
+        assert!(
+            v_soon.abs() > v_later.abs(),
+            "imbalance should decay: soon={} > later={}",
+            v_soon.abs(),
+            v_later.abs()
+        );
     }
 }
