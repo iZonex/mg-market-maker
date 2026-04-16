@@ -43,9 +43,15 @@ use crate::alerts::TelegramConfig;
 pub enum TelegramCommand {
     Status,
     Stop,
-    Pause { symbol: String },
-    Resume { symbol: String },
-    ForceExit { symbol: String },
+    Pause {
+        symbol: String,
+    },
+    Resume {
+        symbol: String,
+    },
+    ForceExit {
+        symbol: String,
+    },
     /// Query current positions — responds with per-symbol
     /// inventory, PnL, and spread. No side effects.
     Positions,

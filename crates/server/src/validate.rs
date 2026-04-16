@@ -237,16 +237,10 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
                 errors.push("clients[*].id must be non-empty".to_string());
             }
             if !client_ids.insert(client.id.clone()) {
-                errors.push(format!(
-                    "duplicate client id: {}",
-                    client.id
-                ));
+                errors.push(format!("duplicate client id: {}", client.id));
             }
             if client.symbols.is_empty() {
-                warnings.push(format!(
-                    "client {} has no symbols assigned",
-                    client.id
-                ));
+                warnings.push(format!("client {} has no symbols assigned", client.id));
             }
             for sym in &client.symbols {
                 if let Some(prev) = symbol_owner.get(sym) {
@@ -458,7 +452,8 @@ mod tests {
                 symbols: vec!["BTCUSDT".into()],
                 sla: None,
                 webhook_urls: vec![],
-                api_keys: vec![], report_branding: None,
+                api_keys: vec![],
+                report_branding: None,
             },
             mm_common::config::ClientConfig {
                 id: "bob".into(),
@@ -466,7 +461,8 @@ mod tests {
                 symbols: vec!["BTCUSDT".into(), "ETHUSDT".into()],
                 sla: None,
                 webhook_urls: vec![],
-                api_keys: vec![], report_branding: None,
+                api_keys: vec![],
+                report_branding: None,
             },
         ];
         let err = validate_config(&cfg).unwrap_err().to_string();
@@ -484,7 +480,8 @@ mod tests {
                 symbols: vec!["BTCUSDT".into()],
                 sla: None,
                 webhook_urls: vec![],
-                api_keys: vec![], report_branding: None,
+                api_keys: vec![],
+                report_branding: None,
             },
             mm_common::config::ClientConfig {
                 id: "alice".into(),
@@ -492,7 +489,8 @@ mod tests {
                 symbols: vec!["ETHUSDT".into()],
                 sla: None,
                 webhook_urls: vec![],
-                api_keys: vec![], report_branding: None,
+                api_keys: vec![],
+                report_branding: None,
             },
         ];
         let err = validate_config(&cfg).unwrap_err().to_string();
@@ -509,7 +507,8 @@ mod tests {
                 symbols: vec!["BTCUSDT".into()],
                 sla: None,
                 webhook_urls: vec![],
-                api_keys: vec![], report_branding: None,
+                api_keys: vec![],
+                report_branding: None,
             },
             mm_common::config::ClientConfig {
                 id: "bob".into(),
@@ -517,7 +516,8 @@ mod tests {
                 symbols: vec!["ETHUSDT".into()],
                 sla: None,
                 webhook_urls: vec![],
-                api_keys: vec![], report_branding: None,
+                api_keys: vec![],
+                report_branding: None,
             },
         ];
         // clients mode — top-level symbols is ignored, but warns
@@ -543,7 +543,8 @@ mod tests {
             symbols: vec!["SOLUSDT".into()],
             sla: None,
             webhook_urls: vec![],
-            api_keys: vec![], report_branding: None,
+            api_keys: vec![],
+            report_branding: None,
         }];
         let eff = cfg.effective_clients();
         assert_eq!(eff.len(), 1);

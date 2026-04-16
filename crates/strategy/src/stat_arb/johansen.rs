@@ -120,10 +120,8 @@ impl JohansenTest {
         let mut indices: Vec<usize> = (0..n).collect();
         indices.sort_by(|&a, &b| eigenvalues[b].partial_cmp(&eigenvalues[a]).unwrap());
         let sorted_evals: Vec<f64> = indices.iter().map(|&i| eigenvalues[i]).collect();
-        let sorted_evecs: Vec<Vec<f64>> = indices
-            .iter()
-            .map(|&i| eigenvectors[i].clone())
-            .collect();
+        let sorted_evecs: Vec<Vec<f64>> =
+            indices.iter().map(|&i| eigenvectors[i].clone()).collect();
         eigenvalues = sorted_evals;
         eigenvectors = sorted_evecs;
 
@@ -213,13 +211,7 @@ fn residualise_against_constant(z: &[Vec<f64>], rows: usize, cols: usize) -> Vec
 }
 
 /// (1/T) · A' · B where A is (T × p) and B is (T × q).
-fn moment_matrix(
-    a: &[Vec<f64>],
-    b: &[Vec<f64>],
-    rows: usize,
-    p: usize,
-    q: usize,
-) -> Vec<Vec<f64>> {
+fn moment_matrix(a: &[Vec<f64>], b: &[Vec<f64>], rows: usize, p: usize, q: usize) -> Vec<Vec<f64>> {
     let _ = q; // both are n×n in our usage
     let mut out = vec![vec![0.0; p]; p];
     for i in 0..p {
@@ -335,9 +327,7 @@ fn eigen_decomp(m: &[Vec<f64>], n: usize) -> Option<(Vec<f64>, Vec<Vec<f64>>)> {
     }
 
     let eigenvalues: Vec<f64> = (0..n).map(|i| a[i][i]).collect();
-    let eigenvectors: Vec<Vec<f64>> = (0..n)
-        .map(|j| (0..n).map(|i| q[i][j]).collect())
-        .collect();
+    let eigenvectors: Vec<Vec<f64>> = (0..n).map(|j| (0..n).map(|i| q[i][j]).collect()).collect();
 
     // Verify all eigenvalues are real (imaginary part would show
     // as large off-diagonal entries that didn't converge).
@@ -597,10 +587,7 @@ mod tests {
     fn trivariate_independent_rank_zero() {
         let (a, b, c) = independent_walks_3(200);
         let result = JohansenTest::run(&[&a, &b, &c]).expect("should return result");
-        assert_eq!(
-            result.rank, 0,
-            "three independent walks should have rank 0"
-        );
+        assert_eq!(result.rank, 0, "three independent walks should have rank 0");
     }
 
     #[test]

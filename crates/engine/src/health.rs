@@ -69,10 +69,7 @@ impl HealthManager {
         // Check venue error rate.
         if self.venue_errors >= self.critical_threshold {
             self.mode = HealthMode::Critical {
-                reason: format!(
-                    "{} consecutive venue errors",
-                    self.venue_errors
-                ),
+                reason: format!("{} consecutive venue errors", self.venue_errors),
             };
             return &self.mode;
         }
@@ -81,19 +78,13 @@ impl HealthManager {
         if let Some(last) = self.last_venue_success {
             if last.elapsed() > self.max_staleness * 3 {
                 self.mode = HealthMode::Critical {
-                    reason: format!(
-                        "no venue response for {}s",
-                        last.elapsed().as_secs()
-                    ),
+                    reason: format!("no venue response for {}s", last.elapsed().as_secs()),
                 };
                 return &self.mode;
             }
             if last.elapsed() > self.max_staleness {
                 self.mode = HealthMode::Degraded {
-                    reason: format!(
-                        "venue data stale for {}s",
-                        last.elapsed().as_secs()
-                    ),
+                    reason: format!("venue data stale for {}s", last.elapsed().as_secs()),
                 };
                 return &self.mode;
             }
@@ -101,10 +92,7 @@ impl HealthManager {
 
         if self.venue_errors >= self.degraded_threshold {
             self.mode = HealthMode::Degraded {
-                reason: format!(
-                    "{} consecutive venue errors",
-                    self.venue_errors
-                ),
+                reason: format!("{} consecutive venue errors", self.venue_errors),
             };
             return &self.mode;
         }

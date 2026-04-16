@@ -763,8 +763,12 @@ impl HawkesTradeFlow {
     /// seconds (monotonic, e.g. from `Instant`).
     pub fn on_trade(&mut self, side: Side, t_secs: Decimal) {
         match side {
-            Side::Buy => { self.hawkes.on_buy(t_secs); }
-            Side::Sell => { self.hawkes.on_sell(t_secs); }
+            Side::Buy => {
+                self.hawkes.on_buy(t_secs);
+            }
+            Side::Sell => {
+                self.hawkes.on_sell(t_secs);
+            }
         }
     }
 

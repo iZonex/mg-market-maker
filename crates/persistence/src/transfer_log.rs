@@ -61,11 +61,7 @@ pub fn append(path: &Path, record: &TransferRecord) -> std::io::Result<()> {
 }
 
 /// Read transfer records within a date range.
-pub fn read_range(
-    path: &Path,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
-) -> Vec<TransferRecord> {
+pub fn read_range(path: &Path, from: DateTime<Utc>, to: DateTime<Utc>) -> Vec<TransferRecord> {
     let Ok(content) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -109,10 +105,7 @@ mod tests {
 
     #[test]
     fn append_and_read() {
-        let p = std::env::temp_dir().join(format!(
-            "mm_test_transfer_{}.jsonl",
-            std::process::id()
-        ));
+        let p = std::env::temp_dir().join(format!("mm_test_transfer_{}.jsonl", std::process::id()));
         let r = sample_record();
         append(&p, &r).unwrap();
 

@@ -441,8 +441,7 @@ impl OrderManager {
                     }
                     // Retry unacknowledged orders individually.
                     for quote in &chunk[ack_count..] {
-                        let outcome =
-                            self.place_one_quote_unack(symbol, quote, connector).await;
+                        let outcome = self.place_one_quote_unack(symbol, quote, connector).await;
                         outcomes.push(outcome);
                     }
                 }
@@ -453,8 +452,9 @@ impl OrderManager {
                         "batch place failed — falling back to per-order placement"
                     );
                     for quote in chunk {
-                        let outcome =
-                            self.place_one_quote_fallback(symbol, quote, connector).await;
+                        let outcome = self
+                            .place_one_quote_fallback(symbol, quote, connector)
+                            .await;
                         outcomes.push(outcome);
                     }
                 }
@@ -544,9 +544,7 @@ impl OrderManager {
             BatchPlaceOutcome::Placed { order_id } => {
                 BatchPlaceOutcome::PlacedFallback { order_id }
             }
-            BatchPlaceOutcome::Failed { reason } => {
-                BatchPlaceOutcome::Unacknowledged { reason }
-            }
+            BatchPlaceOutcome::Failed { reason } => BatchPlaceOutcome::Unacknowledged { reason },
             other => other,
         }
     }
@@ -590,8 +588,7 @@ impl OrderManager {
                         "batch cancel failed — falling back to per-order cancellation"
                     );
                     for order_id in chunk {
-                        let outcome =
-                            self.cancel_one_outcome(symbol, *order_id, connector).await;
+                        let outcome = self.cancel_one_outcome(symbol, *order_id, connector).await;
                         let outcome = match outcome {
                             BatchCancelOutcome::Cancelled => BatchCancelOutcome::CancelledFallback,
                             other => other,

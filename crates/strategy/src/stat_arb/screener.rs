@@ -93,8 +93,24 @@ impl PairScreener {
                 continue;
             }
             // Align to the most recent `n` samples.
-            let y_slice: Vec<Decimal> = y_buf.iter().copied().rev().take(n).collect::<Vec<_>>().into_iter().rev().collect();
-            let x_slice: Vec<Decimal> = x_buf.iter().copied().rev().take(n).collect::<Vec<_>>().into_iter().rev().collect();
+            let y_slice: Vec<Decimal> = y_buf
+                .iter()
+                .copied()
+                .rev()
+                .take(n)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let x_slice: Vec<Decimal> = x_buf
+                .iter()
+                .copied()
+                .rev()
+                .take(n)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
             let coint = EngleGrangerTest::run(&y_slice, &x_slice);
             results.push(ScreenResult {
                 y_symbol: y_sym.clone(),
@@ -120,8 +136,24 @@ impl PairScreener {
                 sample_size: n,
             });
         }
-        let y_slice: Vec<Decimal> = y_buf.iter().copied().rev().take(n).collect::<Vec<_>>().into_iter().rev().collect();
-        let x_slice: Vec<Decimal> = x_buf.iter().copied().rev().take(n).collect::<Vec<_>>().into_iter().rev().collect();
+        let y_slice: Vec<Decimal> = y_buf
+            .iter()
+            .copied()
+            .rev()
+            .take(n)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let x_slice: Vec<Decimal> = x_buf
+            .iter()
+            .copied()
+            .rev()
+            .take(n)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         let coint = EngleGrangerTest::run(&y_slice, &x_slice);
         Some(ScreenResult {
             y_symbol: y_sym.clone(),
@@ -155,9 +187,7 @@ mod tests {
 
     #[test]
     fn screener_detects_cointegrated_pair() {
-        let mut screener = PairScreener::new(vec![
-            ("Y".into(), "X".into()),
-        ]);
+        let mut screener = PairScreener::new(vec![("Y".into(), "X".into())]);
         let innov = lcg_innovations(1234, 200, 3);
         let eps = lcg_innovations(5678, 200, 5);
         let mut x_val = dec!(100);
@@ -176,9 +206,7 @@ mod tests {
 
     #[test]
     fn screener_rejects_independent_walks() {
-        let mut screener = PairScreener::new(vec![
-            ("A".into(), "B".into()),
-        ]);
+        let mut screener = PairScreener::new(vec![("A".into(), "B".into())]);
         let i1 = lcg_innovations(111, 200, 3);
         let i2 = lcg_innovations(222, 200, 3);
         let (mut va, mut vb) = (dec!(100), dec!(50));
@@ -197,9 +225,7 @@ mod tests {
 
     #[test]
     fn screener_skips_insufficient_samples() {
-        let mut screener = PairScreener::new(vec![
-            ("Y".into(), "X".into()),
-        ]);
+        let mut screener = PairScreener::new(vec![("Y".into(), "X".into())]);
         for i in 0..10 {
             screener.push_price("X", Decimal::from(100 + i));
             screener.push_price("Y", Decimal::from(200 + i));
@@ -212,9 +238,7 @@ mod tests {
 
     #[test]
     fn rolling_buffer_caps_at_max() {
-        let mut screener = PairScreener::new(vec![
-            ("A".into(), "B".into()),
-        ]);
+        let mut screener = PairScreener::new(vec![("A".into(), "B".into())]);
         for i in 0..(MAX_PRICE_SAMPLES + 100) {
             screener.push_price("A", Decimal::from(i as u64));
             screener.push_price("B", Decimal::from(i as u64));
@@ -225,10 +249,8 @@ mod tests {
 
     #[test]
     fn multi_pair_screening() {
-        let mut screener = PairScreener::new(vec![
-            ("A".into(), "B".into()),
-            ("C".into(), "D".into()),
-        ]);
+        let mut screener =
+            PairScreener::new(vec![("A".into(), "B".into()), ("C".into(), "D".into())]);
         let innov = lcg_innovations(42, 200, 3);
         let eps = lcg_innovations(99, 200, 5);
         let mut x_val = dec!(100);

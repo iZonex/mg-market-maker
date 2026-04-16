@@ -104,10 +104,7 @@ impl PortfolioRiskManager {
     ///
     /// `factor_deltas` maps factor name → net delta in base units
     /// (e.g. "BTC" → 0.5 means long 0.5 BTC across all symbols).
-    pub fn evaluate(
-        &self,
-        factor_deltas: &HashMap<String, Decimal>,
-    ) -> PortfolioRiskSummary {
+    pub fn evaluate(&self, factor_deltas: &HashMap<String, Decimal>) -> PortfolioRiskSummary {
         let mut actions = Vec::new();
         let mut utilization = HashMap::new();
 
@@ -188,7 +185,13 @@ mod tests {
         let mut deltas = HashMap::new();
         deltas.insert("BTC".into(), dec!(5));
         let summary = mgr.evaluate(&deltas);
-        assert!(summary.actions.iter().all(|a| *a == PortfolioRiskAction::Normal || matches!(a, PortfolioRiskAction::Normal)));
+        assert!(
+            summary
+                .actions
+                .iter()
+                .all(|a| *a == PortfolioRiskAction::Normal
+                    || matches!(a, PortfolioRiskAction::Normal))
+        );
         assert!(summary.actions.is_empty());
     }
 
@@ -288,8 +291,10 @@ mod tests {
         deltas.insert("SOL".into(), dec!(1000)); // not configured
         let summary = mgr.evaluate(&deltas);
         // No factor-specific action; global limit still applies
-        assert!(summary.factor_utilization.is_empty()
-            || !summary.factor_utilization.contains_key("SOL"));
+        assert!(
+            summary.factor_utilization.is_empty()
+                || !summary.factor_utilization.contains_key("SOL")
+        );
     }
 
     #[test]

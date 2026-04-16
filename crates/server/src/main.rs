@@ -740,10 +740,7 @@ fn spawn_event_merger(
 /// conservative default if the venue doesn't support
 /// `get_product_spec` — the fee-tier refresh task will
 /// overwrite these on its first tick.
-async fn product_for_symbol(
-    symbol: &str,
-    connector: &Arc<dyn ExchangeConnector>,
-) -> ProductSpec {
+async fn product_for_symbol(symbol: &str, connector: &Arc<dyn ExchangeConnector>) -> ProductSpec {
     match connector.get_product_spec(symbol).await {
         Ok(spec) => {
             info!(symbol, tick = %spec.tick_size, lot = %spec.lot_size, "loaded product spec from venue");

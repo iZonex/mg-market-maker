@@ -906,10 +906,7 @@ mod tests {
     #[test]
     fn luna_has_worst_drawdown_of_all_scenarios() {
         let reports = run_all_stress(StressRunConfig::defaults_for);
-        let luna = reports
-            .iter()
-            .find(|r| r.scenario == "luna-2022")
-            .unwrap();
+        let luna = reports.iter().find(|r| r.scenario == "luna-2022").unwrap();
         for report in &reports {
             assert!(
                 luna.max_drawdown >= report.max_drawdown,

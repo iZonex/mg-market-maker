@@ -56,7 +56,7 @@ impl SmartOrderRouter {
                 levels.push((effective, venue, qty.min(remaining)));
             }
         }
-        levels.sort_by(|a, b| a.0.cmp(&b.0));
+        levels.sort_by_key(|a| a.0);
 
         for (_, venue, available) in levels {
             if remaining.is_zero() {
@@ -96,7 +96,7 @@ impl SmartOrderRouter {
             }
         }
         // Sort descending (best effective sell price first).
-        levels.sort_by(|a, b| b.0.cmp(&a.0));
+        levels.sort_by_key(|b| std::cmp::Reverse(b.0));
 
         for (_, venue, available) in levels {
             if remaining.is_zero() {

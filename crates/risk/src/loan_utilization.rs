@@ -77,11 +77,7 @@ impl LoanUtilizationTracker {
     /// Compute utilization for a symbol. `current_position` is
     /// the absolute inventory in base asset. Returns `None` if
     /// no active loan exists for the symbol.
-    pub fn utilization_pct(
-        &self,
-        symbol: &str,
-        current_position: Decimal,
-    ) -> Option<Decimal> {
+    pub fn utilization_pct(&self, symbol: &str, current_position: Decimal) -> Option<Decimal> {
         let agreement = self
             .agreements
             .values()
@@ -94,10 +90,7 @@ impl LoanUtilizationTracker {
 
     /// Check all loans for utilization alerts. Returns alerts
     /// for loans where utilization exceeds the threshold.
-    pub fn check_alerts(
-        &self,
-        positions: &HashMap<String, Decimal>,
-    ) -> Vec<UtilizationAlert> {
+    pub fn check_alerts(&self, positions: &HashMap<String, Decimal>) -> Vec<UtilizationAlert> {
         let mut alerts = Vec::new();
         for agreement in self.agreements.values() {
             if agreement.status == LoanStatus::Returned {
@@ -183,11 +176,7 @@ impl LoanUtilizationTracker {
     }
 
     /// Mark a specific installment as completed.
-    pub fn mark_return_completed(
-        &mut self,
-        loan_id: &str,
-        installment_idx: usize,
-    ) -> bool {
+    pub fn mark_return_completed(&mut self, loan_id: &str, installment_idx: usize) -> bool {
         if let Some(agreement) = self.agreements.get_mut(loan_id) {
             agreement.complete_installment(installment_idx)
         } else {
@@ -201,7 +190,12 @@ mod tests {
     use super::*;
     use mm_persistence::loan::{LoanTerms, ReturnInstallment, ReturnSchedule};
 
-    fn make_agreement(id: &str, symbol: &str, qty: Decimal, due_days_from_now: i64) -> LoanAgreement {
+    fn make_agreement(
+        id: &str,
+        symbol: &str,
+        qty: Decimal,
+        due_days_from_now: i64,
+    ) -> LoanAgreement {
         let today = Utc::now().date_naive();
         LoanAgreement {
             id: id.into(),

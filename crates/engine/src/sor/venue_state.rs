@@ -168,12 +168,7 @@ impl VenueStateAggregator {
     /// from the engine's P1.2 fee-tier refresh task when
     /// the venue returns updated maker/taker fees. No-op
     /// if the venue is not registered. Stage-2 auto-refresh.
-    pub fn update_fees(
-        &mut self,
-        venue: VenueId,
-        maker_fee: Decimal,
-        taker_fee: Decimal,
-    ) {
+    pub fn update_fees(&mut self, venue: VenueId, maker_fee: Decimal, taker_fee: Decimal) {
         if let Some(seed) = self.seeds.get_mut(&venue) {
             seed.product.maker_fee = maker_fee;
             seed.product.taker_fee = taker_fee;

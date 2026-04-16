@@ -625,8 +625,7 @@ mod tests {
         assert!(
             result.is_cointegrated,
             "AIC ADF should detect cointegration: ADF={} crit={}",
-            result.adf_statistic,
-            result.critical_value_5pct
+            result.adf_statistic, result.critical_value_5pct
         );
     }
 
@@ -658,11 +657,7 @@ mod tests {
         let (y, x) = cointegrated_pair(200);
         for lag in [1, 2, 4, 8] {
             let r = EngleGrangerTest::run_with_lag(&y, &x, lag);
-            assert!(
-                r.is_some(),
-                "lag={} should produce a result",
-                lag
-            );
+            assert!(r.is_some(), "lag={} should produce a result", lag);
             let r = r.unwrap();
             assert!(
                 r.adf_statistic != Decimal::ZERO || lag == 0,

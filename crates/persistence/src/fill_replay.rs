@@ -190,9 +190,17 @@ mod tests {
     fn replay_ignores_non_fill_events() {
         let p = tmp_path("non_fill");
         let mut f = std::fs::File::create(&p).unwrap();
-        writeln!(f, r#"{{"seq":1,"event_type":"engine_started","symbol":"BTCUSDT"}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"seq":1,"event_type":"engine_started","symbol":"BTCUSDT"}}"#
+        )
+        .unwrap();
         write_audit_line(&mut f, "Buy", "50000", "1");
-        writeln!(f, r#"{{"seq":3,"event_type":"order_cancelled","symbol":"BTCUSDT"}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"seq":3,"event_type":"order_cancelled","symbol":"BTCUSDT"}}"#
+        )
+        .unwrap();
         drop(f);
 
         let result = replay_fills_from_audit(&p).unwrap();

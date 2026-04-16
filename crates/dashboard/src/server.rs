@@ -125,7 +125,10 @@ async fn health() -> &'static str {
 /// startup before the first book snapshot lands.
 async fn readiness(State(state): State<DashboardState>) -> axum::http::StatusCode {
     let symbols = state.get_all();
-    if symbols.iter().any(|s| s.mid_price > rust_decimal::Decimal::ZERO) {
+    if symbols
+        .iter()
+        .any(|s| s.mid_price > rust_decimal::Decimal::ZERO)
+    {
         axum::http::StatusCode::OK
     } else {
         axum::http::StatusCode::SERVICE_UNAVAILABLE
@@ -338,9 +341,7 @@ struct WebhookListResponse {
     events_failed: u64,
 }
 
-async fn admin_list_webhooks(
-    State(state): State<DashboardState>,
-) -> Json<WebhookListResponse> {
+async fn admin_list_webhooks(State(state): State<DashboardState>) -> Json<WebhookListResponse> {
     let wh = state.webhook_dispatcher();
     Json(match wh {
         Some(w) => WebhookListResponse {
@@ -400,18 +401,14 @@ struct AlertCheckResponse {
     triggered: Vec<(String, String)>,
 }
 
-async fn admin_check_alerts(
-    State(state): State<DashboardState>,
-) -> Json<AlertCheckResponse> {
+async fn admin_check_alerts(State(state): State<DashboardState>) -> Json<AlertCheckResponse> {
     Json(AlertCheckResponse {
         triggered: state.check_alert_rules(),
     })
 }
 
 /// List all active symbols with their current state summary.
-async fn admin_list_symbols(
-    State(state): State<DashboardState>,
-) -> Json<Vec<serde_json::Value>> {
+async fn admin_list_symbols(State(state): State<DashboardState>) -> Json<Vec<serde_json::Value>> {
     let symbols = state.get_all();
     let config_syms = state.config_symbols();
     Json(
@@ -487,8 +484,7 @@ async fn admin_create_loan(
         .installments
         .iter()
         .map(|i| {
-            let due = chrono::NaiveDate::parse_from_str(&i.due_date, "%Y-%m-%d")
-                .unwrap_or(end);
+            let due = chrono::NaiveDate::parse_from_str(&i.due_date, "%Y-%m-%d").unwrap_or(end);
             mm_persistence::loan::ReturnInstallment {
                 due_date: due,
                 qty: i.qty,

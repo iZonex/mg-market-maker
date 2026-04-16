@@ -196,8 +196,7 @@ impl LoanStore {
             .create(true)
             .append(true)
             .open(path)?;
-        let json = serde_json::to_string(agreement)
-            .map_err(std::io::Error::other)?;
+        let json = serde_json::to_string(agreement).map_err(std::io::Error::other)?;
         writeln!(file, "{}", json)?;
         info!(id = %agreement.id, symbol = %agreement.symbol, "loan agreement persisted");
         Ok(())
@@ -212,8 +211,7 @@ impl LoanStore {
         {
             let mut file = std::fs::File::create(&tmp)?;
             for agreement in agreements {
-                let json = serde_json::to_string(agreement)
-                    .map_err(std::io::Error::other)?;
+                let json = serde_json::to_string(agreement).map_err(std::io::Error::other)?;
                 writeln!(file, "{}", json)?;
             }
             file.flush()?;
@@ -349,8 +347,14 @@ mod tests {
         let mut a = sample_agreement();
         let future = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
         a.check_overdue(future);
-        assert_eq!(a.schedule.installments[0].status, InstallmentStatus::Overdue);
-        assert_eq!(a.schedule.installments[1].status, InstallmentStatus::Pending);
+        assert_eq!(
+            a.schedule.installments[0].status,
+            InstallmentStatus::Overdue
+        );
+        assert_eq!(
+            a.schedule.installments[1].status,
+            InstallmentStatus::Pending
+        );
     }
 
     #[test]

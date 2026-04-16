@@ -546,9 +546,7 @@ impl ExchangeConnector for BinanceConnector {
         address: &str,
         network: &str,
     ) -> anyhow::Result<String> {
-        let params = format!(
-            "coin={asset}&amount={qty}&address={address}&network={network}"
-        );
+        let params = format!("coin={asset}&amount={qty}&address={address}&network={network}");
         let resp = self
             .signed_post("/sapi/v1/capital/withdraw/apply", &params)
             .await?;
@@ -568,12 +566,8 @@ impl ExchangeConnector for BinanceConnector {
         to_wallet: &str,
     ) -> anyhow::Result<String> {
         let transfer_type = binance_transfer_type(from_wallet, to_wallet)?;
-        let params = format!(
-            "type={transfer_type}&asset={asset}&amount={qty}"
-        );
-        let resp = self
-            .signed_post("/sapi/v1/asset/transfer", &params)
-            .await?;
+        let params = format!("type={transfer_type}&asset={asset}&amount={qty}");
+        let resp = self.signed_post("/sapi/v1/asset/transfer", &params).await?;
         resp.get("tranId")
             .map(|v| v.to_string())
             .ok_or_else(|| anyhow::anyhow!("missing tranId in response"))

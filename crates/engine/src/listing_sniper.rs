@@ -275,8 +275,7 @@ impl ListingSniperRunner {
                                 }
                             }
                             ListingEvent::Removed { venue, symbol } => {
-                                let detail =
-                                    format!("venue={venue:?} symbol={symbol}");
+                                let detail = format!("venue={venue:?} symbol={symbol}");
                                 info!(%detail, "listing removed");
                                 self.audit.risk_event(
                                     symbol,
@@ -615,17 +614,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mm_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).ok();
         let audit_path = dir.join("audit_runner.jsonl");
-        let audit = Arc::new(
-            mm_risk::audit::AuditLog::new(&audit_path).unwrap(),
-        );
+        let audit = Arc::new(mm_risk::audit::AuditLog::new(&audit_path).unwrap());
 
-        let mut runner = ListingSniperRunner::new(
-            vec![connector.clone()],
-            audit.clone(),
-            None,
-            60,
-            true,
-        );
+        let mut runner =
+            ListingSniperRunner::new(vec![connector.clone()], audit.clone(), None, 60, true);
         // First scan seeds.
         runner.scan_all_venues().await;
 
@@ -650,17 +642,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mm_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).ok();
         let audit_path = dir.join("audit_runner.jsonl");
-        let audit = Arc::new(
-            mm_risk::audit::AuditLog::new(&audit_path).unwrap(),
-        );
+        let audit = Arc::new(mm_risk::audit::AuditLog::new(&audit_path).unwrap());
 
-        let mut runner = ListingSniperRunner::new(
-            vec![connector.clone()],
-            audit,
-            None,
-            60,
-            false,
-        );
+        let mut runner = ListingSniperRunner::new(vec![connector.clone()], audit, None, 60, false);
         runner.scan_all_venues().await; // seed
 
         // Now inject an error.
@@ -682,17 +666,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mm_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).ok();
         let audit_path = dir.join("audit_runner.jsonl");
-        let audit = Arc::new(
-            mm_risk::audit::AuditLog::new(&audit_path).unwrap(),
-        );
+        let audit = Arc::new(mm_risk::audit::AuditLog::new(&audit_path).unwrap());
 
-        let mut runner = ListingSniperRunner::new(
-            vec![connector.clone()],
-            audit,
-            None,
-            60,
-            true,
-        );
+        let mut runner = ListingSniperRunner::new(vec![connector.clone()], audit, None, 60, true);
         runner.scan_all_venues().await; // seed
 
         // Remove ETHUSDT.

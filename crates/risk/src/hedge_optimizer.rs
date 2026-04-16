@@ -348,12 +348,8 @@ impl FactorCovarianceEstimator {
     /// zero variance or too few samples.
     pub fn correlation(&self, factor_a: &str, factor_b: &str) -> Option<Decimal> {
         let cov = self.covariance(factor_a, factor_b)?;
-        let var_a = self.sample_variance(
-            self.factors.iter().position(|f| f == factor_a)?,
-        )?;
-        let var_b = self.sample_variance(
-            self.factors.iter().position(|f| f == factor_b)?,
-        )?;
+        let var_a = self.sample_variance(self.factors.iter().position(|f| f == factor_a)?)?;
+        let var_b = self.sample_variance(self.factors.iter().position(|f| f == factor_b)?)?;
         if var_a.is_zero() || var_b.is_zero() {
             return None;
         }
@@ -414,7 +410,10 @@ impl FactorCovarianceEstimator {
         let n = buf.len();
         let n_dec = Decimal::from(n as u64);
         let mean: Decimal = buf.iter().sum::<Decimal>() / n_dec;
-        let var: Decimal = buf.iter().map(|x| (*x - mean) * (*x - mean)).sum::<Decimal>()
+        let var: Decimal = buf
+            .iter()
+            .map(|x| (*x - mean) * (*x - mean))
+            .sum::<Decimal>()
             / Decimal::from((n - 1) as u64);
         Some(var)
     }
@@ -739,11 +738,7 @@ mod tests {
         let exposure = vec![("BTC".into(), dec!(10)), ("ETH".into(), dec!(5))];
         // ETH hedge: -5. Cross-beta: -5 * 0.3 = -1.5 on BTC.
         // BTC residual: 10 + (-5 * 0.3) = 8.5 → BTC-PERP = -8.5.
-        let basket = opt.optimize(
-            &exposure,
-            &[eth_cross, btc_perp()],
-            &default_variances(),
-        );
+        let basket = opt.optimize(&exposure, &[eth_cross, btc_perp()], &default_variances());
         let btc = basket
             .entries
             .iter()
@@ -757,14 +752,18 @@ mod tests {
     fn empty_cross_betas_matches_diagonal() {
         let opt = HedgeOptimizer::new(dec!(0));
         let exposure = vec![("BTC".into(), dec!(1)), ("ETH".into(), dec!(-2))];
-        let basket = opt.optimize(
-            &exposure,
-            &[btc_perp(), eth_perp()],
-            &default_variances(),
-        );
-        let btc = basket.entries.iter().find(|(s, _)| s == "BTC-PERP").unwrap();
+        let basket = opt.optimize(&exposure, &[btc_perp(), eth_perp()], &default_variances());
+        let btc = basket
+            .entries
+            .iter()
+            .find(|(s, _)| s == "BTC-PERP")
+            .unwrap();
         assert_eq!(btc.1, dec!(-1));
-        let eth = basket.entries.iter().find(|(s, _)| s == "ETH-PERP").unwrap();
+        let eth = basket
+            .entries
+            .iter()
+            .find(|(s, _)| s == "ETH-PERP")
+            .unwrap();
         assert_eq!(eth.1, dec!(2));
     }
 
@@ -772,10 +771,7 @@ mod tests {
 
     #[test]
     fn covariance_estimator_diagonal_variances() {
-        let mut est = FactorCovarianceEstimator::new(
-            vec!["BTC".into(), "ETH".into()],
-            100,
-        );
+        let mut est = FactorCovarianceEstimator::new(vec!["BTC".into(), "ETH".into()], 100);
         // Push identical returns → variance should be ~0.
         for _ in 0..50 {
             est.push_return("BTC", dec!(0.01));
@@ -788,10 +784,7 @@ mod tests {
 
     #[test]
     fn covariance_estimator_positive_correlation() {
-        let mut est = FactorCovarianceEstimator::new(
-            vec!["BTC".into(), "ETH".into()],
-            100,
-        );
+        let mut est = FactorCovarianceEstimator::new(vec!["BTC".into(), "ETH".into()], 100);
         // Perfectly correlated: BTC and ETH move together.
         for i in 0..50 {
             let r = if i % 2 == 0 { dec!(0.01) } else { dec!(-0.01) };
@@ -808,10 +801,7 @@ mod tests {
 
     #[test]
     fn covariance_estimator_negative_correlation() {
-        let mut est = FactorCovarianceEstimator::new(
-            vec!["A".into(), "B".into()],
-            100,
-        );
+        let mut est = FactorCovarianceEstimator::new(vec!["A".into(), "B".into()], 100);
         // Anti-correlated: A and B move in opposite directions.
         for i in 0..50 {
             let r = if i % 2 == 0 { dec!(0.01) } else { dec!(-0.01) };
@@ -828,20 +818,14 @@ mod tests {
 
     #[test]
     fn covariance_estimator_unknown_factor_is_noop() {
-        let mut est = FactorCovarianceEstimator::new(
-            vec!["BTC".into()],
-            100,
-        );
+        let mut est = FactorCovarianceEstimator::new(vec!["BTC".into()], 100);
         est.push_return("UNKNOWN", dec!(0.01));
         assert_eq!(est.sample_count("UNKNOWN"), 0);
     }
 
     #[test]
     fn covariance_estimator_rolling_window_caps() {
-        let mut est = FactorCovarianceEstimator::new(
-            vec!["BTC".into()],
-            50,
-        );
+        let mut est = FactorCovarianceEstimator::new(vec!["BTC".into()], 50);
         for i in 0..100 {
             est.push_return("BTC", Decimal::from(i));
         }
@@ -882,9 +866,15 @@ mod tests {
         // 3 factors → 3 unique pairs
         assert_eq!(matrix.len(), 3);
         // BTC-ETH should be positive, BTC-SOL should be negative
-        let btc_eth = matrix.iter().find(|(a, b, _)| a == "BTC" && b == "ETH").unwrap();
+        let btc_eth = matrix
+            .iter()
+            .find(|(a, b, _)| a == "BTC" && b == "ETH")
+            .unwrap();
         assert!(btc_eth.2 > dec!(0.9));
-        let btc_sol = matrix.iter().find(|(a, b, _)| a == "BTC" && b == "SOL").unwrap();
+        let btc_sol = matrix
+            .iter()
+            .find(|(a, b, _)| a == "BTC" && b == "SOL")
+            .unwrap();
         assert!(btc_sol.2 < dec!(-0.9));
     }
 }

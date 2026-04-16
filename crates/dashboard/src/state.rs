@@ -332,10 +332,7 @@ impl DashboardState {
     /// from the resolved `effective_clients()` list.
     pub fn register_client(&self, client_id: &str, symbols: &[String]) {
         let mut inner = self.inner.write().unwrap();
-        inner
-            .clients
-            .entry(client_id.to_string())
-            .or_default();
+        inner.clients.entry(client_id.to_string()).or_default();
         for sym in symbols {
             inner
                 .symbol_to_client
@@ -590,11 +587,7 @@ impl DashboardState {
 
     /// Dispatch a webhook event, routing to the correct client
     /// based on the symbol in the event.
-    pub fn dispatch_webhook_for_symbol(
-        &self,
-        symbol: &str,
-        event: crate::webhooks::WebhookEvent,
-    ) {
+    pub fn dispatch_webhook_for_symbol(&self, symbol: &str, event: crate::webhooks::WebhookEvent) {
         let inner = self.inner.read().unwrap();
         let client_id = Self::client_for_symbol(&inner, symbol);
         if let Some(client) = inner.clients.get(&client_id) {
@@ -609,10 +602,7 @@ impl DashboardState {
     /// Push a PnL sample for a symbol's time-series.
     pub fn push_pnl_sample(&self, symbol: &str, timestamp_ms: i64, total_pnl: Decimal) {
         let mut inner = self.inner.write().unwrap();
-        let ts = inner
-            .pnl_timeseries
-            .entry(symbol.to_string())
-            .or_default();
+        let ts = inner.pnl_timeseries.entry(symbol.to_string()).or_default();
         ts.push_back((timestamp_ms, total_pnl));
         while ts.len() > MAX_PNL_TIMESERIES {
             ts.pop_front();
@@ -717,7 +707,12 @@ impl DashboardState {
 
     /// Get a loan agreement by ID.
     pub fn get_loan_agreement(&self, loan_id: &str) -> Option<mm_persistence::loan::LoanAgreement> {
-        self.inner.read().unwrap().loan_agreements.get(loan_id).cloned()
+        self.inner
+            .read()
+            .unwrap()
+            .loan_agreements
+            .get(loan_id)
+            .cloned()
     }
 
     /// Get loan agreement for a symbol.
@@ -902,9 +897,7 @@ impl DashboardState {
         let mut inner = self.inner.write().unwrap();
         let client_id = Self::client_for_symbol(&inner, symbol);
         let client = inner.clients.entry(client_id).or_default();
-        client
-            .config_overrides
-            .insert(symbol.to_string(), tx);
+        client.config_overrides.insert(symbol.to_string(), tx);
     }
 
     /// Send a config override to a specific symbol's engine.
@@ -981,11 +974,7 @@ impl DashboardState {
     }
 
     /// Get recent fills for a specific client.
-    pub fn get_client_fills(
-        &self,
-        client_id: &str,
-        limit: usize,
-    ) -> Vec<FillRecord> {
+    pub fn get_client_fills(&self, client_id: &str, limit: usize) -> Vec<FillRecord> {
         let inner = self.inner.read().unwrap();
         inner
             .clients

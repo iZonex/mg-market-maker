@@ -42,7 +42,10 @@ pub fn client_routes() -> Router<DashboardState> {
         .route("/api/v1/system/preflight", get(get_system_preflight))
         .route("/api/v1/loans", get(get_loans))
         .route("/api/v1/loans/{symbol}", get(get_loan_by_symbol))
-        .route("/api/v1/portfolio/correlation", get(get_portfolio_correlation))
+        .route(
+            "/api/v1/portfolio/correlation",
+            get(get_portfolio_correlation),
+        )
         .route("/api/v1/portfolio/risk", get(get_portfolio_risk))
         .route("/api/v1/client/{id}/sla", get(get_client_sla))
         .route(
@@ -527,7 +530,8 @@ async fn get_risk_summary(State(state): State<DashboardState>) -> Json<Vec<RiskS
                 inventory: s.inventory,
                 inventory_value: s.inventory_value,
                 max_inventory_pct: if s.mid_price > Decimal::ZERO {
-                    s.inventory.abs() * s.mid_price / s.inventory_value.abs().max(dec!(1)) * dec!(100)
+                    s.inventory.abs() * s.mid_price / s.inventory_value.abs().max(dec!(1))
+                        * dec!(100)
                 } else {
                     Decimal::ZERO
                 },
@@ -716,9 +720,7 @@ struct AuditQuery {
     event_type: Option<String>,
 }
 
-async fn get_audit_recent(
-    Query(query): Query<AuditQuery>,
-) -> Json<Vec<serde_json::Value>> {
+async fn get_audit_recent(Query(query): Query<AuditQuery>) -> Json<Vec<serde_json::Value>> {
     let limit = query.limit.unwrap_or(100).min(500);
     let path = std::path::Path::new("data/audit.jsonl");
     let content = match std::fs::read_to_string(path) {
@@ -750,9 +752,7 @@ async fn get_audit_recent(
 }
 
 /// List available historical report dates.
-async fn get_report_history(
-    State(state): State<DashboardState>,
-) -> Json<Vec<String>> {
+async fn get_report_history(State(state): State<DashboardState>) -> Json<Vec<String>> {
     Json(state.available_report_dates())
 }
 
@@ -830,24 +830,14 @@ async fn get_client_sla(
         .collect();
 
     let count = Decimal::from(symbol_slas.len().max(1));
-    let avg_presence = symbol_slas
-        .iter()
-        .map(|s| s.presence_pct)
-        .sum::<Decimal>()
-        / count;
-    let avg_two_sided = symbol_slas
-        .iter()
-        .map(|s| s.two_sided_pct)
-        .sum::<Decimal>()
-        / count;
+    let avg_presence = symbol_slas.iter().map(|s| s.presence_pct).sum::<Decimal>() / count;
+    let avg_two_sided = symbol_slas.iter().map(|s| s.two_sided_pct).sum::<Decimal>() / count;
     let min_presence = symbol_slas
         .iter()
         .map(|s| s.presence_pct)
         .min()
         .unwrap_or(dec!(100));
-    let is_compliant = symbol_slas
-        .iter()
-        .all(|s| s.presence_pct >= dec!(95));
+    let is_compliant = symbol_slas.iter().all(|s| s.presence_pct >= dec!(95));
 
     Json(ClientSlaSummary {
         client_id,
@@ -957,11 +947,7 @@ async fn get_client_sla_certificate(
         .collect();
 
     let count = Decimal::from(symbol_slas.len().max(1));
-    let avg_presence = symbol_slas
-        .iter()
-        .map(|s| s.presence_pct)
-        .sum::<Decimal>()
-        / count;
+    let avg_presence = symbol_slas.iter().map(|s| s.presence_pct).sum::<Decimal>() / count;
     let min_presence = symbol_slas
         .iter()
         .map(|s| s.presence_pct)
@@ -1002,9 +988,7 @@ struct PreflightHealth {
     total_pnl: Decimal,
 }
 
-async fn get_system_preflight(
-    State(state): State<DashboardState>,
-) -> Json<PreflightHealth> {
+async fn get_system_preflight(State(state): State<DashboardState>) -> Json<PreflightHealth> {
     let symbols = state.get_all();
     let max_kill = symbols.iter().map(|s| s.kill_level).max().unwrap_or(0);
     let any_kill = max_kill > 0;

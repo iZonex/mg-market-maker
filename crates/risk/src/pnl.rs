@@ -32,7 +32,8 @@ pub struct PnlAttribution {
 impl PnlAttribution {
     pub fn total_pnl(&self) -> Decimal {
         self.spread_pnl + self.inventory_pnl + self.rebate_income
-            - self.fees_paid - self.loan_cost_amortized
+            - self.fees_paid
+            - self.loan_cost_amortized
     }
 
     /// PnL per unit of volume traded (efficiency metric).

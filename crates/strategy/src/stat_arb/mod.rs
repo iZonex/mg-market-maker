@@ -21,13 +21,13 @@ pub mod screener;
 pub mod signal;
 
 pub use cointegration::{
-    CointegrationResult, EngleGrangerTest, MacKinnonLevel, mackinnon_critical_value,
+    mackinnon_critical_value, CointegrationResult, EngleGrangerTest, MacKinnonLevel,
 };
 pub use driver::{
     ExitLegs, LegDispatchReport, LegOutcome, NullStatArbSink, StatArbDriver, StatArbDriverConfig,
     StatArbEvent, StatArbEventSink, StatArbPair, StatArbPosition,
 };
 pub use johansen::{JohansenResult, JohansenTest};
-pub use screener::{PairScreener, ScreenResult};
 pub use kalman::KalmanHedgeRatio;
+pub use screener::{PairScreener, ScreenResult};
 pub use signal::{SignalAction, SpreadDirection, ZScoreConfig, ZScoreSignal};

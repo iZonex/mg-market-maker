@@ -379,7 +379,8 @@ mod tests {
             var_guard_limit_95: None,
             var_guard_limit_99: None,
             var_guard_ewma_lambda: None,
-            cross_venue_basis_max_staleness_ms: 1500, sor_inline_enabled: false,
+            cross_venue_basis_max_staleness_ms: 1500,
+            sor_inline_enabled: false,
         };
         let mut book = LocalOrderBook::new("BTCUSDT".into());
         book.apply_snapshot(
@@ -460,7 +461,8 @@ mod tests {
             var_guard_limit_95: None,
             var_guard_limit_99: None,
             var_guard_ewma_lambda: None,
-            cross_venue_basis_max_staleness_ms: 1500, sor_inline_enabled: false,
+            cross_venue_basis_max_staleness_ms: 1500,
+            sor_inline_enabled: false,
         };
         let mut book = LocalOrderBook::new("BTCUSDT".into());
         book.apply_snapshot(
@@ -604,7 +606,8 @@ mod tests {
             var_guard_limit_95: None,
             var_guard_limit_99: None,
             var_guard_ewma_lambda: None,
-            cross_venue_basis_max_staleness_ms: 1500, sor_inline_enabled: false,
+            cross_venue_basis_max_staleness_ms: 1500,
+            sor_inline_enabled: false,
         };
         let mut book = LocalOrderBook::new("BTCUSDT".into());
         book.apply_snapshot(

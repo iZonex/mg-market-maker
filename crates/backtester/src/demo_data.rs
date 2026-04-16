@@ -141,7 +141,9 @@ pub fn generate_demo_events(
 
 // Simple LCG for deterministic pseudo-random numbers.
 fn lcg_uniform(state: u64) -> (f64, u64) {
-    let next = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let next = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     let val = (next >> 33) as f64 / (1u64 << 31) as f64;
     (val, next)
 }

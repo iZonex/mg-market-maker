@@ -342,9 +342,7 @@ impl VarGuard {
         let sample_sigma = decimal_sqrt(sample_variance);
 
         // Conservative σ: max(sample, ewma) when EWMA is available.
-        let ewma_var = ewma_state
-            .filter(|s| s.initialised)
-            .map(|s| s.variance);
+        let ewma_var = ewma_state.filter(|s| s.initialised).map(|s| s.variance);
         let effective_sigma = match ewma_var {
             Some(ev) => {
                 let ewma_sigma = decimal_sqrt(ev);

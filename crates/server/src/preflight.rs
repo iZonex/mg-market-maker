@@ -142,7 +142,10 @@ pub async fn run_preflight(
         results.push(CheckResult {
             name: "config_gamma".into(),
             status: CheckStatus::Warn,
-            message: format!("gamma={} is very high — spread will be extremely wide", mm.gamma),
+            message: format!(
+                "gamma={} is very high — spread will be extremely wide",
+                mm.gamma
+            ),
         });
     }
     if mm.order_size <= Decimal::ZERO {
@@ -164,9 +167,18 @@ pub async fn run_preflight(
     }
 
     // Report.
-    let fails = results.iter().filter(|r| r.status == CheckStatus::Fail).count();
-    let warns = results.iter().filter(|r| r.status == CheckStatus::Warn).count();
-    let passes = results.iter().filter(|r| r.status == CheckStatus::Pass).count();
+    let fails = results
+        .iter()
+        .filter(|r| r.status == CheckStatus::Fail)
+        .count();
+    let warns = results
+        .iter()
+        .filter(|r| r.status == CheckStatus::Warn)
+        .count();
+    let passes = results
+        .iter()
+        .filter(|r| r.status == CheckStatus::Pass)
+        .count();
 
     for r in &results {
         match r.status {
@@ -176,12 +188,7 @@ pub async fn run_preflight(
         }
     }
 
-    info!(
-        passes,
-        warns,
-        fails,
-        "preflight complete"
-    );
+    info!(passes, warns, fails, "preflight complete");
 
     if fails > 0 && config.mode == "live" {
         anyhow::bail!(

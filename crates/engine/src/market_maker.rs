@@ -375,7 +375,8 @@ pub struct MarketMakerEngine {
     /// overrides through the corresponding sender registered
     /// in `DashboardState`. The engine applies them on the
     /// next select-loop iteration.
-    config_override_rx: Option<tokio::sync::mpsc::UnboundedReceiver<mm_dashboard::state::ConfigOverride>>,
+    config_override_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<mm_dashboard::state::ConfigOverride>>,
 }
 
 impl MarketMakerEngine {
@@ -1538,12 +1539,7 @@ impl MarketMakerEngine {
         let internal_ids: std::collections::HashSet<_> =
             self.order_manager.live_order_ids().into_iter().collect();
 
-        match self
-            .connectors
-            .primary
-            .get_open_orders(&self.symbol)
-            .await
-        {
+        match self.connectors.primary.get_open_orders(&self.symbol).await {
             Ok(venue_orders) => {
                 let venue_ids: std::collections::HashSet<_> =
                     venue_orders.iter().map(|o| o.order_id).collect();
@@ -1838,7 +1834,12 @@ impl MarketMakerEngine {
         // Record market data for offline backtesting.
         if let Some(recorder) = &mut self.event_recorder {
             match &event {
-                MarketEvent::BookSnapshot { bids, asks, sequence, .. } => {
+                MarketEvent::BookSnapshot {
+                    bids,
+                    asks,
+                    sequence,
+                    ..
+                } => {
                     let _ = recorder.record(&mm_backtester::data::RecordedEvent::BookSnapshot {
                         timestamp: chrono::Utc::now(),
                         bids: bids.clone(),
@@ -2021,16 +2022,8 @@ impl MarketMakerEngine {
 
                     // NBBO capture + dashboard fill recording.
                     if let Some(ds) = &self.dashboard {
-                        let nbbo_bid = self
-                            .book_keeper
-                            .book
-                            .best_bid()
-                            .unwrap_or(mid);
-                        let nbbo_ask = self
-                            .book_keeper
-                            .book
-                            .best_ask()
-                            .unwrap_or(mid);
+                        let nbbo_bid = self.book_keeper.book.best_bid().unwrap_or(mid);
+                        let nbbo_ask = self.book_keeper.book.best_ask().unwrap_or(mid);
                         let slippage_bps = if mid > Decimal::ZERO {
                             match fill.side {
                                 mm_common::types::Side::Buy => {
@@ -2369,26 +2362,24 @@ impl MarketMakerEngine {
         }
 
         // Auto-tune.
-        let (mut eff_gamma, mut eff_size, mut eff_spread) =
-            if self.config.toxicity.autotune_enabled {
-                (
-                    self.config.market_maker.gamma
-                        * self.auto_tuner.effective_gamma_mult()
-                        * ks_spread,
-                    self.config.market_maker.order_size
-                        * self.auto_tuner.effective_size_mult()
-                        * ks_size,
-                    self.config.market_maker.min_spread_bps
-                        * self.auto_tuner.effective_spread_mult()
-                        * ks_spread,
-                )
-            } else {
-                (
-                    self.config.market_maker.gamma * ks_spread,
-                    self.config.market_maker.order_size * ks_size,
-                    self.config.market_maker.min_spread_bps * ks_spread,
-                )
-            };
+        let (mut eff_gamma, mut eff_size, mut eff_spread) = if self.config.toxicity.autotune_enabled
+        {
+            (
+                self.config.market_maker.gamma * self.auto_tuner.effective_gamma_mult() * ks_spread,
+                self.config.market_maker.order_size
+                    * self.auto_tuner.effective_size_mult()
+                    * ks_size,
+                self.config.market_maker.min_spread_bps
+                    * self.auto_tuner.effective_spread_mult()
+                    * ks_spread,
+            )
+        } else {
+            (
+                self.config.market_maker.gamma * ks_spread,
+                self.config.market_maker.order_size * ks_size,
+                self.config.market_maker.min_spread_bps * ks_spread,
+            )
+        };
 
         // A/B split — apply variant multipliers if active.
         if let Some(ab) = &mut self.ab_split {

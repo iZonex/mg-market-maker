@@ -219,12 +219,7 @@ impl BivariateHawkes {
         }
     }
 
-    fn decayed_kernel(
-        &self,
-        kernel: Decimal,
-        last_time: Option<Decimal>,
-        t: Decimal,
-    ) -> Decimal {
+    fn decayed_kernel(&self, kernel: Decimal, last_time: Option<Decimal>, t: Decimal) -> Decimal {
         match last_time {
             None => Decimal::ZERO,
             Some(prev) => {
@@ -258,8 +253,7 @@ fn exp_neg(x: Decimal) -> Decimal {
     let x4 = x3 * x;
     let x5 = x4 * x;
     let x6 = x5 * x;
-    let result = Decimal::ONE - x + x2 / dec!(2) - x3 / dec!(6) + x4 / dec!(24)
-        - x5 / dec!(120)
+    let result = Decimal::ONE - x + x2 / dec!(2) - x3 / dec!(6) + x4 / dec!(24) - x5 / dec!(120)
         + x6 / dec!(720);
     result.max(Decimal::ZERO) // clamp negative residuals
 }

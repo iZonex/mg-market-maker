@@ -78,10 +78,7 @@ impl Rebalancer {
         // Group by asset.
         let mut by_asset: HashMap<String, Vec<&VenueBalance>> = HashMap::new();
         for b in balances {
-            by_asset
-                .entry(b.asset.clone())
-                .or_default()
-                .push(b);
+            by_asset.entry(b.asset.clone()).or_default().push(b);
         }
 
         let mut recs = Vec::new();
