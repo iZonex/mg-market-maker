@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Production hardening: covariance estimator wiring + safe
+  mid-price access** (Apr 2026).
+  - Wire `FactorCovarianceEstimator` into engine: per-tick
+    mid-price returns feed the rolling estimator, replacing the
+    v1 constant-1.0 `factor_variances()` stub. Hedge optimizer
+    now uses real rolling variance.
+  - Safe mid-price: replace `unwrap()` on `book.mid_price()`
+    with `let Some(mid) = ... else { return Ok(()) }` to
+    prevent panics on empty books after flash crashes.
+
 - **Epic F stage-2 — Cartea-Jaimungal Poisson jump intensity
   for news retreat** (Apr 2026). `NewsJumpIntensity` models
   news arrival as a self-exciting point process with per-class

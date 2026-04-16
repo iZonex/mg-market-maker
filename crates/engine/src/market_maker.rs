@@ -16,7 +16,7 @@ use mm_risk::audit::{AuditEventType, AuditLog};
 use mm_risk::borrow::BorrowManager;
 use mm_risk::circuit_breaker::{CircuitBreaker, TripReason};
 use mm_risk::exposure::ExposureManager;
-use mm_risk::hedge_optimizer::{HedgeBasket, HedgeOptimizer};
+use mm_risk::hedge_optimizer::{FactorCovarianceEstimator, HedgeBasket, HedgeOptimizer};
 use mm_risk::inventory::InventoryManager;
 use mm_risk::inventory_drift::InventoryDriftReconciler;
 use mm_risk::kill_switch::{KillLevel, KillSwitch, KillSwitchConfig};
@@ -188,6 +188,10 @@ pub struct MarketMakerEngine {
     /// the recommendation is a read-only advisory the
     /// operator / dashboard can consume without acting on it.
     hedge_optimizer: HedgeOptimizer,
+    /// Rolling factor covariance estimator (stage-2). Fed
+    /// with per-tick mid-price returns from the book keeper;
+    /// replaces the v1 constant-1.0 diagonal stub.
+    factor_covariance: FactorCovarianceEstimator,
     /// Latest hedge basket recommendation from
     /// `hedge_optimizer::optimize()`. Refreshed on every
     /// quote tick where the engine has a portfolio snapshot.
@@ -410,6 +414,10 @@ impl MarketMakerEngine {
                 None
             },
             hedge_optimizer: HedgeOptimizer::new(dec!(1)),
+            factor_covariance: FactorCovarianceEstimator::new(
+                vec![product.base_asset.clone()],
+                1440,
+            ),
             last_hedge_basket: HedgeBasket::default(),
             sor_aggregator: {
                 let mut agg = VenueStateAggregator::new();
@@ -1916,7 +1924,20 @@ impl MarketMakerEngine {
             return Ok(());
         }
 
-        let mid = self.book_keeper.book.mid_price().unwrap();
+        let Some(mid) = self.book_keeper.book.mid_price() else {
+            // Book was marked ready but mid is unavailable
+            // (e.g. empty side after a flash crash). Skip this
+            // tick — next refresh will retry.
+            return Ok(());
+        };
+
+        // Feed mid-price return into the factor covariance
+        // estimator for the hedge optimizer.
+        if self.last_mid > Decimal::ZERO {
+            let ret = (mid - self.last_mid) / self.last_mid;
+            self.factor_covariance
+                .push_return(&self.product.base_asset, ret);
+        }
 
         // Time remaining.
         let elapsed_secs = self.cycle_start.elapsed().as_secs();
@@ -2303,16 +2324,11 @@ impl MarketMakerEngine {
         }]
     }
 
-    /// Per-factor variance map used by the hedge optimizer.
-    /// Stage-1 returns a constant `1.0` for every factor in
-    /// the portfolio snapshot — the closed form collapses to
-    /// the trivial `-x` hedge when every variance is equal.
-    /// Stage-2 will thread a rolling 30-day mid-price
-    /// variance estimate from the backtester here.
+    /// Per-factor variance map from the rolling covariance
+    /// estimator. Falls back to constant `1.0` when the
+    /// estimator has too few samples.
     fn factor_variances(&self) -> std::collections::HashMap<String, Decimal> {
-        let mut out = std::collections::HashMap::new();
-        out.insert(self.product.base_asset.clone(), dec!(1));
-        out
+        self.factor_covariance.variances()
     }
 
     fn update_dashboard(&mut self) {
