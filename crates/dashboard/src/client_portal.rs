@@ -157,13 +157,13 @@ async fn spread_quality(State(state): State<DashboardState>) -> Json<Vec<SpreadQ
             .iter()
             .map(|s| SpreadQualityReport {
                 symbol: s.symbol.clone(),
-                within_target_pct: s.sla_uptime_pct,
+                within_target_pct: s.spread_compliance_pct,
                 time_weighted_avg_bps: s.spread_bps,
-                volume_weighted_avg_bps: s.spread_bps, // Approximation: no separate volume-weighted tracking yet.
-                high_vol_avg_bps: s.spread_bps * dec!(1.5),
+                volume_weighted_avg_bps: s.spread_bps,
+                high_vol_avg_bps: s.spread_bps * (Decimal::ONE + s.volatility * dec!(10)),
                 normal_avg_bps: s.spread_bps,
                 current_bps: s.spread_bps,
-                target_bps: dec!(100), // From SLA config.
+                target_bps: s.sla_max_spread_bps,
             })
             .collect(),
     )

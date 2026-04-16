@@ -2652,6 +2652,15 @@ impl MarketMakerEngine {
             hourly_presence: self.sla_tracker.hourly_presence_summary(),
             market_impact: Some(self.market_impact.report()),
         });
+
+        // Push market impact metrics to Prometheus.
+        let impact = self.market_impact.report();
+        mm_dashboard::metrics::MARKET_IMPACT_MEAN_BPS
+            .with_label_values(&[&self.symbol])
+            .set(decimal_to_f64(impact.mean_impact_bps));
+        mm_dashboard::metrics::MARKET_IMPACT_ADVERSE_PCT
+            .with_label_values(&[&self.symbol])
+            .set(decimal_to_f64(impact.adverse_fill_pct));
     }
 
     /// Refresh the venue's effective fee schedule for this

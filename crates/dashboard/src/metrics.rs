@@ -161,6 +161,34 @@ pub static AS_PROB_ASK: Lazy<GaugeVec> = Lazy::new(|| {
     .unwrap()
 });
 
+// Market impact (production service reporting)
+pub static MARKET_IMPACT_MEAN_BPS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_market_impact_mean_bps",
+        "Mean market impact in bps (positive = adverse, fills move the market)",
+        &["symbol"]
+    )
+    .unwrap()
+});
+pub static MARKET_IMPACT_ADVERSE_PCT: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_market_impact_adverse_pct",
+        "Percentage of fills with adverse market impact (> 0 bps)",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
+// Fill quality (slippage tracking)
+pub static FILL_SLIPPAGE_AVG_BPS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_fill_slippage_avg_bps",
+        "Average fill slippage vs mid in bps (positive = worse than mid)",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
 // Fee schedule (refreshed by the periodic fee-tier task — P1.2)
 pub static MAKER_FEE_BPS: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge_vec!(
@@ -380,4 +408,10 @@ pub fn init() {
     let _ = &*MOMENTUM_LEARNED_MP_DRIFT;
     let _ = &*AS_PROB_BID;
     let _ = &*AS_PROB_ASK;
+    let _ = &*MARKET_RESILIENCE;
+    let _ = &*ORDER_TO_TRADE_RATIO;
+    let _ = &*HMA_VALUE;
+    let _ = &*MARKET_IMPACT_MEAN_BPS;
+    let _ = &*MARKET_IMPACT_ADVERSE_PCT;
+    let _ = &*FILL_SLIPPAGE_AVG_BPS;
 }

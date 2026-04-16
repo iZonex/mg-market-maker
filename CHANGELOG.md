@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Prometheus metrics fix + market impact gauges + client
+  portal spread compliance fix** (Apr 2026).
+  - Fix 3 uninitialized Prometheus metrics: `MARKET_RESILIENCE`,
+    `ORDER_TO_TRADE_RATIO`, `HMA_VALUE` — were declared but
+    never force-initialized in `init()`.
+  - 3 new Prometheus gauges: `mm_market_impact_mean_bps`,
+    `mm_market_impact_adverse_pct`, `mm_fill_slippage_avg_bps`.
+    Engine pushes market impact report to Prometheus on every
+    dashboard update tick.
+  - Client portal: `spread_quality` endpoint now uses real
+    `spread_compliance_pct` (was `sla_uptime_pct`), real SLA
+    target (was hardcoded 100), and volatility-adjusted
+    high-vol estimate.
+
 - **Market impact API + fill reload + admin bulk config**
   (Apr 2026).
   - `GET /api/v1/market-impact` — per-symbol market impact
