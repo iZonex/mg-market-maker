@@ -76,6 +76,7 @@ pub async fn start(
         .route("/api/admin/alerts", get(admin_list_alerts))
         .route("/api/admin/alerts", post(admin_add_alert))
         .route("/api/admin/alerts/check", get(admin_check_alerts))
+        .route("/api/admin/symbols", get(admin_list_symbols))
         .with_state(state.clone());
 
     // WebSocket — auth via query param (?token=...).
@@ -399,6 +400,34 @@ async fn admin_check_alerts(
     Json(AlertCheckResponse {
         triggered: state.check_alert_rules(),
     })
+}
+
+/// List all active symbols with their current state summary.
+async fn admin_list_symbols(
+    State(state): State<DashboardState>,
+) -> Json<Vec<serde_json::Value>> {
+    let symbols = state.get_all();
+    let config_syms = state.config_symbols();
+    Json(
+        symbols
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "symbol": s.symbol,
+                    "mid_price": s.mid_price.to_string(),
+                    "spread_bps": s.spread_bps.to_string(),
+                    "inventory": s.inventory.to_string(),
+                    "kill_level": s.kill_level,
+                    "live_orders": s.live_orders,
+                    "total_fills": s.total_fills,
+                    "pnl": s.pnl.total.to_string(),
+                    "uptime_pct": s.sla_uptime_pct.to_string(),
+                    "has_config_channel": config_syms.contains(&s.symbol),
+                    "regime": s.regime,
+                })
+            })
+            .collect(),
+    )
 }
 
 async fn admin_resume_symbol(

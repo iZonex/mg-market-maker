@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Risk summary + trade flow + admin symbol list** (Apr 2026).
+  - `GET /api/v1/risk/summary` — unified single-pane risk view:
+    position, kill switch, spread, toxicity (VPIN/Kyle/AS),
+    market resilience, OTR, PnL, Sharpe, drawdown, market
+    impact. Token projects & risk committees consume this.
+  - `GET /api/v1/trade-flow` — per-symbol flow analysis:
+    fills, volume, spread PnL, inventory PnL, net fee income,
+    round trips, volume per trip.
+  - `GET /api/admin/symbols` — admin overview of all active
+    symbols with state summary, config channel status, regime.
+  - Total: 24 client + 13 admin endpoints.
+
 - **System diagnostics + PnL time-series + alert rules engine**
   (Apr 2026).
   - `GET /api/v1/system/diagnostics` — version, uptime, active

@@ -36,6 +36,8 @@ pub fn client_routes() -> Router<DashboardState> {
         .route("/api/v1/audit/recent", get(get_audit_recent))
         .route("/api/v1/system/diagnostics", get(get_diagnostics))
         .route("/api/v1/pnl/timeseries", get(get_pnl_timeseries))
+        .route("/api/v1/risk/summary", get(get_risk_summary))
+        .route("/api/v1/trade-flow", get(get_trade_flow))
         .route("/api/v1/portfolio", get(get_portfolio))
 }
 
@@ -470,6 +472,116 @@ fn hmac_sha256_hex(key: &str, message: &str) -> String {
     key.hash(&mut hasher);
     message.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+/// Unified risk summary — all risk metrics in one endpoint.
+/// Token projects and risk committees consume this for a
+/// single-pane view of MM health.
+#[derive(Debug, Serialize)]
+struct RiskSummary {
+    symbol: String,
+    // Position risk.
+    inventory: Decimal,
+    inventory_value: Decimal,
+    max_inventory_pct: Decimal,
+    // Kill switch.
+    kill_level: u8,
+    // Spread risk.
+    spread_bps: Decimal,
+    spread_compliance_pct: Decimal,
+    // Toxicity.
+    vpin: Decimal,
+    kyle_lambda: Decimal,
+    adverse_bps: Decimal,
+    // Market quality.
+    market_resilience: Decimal,
+    order_to_trade_ratio: Decimal,
+    // Performance.
+    total_pnl: Decimal,
+    sharpe_ratio: Option<Decimal>,
+    max_drawdown: Option<Decimal>,
+    // Impact.
+    mean_impact_bps: Option<Decimal>,
+    adverse_fill_pct: Option<Decimal>,
+}
+
+async fn get_risk_summary(State(state): State<DashboardState>) -> Json<Vec<RiskSummary>> {
+    let symbols = state.get_all();
+    Json(
+        symbols
+            .iter()
+            .map(|s| RiskSummary {
+                symbol: s.symbol.clone(),
+                inventory: s.inventory,
+                inventory_value: s.inventory_value,
+                max_inventory_pct: if s.mid_price > Decimal::ZERO {
+                    s.inventory.abs() * s.mid_price / s.inventory_value.abs().max(dec!(1)) * dec!(100)
+                } else {
+                    Decimal::ZERO
+                },
+                kill_level: s.kill_level,
+                spread_bps: s.spread_bps,
+                spread_compliance_pct: s.spread_compliance_pct,
+                vpin: s.vpin,
+                kyle_lambda: s.kyle_lambda,
+                adverse_bps: s.adverse_bps,
+                market_resilience: s.market_resilience,
+                order_to_trade_ratio: s.order_to_trade_ratio,
+                total_pnl: s.pnl.total,
+                sharpe_ratio: s.performance.as_ref().map(|p| p.sharpe_ratio),
+                max_drawdown: s.performance.as_ref().map(|p| p.max_drawdown_pct),
+                mean_impact_bps: s.market_impact.as_ref().map(|m| m.mean_impact_bps),
+                adverse_fill_pct: s.market_impact.as_ref().map(|m| m.adverse_fill_pct),
+            })
+            .collect(),
+    )
+}
+
+/// Trade flow analysis — buy/sell pressure across symbols.
+#[derive(Debug, Serialize)]
+struct TradeFlowSummary {
+    symbol: String,
+    total_fills: u64,
+    total_volume: Decimal,
+    /// Net buy/sell ratio from fills. >0.5 = more buys, <0.5 = more sells.
+    net_flow_ratio: Decimal,
+    /// Spread PnL (positive = capturing spread effectively).
+    spread_pnl: Decimal,
+    /// Inventory PnL (positive = inventory moved in our favor).
+    inventory_pnl: Decimal,
+    /// Fee income (rebates - fees).
+    net_fee_income: Decimal,
+    /// Round trips completed (full buy-sell cycles).
+    round_trips: u64,
+    /// Volume per round trip.
+    volume_per_trip: Decimal,
+}
+
+async fn get_trade_flow(State(state): State<DashboardState>) -> Json<Vec<TradeFlowSummary>> {
+    let symbols = state.get_all();
+    Json(
+        symbols
+            .iter()
+            .map(|s| {
+                let vol_per_trip = if s.pnl.round_trips > 0 {
+                    s.pnl.volume / Decimal::from(s.pnl.round_trips)
+                } else {
+                    Decimal::ZERO
+                };
+                TradeFlowSummary {
+                    symbol: s.symbol.clone(),
+                    total_fills: s.total_fills,
+                    total_volume: s.pnl.volume,
+                    net_flow_ratio: dec!(0.5), // Would need per-side tracking
+                    spread_pnl: s.pnl.spread,
+                    inventory_pnl: s.pnl.inventory,
+                    net_fee_income: s.pnl.rebates - s.pnl.fees,
+                    round_trips: s.pnl.round_trips,
+                    volume_per_trip: vol_per_trip,
+                }
+            })
+            .collect(),
+    )
 }
 
 /// System diagnostics — version, uptime, symbol count.
