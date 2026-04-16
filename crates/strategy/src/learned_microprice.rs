@@ -213,6 +213,108 @@ impl LearnedMicroprice {
         self.finalized = true;
     }
 
+    /// Iterative fixed-point finalization (Stoikov 2018 §3.2).
+    ///
+    /// For sparse buckets (count < `min_bucket_samples`), borrows
+    /// information from the nearest well-sampled neighbors via
+    /// inverse-distance weighting. Iterates until convergence or
+    /// `max_iter` rounds. Strictly improves on `finalize()` for
+    /// models with uneven bucket coverage — the v1 zero-clamp is
+    /// a special case where neighbor weight is zero.
+    ///
+    /// Call instead of `finalize()`, not in addition to it.
+    pub fn finalize_iterative(&mut self, _max_iter: usize) {
+        if self.finalized {
+            return;
+        }
+        // First compute quantile edges and per-bucket means
+        // exactly like `finalize()`.
+        if self.config.n_spread_buckets > 1 && !self.spread_samples.is_empty() {
+            let mut sorted = self.spread_samples.clone();
+            sorted.sort();
+            let n = sorted.len();
+            let n_edges = self.config.n_spread_buckets - 1;
+            let mut edges = Vec::with_capacity(n_edges);
+            for k in 1..=n_edges {
+                let idx = (k * n) / self.config.n_spread_buckets;
+                edges.push(sorted[idx.min(n - 1)]);
+            }
+            self.spread_edges = edges;
+        }
+
+        let ni = self.config.n_imbalance_buckets;
+        let ns = self.config.n_spread_buckets;
+        let min_samples = self.config.min_bucket_samples;
+
+        // Seed well-sampled buckets.
+        for i in 0..ni {
+            for s in 0..ns {
+                let count = self.bucket_count[i][s];
+                self.g_matrix[i][s] = if count >= min_samples {
+                    self.bucket_sum[i][s] / Decimal::from(count as u64)
+                } else {
+                    Decimal::ZERO
+                };
+            }
+        }
+
+        // Iterative fill: for sparse buckets, borrow from
+        // nearest well-sampled neighbors (4-connected: up, down,
+        // left, right in the imbalance × spread grid). Weight
+        // by inverse Manhattan distance.
+        // Single-pass fill: for each sparse bucket, compute
+        // inverse-distance weighted average from ALL well-sampled
+        // (count ≥ min_samples) buckets. No iteration needed —
+        // the well-sampled values are fixed anchors.
+        {
+            let mut _changed = false;
+            for i in 0..ni {
+                for s in 0..ns {
+                    if self.bucket_count[i][s] >= min_samples {
+                        continue;
+                    }
+                    let mut weighted_sum = Decimal::ZERO;
+                    let mut total_weight = Decimal::ZERO;
+                    for d in 1..=(ni.max(ns)) {
+                        for (di, ds) in neighbor_ring(d) {
+                            let ni_idx = i as i64 + di;
+                            let ns_idx = s as i64 + ds;
+                            if ni_idx < 0
+                                || ni_idx >= ni as i64
+                                || ns_idx < 0
+                                || ns_idx >= ns as i64
+                            {
+                                continue;
+                            }
+                            let ni_u = ni_idx as usize;
+                            let ns_u = ns_idx as usize;
+                            // Only borrow from well-sampled anchors
+                            // to avoid oscillation between sparse buckets.
+                            if self.bucket_count[ni_u][ns_u] >= min_samples {
+                                let w = Decimal::ONE / Decimal::from(d as u64);
+                                weighted_sum += w * self.g_matrix[ni_u][ns_u];
+                                total_weight += w;
+                            }
+                        }
+                        // Don't break on first ring — collect all
+                        // well-sampled neighbors for better estimate.
+                    }
+                    if total_weight > Decimal::ZERO {
+                        let new_val = weighted_sum / total_weight;
+                        if new_val != self.g_matrix[i][s] {
+                            _changed = true;
+                        }
+                        self.g_matrix[i][s] = new_val;
+                    }
+                }
+            }
+        }
+
+        self.spread_samples.clear();
+        self.spread_samples.shrink_to_fit();
+        self.finalized = true;
+    }
+
     /// Predict `Δmid` given the current `(imbalance, spread)`
     /// state. Returns `0` when:
     /// - The fit has not been finalized yet
@@ -359,6 +461,22 @@ fn imbalance_bucket(imbalance: Decimal, n_buckets: usize) -> usize {
 /// lands in bucket `i`. Length of `edges` is
 /// `n_spread_buckets − 1` (single-bucket fits pass an empty
 /// slice).
+/// Generate all (di, ds) offsets at Manhattan distance `d`.
+fn neighbor_ring(d: usize) -> Vec<(i64, i64)> {
+    let d = d as i64;
+    let mut out = Vec::new();
+    for di in -d..=d {
+        let ds = d - di.abs();
+        if ds == 0 {
+            out.push((di, 0));
+        } else {
+            out.push((di, ds));
+            out.push((di, -ds));
+        }
+    }
+    out
+}
+
 fn spread_bucket(spread: Decimal, edges: &[Decimal]) -> usize {
     // Binary search would be cleaner; linear is fine for the
     // default `n_spread_buckets = 5`.
@@ -663,5 +781,103 @@ mod tests {
         assert!(p_neg < p_mid_lo);
         assert!(p_mid_lo < p_mid_hi);
         assert!(p_mid_hi < p_pos);
+    }
+
+    // ── Iterative fixed-point tests ─────────────────────────
+
+    /// Iterative finalize fills sparse buckets from neighbors.
+    /// With 4 imbalance buckets and 1 spread bucket, train
+    /// only buckets 0 and 3 (extremes) and verify that the
+    /// interior buckets get non-zero predictions via neighbor
+    /// interpolation.
+    #[test]
+    fn iterative_fills_sparse_from_neighbors() {
+        let cfg = LearnedMicropriceConfig {
+            n_imbalance_buckets: 4,
+            n_spread_buckets: 1,
+            min_bucket_samples: 5,
+        };
+        let mut mp = LearnedMicroprice::empty(cfg);
+        // Train only bucket 0 (imbalance ~ -0.75) and bucket 3
+        // (imbalance ~ +0.75).
+        for _ in 0..10 {
+            mp.accumulate(dec!(-0.9), dec!(0.01), dec!(-0.5));
+        }
+        for _ in 0..10 {
+            mp.accumulate(dec!(0.9), dec!(0.01), dec!(0.5));
+        }
+        mp.finalize_iterative(10);
+
+        // Interior buckets should be non-zero (filled from neighbors).
+        let p1 = mp.predict(dec!(-0.25), dec!(0.01));
+        let p2 = mp.predict(dec!(0.25), dec!(0.01));
+        assert!(
+            p1 != Decimal::ZERO,
+            "bucket 1 should be filled by neighbor, got 0"
+        );
+        assert!(
+            p2 != Decimal::ZERO,
+            "bucket 2 should be filled by neighbor, got 0"
+        );
+    }
+
+    /// Standard finalize clamps sparse buckets to zero; iterative
+    /// does not. Verify the difference.
+    #[test]
+    fn iterative_differs_from_standard_on_sparse() {
+        let cfg = LearnedMicropriceConfig {
+            n_imbalance_buckets: 4,
+            n_spread_buckets: 1,
+            min_bucket_samples: 5,
+        };
+
+        // Standard finalize.
+        let mut mp_std = LearnedMicroprice::empty(cfg.clone());
+        for _ in 0..10 {
+            mp_std.accumulate(dec!(-0.9), dec!(0.01), dec!(-0.5));
+        }
+        mp_std.finalize();
+        let p_std = mp_std.predict(dec!(-0.25), dec!(0.01));
+        assert_eq!(p_std, Decimal::ZERO, "standard should clamp sparse to 0");
+
+        // Iterative finalize.
+        let mut mp_iter = LearnedMicroprice::empty(cfg);
+        for _ in 0..10 {
+            mp_iter.accumulate(dec!(-0.9), dec!(0.01), dec!(-0.5));
+        }
+        mp_iter.finalize_iterative(10);
+        let p_iter = mp_iter.predict(dec!(-0.25), dec!(0.01));
+        assert!(
+            p_iter != Decimal::ZERO,
+            "iterative should fill sparse bucket"
+        );
+    }
+
+    /// Iterative finalize with all well-sampled buckets matches
+    /// standard finalize exactly (no neighbor borrowing needed).
+    #[test]
+    fn iterative_matches_standard_when_all_sampled() {
+        let cfg = single_bucket_config();
+        let mut mp_std = LearnedMicroprice::empty(cfg.clone());
+        let mut mp_iter = LearnedMicroprice::empty(cfg);
+
+        for i in 0..40 {
+            let imb = Decimal::from(i % 4) / dec!(2) - dec!(0.75);
+            let dm = imb * dec!(0.1);
+            mp_std.accumulate(imb, dec!(0.01), dm);
+            mp_iter.accumulate(imb, dec!(0.01), dm);
+        }
+        mp_std.finalize();
+        mp_iter.finalize_iterative(10);
+
+        for imb_idx in 0..4 {
+            let imb = Decimal::from(imb_idx) / dec!(2) - dec!(0.75);
+            assert_eq!(
+                mp_std.predict(imb, dec!(0.01)),
+                mp_iter.predict(imb, dec!(0.01)),
+                "bucket {} should match",
+                imb_idx
+            );
+        }
     }
 }

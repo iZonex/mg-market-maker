@@ -874,4 +874,66 @@ mod tests {
         let report = run_stress(scenario, &config);
         assert_eq!(report.var_throttle_hits, 0);
     }
+
+    // ── Full-engine stress integration tests ────────────────
+
+    /// Run ALL five canonical scenarios with default configs
+    /// and verify basic invariants hold across every report.
+    #[test]
+    fn all_scenarios_produce_valid_reports() {
+        let reports = run_all_stress(StressRunConfig::defaults_for);
+        assert_eq!(reports.len(), 5);
+        for report in &reports {
+            // Max drawdown should be positive (absolute value
+            // of the worst PnL dip during the scenario).
+            assert!(
+                report.max_drawdown >= dec!(0),
+                "scenario {} max_drawdown={} should be ≥ 0",
+                report.scenario,
+                report.max_drawdown
+            );
+            // Inventory peak should be non-negative.
+            assert!(
+                report.inventory_peak_value >= dec!(0),
+                "scenario {} inventory_peak_value should be ≥ 0",
+                report.scenario
+            );
+        }
+    }
+
+    /// The LUNA -95% crash should be the most severe scenario
+    /// by max drawdown across the canonical five.
+    #[test]
+    fn luna_has_worst_drawdown_of_all_scenarios() {
+        let reports = run_all_stress(StressRunConfig::defaults_for);
+        let luna = reports
+            .iter()
+            .find(|r| r.scenario == "luna-2022")
+            .unwrap();
+        for report in &reports {
+            assert!(
+                luna.max_drawdown >= report.max_drawdown,
+                "LUNA dd={} should be worst (highest), but {} has {}",
+                luna.max_drawdown,
+                report.scenario,
+                report.max_drawdown
+            );
+        }
+    }
+
+    /// Kill switch should trip at least once on the severe
+    /// scenarios (covid, luna, ftx).
+    #[test]
+    fn severe_scenarios_trip_kill_switch() {
+        for slug in ["covid-2020", "luna-2022", "ftx-2022"] {
+            let scenario = scenario_by_slug(slug).unwrap();
+            let config = StressRunConfig::defaults_for(scenario);
+            let report = run_stress(scenario, &config);
+            assert!(
+                report.kill_switch_trips > 0,
+                "scenario {} should trip the kill switch",
+                slug
+            );
+        }
+    }
 }

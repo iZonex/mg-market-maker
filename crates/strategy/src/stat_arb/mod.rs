@@ -17,6 +17,7 @@ pub mod driver;
 #[allow(clippy::needless_range_loop, clippy::manual_range_contains)]
 pub mod johansen;
 pub mod kalman;
+pub mod screener;
 pub mod signal;
 
 pub use cointegration::{
@@ -27,5 +28,6 @@ pub use driver::{
     StatArbEvent, StatArbEventSink, StatArbPair, StatArbPosition,
 };
 pub use johansen::{JohansenResult, JohansenTest};
+pub use screener::{PairScreener, ScreenResult};
 pub use kalman::KalmanHedgeRatio;
 pub use signal::{SignalAction, SpreadDirection, ZScoreConfig, ZScoreSignal};

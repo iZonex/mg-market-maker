@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Epic D stage-2 — Stoikov iterative fixed-point for learned
+  microprice** (Apr 2026). Adds `finalize_iterative()` to
+  `LearnedMicroprice` that fills sparse buckets via
+  inverse-distance weighting from well-sampled neighbors
+  instead of clamping to zero. Single-pass, no oscillation —
+  only well-sampled anchors contribute. 3 new tests.
+
+- **Epic B stage-2 — background pair screener** (Apr 2026).
+  `PairScreener` maintains a rolling mid-price buffer per
+  symbol and runs Engle-Granger cointegration tests on all
+  configured pairs on demand. Rolling buffer capped at 500
+  samples per symbol. 5 new tests.
+
+- **Epic C stage-2 — full-engine stress integration tests**
+  (Apr 2026). Three new tests that run ALL five canonical
+  stress scenarios and validate invariants: drawdown sign,
+  LUNA worst-case ordering, kill-switch trips on severe
+  scenarios.
+
 - **Epic C stage-2 — cross-beta hedge optimizer** (Apr 2026).
   Extends the diagonal-only Markowitz hedge optimizer with
   off-diagonal β support. `HedgeInstrument.cross_betas` carries
