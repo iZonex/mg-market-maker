@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Automated daily snapshots + audit API + book analytics +
+  rate limiter** (Apr 2026).
+  - Automated daily report snapshots: engine detects UTC date
+    change on summary tick and calls
+    `DashboardState::snapshot_daily_report()`. 90-day rolling
+    buffer persisted in memory.
+  - `GET /api/v1/audit/recent?limit=N&symbol=X&event_type=Y`
+    — query the audit JSONL log with filtering by symbol and
+    event type. Returns structured JSON events.
+  - `GET /api/v1/book/analytics` — per-symbol order book
+    analytics: depth at multiple levels, top-of-book imbalance,
+    liquidity score (depth/spread), locked order value.
+  - `RateLimiter` module: token-bucket rate limiting per API
+    key. Configurable max requests/minute with automatic
+    bucket cleanup. 3 new tests.
+  - Total client API: 20 endpoints.
+
 - **Config validation + K8s probes + historical reports**
   (Apr 2026).
   - Config validation: VaR guard EWMA lambda range check,

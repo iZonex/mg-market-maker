@@ -416,6 +416,44 @@ impl DashboardState {
         self.inner.read().unwrap().webhook_dispatcher.clone()
     }
 
+    /// Auto-snapshot the current state as a daily report. Called
+    /// by the midnight UTC tick in the engine. Builds the
+    /// snapshot from the current SymbolState data.
+    pub fn snapshot_daily_report(&self) {
+        let symbols = self.get_all();
+        if symbols.is_empty() {
+            return;
+        }
+        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let mut total_pnl = Decimal::ZERO;
+        let mut total_volume = Decimal::ZERO;
+        let mut total_fills = 0u64;
+        let sym_snaps: Vec<DailySymbolSnapshot> = symbols
+            .iter()
+            .map(|s| {
+                total_pnl += s.pnl.total;
+                total_volume += s.pnl.volume;
+                total_fills += s.pnl.round_trips;
+                DailySymbolSnapshot {
+                    symbol: s.symbol.clone(),
+                    pnl: s.pnl.total,
+                    volume: s.pnl.volume,
+                    fills: s.pnl.round_trips,
+                    avg_spread_bps: s.spread_bps,
+                    uptime_pct: s.sla_uptime_pct,
+                    presence_pct: s.presence_pct_24h,
+                }
+            })
+            .collect();
+        self.store_daily_report(DailyReportSnapshot {
+            date,
+            total_pnl,
+            total_volume,
+            total_fills,
+            symbols: sym_snaps,
+        });
+    }
+
     /// Store a daily report snapshot for historical queries.
     /// Automatically trims to 90 days.
     pub fn store_daily_report(&self, report: DailyReportSnapshot) {

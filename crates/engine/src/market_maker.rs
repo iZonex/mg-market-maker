@@ -344,6 +344,9 @@ pub struct MarketMakerEngine {
     last_mid: Decimal,
     tick_count: u64,
     reconcile_counter: u64,
+    /// Last UTC date we snapshotted a daily report. Prevents
+    /// double-snapshots on the same day.
+    last_daily_snapshot_date: String,
 
     /// Hot config override receiver. Admin endpoints send
     /// overrides through the corresponding sender registered
@@ -568,6 +571,7 @@ impl MarketMakerEngine {
             last_mid: dec!(0),
             tick_count: 0,
             reconcile_counter: 0,
+            last_daily_snapshot_date: String::new(),
             config_override_rx: None,
         }
     }
@@ -1114,6 +1118,14 @@ impl MarketMakerEngine {
                     self.performance.record_return(pnl_return);
                     self.performance.update_equity(self.pnl_tracker.attribution.total_pnl());
                     self.performance.sample_inventory(self.inventory_manager.inventory().abs());
+                    // Midnight UTC snapshot — auto-persist daily report.
+                    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                    if today != self.last_daily_snapshot_date {
+                        if let Some(ds) = &self.dashboard {
+                            ds.snapshot_daily_report();
+                        }
+                        self.last_daily_snapshot_date = today;
+                    }
                     self.log_periodic_summary();
                     self.update_dashboard();
                     // Epic F sub-component #2: drive the

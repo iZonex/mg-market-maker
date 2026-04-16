@@ -32,6 +32,8 @@ pub fn client_routes() -> Router<DashboardState> {
         .route("/api/v1/performance", get(get_performance))
         .route("/api/v1/report/history", get(get_report_history))
         .route("/api/v1/report/history/{date}", get(get_historical_report))
+        .route("/api/v1/book/analytics", get(get_book_analytics))
+        .route("/api/v1/audit/recent", get(get_audit_recent))
         .route("/api/v1/portfolio", get(get_portfolio))
 }
 
@@ -466,6 +468,108 @@ fn hmac_sha256_hex(key: &str, message: &str) -> String {
     key.hash(&mut hasher);
     message.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+/// Order book analytics — depth, imbalance, liquidity score.
+#[derive(Debug, Serialize)]
+struct BookAnalytics {
+    symbol: String,
+    mid_price: Decimal,
+    spread_bps: Decimal,
+    /// Depth levels from the dashboard state.
+    depth_levels: Vec<crate::state::BookDepthLevel>,
+    /// Top-of-book imbalance: (bid_depth - ask_depth) / total.
+    /// Range [-1, +1]. Positive = more bids.
+    top_imbalance: Decimal,
+    /// Total depth within 1% of mid (both sides, quote asset).
+    total_depth_1pct: Decimal,
+    /// Liquidity score: depth × (1/spread). Higher = better
+    /// liquidity provision. Unitless relative metric.
+    liquidity_score: Decimal,
+    /// Value locked in open orders (quote asset).
+    locked_in_orders: Decimal,
+}
+
+async fn get_book_analytics(State(state): State<DashboardState>) -> Json<Vec<BookAnalytics>> {
+    let symbols = state.get_all();
+    let analytics: Vec<BookAnalytics> = symbols
+        .iter()
+        .map(|s| {
+            let bid_depth: Decimal = s.book_depth_levels.iter().map(|l| l.bid_depth_quote).sum();
+            let ask_depth: Decimal = s.book_depth_levels.iter().map(|l| l.ask_depth_quote).sum();
+            let total = bid_depth + ask_depth;
+            let top_imbalance = if total > Decimal::ZERO {
+                (bid_depth - ask_depth) / total
+            } else {
+                Decimal::ZERO
+            };
+            // Depth within 1% — find the 1% level.
+            let depth_1pct = s
+                .book_depth_levels
+                .iter()
+                .find(|l| l.pct_from_mid == dec!(1))
+                .map(|l| l.bid_depth_quote + l.ask_depth_quote)
+                .unwrap_or(Decimal::ZERO);
+            let liquidity_score = if s.spread_bps > Decimal::ZERO {
+                depth_1pct / s.spread_bps
+            } else {
+                Decimal::ZERO
+            };
+            BookAnalytics {
+                symbol: s.symbol.clone(),
+                mid_price: s.mid_price,
+                spread_bps: s.spread_bps,
+                depth_levels: s.book_depth_levels.clone(),
+                top_imbalance,
+                total_depth_1pct: depth_1pct,
+                liquidity_score,
+                locked_in_orders: s.locked_in_orders_quote,
+            }
+        })
+        .collect();
+    Json(analytics)
+}
+
+/// Recent audit log entries. Reads the last N lines from the
+/// audit JSONL file. Filter by symbol or event type.
+#[derive(Debug, Deserialize)]
+struct AuditQuery {
+    limit: Option<usize>,
+    symbol: Option<String>,
+    event_type: Option<String>,
+}
+
+async fn get_audit_recent(
+    Query(query): Query<AuditQuery>,
+) -> Json<Vec<serde_json::Value>> {
+    let limit = query.limit.unwrap_or(100).min(500);
+    let path = std::path::Path::new("data/audit.jsonl");
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Json(vec![]),
+    };
+
+    let entries: Vec<serde_json::Value> = content
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|v| {
+            if let Some(sym) = &query.symbol {
+                if v.get("symbol").and_then(|s| s.as_str()) != Some(sym) {
+                    return false;
+                }
+            }
+            if let Some(et) = &query.event_type {
+                if v.get("event_type").and_then(|s| s.as_str()) != Some(et) {
+                    return false;
+                }
+            }
+            true
+        })
+        .take(limit)
+        .collect();
+
+    Json(entries)
 }
 
 /// List available historical report dates.
