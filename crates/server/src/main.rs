@@ -854,12 +854,21 @@ fn split_base_quote(symbol: &str) -> (String, String) {
 /// it with `std::mem::forget` keeps the connection alive until
 /// process exit.
 ///
-/// Sentry is gated on the `MM_SENTRY_DSN` env var:
+/// Sentry is gated on `MM_SENTRY_DSN`:
 /// - Unset / empty: no Sentry, zero overhead.
 /// - Set: `sentry::init()` with the DSN, release = crate version,
 ///   environment = `MM_MODE` (live/paper/smoke), attaches a
 ///   panic hook + a tracing layer that forwards `error!` and
 ///   `warn!` events as Sentry breadcrumbs / errors.
+///
+/// OpenTelemetry OTLP export is intentionally NOT wired in the
+/// default build. The `tracing-opentelemetry` layer's generic
+/// signature does not compose cleanly with the current layered
+/// subscriber (sentry + two fmt layers + env filter) under
+/// tracing-subscriber 0.3. The working pattern is to rebuild
+/// the subscriber behind a cargo feature flag — tracked as a
+/// deferred item in ROADMAP. Sentry already covers the primary
+/// need (error aggregation + panic capture) for prod.
 fn init_logging(config: &AppConfig) -> Option<sentry::ClientInitGuard> {
     use tracing_subscriber::prelude::*;
 

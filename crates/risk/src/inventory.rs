@@ -243,4 +243,164 @@ mod tests {
         let sell_scale = mgr.inventory_scale(Side::Sell, &config);
         assert_eq!(sell_scale, dec!(1)); // Not short, full room.
     }
+
+    // ── Property-based tests (Epic 9) ────────────────────────
+    //
+    // Exercise the `InventoryManager` arithmetic against random
+    // fill sequences. Catches off-by-one in the avg-entry-price
+    // weighted average + PnL accounting that hand-written tests
+    // miss by only exercising a handful of patterns.
+
+    use proptest::prelude::*;
+    use proptest::sample::select;
+
+    /// Hand-roll a Fill so proptest-generated inputs go through
+    /// the same path live fills do. The only fields `on_fill`
+    /// reads are `side`, `price`, and `qty`.
+    fn mk_fill(side: Side, price: Decimal, qty: Decimal) -> Fill {
+        Fill {
+            trade_id: 0,
+            order_id: uuid::Uuid::nil(),
+            symbol: "TEST".into(),
+            side,
+            price,
+            qty,
+            is_maker: true,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    // Concrete Decimal strategy: positive decimals with 4 dp,
+    // bounded well clear of overflow.
+    prop_compose! {
+        fn price_strat()(cents in 1i64..10_000_000i64) -> Decimal {
+            Decimal::new(cents, 2)  // 0.01 .. 100_000.00
+        }
+    }
+    prop_compose! {
+        fn qty_strat()(units in 1i64..1_000_000i64) -> Decimal {
+            Decimal::new(units, 4)  // 0.0001 .. 100.0000
+        }
+    }
+    fn side_strat() -> impl Strategy<Value = Side> {
+        select(vec![Side::Buy, Side::Sell])
+    }
+    prop_compose! {
+        fn fill_strat()(
+            side in side_strat(),
+            price in price_strat(),
+            qty in qty_strat(),
+        ) -> Fill {
+            mk_fill(side, price, qty)
+        }
+    }
+
+    proptest! {
+        /// Inventory after a sequence equals the net signed qty
+        /// across every fill. Invariant regardless of price path
+        /// or intermediate flip direction.
+        #[test]
+        fn inventory_equals_net_signed_qty(
+            fills in proptest::collection::vec(fill_strat(), 0..50),
+        ) {
+            let mut mgr = InventoryManager::new();
+            let mut expected = dec!(0);
+            for f in &fills {
+                mgr.on_fill(f);
+                expected += match f.side {
+                    Side::Buy => f.qty,
+                    Side::Sell => -f.qty,
+                };
+            }
+            prop_assert_eq!(mgr.inventory(), expected);
+        }
+
+        /// total_bought − total_sold equals inventory. Mirrors
+        /// the invariant above but from the accumulator angle —
+        /// catches a regression where one counter drifts out of
+        /// sync with the signed-qty sum.
+        #[test]
+        fn bought_minus_sold_equals_inventory(
+            fills in proptest::collection::vec(fill_strat(), 0..50),
+        ) {
+            let mut mgr = InventoryManager::new();
+            for f in &fills {
+                mgr.on_fill(f);
+            }
+            let bought: Decimal = fills.iter().filter(|f| f.side == Side::Buy).map(|f| f.qty).sum();
+            let sold: Decimal   = fills.iter().filter(|f| f.side == Side::Sell).map(|f| f.qty).sum();
+            prop_assert_eq!(mgr.inventory(), bought - sold);
+        }
+
+        /// A flat sequence that closes out to zero inventory
+        /// must produce zero unrealized PnL at ANY mark price.
+        /// The realized PnL captured everything.
+        #[test]
+        fn closed_position_has_zero_unrealized(
+            fill in fill_strat(),
+            mark in price_strat(),
+        ) {
+            let mut mgr = InventoryManager::new();
+            mgr.on_fill(&fill);
+            // Close by mirroring.
+            let opposite = mk_fill(
+                match fill.side { Side::Buy => Side::Sell, Side::Sell => Side::Buy },
+                fill.price,
+                fill.qty,
+            );
+            mgr.on_fill(&opposite);
+            prop_assert!(mgr.inventory().is_zero());
+            prop_assert_eq!(mgr.unrealized_pnl(mark), dec!(0));
+        }
+
+        /// Open → close at the SAME price nets zero realized PnL.
+        /// Flushes out any sign error in the flip branch.
+        #[test]
+        fn round_trip_at_same_price_is_zero_realized(
+            fill in fill_strat(),
+        ) {
+            let mut mgr = InventoryManager::new();
+            mgr.on_fill(&fill);
+            let opposite = mk_fill(
+                match fill.side { Side::Buy => Side::Sell, Side::Sell => Side::Buy },
+                fill.price,
+                fill.qty,
+            );
+            mgr.on_fill(&opposite);
+            prop_assert_eq!(mgr.realized_pnl(), dec!(0));
+        }
+
+        /// Long-only sequence: realized PnL stays non-negative
+        /// if every sell is at a price ≥ avg_entry at sale time.
+        /// We ensure that by selling at a price STRICTLY LARGER
+        /// than every prior buy — the weighted average is
+        /// bounded above by that maximum so the realized
+        /// delta per reducing slice is non-negative.
+        #[test]
+        fn long_sequence_with_higher_exits_never_realizes_loss(
+            buys in proptest::collection::vec(
+                (price_strat(), qty_strat()),
+                1..10
+            ),
+            exit_premium in 1i64..100i64,
+            exit_qty in qty_strat(),
+        ) {
+            let mut mgr = InventoryManager::new();
+            let mut max_entry = dec!(0);
+            for (p, q) in &buys {
+                mgr.on_fill(&mk_fill(Side::Buy, *p, *q));
+                if *p > max_entry { max_entry = *p; }
+            }
+            // Exit above the highest entry so weighted avg ≤ exit price.
+            let exit_price = max_entry + Decimal::new(exit_premium, 2);
+            // Exit qty capped at inventory so we don't flip.
+            let exit = exit_qty.min(mgr.inventory());
+            if exit > dec!(0) {
+                mgr.on_fill(&mk_fill(Side::Sell, exit_price, exit));
+            }
+            prop_assert!(mgr.realized_pnl() >= dec!(0),
+                "realized_pnl went negative: {} (max_entry={} exit_price={})",
+                mgr.realized_pnl(), max_entry, exit_price);
+        }
+    }
 }

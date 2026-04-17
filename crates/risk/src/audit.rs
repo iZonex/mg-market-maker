@@ -355,6 +355,14 @@ impl AuditLog {
                 return Err(e.into());
             }
             info!(archive = %archived.display(), "audit log rotated");
+            // Post-rotation archival: gzip the file + optionally
+            // spawn the configured upload command. Runs on a
+            // detached std::thread so the compression + upload
+            // does not stall the next audit write.
+            let path_for_archive = archived.clone();
+            std::thread::spawn(move || {
+                archive_rotated_file(&path_for_archive);
+            });
         }
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -500,4 +508,104 @@ fn audit_archive_name(base_path: &Path, day: NaiveDate) -> PathBuf {
         .and_then(|s| s.to_str())
         .unwrap_or("jsonl");
     parent.join(format!("{stem}-{}.{ext}", day.format("%Y-%m-%d")))
+}
+
+/// Post-rotation archival: gzip the rotated file, then
+/// optionally run the configured upload command. Runs on a
+/// detached OS thread so the audit-log hot path never blocks
+/// on compression or a flaky S3 PUT.
+///
+/// Pipeline:
+/// 1. Compress `archived` → `archived.gz` (flate2 default level).
+/// 2. Remove the original plain-text file — we only keep the
+///    `.gz` so retention storage does not carry both copies.
+/// 3. If `MM_AUDIT_ARCHIVE_CMD` is set, spawn a subprocess with
+///    the literal substring `{file}` replaced by the absolute
+///    `.gz` path. Typical values:
+///      - `aws s3 cp {file} s3://bucket/audit/`
+///      - `gcloud storage cp {file} gs://bucket/audit/`
+///      - `rclone copy {file} remote:audit/`
+///
+///    The subprocess is NOT retried — on failure the `.gz` is
+///    left on the local filesystem for the next cron to pick
+///    up. Compliance treats on-disk .gz as a durable copy.
+///
+/// Errors at every stage are logged but never panic — a failed
+/// archive must not take down the engine.
+fn archive_rotated_file(archived: &Path) {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write as _;
+
+    // 1. Gzip.
+    let gz_path = archived.with_extension(match archived.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{ext}.gz"),
+        None => "gz".into(),
+    });
+    let src = match std::fs::read(archived) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(file = %archived.display(), error = %e, "audit archive: read failed");
+            return;
+        }
+    };
+    let gz_file = match std::fs::File::create(&gz_path) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(path = %gz_path.display(), error = %e, "audit archive: create .gz failed");
+            return;
+        }
+    };
+    let mut encoder = GzEncoder::new(gz_file, Compression::default());
+    if let Err(e) = encoder.write_all(&src) {
+        warn!(path = %gz_path.display(), error = %e, "audit archive: gzip write failed");
+        return;
+    }
+    if let Err(e) = encoder.finish() {
+        warn!(path = %gz_path.display(), error = %e, "audit archive: gzip finish failed");
+        return;
+    }
+    // Original file removed AFTER successful compression so a
+    // mid-write crash does not lose both copies.
+    let _ = std::fs::remove_file(archived);
+    info!(gz = %gz_path.display(), "audit archive gzipped");
+
+    // 2. Upload via configured command.
+    let Ok(cmd_tmpl) = std::env::var("MM_AUDIT_ARCHIVE_CMD") else {
+        return;
+    };
+    if cmd_tmpl.trim().is_empty() {
+        return;
+    }
+    let gz_str = gz_path.to_string_lossy().into_owned();
+    let cmd_str = cmd_tmpl.replace("{file}", &gz_str);
+    // `sh -c` so the command template can use shell features
+    // (pipes, env expansion). Operators who want strict arg
+    // splitting should wrap their command in `/bin/sh -c`
+    // themselves and skip expansion.
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd_str)
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            info!(gz = %gz_path.display(), "audit archive upload ok");
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            warn!(
+                gz = %gz_path.display(),
+                status = ?out.status.code(),
+                stderr = %stderr,
+                "audit archive upload failed — file retained on local disk"
+            );
+        }
+        Err(e) => {
+            warn!(
+                gz = %gz_path.display(),
+                error = %e,
+                "audit archive upload spawn failed — file retained on local disk"
+            );
+        }
+    }
 }

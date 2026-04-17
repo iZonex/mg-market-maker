@@ -19,3 +19,14 @@ regex = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Audit log compression: archived JSONL → .jsonl.gz before
+# operators ship it off to S3/GCS cold storage. Gzip is the
+# lowest-common-denominator format for log archival (AWS
+# Athena, BigQuery external tables, grep-backed greps on an
+# ops box all handle it) — we do not reach for the richer zstd
+# yet to keep the retention pipeline compatible with stock
+# tooling.
+flate2 = "1"
+
+[dev-dependencies]
+proptest = "1"
