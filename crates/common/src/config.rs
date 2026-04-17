@@ -629,6 +629,20 @@ pub struct MarketMakerConfig {
     /// Ignored when strategy is not `CrossExchange`.
     #[serde(default = "default_cross_exchange_min_profit_bps")]
     pub cross_exchange_min_profit_bps: Decimal,
+
+    /// Maximum acceptable divergence between the primary book's
+    /// mid and the hedge book's mid, expressed as a fraction of
+    /// the primary mid. When the two venues disagree by more than
+    /// this percentage the engine skips the refresh tick instead
+    /// of feeding a stale / bogus ref_price into a cross-product
+    /// strategy. Typical value `0.005` (50 bps): BTC/ETH cross-
+    /// venue steady state is under 10 bps, so 50 bps catches a
+    /// halted feed or a bad venue before it drives a bad quote,
+    /// without false-flagging normal wiggle. `None` disables the
+    /// guard — legacy behaviour. Ignored when no hedge book is
+    /// configured.
+    #[serde(default)]
+    pub max_cross_venue_divergence_pct: Option<Decimal>,
 }
 
 fn default_cross_exchange_min_profit_bps() -> Decimal {
@@ -1042,6 +1056,17 @@ pub struct ClientConfig {
     /// Per-client report branding (Epic 5 item 5.6).
     #[serde(default)]
     pub report_branding: Option<ReportBranding>,
+    /// Per-client daily loss circuit breaker (Epic 6). When set
+    /// and the client's aggregate daily PnL across all owned
+    /// symbols drops below `-daily_loss_limit_usd`, every one of
+    /// this client's symbols is halted (kill switch L3 / cancel
+    /// all) and new orders are refused until manual reset. `None`
+    /// inherits the global `KillSwitchCfg.daily_loss_limit` from
+    /// the server — per-client isolation means one client blowing
+    /// up their budget does NOT stop the other clients from
+    /// trading.
+    #[serde(default)]
+    pub daily_loss_limit_usd: Option<Decimal>,
 }
 
 /// Loan configuration for token loan tracking (optional).
@@ -1109,6 +1134,7 @@ impl Default for AppConfig {
                 cross_venue_basis_max_staleness_ms: 1500,
                 sor_inline_enabled: false,
                 cross_exchange_min_profit_bps: dec!(5),
+                max_cross_venue_divergence_pct: None,
             },
             kill_switch: KillSwitchCfg::default(),
             risk: RiskConfig {
@@ -1163,6 +1189,7 @@ impl AppConfig {
             webhook_urls: Vec::new(),
             api_keys: Vec::new(),
             report_branding: None,
+            daily_loss_limit_usd: None,
         }]
     }
 }

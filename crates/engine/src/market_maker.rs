@@ -181,6 +181,11 @@ pub struct MarketMakerEngine {
     /// Set when the book hasn't updated for stale_book_timeout_secs.
     /// Cleared when fresh data arrives.
     stale_book_paused: bool,
+    /// Set when the primary-vs-hedge mid divergence exceeded
+    /// `max_cross_venue_divergence_pct` on the last tick. Used
+    /// to suppress duplicate audit events on consecutive trips
+    /// and to log a single "resumed" line when the gap closes.
+    cross_venue_divergence_tripped: bool,
     /// Per-strategy VaR guard (Epic C sub-component #4).
     /// Rolling 24 h ring buffer of PnL samples, parametric
     /// Gaussian VaR, composes into the effective size
@@ -451,6 +456,7 @@ impl MarketMakerEngine {
             },
             lifecycle_paused: false,
             stale_book_paused: false,
+            cross_venue_divergence_tripped: false,
             var_guard: if config.market_maker.var_guard_enabled {
                 Some(VarGuard::new(VarGuardConfig {
                     limit_95: config.market_maker.var_guard_limit_95,
@@ -2504,6 +2510,71 @@ impl MarketMakerEngine {
         tuned.min_spread_bps = eff_spread;
 
         let ref_price = self.hedge_book.as_ref().and_then(|hb| hb.book.mid_price());
+
+        // Cross-venue divergence guard. When both books have
+        // mids and the operator has opted into the guard via
+        // `max_cross_venue_divergence_pct`, compare the two and
+        // stand down when the relative gap exceeds the threshold.
+        // A 50 bps gap on BTC/ETH in steady state is already
+        // anomalous — either one venue halted / is mispriced, or
+        // our feed stalled. Quoting through it drives orders at a
+        // mid that does not exist on the other leg. The tick is
+        // skipped and an audit event fires once per crossing so
+        // the operator sees the symptom in the MiCA trail.
+        if let (Some(primary_mid), Some(hedge_mid), Some(limit)) = (
+            self.book_keeper.book.mid_price(),
+            ref_price,
+            self.config.market_maker.max_cross_venue_divergence_pct,
+        ) {
+            if !primary_mid.is_zero() && limit > dec!(0) {
+                let diff = if primary_mid > hedge_mid {
+                    primary_mid - hedge_mid
+                } else {
+                    hedge_mid - primary_mid
+                };
+                let pct = diff / primary_mid;
+                if pct > limit {
+                    warn!(
+                        symbol = %self.symbol,
+                        %primary_mid,
+                        %hedge_mid,
+                        divergence_pct = %pct,
+                        limit = %limit,
+                        "cross-venue divergence exceeds limit — skipping quote refresh"
+                    );
+                    // One audit event per crossing: use the flag
+                    // on self to suppress duplicates across
+                    // consecutive ticks where the condition
+                    // persists. Reset when we come back inside.
+                    if !self.cross_venue_divergence_tripped {
+                        self.audit.risk_event(
+                            &self.symbol,
+                            AuditEventType::CircuitBreakerTripped,
+                            &format!(
+                                "cross-venue divergence {pct:.6} > {limit:.6} \
+                                 (primary {primary_mid} / hedge {hedge_mid})"
+                            ),
+                        );
+                        self.cross_venue_divergence_tripped = true;
+                        self.record_incident(
+                            "high",
+                            &format!(
+                                "Cross-venue divergence tripped: {}",
+                                (pct * dec!(10000)).round_dp(1)
+                            ),
+                        );
+                    }
+                    return Ok(());
+                } else if self.cross_venue_divergence_tripped {
+                    info!(
+                        symbol = %self.symbol,
+                        %pct,
+                        "cross-venue divergence back within limits — resuming quotes"
+                    );
+                    self.cross_venue_divergence_tripped = false;
+                }
+            }
+        }
 
         let borrow_cost_bps = self
             .borrow_manager

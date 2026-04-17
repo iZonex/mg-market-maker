@@ -475,6 +475,7 @@ mod tests {
                 webhook_urls: vec![],
                 api_keys: vec![],
                 report_branding: None,
+                daily_loss_limit_usd: None,
             },
             mm_common::config::ClientConfig {
                 id: "bob".into(),
@@ -484,6 +485,7 @@ mod tests {
                 webhook_urls: vec![],
                 api_keys: vec![],
                 report_branding: None,
+                daily_loss_limit_usd: None,
             },
         ];
         let err = validate_config(&cfg).unwrap_err().to_string();
@@ -503,6 +505,7 @@ mod tests {
                 webhook_urls: vec![],
                 api_keys: vec![],
                 report_branding: None,
+                daily_loss_limit_usd: None,
             },
             mm_common::config::ClientConfig {
                 id: "alice".into(),
@@ -512,6 +515,7 @@ mod tests {
                 webhook_urls: vec![],
                 api_keys: vec![],
                 report_branding: None,
+                daily_loss_limit_usd: None,
             },
         ];
         let err = validate_config(&cfg).unwrap_err().to_string();
@@ -530,6 +534,7 @@ mod tests {
                 webhook_urls: vec![],
                 api_keys: vec![],
                 report_branding: None,
+                daily_loss_limit_usd: None,
             },
             mm_common::config::ClientConfig {
                 id: "bob".into(),
@@ -539,6 +544,7 @@ mod tests {
                 webhook_urls: vec![],
                 api_keys: vec![],
                 report_branding: None,
+                daily_loss_limit_usd: None,
             },
         ];
         // clients mode — top-level symbols is ignored, but warns
@@ -566,6 +572,7 @@ mod tests {
             webhook_urls: vec![],
             api_keys: vec![],
             report_branding: None,
+            daily_loss_limit_usd: None,
         }];
         let eff = cfg.effective_clients();
         assert_eq!(eff.len(), 1);

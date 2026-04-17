@@ -14,6 +14,7 @@ pub mod market_impact;
 pub mod news_retreat;
 pub mod order_emulator;
 pub mod otr;
+pub mod per_client_circuit;
 pub mod performance;
 pub mod pnl;
 pub mod portfolio_risk;
@@ -31,6 +32,7 @@ pub use inventory::InventoryManager;
 pub use inventory_drift::{DriftReport, InventoryDriftReconciler};
 pub use kill_switch::{KillLevel, KillSwitch, KillSwitchConfig};
 pub use otr::OrderToTradeRatio;
+pub use per_client_circuit::{ClientLossState, PerClientLossCircuit};
 pub use pnl::PnlTracker;
 pub use protections::{
     CooldownConfig, LowProfitPairsConfig, MaxDrawdownConfig, ProtectionStatus, Protections,

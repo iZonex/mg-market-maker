@@ -28,8 +28,10 @@ async fn main() -> Result<()> {
     // Load config first (needed for log_file).
     let config = config::load_config()?;
 
-    // Initialize logging.
-    init_logging(&config);
+    // Initialize logging + Sentry. The guard MUST live for the
+    // program's duration so in-flight Sentry events flush on
+    // exit; we hold it in `main` and drop it on return.
+    let _sentry_guard = init_logging(&config);
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -807,17 +809,57 @@ fn split_base_quote(symbol: &str) -> (String, String) {
     (symbol.to_string(), "USDT".to_string())
 }
 
-fn init_logging(config: &AppConfig) {
+/// Initialize logging, and optionally Sentry, returning a guard
+/// that must live for the program's duration. Dropping the guard
+/// flushes any in-flight Sentry events to the backend — leaking
+/// it with `std::mem::forget` keeps the connection alive until
+/// process exit.
+///
+/// Sentry is gated on the `MM_SENTRY_DSN` env var:
+/// - Unset / empty: no Sentry, zero overhead.
+/// - Set: `sentry::init()` with the DSN, release = crate version,
+///   environment = `MM_MODE` (live/paper/smoke), attaches a
+///   panic hook + a tracing layer that forwards `error!` and
+///   `warn!` events as Sentry breadcrumbs / errors.
+fn init_logging(config: &AppConfig) -> Option<sentry::ClientInitGuard> {
     use tracing_subscriber::prelude::*;
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "info,mm_engine=debug,mm_strategy=debug".into());
 
+    // Sentry first — so the tracing layer can attach. Gated on
+    // the env var so dev / paper builds do not pay network cost
+    // or accidentally leak crash data to a shared project.
+    let sentry_guard = std::env::var("MM_SENTRY_DSN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|dsn| {
+            sentry::init((
+                dsn,
+                sentry::ClientOptions {
+                    release: Some(
+                        format!("mm-server@{}", env!("CARGO_PKG_VERSION")).into(),
+                    ),
+                    environment: Some(config.mode.clone().into()),
+                    // Traces sample rate left at 0 (errors only);
+                    // operators wanting performance traces can
+                    // override via `SENTRY_TRACES_SAMPLE_RATE`
+                    // handled by the sentry crate directly.
+                    ..Default::default()
+                },
+            ))
+        });
+    if sentry_guard.is_some() {
+        info!("Sentry enabled (MM_SENTRY_DSN set)");
+    }
+
     if config.log_file.is_empty() {
-        // Stdout only.
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(sentry_tracing::layer())
+            .init();
     } else {
-        // Stdout + file with rotation.
         let log_dir = std::path::Path::new(&config.log_file)
             .parent()
             .unwrap_or(std::path::Path::new("."));
@@ -827,7 +869,6 @@ fn init_logging(config: &AppConfig) {
 
         let file_appender = tracing_appender::rolling::daily(log_dir, log_name);
         let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
-        // Leak the guard so it lives for the program duration.
         std::mem::forget(_guard);
 
         tracing_subscriber::registry()
@@ -838,8 +879,11 @@ fn init_logging(config: &AppConfig) {
                     .json()
                     .with_writer(file_writer),
             )
+            .with(sentry_tracing::layer())
             .init();
 
         info!(path = %config.log_file, "file logging enabled");
     }
+
+    sentry_guard
 }

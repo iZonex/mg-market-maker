@@ -18,6 +18,11 @@ mm-persistence = { workspace = true }
 mm-portfolio = { workspace = true }
 mm-backtester = { workspace = true }
 mm-hyperopt = { workspace = true }
+# Sentry error aggregation — activates only when MM_SENTRY_DSN
+# is set at runtime. The sentry crate has no side effects until
+# `sentry::init()` is called, so the always-on dep is cheap.
+sentry = { version = "0.36", default-features = false, features = ["rustls", "contexts", "panic", "backtrace"] }
+sentry-tracing = "0.36"
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
