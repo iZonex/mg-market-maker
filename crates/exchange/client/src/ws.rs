@@ -1,6 +1,7 @@
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use mm_common::{Fill, PriceLevel, Side, Trade};
+use mm_exchange_core::metrics::WS_RECONNECTS_TOTAL;
 use rust_decimal::Decimal;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -9,6 +10,35 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::ExchangeError;
 use crate::types::{WsMessage, WsRequest};
+
+/// Initial reconnect delay after a WS failure. Exponential backoff
+/// doubles this each consecutive failure, with jitter, up to
+/// [`WS_RECONNECT_MAX_SECS`]. Reset to the initial delay as soon as
+/// a connection survives long enough to complete the subscribe
+/// handshake — sustained outages stay at the cap instead of
+/// hammering the endpoint at 0.5 req/sec (which used to trip venue
+/// rate-limits and keep the engine disconnected even after the
+/// server recovered).
+const WS_RECONNECT_INITIAL_SECS: u64 = 1;
+const WS_RECONNECT_MAX_SECS: u64 = 30;
+
+/// Cheap deterministic-enough jitter without pulling in the `rand`
+/// crate. Mixes nanos from the system clock and the previous delay
+/// so two clients that failed at the same moment do not sync up on
+/// retries.
+fn jittered_backoff(base_secs: u64) -> tokio::time::Duration {
+    use std::time::SystemTime;
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    // ±25% jitter around the base delay.
+    let jitter_pct = (nanos.wrapping_mul(2654435761) % 51) as i64 - 25; // [-25, +25]
+    let base_ms = base_secs as i64 * 1000;
+    let delta_ms = base_ms * jitter_pct / 100;
+    let total_ms = (base_ms + delta_ms).max(100) as u64;
+    tokio::time::Duration::from_millis(total_ms)
+}
 
 /// Events received from the exchange WebSocket.
 #[derive(Debug, Clone)]
@@ -61,18 +91,41 @@ impl ExchangeWsClient {
         let ws_url = self.ws_url.clone();
 
         tokio::spawn(async move {
+            let mut delay_secs = WS_RECONNECT_INITIAL_SECS;
             loop {
+                let started = std::time::Instant::now();
                 match Self::run_connection(&ws_url, &subscriptions, &tx).await {
                     Ok(()) => {
                         info!("WebSocket closed cleanly");
                         break;
                     }
                     Err(e) => {
-                        error!("WebSocket error: {e}");
+                        error!(error = %e, "WebSocket error");
                         let _ = tx.send(WsEvent::Disconnected);
-                        // Reconnect after a short delay.
-                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                        info!("Reconnecting WebSocket...");
+                        // A connection that lasted long enough to
+                        // reach steady state resets the backoff —
+                        // this was a one-off, not a sustained
+                        // outage. The 60 s threshold is well past
+                        // the subscribe handshake and the first
+                        // ping interval.
+                        if started.elapsed() > tokio::time::Duration::from_secs(60) {
+                            delay_secs = WS_RECONNECT_INITIAL_SECS;
+                        }
+                        let outcome = if delay_secs >= WS_RECONNECT_MAX_SECS {
+                            "backoff_cap"
+                        } else {
+                            "retry"
+                        };
+                        WS_RECONNECTS_TOTAL
+                            .with_label_values(&["custom", "market_data", outcome])
+                            .inc();
+                        let sleep = jittered_backoff(delay_secs);
+                        warn!(
+                            delay_ms = sleep.as_millis() as u64,
+                            outcome, "reconnecting WebSocket after backoff"
+                        );
+                        tokio::time::sleep(sleep).await;
+                        delay_secs = (delay_secs.saturating_mul(2)).min(WS_RECONNECT_MAX_SECS);
                     }
                 }
             }

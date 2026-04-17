@@ -1101,6 +1101,26 @@ impl MarketMakerEngine {
         // Initial balance fetch.
         self.refresh_balances().await;
 
+        // Startup reconciliation — reconcile local order state
+        // against the venue BEFORE the first refresh_quotes tick
+        // fires. Without this, orphaned orders from a previous
+        // session stay live on the venue while the engine happily
+        // quotes new orders, doubling exposure until the first
+        // 60-second reconcile cycle runs. The reconcile path
+        // cancels any phantom orders it finds and cleans up ghosts.
+        self.reconcile().await;
+        if let Err(e) = self
+            .order_manager
+            .cancel_all(&self.connectors.primary, &self.symbol)
+            .await
+        {
+            warn!(
+                symbol = %self.symbol,
+                error = %e,
+                "startup cancel_all left survivors — next reconcile will retry"
+            );
+        }
+
         // Initial orderbook snapshot via REST.
         match self
             .connectors
@@ -1746,12 +1766,32 @@ impl MarketMakerEngine {
             }
         }
 
-        // Kill switch L3+ → cancel all.
+        // Kill switch L3+ → cancel all. If verification reports
+        // surviving orders we hold off on L4 flatten so TwapExecutor
+        // does not race the still-live quotes.
         if self.kill_switch.level() >= KillLevel::CancelAll {
-            self.order_manager
+            match self
+                .order_manager
                 .cancel_all(&self.connectors.primary, &self.symbol)
-                .await;
-            self.balance_cache.reset_reservations();
+                .await
+            {
+                Ok(()) => {
+                    self.balance_cache.reset_reservations();
+                }
+                Err(e) => {
+                    warn!(
+                        symbol = %self.symbol,
+                        error = %e,
+                        "cancel_all left orders on venue — deferring L4 flatten this tick"
+                    );
+                    self.audit.risk_event(
+                        &self.symbol,
+                        AuditEventType::CircuitBreakerTripped,
+                        &format!("cancel_all incomplete: {e}"),
+                    );
+                    return;
+                }
+            }
 
             // Kill switch L4 → start the right flatten executor.
             //
@@ -2146,9 +2186,13 @@ impl MarketMakerEngine {
                         elapsed_secs = last.elapsed().as_secs(),
                         "book stale — pausing quotes and cancelling orders"
                     );
-                    self.order_manager
+                    if let Err(e) = self
+                        .order_manager
                         .cancel_all(&self.connectors.primary, &self.symbol)
-                        .await;
+                        .await
+                    {
+                        warn!(symbol = %self.symbol, error = %e, "cancel_all during stale-book pause left survivors");
+                    }
                     self.balance_cache.reset_reservations();
                     self.stale_book_paused = true;
                     self.audit.risk_event(
@@ -2183,9 +2227,13 @@ impl MarketMakerEngine {
         // Kill switch check.
         if !self.kill_switch.allow_new_orders() {
             if self.kill_switch.level() >= KillLevel::CancelAll {
-                self.order_manager
+                if let Err(e) = self
+                    .order_manager
                     .cancel_all(&self.connectors.primary, &self.symbol)
-                    .await;
+                    .await
+                {
+                    warn!(symbol = %self.symbol, error = %e, "cancel_all during kill-switch tick left survivors");
+                }
                 self.balance_cache.reset_reservations();
             }
             return Ok(());
@@ -2251,9 +2299,13 @@ impl MarketMakerEngine {
         }
 
         if self.circuit_breaker.is_tripped() {
-            self.order_manager
+            if let Err(e) = self
+                .order_manager
                 .cancel_all(&self.connectors.primary, &self.symbol)
-                .await;
+                .await
+            {
+                warn!(symbol = %self.symbol, error = %e, "cancel_all on circuit-breaker trip left survivors");
+            }
             self.balance_cache.reset_reservations();
             return Ok(());
         }
@@ -3073,9 +3125,13 @@ impl MarketMakerEngine {
             // not per-pair, so flushing only the primary leg is
             // the right scope.
             let symbol = self.symbol.clone();
-            self.order_manager
+            if let Err(e) = self
+                .order_manager
                 .cancel_all(&self.connectors.primary, &symbol)
-                .await;
+                .await
+            {
+                warn!(symbol = %symbol, error = %e, "cancel_all on lifecycle halt left survivors");
+            }
         }
     }
 
@@ -3223,9 +3279,13 @@ impl MarketMakerEngine {
         info!(symbol = %self.symbol, "shutting down — cancelling all orders");
         self.audit
             .risk_event(&self.symbol, AuditEventType::EngineShutdown, "graceful");
-        self.order_manager
+        if let Err(e) = self
+            .order_manager
             .cancel_all(&self.connectors.primary, &self.symbol)
-            .await;
+            .await
+        {
+            error!(symbol = %self.symbol, error = %e, "shutdown cancel_all left survivors on primary venue");
+        }
         // Cancel live orders on the hedge leg too — a shutdown
         // with a dangling hedge order is the exact state that
         // turns a delta-neutral pair into a naked position over
@@ -3235,7 +3295,9 @@ impl MarketMakerEngine {
             self.connectors.hedge.as_ref(),
             self.connectors.pair.as_ref(),
         ) {
-            hedge_om.cancel_all(hedge_conn, &pair.hedge_symbol).await;
+            if let Err(e) = hedge_om.cancel_all(hedge_conn, &pair.hedge_symbol).await {
+                error!(hedge = %pair.hedge_symbol, error = %e, "shutdown cancel_all left survivors on hedge venue");
+            }
         }
         self.balance_cache.reset_reservations();
         self.pnl_tracker.log_summary();

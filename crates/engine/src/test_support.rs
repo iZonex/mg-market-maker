@@ -52,6 +52,11 @@ pub struct MockConnector {
     /// endpoint. `Some(Ok(vec))` returns the vec; `Some(Err(_))`
     /// simulates a connector-side failure.
     list_symbols_response: Mutex<Option<Result<Vec<ProductSpec>, String>>>,
+    /// Epic 2 (cancel_all verification): controllable response
+    /// for `get_open_orders`. Empty by default — tests that want
+    /// to simulate a surviving order after cancel_all push ids
+    /// here via [`MockConnector::set_open_orders`].
+    open_orders: Mutex<Vec<LiveOrder>>,
 }
 
 impl MockConnector {
@@ -79,7 +84,17 @@ impl MockConnector {
             fail_next_batch_place: Mutex::new(false),
             fail_next_batch_cancel: Mutex::new(false),
             list_symbols_response: Mutex::new(None),
+            open_orders: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Set the venue's open-order set seen by
+    /// `get_open_orders`. Tests that want to simulate a
+    /// cancel_all that leaves survivors call this with the
+    /// surviving `LiveOrder` so the verification pass picks
+    /// them up.
+    pub fn set_open_orders(&self, orders: Vec<LiveOrder>) {
+        *self.open_orders.lock().unwrap() = orders;
     }
 
     /// Epic F listing sniper (stage-2): program the next (and
@@ -230,7 +245,7 @@ impl ExchangeConnector for MockConnector {
         Ok(())
     }
     async fn get_open_orders(&self, _symbol: &str) -> anyhow::Result<Vec<LiveOrder>> {
-        Ok(vec![])
+        Ok(self.open_orders.lock().unwrap().clone())
     }
     async fn get_balances(&self) -> anyhow::Result<Vec<Balance>> {
         // Return both USDT and BTC so that engine tests

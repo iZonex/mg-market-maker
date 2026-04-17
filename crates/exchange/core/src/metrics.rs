@@ -10,7 +10,7 @@
 //! same process-global timeseries.
 
 use once_cell::sync::Lazy;
-use prometheus::{register_histogram_vec, HistogramVec};
+use prometheus::{register_histogram_vec, register_int_counter_vec, HistogramVec, IntCounterVec};
 
 /// Round-trip latency of `place_order` calls, labelled by venue and
 /// transport path. Observers must call:
@@ -34,6 +34,39 @@ pub static ORDER_ENTRY_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
         "Round-trip latency of place_order calls, by venue and transport path",
         &["venue", "path", "method"],
         vec![0.0005, 0.001, 0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.200, 0.500, 1.0, 2.0, 5.0]
+    )
+    .unwrap()
+});
+
+/// Count of WebSocket reconnect attempts per venue and stream kind.
+/// Incremented each time a stream transitions disconnected→reconnecting.
+/// A steady increase indicates flaky connectivity, venue maintenance,
+/// or an account-level ban — dashboards should alert on `rate(5m) > 0.5`.
+///
+/// Label conventions:
+///
+/// - `venue`: "binance" | "bybit" | "hyperliquid" | "custom" | ...
+/// - `stream`: "market_data" | "user_data" | "order_entry"
+/// - `outcome`: "retry" (about to sleep+reconnect) | "backoff_cap"
+///   (capped at max delay, likely sustained outage)
+pub static WS_RECONNECTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "mm_ws_reconnects_total",
+        "WebSocket reconnect attempts by venue / stream / outcome",
+        &["venue", "stream", "outcome"]
+    )
+    .unwrap()
+});
+
+/// Count of silently-dropped exchange events (malformed payloads,
+/// parse errors in user-data streams). A non-zero rate means the
+/// connector is quietly discarding data — positions and balances
+/// drift until the next full reconciliation.
+pub static WS_PARSE_ERRORS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "mm_ws_parse_errors_total",
+        "Malformed / unparseable WebSocket payloads by venue and stream",
+        &["venue", "stream", "kind"]
     )
     .unwrap()
 });

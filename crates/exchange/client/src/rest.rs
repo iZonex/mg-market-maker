@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mm_common::{Balance, OrderId, PriceLevel, ProductSpec};
 use reqwest::Client;
 use rust_decimal::Decimal;
@@ -6,6 +6,29 @@ use tracing::{debug, warn};
 
 use crate::error::ExchangeError;
 use crate::types::*;
+
+/// Read a response body as text without ever silently dropping
+/// errors. When `text()` itself fails (connection reset mid-read,
+/// invalid UTF-8) we surface a non-empty marker so the subsequent
+/// log line shows that the body is missing for a KNOWN reason
+/// instead of being indistinguishable from an empty 401.
+async fn read_body_or_error(resp: reqwest::Response) -> String {
+    match resp.text().await {
+        Ok(body) => body,
+        Err(e) => format!("<body read failed: {e}>"),
+    }
+}
+
+/// Parse a Decimal that MUST come out of a trusted exchange
+/// response. A malformed field is not a zero-balance situation —
+/// zeroing it silently would tell the trading loop the account
+/// is empty and cause it to stop quoting (or over-leverage on
+/// locked-balance math). We propagate the parse error instead so
+/// the caller can decide to retry, alert, or halt.
+fn parse_required_decimal(field: &str, raw: &str) -> Result<Decimal> {
+    raw.parse::<Decimal>()
+        .with_context(|| format!("failed to parse `{field}` from exchange: {raw:?}"))
+}
 
 /// HTTP client for the exchange REST API.
 pub struct ExchangeRestClient {
@@ -29,7 +52,7 @@ impl ExchangeRestClient {
         let resp = self.client.post(&url).json(req).send().await?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = read_body_or_error(resp).await;
             warn!(status = %status, body = %body, "place order failed");
             return Err(ExchangeError::Api {
                 status: status.as_u16(),
@@ -48,8 +71,8 @@ impl ExchangeRestClient {
         let resp = self.client.delete(&url).send().await?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            warn!(status = %status, %order_id, "cancel failed");
+            let body = read_body_or_error(resp).await;
+            warn!(status = %status, %order_id, body = %body, "cancel failed");
             return Err(ExchangeError::Api {
                 status: status.as_u16(),
                 message: body,
@@ -76,21 +99,42 @@ impl ExchangeRestClient {
         Ok((bids, asks, resp.sequence))
     }
 
-    /// Get account balances.
+    /// Get account balances. Parsing errors on the balance decimal
+    /// fields are propagated, not silently defaulted — a malformed
+    /// response would otherwise make the trading loop believe the
+    /// account is empty (stopping quotes) or leak locked-balance
+    /// reservation math (over-leveraging). The caller can decide
+    /// whether to retry, alert, or halt.
     pub async fn get_balances(&self) -> Result<Vec<Balance>> {
         let url = format!("{}/api/v1/account/balances", self.base_url);
-        let resp: Vec<BalanceResponse> = self.client.get(&url).send().await?.json().await?;
+        let http = self.client.get(&url).send().await?;
+        let status = http.status();
+        if !status.is_success() {
+            let body = read_body_or_error(http).await;
+            warn!(status = %status, body = %body, "get_balances failed");
+            return Err(ExchangeError::Api {
+                status: status.as_u16(),
+                message: body,
+            }
+            .into());
+        }
+        let resp: Vec<BalanceResponse> = http.json().await?;
 
-        Ok(resp
-            .into_iter()
-            .map(|b| Balance {
-                asset: b.asset,
-                wallet: mm_common::types::WalletType::Spot,
-                total: b.total.parse().unwrap_or_default(),
-                locked: b.locked.parse().unwrap_or_default(),
-                available: b.available.parse().unwrap_or_default(),
+        resp.into_iter()
+            .map(|b| {
+                let total = parse_required_decimal(&format!("{}.total", b.asset), &b.total)?;
+                let locked = parse_required_decimal(&format!("{}.locked", b.asset), &b.locked)?;
+                let available =
+                    parse_required_decimal(&format!("{}.available", b.asset), &b.available)?;
+                Ok(Balance {
+                    asset: b.asset,
+                    wallet: mm_common::types::WalletType::Spot,
+                    total,
+                    locked,
+                    available,
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// Get recent trades for a symbol.
