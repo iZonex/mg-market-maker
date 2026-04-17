@@ -370,6 +370,13 @@ pub trait ExchangeConnector: Send + Sync {
     ///
     /// Default returns `Err` — venue connectors that support
     /// programmatic withdrawals override this.
+    ///
+    /// Implementations MUST call [`validate_withdraw_address`]
+    /// with their configured `withdraw_whitelist` BEFORE
+    /// hitting the network. A compromised trading key should
+    /// not be able to drain the account to an attacker-
+    /// controlled address even if venue-side withdraw scopes
+    /// are accidentally left enabled.
     async fn withdraw(
         &self,
         _asset: &str,
@@ -447,5 +454,102 @@ pub trait ExchangeConnector: Send + Sync {
     /// has to await the lock.
     async fn rate_limit_remaining(&self) -> u32 {
         u32::MAX
+    }
+}
+
+/// Fail-closed check against a configured withdraw address
+/// whitelist. See [`ExchangeConnector::withdraw`] for the
+/// integration contract.
+///
+/// Semantics (mirrors
+/// `mm_common::config::ExchangeConfig::withdraw_whitelist`):
+/// - `None`: unchecked — legacy setups that rely on venue-side
+///   whitelisting. Returns `Ok(())`. Logs once per call at
+///   `warn!` so operators see that the guard is not active.
+/// - `Some(&[])`: every address is blocked. Used to freeze
+///   outflows during an incident.
+/// - `Some(addrs)`: only entries in the slice pass.
+///
+/// Comparison is case-sensitive — the caller is responsible for
+/// normalising the on-wire address (lowercase hex for EVM,
+/// base58 for SOL, etc.) to match however operators populated
+/// the list. A mismatch returns a redacted error (never echoes
+/// the attempted address back) to avoid feeding an attacker's
+/// probing with exact-match telemetry.
+pub fn validate_withdraw_address(
+    whitelist: Option<&[String]>,
+    address: &str,
+) -> anyhow::Result<()> {
+    match whitelist {
+        None => {
+            tracing::warn!(
+                "withdraw_whitelist not configured — venue-side controls are the only guard"
+            );
+            Ok(())
+        }
+        Some([]) => {
+            tracing::warn!(
+                target_len = address.len(),
+                "withdraw blocked by empty whitelist (fail-closed)"
+            );
+            Err(anyhow::anyhow!(
+                "withdraw blocked: whitelist is empty — populate \
+                 exchange.withdraw_whitelist before attempting withdrawals"
+            ))
+        }
+        Some(addrs) => {
+            if addrs.iter().any(|a| a == address) {
+                Ok(())
+            } else {
+                tracing::warn!(
+                    allowed = addrs.len(),
+                    target_len = address.len(),
+                    "withdraw blocked: address not in whitelist"
+                );
+                Err(anyhow::anyhow!(
+                    "withdraw blocked: destination address is not in the configured whitelist"
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod withdraw_whitelist_tests {
+    use super::*;
+
+    #[test]
+    fn none_means_unchecked() {
+        assert!(validate_withdraw_address(None, "0xabc").is_ok());
+    }
+
+    #[test]
+    fn empty_blocks_all() {
+        let empty: &[String] = &[];
+        assert!(validate_withdraw_address(Some(empty), "0xabc").is_err());
+    }
+
+    #[test]
+    fn exact_match_allowed() {
+        let list = vec!["0xaAbBcC".to_string(), "bc1qxyz".to_string()];
+        assert!(validate_withdraw_address(Some(&list), "0xaAbBcC").is_ok());
+        assert!(validate_withdraw_address(Some(&list), "bc1qxyz").is_ok());
+    }
+
+    #[test]
+    fn mismatch_rejected_and_redacted() {
+        let list = vec!["0xaAbBcC".to_string()];
+        let err = validate_withdraw_address(Some(&list), "0xdeadBeef").unwrap_err();
+        let msg = err.to_string();
+        // Error must NOT echo the attempted address back.
+        assert!(!msg.contains("0xdead"), "error leaked target: {msg}");
+    }
+
+    #[test]
+    fn case_sensitive() {
+        let list = vec!["0xAABB".to_string()];
+        // Mixed case mismatch — operators should normalise
+        // before populating the list.
+        assert!(validate_withdraw_address(Some(&list), "0xaabb").is_err());
     }
 }

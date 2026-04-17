@@ -653,6 +653,18 @@ fn create_hedge_connector(
 fn create_connector(config: &AppConfig) -> Result<Arc<dyn ExchangeConnector>> {
     let api_key = config.exchange.api_key.clone().unwrap_or_default();
     let api_secret = config.exchange.api_secret.clone().unwrap_or_default();
+    let whitelist = config.exchange.withdraw_whitelist.clone();
+    match &whitelist {
+        Some(list) if list.is_empty() => {
+            info!("withdraw_whitelist configured as empty — ALL withdraws will be blocked");
+        }
+        Some(list) => {
+            info!(addresses = list.len(), "withdraw_whitelist configured");
+        }
+        None => {
+            info!("withdraw_whitelist not set — venue-side controls are the only guard");
+        }
+    }
 
     match config.exchange.exchange_type {
         ExchangeType::Custom => {
@@ -668,33 +680,36 @@ fn create_connector(config: &AppConfig) -> Result<Arc<dyn ExchangeConnector>> {
         }
         ExchangeType::Binance => {
             info!("connecting to Binance");
-            Ok(Arc::new(mm_exchange_binance::BinanceConnector::new(
-                "https://api.binance.com",
-                "wss://stream.binance.com:9443/ws",
-                &api_key,
-                &api_secret,
-            )))
+            Ok(Arc::new(
+                mm_exchange_binance::BinanceConnector::new(
+                    "https://api.binance.com",
+                    "wss://stream.binance.com:9443/ws",
+                    &api_key,
+                    &api_secret,
+                )
+                .with_withdraw_whitelist(whitelist),
+            ))
         }
         ExchangeType::BinanceTestnet => {
             info!("connecting to Binance Testnet");
-            Ok(Arc::new(mm_exchange_binance::BinanceConnector::testnet(
-                &api_key,
-                &api_secret,
-            )))
+            Ok(Arc::new(
+                mm_exchange_binance::BinanceConnector::testnet(&api_key, &api_secret)
+                    .with_withdraw_whitelist(whitelist),
+            ))
         }
         ExchangeType::Bybit => {
             info!("connecting to Bybit");
-            Ok(Arc::new(mm_exchange_bybit::BybitConnector::new(
-                &api_key,
-                &api_secret,
-            )))
+            Ok(Arc::new(
+                mm_exchange_bybit::BybitConnector::new(&api_key, &api_secret)
+                    .with_withdraw_whitelist(whitelist),
+            ))
         }
         ExchangeType::BybitTestnet => {
             info!("connecting to Bybit Testnet");
-            Ok(Arc::new(mm_exchange_bybit::BybitConnector::testnet(
-                &api_key,
-                &api_secret,
-            )))
+            Ok(Arc::new(
+                mm_exchange_bybit::BybitConnector::testnet(&api_key, &api_secret)
+                    .with_withdraw_whitelist(whitelist),
+            ))
         }
         ExchangeType::HyperLiquid => {
             info!("connecting to HyperLiquid");

@@ -366,6 +366,7 @@ mod tests {
                 api_secret: Some("s".to_string()),
                 read_key: None,
                 read_secret: None,
+                withdraw_whitelist: None,
             },
             pair: HedgePairConfig {
                 primary_symbol: "BTCUSDT".to_string(),

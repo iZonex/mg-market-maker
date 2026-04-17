@@ -315,6 +315,36 @@ pub struct SymbolState {
     pub market_impact: Option<mm_risk::market_impact::MarketImpactReport>,
     /// Performance metrics (Sharpe, Sortino, drawdown, etc.).
     pub performance: Option<mm_risk::performance::PerformanceMetrics>,
+    /// Live-tunable config snapshot (Epic 8). UI slider panels
+    /// read these to show the current value before dispatching
+    /// a `ConfigOverride` via the admin config endpoint. Only
+    /// fields that are safe to hot-reload are exposed here —
+    /// gamma, kappa, sigma floor, order size, level count,
+    /// spread floors, inventory limit. Missing fields mean the
+    /// engine has not published a snapshot yet (fresh startup).
+    #[serde(default)]
+    pub tunable_config: Option<TunableConfigSnapshot>,
+}
+
+/// Snapshot of the hot-reloadable parameters the dashboard shows
+/// in the tuning panel. The keys line up 1-to-1 with
+/// `ConfigOverride` variants so the UI can post the matching
+/// override without a separate mapping table.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct TunableConfigSnapshot {
+    pub gamma: Decimal,
+    pub kappa: Decimal,
+    pub sigma: Decimal,
+    pub order_size: Decimal,
+    pub num_levels: u32,
+    pub min_spread_bps: Decimal,
+    pub max_distance_bps: Decimal,
+    pub max_inventory: Decimal,
+    pub momentum_enabled: bool,
+    pub market_resilience_enabled: bool,
+    pub amend_enabled: bool,
+    pub amend_max_ticks: u32,
+    pub otr_enabled: bool,
 }
 
 /// Depth at a specific percentage from mid price.
@@ -1060,6 +1090,7 @@ mod tests {
             hourly_presence: vec![],
             market_impact: None,
             performance: None,
+            tunable_config: None,
         }
     }
 

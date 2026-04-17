@@ -274,6 +274,27 @@ pub struct ExchangeConfig {
     pub read_key: Option<String>,
     #[serde(default)]
     pub read_secret: Option<String>,
+    /// Fail-closed withdraw address whitelist (Epic 8). Guards
+    /// every `connector.withdraw(...)` call:
+    /// - `None`: legacy behaviour — the venue's own whitelist
+    ///   is the sole line of defence. Operators who have locked
+    ///   their API key to withdrawal-disabled can leave this
+    ///   unset; operators who keep withdraw permission enabled
+    ///   **must** populate it.
+    /// - `Some([])`: block every withdraw attempt. Used as a
+    ///   paranoid default during incident response.
+    /// - `Some(addrs)`: only the listed addresses are accepted.
+    ///   Entries are compared case-sensitively to the `address`
+    ///   passed to `withdraw` — enforce whatever normalisation
+    ///   the venue uses (lowercase hex for EVM, base58 for SOL,
+    ///   etc.) when you populate the list.
+    ///
+    /// Config this at the network boundary so a compromised
+    /// trading key cannot drain the account to an attacker-
+    /// controlled address even if venue-side withdraw scopes
+    /// are accidentally left enabled.
+    #[serde(default)]
+    pub withdraw_whitelist: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for ExchangeConfig {
@@ -1091,6 +1112,7 @@ impl Default for AppConfig {
                 api_secret: None,
                 read_key: None,
                 read_secret: None,
+                withdraw_whitelist: None,
             },
             market_maker: MarketMakerConfig {
                 gamma: "0.1".parse().unwrap(),

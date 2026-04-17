@@ -3195,6 +3195,26 @@ impl MarketMakerEngine {
             hourly_presence: self.sla_tracker.hourly_presence_summary(),
             market_impact: Some(self.market_impact.report()),
             performance: Some(self.performance.compute(dec!(525600))), // 365.25d × 1440min
+            // Epic 8: publish the hot-reloadable config so the
+            // dashboard's tuning panel shows the LIVE value
+            // before the operator moves a slider. Reads
+            // directly from `self.config` — any `ConfigOverride`
+            // the engine has applied is already stored there.
+            tunable_config: Some(mm_dashboard::state::TunableConfigSnapshot {
+                gamma: self.config.market_maker.gamma,
+                kappa: self.config.market_maker.kappa,
+                sigma: self.config.market_maker.sigma,
+                order_size: self.config.market_maker.order_size,
+                num_levels: self.config.market_maker.num_levels as u32,
+                min_spread_bps: self.config.market_maker.min_spread_bps,
+                max_distance_bps: self.config.market_maker.max_distance_bps,
+                max_inventory: self.config.risk.max_inventory,
+                momentum_enabled: self.config.market_maker.momentum_enabled,
+                market_resilience_enabled: self.config.market_maker.market_resilience_enabled,
+                amend_enabled: self.config.market_maker.amend_enabled,
+                amend_max_ticks: self.config.market_maker.amend_max_ticks,
+                otr_enabled: self.config.market_maker.otr_enabled,
+            }),
         });
 
         // Push PnL time-series sample for charting.

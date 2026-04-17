@@ -99,6 +99,9 @@ pub struct BybitConnector {
     /// `category.wallet_type()` but can be overridden for classic
     /// sub-accounts via `with_wallet`.
     wallet: WalletType,
+    /// Fail-closed withdraw address whitelist (Epic 8). Threaded
+    /// into `withdraw()` via `validate_withdraw_address`.
+    withdraw_whitelist: Option<Vec<String>>,
 }
 
 impl BybitConnector {
@@ -179,6 +182,7 @@ impl BybitConnector {
             },
             wallet: category.wallet_type(),
             category,
+            withdraw_whitelist: None,
         }
     }
 
@@ -187,6 +191,13 @@ impl BybitConnector {
     /// wallet is its own bucket, not Unified).
     pub fn with_wallet(mut self, wallet: WalletType) -> Self {
         self.wallet = wallet;
+        self
+    }
+
+    /// Attach a fail-closed withdraw address whitelist (Epic 8).
+    /// See `validate_withdraw_address` for semantics.
+    pub fn with_withdraw_whitelist(mut self, list: Option<Vec<String>>) -> Self {
+        self.withdraw_whitelist = list;
         self
     }
 
@@ -660,7 +671,8 @@ impl ExchangeConnector for BybitConnector {
     }
 
     /// Withdraw to an external address via
-    /// `POST /v5/asset/withdraw`.
+    /// `POST /v5/asset/withdraw`. Enforces the configured
+    /// `withdraw_whitelist` before hitting the network.
     async fn withdraw(
         &self,
         asset: &str,
@@ -668,6 +680,10 @@ impl ExchangeConnector for BybitConnector {
         address: &str,
         network: &str,
     ) -> anyhow::Result<String> {
+        mm_exchange_core::validate_withdraw_address(
+            self.withdraw_whitelist.as_deref(),
+            address,
+        )?;
         let body = serde_json::json!({
             "coin": asset,
             "amount": qty.to_string(),

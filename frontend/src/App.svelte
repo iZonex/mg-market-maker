@@ -12,6 +12,7 @@
   import ConnectivityPanel from './lib/components/ConnectivityPanel.svelte'
   import AuditStream from './lib/components/AuditStream.svelte'
   import ClientCircuitPanel from './lib/components/ClientCircuitPanel.svelte'
+  import ParamTuner from './lib/components/ParamTuner.svelte'
   import Login from './lib/components/Login.svelte'
   import { createWsStore } from './lib/ws.svelte.js'
   import { createAuthStore } from './lib/auth.svelte.js'
@@ -104,6 +105,11 @@
         <div class="panel span-3">
           <ClientCircuitPanel {auth} />
         </div>
+        {#if auth.canControl()}
+          <div class="panel span-3">
+            <ParamTuner data={ws} {auth} />
+          </div>
+        {/if}
       {/if}
     </div>
 

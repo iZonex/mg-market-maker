@@ -30,9 +30,20 @@ pub struct BinanceConnector {
     /// `cancel_order` / `cancel_all_orders` go through WS first with
     /// REST as the fallback on disconnect or WS-side error.
     ws_trader: Option<Arc<BinanceWsTrader>>,
+    /// Fail-closed withdraw address whitelist (Epic 8). Threaded
+    /// into the `withdraw()` impl via `validate_withdraw_address`.
+    /// `None` leaves the venue-side whitelist as the only control.
+    withdraw_whitelist: Option<Vec<String>>,
 }
 
 impl BinanceConnector {
+    /// Attach a fail-closed withdraw address whitelist (Epic 8).
+    /// See `validate_withdraw_address` for semantics.
+    pub fn with_withdraw_whitelist(mut self, list: Option<Vec<String>>) -> Self {
+        self.withdraw_whitelist = list;
+        self
+    }
+
     pub fn new(base_url: &str, ws_url: &str, api_key: &str, api_secret: &str) -> Self {
         Self {
             client: Client::new(),
@@ -67,6 +78,7 @@ impl BinanceConnector {
                 supports_funding_rate: false, // spot has no funding
             },
             ws_trader: None,
+            withdraw_whitelist: None,
         }
     }
 
@@ -538,7 +550,10 @@ impl ExchangeConnector for BinanceConnector {
     }
 
     /// Withdraw to an external address via
-    /// `POST /sapi/v1/capital/withdraw/apply`.
+    /// `POST /sapi/v1/capital/withdraw/apply`. Enforces the
+    /// configured `withdraw_whitelist` before hitting the
+    /// network — a compromised trading key cannot drain funds
+    /// to an attacker-controlled address.
     async fn withdraw(
         &self,
         asset: &str,
@@ -546,6 +561,10 @@ impl ExchangeConnector for BinanceConnector {
         address: &str,
         network: &str,
     ) -> anyhow::Result<String> {
+        mm_exchange_core::validate_withdraw_address(
+            self.withdraw_whitelist.as_deref(),
+            address,
+        )?;
         let params = format!("coin={asset}&amount={qty}&address={address}&network={network}");
         let resp = self
             .signed_post("/sapi/v1/capital/withdraw/apply", &params)
