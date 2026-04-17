@@ -2314,6 +2314,51 @@ impl MarketMakerEngine {
             return Ok(());
         }
 
+        // Sequence-gap guard: if the WS book stream skipped a
+        // delta, the local book is out of sync with the venue.
+        // Quoting against an out-of-sync book is how phantom
+        // inventory shows up — we would place orders that cross
+        // the real best quote. Pull a fresh REST snapshot and
+        // feed it through the keeper; that re-anchors the stream
+        // and clears the flag. If the REST call itself fails we
+        // stand down this tick and retry next.
+        if self.book_keeper.needs_resync() {
+            warn!(
+                symbol = %self.symbol,
+                gaps = self.book_keeper.gap_count(),
+                "book stream had a sequence gap — fetching REST snapshot to resync"
+            );
+            match self
+                .connectors
+                .primary
+                .get_orderbook(&self.symbol, 25)
+                .await
+            {
+                Ok((bids, asks, seq)) => {
+                    // Replay as a synthetic snapshot event so the
+                    // keeper clears needs_resync and re-seeds
+                    // last_sequence the same way a WS snapshot would.
+                    let snap = mm_exchange_core::events::MarketEvent::BookSnapshot {
+                        venue: self.connectors.primary.venue_id(),
+                        symbol: self.symbol.clone(),
+                        bids,
+                        asks,
+                        sequence: seq,
+                    };
+                    self.book_keeper.on_event(&snap);
+                    self.audit.risk_event(
+                        &self.symbol,
+                        AuditEventType::BookResync,
+                        &format!("sequence-gap resync via REST (seq={seq})"),
+                    );
+                }
+                Err(e) => {
+                    warn!(symbol = %self.symbol, error = %e, "REST snapshot resync failed — skipping tick");
+                    return Ok(());
+                }
+            }
+        }
+
         let Some(mid) = self.book_keeper.book.mid_price() else {
             // Book was marked ready but mid is unavailable
             // (e.g. empty side after a flash crash). Skip this

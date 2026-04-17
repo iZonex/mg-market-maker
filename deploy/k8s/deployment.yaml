@@ -1,0 +1,210 @@
+# MG Market Maker — single-symbol engine Deployment.
+#
+# Reference manifest. Adjust resource requests/limits, image
+# reference, and the ConfigMap/Secret mount paths to match your
+# cluster. The server reads MM_CONFIG for the TOML path (baked
+# into the image at /etc/mm/default.toml by default) and pulls
+# every credential from env vars — NEVER put secrets in the
+# ConfigMap.
+#
+# Health endpoints:
+#   /health   — cheap liveness (always 200 after startup)
+#   /ready    — readiness probe; returns 503 until the first book
+#               snapshot lands, so the Service does not route
+#               traffic to an engine that cannot yet price
+#   /startup  — same handler as /ready for k8s startup-probe
+#               gating (lets slow connectors warm up without
+#               tripping livenessProbe)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mm
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mm-config
+  namespace: mm
+data:
+  default.toml: |
+    # Copy the relevant sections from config/default.toml here.
+    # See docs/guides/configuration-reference.md for every field.
+    symbols = ["BTCUSDC"]
+    dashboard_port = 9090
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mm-secrets
+  namespace: mm
+type: Opaque
+stringData:
+  # Populate these via your secret manager (SealedSecrets, SOPS,
+  # Vault, External Secrets Operator). Never commit real values.
+  MM_API_KEY: "REPLACE_ME"
+  MM_API_SECRET: "REPLACE_ME"
+  MM_READ_KEY: "REPLACE_ME_OR_REMOVE"
+  MM_READ_SECRET: "REPLACE_ME_OR_REMOVE"
+  MM_AUTH_SECRET: "REPLACE_WITH_32_BYTE_RANDOM"
+  MM_CHECKPOINT_SECRET: "REPLACE_WITH_32_BYTE_RANDOM"
+  MM_TELEGRAM_TOKEN: ""
+  MM_TELEGRAM_CHAT: ""
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mm-engine
+  namespace: mm
+  labels:
+    app: mm-engine
+spec:
+  # StatefulSet would be more correct (the engine keeps a
+  # checkpoint file on a PVC), but a Deployment + RWO PVC works
+  # for a single-replica engine. Two replicas would double-book
+  # the exchange — never set replicas > 1 per symbol.
+  replicas: 1
+  strategy:
+    type: Recreate  # no rolling update; new pod must see clean venue state
+  selector:
+    matchLabels:
+      app: mm-engine
+  template:
+    metadata:
+      labels:
+        app: mm-engine
+    spec:
+      terminationGracePeriodSeconds: 45  # matches systemd unit's 30s + buffer
+      containers:
+        - name: engine
+          image: ghcr.io/your-org/market-maker:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MM_CONFIG
+              value: /etc/mm/default.toml
+            - name: MM_MODE
+              value: live
+            - name: RUST_LOG
+              value: info,mm_engine=info,mm_exchange_binance=warn
+            - name: MM_DASHBOARD_CORS_ORIGINS
+              value: "https://mm-dashboard.internal"
+          envFrom:
+            - secretRef:
+                name: mm-secrets
+          ports:
+            - name: dashboard
+              containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/mm
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/mm
+          # Startup probe: gives the engine time to reach a book
+          # snapshot before livenessProbe kicks in. Up to 90s on
+          # a cold start (WS auth + initial REST book).
+          startupProbe:
+            httpGet:
+              path: /startup
+              port: dashboard
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 18  # 18 * 5s = 90s
+          # Readiness probe: stays in NotReady while no fresh book.
+          # Used by the Service to gate traffic (also gated by
+          # PodDisruptionBudget below).
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: dashboard
+            periodSeconds: 10
+            failureThreshold: 3
+          # Liveness probe: only kills the pod on a truly wedged
+          # process. /health always returns 200 after boot so the
+          # probe fails only on true unresponsiveness.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: dashboard
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          configMap:
+            name: mm-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: mm-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mm-data
+  namespace: mm
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mm-dashboard
+  namespace: mm
+spec:
+  type: ClusterIP
+  selector:
+    app: mm-engine
+  ports:
+    - port: 9090
+      targetPort: dashboard
+      name: http
+---
+# Prevents the pod from being evicted during node drains
+# without operator acknowledgement — eviction mid-trade can leave
+# orphaned orders on the venue.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mm-engine
+  namespace: mm
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: mm-engine
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: mm-engine
+  namespace: mm
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: mm-engine
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      # /metrics is behind HTTP auth (Admin|Operator role). Supply
+      # a Prometheus bearer token via the `bearerTokenFile` field
+      # if your Prometheus supports it; otherwise expose an
+      # unauthenticated scrape-only service (e.g. a sidecar
+      # exporter) inside the cluster boundary.

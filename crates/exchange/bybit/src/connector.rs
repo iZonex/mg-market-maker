@@ -403,7 +403,7 @@ impl ExchangeConnector for BybitConnector {
             "orderType": match order.order_type { OrderType::Limit => "Limit", OrderType::Market => "Market" },
             "qty": order.qty.to_string(),
             "price": order.price.map(|p| p.to_string()),
-            "timeInForce": "PostOnly",
+            "timeInForce": bybit_tif(order.time_in_force),
         });
         // Only a REST path exists today — WS trading is listed as an
         // operator next-step in docs/deployment.md §3. The metric label
@@ -432,7 +432,7 @@ impl ExchangeConnector for BybitConnector {
                     "orderType": match o.order_type { OrderType::Limit => "Limit", OrderType::Market => "Market" },
                     "qty": o.qty.to_string(),
                     "price": o.price.map(|p| p.to_string()),
-                    "timeInForce": "PostOnly",
+                    "timeInForce": bybit_tif(o.time_in_force),
                 })
             })
             .collect();
@@ -832,6 +832,25 @@ pub(crate) fn build_amend_body(category: &str, amend: &AmendOrder) -> Value {
         body["qty"] = Value::String(qty.to_string());
     }
     body
+}
+
+/// Map our `TimeInForce` enum onto Bybit V5's string codes. Bybit
+/// accepts "GTC" | "IOC" | "FOK" | "PostOnly" on spot and linear
+/// perp; "PostOnly" is the MM default. Connector previously
+/// hardcoded "PostOnly" ignoring the field on every order, which
+/// made it impossible to dispatch an IOC slice for kill-switch L4
+/// flatten or an FOK probe from execution algos.
+fn bybit_tif(tif: Option<TimeInForce>) -> &'static str {
+    match tif {
+        // Absent or explicitly PostOnly → keep the historical
+        // default so nothing changes for standard MM quoting.
+        None | Some(TimeInForce::PostOnly) => "PostOnly",
+        Some(TimeInForce::Ioc) => "IOC",
+        Some(TimeInForce::Fok) => "FOK",
+        // Bybit has no `DAY` — GTC is the closest semantic; the
+        // engine cancels at its own cadence anyway.
+        Some(TimeInForce::Gtc) | Some(TimeInForce::Gtd) | Some(TimeInForce::Day) => "GTC",
+    }
 }
 
 fn parse_bybit_event(v: &Value) -> Option<MarketEvent> {

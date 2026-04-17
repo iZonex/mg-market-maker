@@ -34,6 +34,18 @@ pub fn load_config() -> Result<AppConfig> {
         config.exchange.api_secret = Some(secret);
         info!("API secret loaded from MM_API_SECRET env var");
     }
+    // Optional read-only key pair (Epic 3). Lets operators
+    // isolate the trading key (write, IP-whitelisted) from a
+    // second key used for market data / balance polls / fee
+    // tier lookups. Both keys are redacted in Debug output.
+    if let Ok(key) = std::env::var("MM_READ_KEY") {
+        config.exchange.read_key = Some(key);
+        info!("read-only key loaded from MM_READ_KEY env var");
+    }
+    if let Ok(secret) = std::env::var("MM_READ_SECRET") {
+        config.exchange.read_secret = Some(secret);
+        info!("read-only secret loaded from MM_READ_SECRET env var");
+    }
     if let Ok(mode) = std::env::var("MM_MODE") {
         config.mode = mode;
     }

@@ -345,6 +345,8 @@ mod tests {
                 ws_url: "ws://localhost:8080/ws".to_string(),
                 api_key: Some("k".to_string()),
                 api_secret: Some("s".to_string()),
+                read_key: None,
+                read_secret: None,
             },
             pair: HedgePairConfig {
                 primary_symbol: "BTCUSDT".to_string(),

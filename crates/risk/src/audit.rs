@@ -1,10 +1,10 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use mm_common::types::{OrderId, Price, Qty, Side};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tracing::error;
+use tracing::{error, info, warn};
 
 /// Structured audit trail — append-only log of all market maker actions.
 ///
@@ -16,8 +16,21 @@ use tracing::error;
 ///
 /// Format: JSONL (one JSON object per line, append-only).
 pub struct AuditLog {
-    writer: Mutex<std::io::BufWriter<std::fs::File>>,
+    state: Mutex<AuditLogInner>,
     sequence: std::sync::atomic::AtomicU64,
+}
+
+struct AuditLogInner {
+    writer: std::io::BufWriter<std::fs::File>,
+    /// Base path (e.g. `data/audit.jsonl`). Rolled files live next
+    /// to it as `audit-YYYY-MM-DD.jsonl`. Keeping the active file
+    /// at a stable name lets external tools (log shippers, MiCA
+    /// exporters) tail without following renames.
+    base_path: PathBuf,
+    /// UTC date of the current file. We compare against "today"
+    /// on every write; the comparison is a single integer check,
+    /// not a syscall, so the hot path overhead is negligible.
+    current_date: NaiveDate,
 }
 
 /// An audit event — every action the MM takes.
@@ -64,6 +77,11 @@ pub enum AuditEventType {
     ExchangeConnected,
     ExchangeDisconnected,
     ExchangeReconnected,
+    /// WebSocket book stream had a sequence gap and the engine
+    /// re-anchored by pulling a fresh REST snapshot. `detail`
+    /// carries the sequence the resync landed on so compliance
+    /// can correlate with venue-side incident tickets.
+    BookResync,
 
     // System.
     EngineStarted,
@@ -272,7 +290,11 @@ impl AuditLog {
             .append(true)
             .open(path)?;
         Ok(Self {
-            writer: Mutex::new(std::io::BufWriter::new(file)),
+            state: Mutex::new(AuditLogInner {
+                writer: std::io::BufWriter::new(file),
+                base_path: path.to_path_buf(),
+                current_date: Utc::now().date_naive(),
+            }),
             sequence: std::sync::atomic::AtomicU64::new(1),
         })
     }
@@ -286,13 +308,61 @@ impl AuditLog {
         event.seq = seq;
         event.timestamp = Utc::now();
 
-        if let Ok(json) = serde_json::to_string(&event) {
-            if let Ok(mut writer) = self.writer.lock() {
-                if writeln!(writer, "{json}").is_err() {
-                    error!("failed to write audit log");
-                }
+        let Ok(json) = serde_json::to_string(&event) else {
+            return;
+        };
+
+        let Ok(mut state) = self.state.lock() else {
+            error!("audit log mutex poisoned");
+            return;
+        };
+
+        // Daily rotation check. Compare today's UTC date against
+        // the file's open-date marker — on first write after
+        // midnight we rename the current file to an ISO-stamped
+        // archive and open a fresh one at the base path. Five-year
+        // MiCA retention + 500 MB/day audit volume makes a single
+        // unbounded JSONL impractical for log shippers.
+        let today = event.timestamp.date_naive();
+        if today != state.current_date {
+            if let Err(e) = Self::rotate_locked(&mut state, today) {
+                warn!(error = %e, "audit log rotation failed — continuing on old file");
             }
         }
+
+        if writeln!(state.writer, "{json}").is_err() {
+            error!("failed to write audit log");
+        }
+    }
+
+    /// Rotate the active audit file: flush + close current,
+    /// rename it to `audit-YYYY-MM-DD.jsonl` (using the PREVIOUS
+    /// date so the archive name matches the events it contains),
+    /// then open a fresh file at the base path. Runs under the
+    /// state mutex — callers MUST hold the lock.
+    fn rotate_locked(state: &mut AuditLogInner, today: NaiveDate) -> anyhow::Result<()> {
+        let _ = state.writer.flush();
+        let archived = audit_archive_name(&state.base_path, state.current_date);
+        if state.base_path.exists() {
+            // A rotation failure is never fatal — worst case we
+            // keep writing to the old file until next midnight.
+            if let Err(e) = std::fs::rename(&state.base_path, &archived) {
+                warn!(
+                    archive = %archived.display(),
+                    error = %e,
+                    "audit rename failed — keeping active file"
+                );
+                return Err(e.into());
+            }
+            info!(archive = %archived.display(), "audit log rotated");
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&state.base_path)?;
+        state.writer = std::io::BufWriter::new(file);
+        state.current_date = today;
+        Ok(())
     }
 
     /// Convenience: log an order placement.
@@ -410,8 +480,24 @@ impl AuditLog {
 
     /// Flush buffer to disk.
     pub fn flush(&self) {
-        if let Ok(mut writer) = self.writer.lock() {
-            let _ = writer.flush();
+        if let Ok(mut state) = self.state.lock() {
+            let _ = state.writer.flush();
         }
     }
+}
+
+/// Build the archive path for a given day — `base_path.parent/
+/// base_stem-YYYY-MM-DD.base_ext`. For `data/audit.jsonl` on
+/// 2026-04-17 this yields `data/audit-2026-04-17.jsonl`.
+fn audit_archive_name(base_path: &Path, day: NaiveDate) -> PathBuf {
+    let parent = base_path.parent().unwrap_or(Path::new("."));
+    let stem = base_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("audit");
+    let ext = base_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("jsonl");
+    parent.join(format!("{stem}-{}.{ext}", day.format("%Y-%m-%d")))
 }

@@ -238,7 +238,7 @@ pub enum ExchangeType {
     HyperLiquidTestnet,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ExchangeConfig {
     /// Exchange type: custom, binance, binance_testnet, bybit, bybit_testnet.
     #[serde(default)]
@@ -247,6 +247,41 @@ pub struct ExchangeConfig {
     pub ws_url: String,
     pub api_key: Option<String>,
     pub api_secret: Option<String>,
+    /// Optional read-only key (market data, balance polling, fee
+    /// tier lookup). When set, connectors use this key for
+    /// non-mutating requests so a compromised *trading* key cannot
+    /// also read historical orders/fills. Typical setup:
+    /// generate two keys on the venue, flag the MM_READ_KEY as
+    /// read-only, keep MM_API_KEY restricted to spot-trading with
+    /// an IP whitelist, and disable withdrawals on both. When
+    /// unset the trading key is used for both paths (legacy
+    /// single-key mode).
+    #[serde(default)]
+    pub read_key: Option<String>,
+    #[serde(default)]
+    pub read_secret: Option<String>,
+}
+
+impl std::fmt::Debug for ExchangeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Manual Debug to keep secrets out of accidental log lines.
+        f.debug_struct("ExchangeConfig")
+            .field("exchange_type", &self.exchange_type)
+            .field("rest_url", &self.rest_url)
+            .field("ws_url", &self.ws_url)
+            .field("api_key", &redact_secret(&self.api_key))
+            .field("api_secret", &redact_secret(&self.api_secret))
+            .field("read_key", &redact_secret(&self.read_key))
+            .field("read_secret", &redact_secret(&self.read_secret))
+            .finish()
+    }
+}
+
+fn redact_secret(s: &Option<String>) -> &'static str {
+    match s {
+        Some(v) if !v.is_empty() => "<set:redacted>",
+        _ => "<unset>",
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1001,6 +1036,8 @@ impl Default for AppConfig {
                 ws_url: "ws://localhost:8080/ws/v1".into(),
                 api_key: None,
                 api_secret: None,
+                read_key: None,
+                read_secret: None,
             },
             market_maker: MarketMakerConfig {
                 gamma: "0.1".parse().unwrap(),
