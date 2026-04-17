@@ -818,4 +818,107 @@ mod tests {
         assert_eq!(m.hist_var_95, dec!(7));
         assert_eq!(m.hist_var_99, dec!(7));
     }
+
+    // ── Property-based tests (Epic 14) ───────────────────────
+
+    use proptest::prelude::*;
+
+    prop_compose! {
+        fn pnl_sample_strat()(cents in -100_000i64..100_000i64) -> Decimal {
+            Decimal::new(cents, 2)
+        }
+    }
+
+    proptest! {
+        /// effective_throttle returns Decimal::ONE while the
+        /// buffer is warming up. A regression where a single
+        /// sample triggered an immediate throttle would lock out
+        /// trading right after engine startup — property catches
+        /// that.
+        #[test]
+        fn warmup_always_returns_one(
+            samples in proptest::collection::vec(pnl_sample_strat(), 0..30),
+        ) {
+            let cfg = VarGuardConfig {
+                limit_95: Some(dec!(-1)),
+                limit_99: Some(dec!(-10)),
+                ewma_lambda: None,
+            };
+            let mut g = VarGuard::new(cfg);
+            for s in &samples {
+                g.record_pnl_sample("test", *s);
+            }
+            prop_assert_eq!(g.effective_throttle("test"), Decimal::ONE);
+        }
+
+        /// Throttle output is always one of three discrete
+        /// values: 1.0 (no throttle), THROTTLE_95_TIER (0.5) or
+        /// THROTTLE_99_TIER (0.0). No intermediate values leak
+        /// out — a regression where mean/variance math rolled
+        /// into throttle directly would produce a continuous
+        /// range.
+        #[test]
+        fn throttle_output_is_one_of_three_discrete_values(
+            samples in proptest::collection::vec(pnl_sample_strat(), 30..100),
+            lim_95 in -10_000i64..0i64,
+            lim_99 in -100_000i64..0i64,
+        ) {
+            let cfg = VarGuardConfig {
+                limit_95: Some(Decimal::new(lim_95, 2)),
+                limit_99: Some(Decimal::new(lim_99, 2)),
+                ewma_lambda: None,
+            };
+            let mut g = VarGuard::new(cfg);
+            for s in &samples {
+                g.record_pnl_sample("test", *s);
+            }
+            let t = g.effective_throttle("test");
+            prop_assert!(
+                t == Decimal::ONE || t == THROTTLE_95_TIER || t == THROTTLE_99_TIER,
+                "throttle {} not in discrete set", t
+            );
+        }
+
+        /// Constant-sample buffer → zero variance → parametric
+        /// VaR equals the mean exactly. Exposes numerical issues
+        /// in the sample-variance path.
+        #[test]
+        fn constant_samples_yield_mean_var(
+            value in pnl_sample_strat(),
+        ) {
+            let mut g = VarGuard::new(VarGuardConfig {
+                limit_95: None,
+                limit_99: None,
+                ewma_lambda: None,
+            });
+            for _ in 0..40 {
+                g.record_pnl_sample("flat", value);
+            }
+            let m = g.risk_metrics("flat").expect("warmup complete");
+            prop_assert_eq!(m.var_95, value);
+            prop_assert_eq!(m.var_99, value);
+        }
+
+        /// Per-strategy buffers are isolated — filling one does
+        /// NOT put the other past warm-up. Catches a regression
+        /// where a shared buffer returned throttle for an
+        /// unrelated class.
+        #[test]
+        fn strategy_buffers_are_isolated(
+            samples_a in proptest::collection::vec(pnl_sample_strat(), 40..60),
+        ) {
+            let cfg = VarGuardConfig {
+                limit_95: Some(dec!(-1000)),
+                limit_99: None,
+                ewma_lambda: None,
+            };
+            let mut g = VarGuard::new(cfg);
+            for s in &samples_a {
+                g.record_pnl_sample("A", *s);
+            }
+            // Strategy B has no samples yet — must report full
+            // throttle (= 1.0), regardless of what A reports.
+            prop_assert_eq!(g.effective_throttle("B"), Decimal::ONE);
+        }
+    }
 }

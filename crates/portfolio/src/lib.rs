@@ -737,4 +737,138 @@ mod tests {
         let keys: Vec<&str> = sorted.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["alpha", "zebra"]);
     }
+
+    // ── Property-based tests (Epic 14) ───────────────────────
+
+    use proptest::prelude::*;
+
+    prop_compose! {
+        fn price_strat()(cents in 100i64..10_000_000i64) -> Decimal {
+            Decimal::new(cents, 2)
+        }
+    }
+    prop_compose! {
+        fn qty_strat()(units in -10_000i64..10_000i64) -> Decimal {
+            // Signed qty strategy: positive = buy, negative = sell.
+            Decimal::new(units, 4)
+        }
+    }
+
+    proptest! {
+        /// Round-tripping a position to flat ALWAYS reports zero
+        /// unrealised PnL regardless of intermediate fills. The
+        /// final realised figure accumulates everything. Mirrors
+        /// the inventory-module property on `InventoryManager`
+        /// but crosses the Portfolio's native→reporting FX path.
+        #[test]
+        fn closed_position_has_zero_unrealised(
+            opens in proptest::collection::vec((price_strat(), qty_strat()), 1..10),
+            close_price in price_strat(),
+            mark in price_strat(),
+        ) {
+            let mut pf = Portfolio::new("USDT");
+            pf.register_symbol("TEST", "BASE", "USDT");
+
+            let mut net_qty = dec!(0);
+            for (p, q) in &opens {
+                pf.on_fill("TEST", *q, *p, "test");
+                net_qty += *q;
+            }
+            // Close the net position at close_price.
+            if !net_qty.is_zero() {
+                pf.on_fill("TEST", -net_qty, close_price, "test");
+            }
+            pf.mark_price("TEST", mark);
+
+            let snap = pf.snapshot();
+            prop_assert_eq!(snap.total_unrealised_pnl, dec!(0),
+                "flat portfolio unrealised = {}", snap.total_unrealised_pnl);
+        }
+
+        /// FX conversion is linear: doubling the FX rate doubles
+        /// the reporting-currency realised PnL for a non-zero
+        /// realised figure. Catches a multiplication order
+        /// regression.
+        #[test]
+        fn fx_scales_realised_pnl_linearly(
+            fill1 in (price_strat(), qty_strat()),
+            fill2_price in price_strat(),
+            fx_raw in 1i64..1000i64,
+        ) {
+            let (p1, q1) = fill1;
+            prop_assume!(!q1.is_zero());
+            let fx = Decimal::new(fx_raw, 2);  // 0.01 .. 10.0
+            let mut pf_a = Portfolio::new("USDT");
+            pf_a.register_symbol("TEST", "BASE", "NATIVE");
+            pf_a.set_fx("TEST", fx);
+            pf_a.on_fill("TEST", q1, p1, "s");
+            pf_a.on_fill("TEST", -q1, fill2_price, "s");
+            let snap_a = pf_a.snapshot();
+
+            let mut pf_b = Portfolio::new("USDT");
+            pf_b.register_symbol("TEST", "BASE", "NATIVE");
+            pf_b.set_fx("TEST", fx * dec!(2));
+            pf_b.on_fill("TEST", q1, p1, "s");
+            pf_b.on_fill("TEST", -q1, fill2_price, "s");
+            let snap_b = pf_b.snapshot();
+
+            prop_assert_eq!(snap_b.total_realised_pnl, snap_a.total_realised_pnl * dec!(2),
+                "FX doubling should double realised: a={} b={}",
+                snap_a.total_realised_pnl, snap_b.total_realised_pnl);
+        }
+
+        /// Sum of per-asset realised equals the global
+        /// total_realised. Catches a weighting bug across
+        /// multiple symbols / FX rates.
+        #[test]
+        fn per_asset_realised_sums_to_total(
+            fills in proptest::collection::vec(
+                (price_strat(), qty_strat(), price_strat()),
+                1..15,
+            ),
+        ) {
+            let mut pf = Portfolio::new("USDT");
+            pf.register_symbol("A", "BA", "USDT");
+            pf.register_symbol("B", "BB", "USDT");
+
+            // Alternate fills across two symbols.
+            for (i, (p, q, close)) in fills.iter().enumerate() {
+                let sym = if i % 2 == 0 { "A" } else { "B" };
+                prop_assume!(!q.is_zero());
+                pf.on_fill(sym, *q, *p, "test");
+                pf.on_fill(sym, -*q, *close, "test");
+            }
+            let snap = pf.snapshot();
+            let sum: Decimal = snap.per_asset.values()
+                .map(|a| a.realised_pnl_reporting)
+                .sum();
+            prop_assert_eq!(snap.total_realised_pnl, sum);
+        }
+
+        /// Per-strategy PnL sums to the global total_realised.
+        /// The strategy attribution must partition realised PnL
+        /// exactly — every dollar is tagged to exactly one
+        /// bucket.
+        #[test]
+        fn per_strategy_partitions_realised(
+            opens in proptest::collection::vec(
+                (price_strat(), qty_strat(), price_strat()),
+                1..10,
+            ),
+        ) {
+            let mut pf = Portfolio::new("USDT");
+            pf.register_symbol("T", "BA", "USDT");
+            for (i, (p, q, close)) in opens.iter().enumerate() {
+                prop_assume!(!q.is_zero());
+                let strat = if i % 2 == 0 { "alpha" } else { "beta" };
+                pf.on_fill("T", *q, *p, strat);
+                pf.on_fill("T", -*q, *close, strat);
+            }
+            let snap = pf.snapshot();
+            let sum: Decimal = snap.per_strategy.iter()
+                .map(|(_, pnl)| *pnl)
+                .sum();
+            prop_assert_eq!(snap.total_realised_pnl, sum);
+        }
+    }
 }

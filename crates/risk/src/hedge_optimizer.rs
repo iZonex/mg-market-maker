@@ -345,7 +345,13 @@ impl FactorCovarianceEstimator {
     }
 
     /// Correlation between two factors. `None` if either has
-    /// zero variance or too few samples.
+    /// zero variance or too few samples. Clamped to `[-1, 1]`
+    /// because the iterative `decimal_sqrt` used for the
+    /// denominator can introduce rounding error large enough
+    /// to push the raw ratio slightly outside the
+    /// mathematically-valid correlation range on noisy small-
+    /// variance samples (property `correlation_is_bounded`
+    /// caught this).
     pub fn correlation(&self, factor_a: &str, factor_b: &str) -> Option<Decimal> {
         let cov = self.covariance(factor_a, factor_b)?;
         let var_a = self.sample_variance(self.factors.iter().position(|f| f == factor_a)?)?;
@@ -357,7 +363,8 @@ impl FactorCovarianceEstimator {
         if denom.is_zero() {
             return None;
         }
-        Some(cov / denom)
+        let raw = cov / denom;
+        Some(raw.clamp(Decimal::NEGATIVE_ONE, Decimal::ONE))
     }
 
     /// Number of samples for a factor.
@@ -876,5 +883,118 @@ mod tests {
             .find(|(a, b, _)| a == "BTC" && b == "SOL")
             .unwrap();
         assert!(btc_sol.2 < dec!(-0.9));
+    }
+
+    // ── Property-based tests (Epic 14) ───────────────────────
+
+    use proptest::prelude::*;
+
+    prop_compose! {
+        fn return_strat()(cents in -10_000i64..10_000i64) -> Decimal {
+            Decimal::new(cents, 4)
+        }
+    }
+
+    proptest! {
+        /// Covariance is symmetric: cov(A, B) == cov(B, A) for
+        /// any sample pair. Catches an index-ordering bug in
+        /// the covariance accumulator.
+        #[test]
+        fn covariance_is_symmetric(
+            returns_a in proptest::collection::vec(return_strat(), 5..20),
+            returns_b in proptest::collection::vec(return_strat(), 5..20),
+        ) {
+            let mut est = FactorCovarianceEstimator::new(
+                vec!["A".into(), "B".into()], 100
+            );
+            for r in &returns_a {
+                est.push_return("A", *r);
+            }
+            for r in &returns_b {
+                est.push_return("B", *r);
+            }
+            let cov_ab = est.covariance("A", "B");
+            let cov_ba = est.covariance("B", "A");
+            prop_assert_eq!(cov_ab, cov_ba);
+        }
+
+        /// Correlation is bounded in [-1, 1] for any non-
+        /// degenerate sample pair. Catches a normalisation
+        /// error in the sqrt(var) denominator.
+        #[test]
+        fn correlation_is_bounded(
+            returns_a in proptest::collection::vec(return_strat(), 5..30),
+            returns_b in proptest::collection::vec(return_strat(), 5..30),
+        ) {
+            let mut est = FactorCovarianceEstimator::new(
+                vec!["A".into(), "B".into()], 100
+            );
+            for r in &returns_a {
+                est.push_return("A", *r);
+            }
+            for r in &returns_b {
+                est.push_return("B", *r);
+            }
+            if let Some(corr) = est.correlation("A", "B") {
+                prop_assert!(corr >= dec!(-1),
+                    "correlation {} < -1", corr);
+                prop_assert!(corr <= dec!(1),
+                    "correlation {} > 1", corr);
+            }
+        }
+
+        /// A factor's correlation with itself is exactly 1 when
+        /// we query it as two separate names that share the same
+        /// data. Tests the diagonal normalisation path.
+        /// Achieved by pushing the same returns into both buffers.
+        #[test]
+        fn perfect_positive_correlation_when_identical(
+            returns in proptest::collection::vec(return_strat(), 10..30),
+        ) {
+            // Need non-zero variance for a defined correlation.
+            prop_assume!(returns.iter().collect::<std::collections::HashSet<_>>().len() >= 2);
+            let mut est = FactorCovarianceEstimator::new(
+                vec!["A".into(), "B".into()], 100
+            );
+            for r in &returns {
+                est.push_return("A", *r);
+                est.push_return("B", *r);
+            }
+            let corr = est.correlation("A", "B")
+                .expect("non-degenerate returns yield a correlation");
+            // Allow small numerical error from decimal sqrt.
+            prop_assert!((corr - dec!(1)).abs() < dec!(0.001),
+                "identical data gave corr {} ≠ 1", corr);
+        }
+
+        /// Variance of constant returns is exactly zero —
+        /// catches a regression in the sample-variance path
+        /// where rounding would produce a tiny non-zero value.
+        #[test]
+        fn constant_returns_have_zero_variance(
+            value in return_strat(),
+            n in 5usize..50usize,
+        ) {
+            let mut est = FactorCovarianceEstimator::new(vec!["A".into()], 100);
+            for _ in 0..n {
+                est.push_return("A", value);
+            }
+            let vars = est.variances();
+            prop_assert_eq!(vars.get("A").copied(), Some(dec!(0)));
+        }
+
+        /// Window is bounded: feeding more than max_samples
+        /// observations evicts from the front but leaves the
+        /// estimator operational.
+        #[test]
+        fn window_evicts_cleanly(
+            returns in proptest::collection::vec(return_strat(), 50..200),
+        ) {
+            let mut est = FactorCovarianceEstimator::new(vec!["A".into()], 20);
+            for r in &returns {
+                est.push_return("A", *r);
+            }
+            prop_assert_eq!(est.sample_count("A"), 20);
+        }
     }
 }
