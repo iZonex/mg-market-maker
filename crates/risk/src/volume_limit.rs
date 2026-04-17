@@ -134,4 +134,81 @@ mod tests {
         assert!(tracker.can_trade(dec!(900)));
         assert!(!tracker.can_trade(dec!(1100)));
     }
+
+    // ── Property-based tests (Epic 15) ───────────────────────
+
+    use proptest::prelude::*;
+
+    prop_compose! {
+        fn vol_strat()(raw in 1i64..10_000_000i64) -> Decimal {
+            Decimal::new(raw, 2)
+        }
+    }
+
+    proptest! {
+        /// hourly_volume() ≤ daily_volume() after any fill
+        /// sequence — hourly is a strict subset of daily.
+        #[test]
+        fn hourly_is_subset_of_daily(
+            fills in proptest::collection::vec(vol_strat(), 0..50),
+        ) {
+            let mut t = VolumeLimitTracker::new(dec!(0), dec!(0));
+            for v in &fills {
+                t.on_trade(*v);
+            }
+            prop_assert!(t.hourly_volume() <= t.daily_volume(),
+                "hourly {} > daily {}", t.hourly_volume(), t.daily_volume());
+        }
+
+        /// Zero limits → unlimited. Any volume request passes
+        /// regardless of how much has been traded.
+        #[test]
+        fn zero_limits_are_unlimited(
+            fills in proptest::collection::vec(vol_strat(), 0..30),
+            ask in vol_strat(),
+        ) {
+            let mut t = VolumeLimitTracker::new(dec!(0), dec!(0));
+            for v in &fills {
+                t.on_trade(*v);
+            }
+            prop_assert!(t.can_trade(ask));
+        }
+
+        /// can_trade(v) is true iff adding v would keep each
+        /// configured limit ≥ current_total + v. Catches an
+        /// off-by-one in the limit check.
+        #[test]
+        fn can_trade_matches_limit_arithmetic(
+            daily_limit_raw in 1i64..10_000_000i64,
+            hourly_limit_raw in 1i64..10_000_000i64,
+            existing in proptest::collection::vec(vol_strat(), 0..10),
+            ask in vol_strat(),
+        ) {
+            let daily_limit = Decimal::new(daily_limit_raw, 2);
+            let hourly_limit = Decimal::new(hourly_limit_raw, 2);
+            let mut t = VolumeLimitTracker::new(daily_limit, hourly_limit);
+            for v in &existing {
+                t.on_trade(*v);
+            }
+            let expected = (t.daily_volume() + ask <= daily_limit)
+                && (t.hourly_volume() + ask <= hourly_limit);
+            prop_assert_eq!(t.can_trade(ask), expected);
+        }
+
+        /// daily_volume() equals the sum of all recorded fills
+        /// within the window (here all are within because the
+        /// test takes microseconds).
+        #[test]
+        fn daily_total_equals_sum_of_fills(
+            fills in proptest::collection::vec(vol_strat(), 0..30),
+        ) {
+            let mut t = VolumeLimitTracker::new(dec!(0), dec!(0));
+            let mut sum = dec!(0);
+            for v in &fills {
+                t.on_trade(*v);
+                sum += *v;
+            }
+            prop_assert_eq!(t.daily_volume(), sum);
+        }
+    }
 }

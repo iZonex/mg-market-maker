@@ -334,4 +334,107 @@ mod tests {
         let metrics = tracker.compute(dec!(1));
         assert_eq!(metrics.max_drawdown_abs, dec!(200));
     }
+
+    // ── Property-based tests (Epic 15) ───────────────────────
+
+    use proptest::prelude::*;
+
+    prop_compose! {
+        fn equity_strat()(raw in 1i64..1_000_000_000i64) -> Decimal {
+            Decimal::new(raw, 2)
+        }
+    }
+    prop_compose! {
+        fn ret_strat()(raw in -100_000i64..100_000i64) -> Decimal {
+            Decimal::new(raw, 4)
+        }
+    }
+
+    proptest! {
+        /// max_drawdown is monotonic non-decreasing — once a
+        /// drawdown is observed it stays at least as deep for
+        /// the rest of the session. Only manual reset (not
+        /// modelled here) clears it.
+        #[test]
+        fn max_drawdown_is_monotonic(
+            equities in proptest::collection::vec(equity_strat(), 1..40),
+        ) {
+            let mut t = PerformanceTracker::new(100);
+            let mut prev_dd = dec!(0);
+            for e in &equities {
+                t.update_equity(*e);
+                let m = t.compute(dec!(1));
+                prop_assert!(m.max_drawdown_abs >= prev_dd,
+                    "drawdown shrank {} → {}", prev_dd, m.max_drawdown_abs);
+                prev_dd = m.max_drawdown_abs;
+            }
+        }
+
+        /// fill_rate is in [0, 1] for any sequence of placed /
+        /// filled pairs. Catches a regression where cumulative
+        /// division order flipped.
+        #[test]
+        fn fill_rate_is_bounded(
+            placed in 0u32..1000u32,
+            fill_ratio in 0u32..101u32,
+        ) {
+            let mut t = PerformanceTracker::new(100);
+            let filled = placed * fill_ratio / 100;
+            for _ in 0..placed { t.on_order_placed(); }
+            for _ in 0..filled { t.on_order_filled(dec!(1), dec!(0)); }
+            let m = t.compute(dec!(1));
+            prop_assert!(m.fill_rate >= dec!(0));
+            prop_assert!(m.fill_rate <= dec!(1));
+        }
+
+        /// Sharpe ratio is zero when std_dev is zero (constant
+        /// returns). Catches a regression where a nil-variance
+        /// branch would divide-by-zero to NaN-like values.
+        /// Sortino is NOT tested here: its downside metric uses
+        /// the raw `r^2` sum (not a demeaned deviation), so a
+        /// constant negative return still produces a non-zero
+        /// Sortino. Quirk of the implementation, not a bug —
+        /// tested separately by `sortino_zero_on_non_negative_returns`.
+        #[test]
+        fn sharpe_zero_on_constant_returns(
+            r in ret_strat(),
+            n in 5usize..30usize,
+        ) {
+            let mut t = PerformanceTracker::new(100);
+            for _ in 0..n { t.record_return(r); }
+            let m = t.compute(dec!(365));
+            prop_assert_eq!(m.sharpe_ratio, dec!(0));
+        }
+
+        /// Sortino is zero when every return is ≥ 0 — the
+        /// downside sum is zero so the denominator is zero and
+        /// the ratio short-circuits to 0.
+        #[test]
+        fn sortino_zero_on_non_negative_returns(
+            returns in proptest::collection::vec(0i64..100_000i64, 5..30),
+        ) {
+            let mut t = PerformanceTracker::new(100);
+            for r in &returns {
+                t.record_return(Decimal::new(*r, 4));
+            }
+            let m = t.compute(dec!(365));
+            prop_assert_eq!(m.sortino_ratio, dec!(0));
+        }
+
+        /// Win rate stays bounded even with a mix of profitable
+        /// and losing round-trips. Catches sign errors in the
+        /// gross_profit / gross_loss split.
+        #[test]
+        fn win_rate_bounded(
+            trips in proptest::collection::vec(ret_strat(), 0..50),
+        ) {
+            let mut t = PerformanceTracker::new(100);
+            for r in &trips {
+                t.on_round_trip(*r);
+            }
+            let m = t.compute(dec!(1));
+            prop_assert!(m.win_rate >= dec!(0));
+            prop_assert!(m.win_rate <= dec!(1));
+        }
+    }
 }
