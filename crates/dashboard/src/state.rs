@@ -50,6 +50,18 @@ pub enum ConfigOverride {
     /// effective spread, composable with existing kill switch
     /// and market resilience multipliers.
     PortfolioRiskMult(Decimal),
+    /// Manually escalate the kill switch to a specific level.
+    /// `level` maps onto `mm_risk::KillLevel` (1..=5); `reason`
+    /// is recorded to the audit trail. Emitted by the dashboard
+    /// `/api/v1/ops/*` endpoints so an operator can pull any of
+    /// the kill-switch escalations without touching the process.
+    ManualKillSwitch { level: u8, reason: String },
+    /// Reset the kill switch back to [`KillLevel::Normal`]. Only
+    /// honoured when the audit trail contains a matching manual
+    /// escalation — the engine refuses to reset an
+    /// automatically-triggered kill switch without operator
+    /// intervention.
+    ManualKillSwitchReset { reason: String },
 }
 
 /// Per-client state partition (Epic 1: Multi-Client Isolation).

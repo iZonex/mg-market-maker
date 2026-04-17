@@ -69,6 +69,7 @@ pub async fn start(
     // Protected API routes — any authenticated role.
     let protected_api = Router::new()
         .route("/api/status", get(get_status))
+        .route("/api/v1/venues/status", get(venues_status))
         .merge(crate::client_api::client_routes())
         .merge(crate::client_portal::client_portal_routes())
         .route_layer(middleware::from_fn_with_state(
@@ -90,6 +91,12 @@ pub async fn start(
     // alerts, loans, optimization, clients. Admin role ONLY plus
     // user-scoped rate limit.
     let admin_config = Router::new()
+        .route("/api/v1/ops/widen/{symbol}", post(ops_widen))
+        .route("/api/v1/ops/stop/{symbol}", post(ops_stop))
+        .route("/api/v1/ops/cancel-all/{symbol}", post(ops_cancel_all))
+        .route("/api/v1/ops/flatten/{symbol}", post(ops_flatten))
+        .route("/api/v1/ops/disconnect/{symbol}", post(ops_disconnect))
+        .route("/api/v1/ops/reset/{symbol}", post(ops_kill_reset))
         .route("/api/admin/config/{symbol}", post(admin_config_override))
         .route("/api/admin/config", post(admin_config_broadcast))
         .route("/api/admin/config/bulk", post(admin_config_bulk))
@@ -650,4 +657,179 @@ async fn admin_optimize_results(
         })),
         None => axum::Json(serde_json::json!({"status": "no optimization run"})),
     }
+}
+
+// ── Ops endpoints — manual kill switch control ───────────────
+//
+// These power the Controls.svelte panel in the dashboard frontend.
+// Every endpoint routes through the existing `ConfigOverride`
+// mpsc channel so the engine applies the change on its next
+// select-loop tick. Admin role only + per-user rate limit, both
+// enforced by the admin router's route_layers.
+
+#[derive(serde::Deserialize)]
+struct OpsRequest {
+    /// Free-form reason string captured in the audit trail and
+    /// incident log. Required so every manual escalation has a
+    /// human-readable justification for regulator review.
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(serde::Serialize)]
+struct OpsResponse {
+    symbol: String,
+    level: u8,
+    applied: bool,
+}
+
+async fn ops_kill_at_level(
+    state: &DashboardState,
+    symbol: &str,
+    level: u8,
+    reason: &str,
+) -> Json<OpsResponse> {
+    let effective_reason = if reason.is_empty() {
+        "dashboard operator".to_string()
+    } else {
+        reason.to_string()
+    };
+    let ok = state.send_config_override(
+        symbol,
+        ConfigOverride::ManualKillSwitch {
+            level,
+            reason: effective_reason,
+        },
+    );
+    Json(OpsResponse {
+        symbol: symbol.to_string(),
+        level,
+        applied: ok,
+    })
+}
+
+async fn ops_widen(
+    State(state): State<DashboardState>,
+    Path(symbol): Path<String>,
+    body: Option<Json<OpsRequest>>,
+) -> Json<OpsResponse> {
+    let reason = body.map(|b| b.reason.clone()).unwrap_or_default();
+    ops_kill_at_level(&state, &symbol, 1, &reason).await
+}
+
+async fn ops_stop(
+    State(state): State<DashboardState>,
+    Path(symbol): Path<String>,
+    body: Option<Json<OpsRequest>>,
+) -> Json<OpsResponse> {
+    let reason = body.map(|b| b.reason.clone()).unwrap_or_default();
+    ops_kill_at_level(&state, &symbol, 2, &reason).await
+}
+
+async fn ops_cancel_all(
+    State(state): State<DashboardState>,
+    Path(symbol): Path<String>,
+    body: Option<Json<OpsRequest>>,
+) -> Json<OpsResponse> {
+    let reason = body.map(|b| b.reason.clone()).unwrap_or_default();
+    ops_kill_at_level(&state, &symbol, 3, &reason).await
+}
+
+async fn ops_flatten(
+    State(state): State<DashboardState>,
+    Path(symbol): Path<String>,
+    body: Option<Json<OpsRequest>>,
+) -> Json<OpsResponse> {
+    let reason = body.map(|b| b.reason.clone()).unwrap_or_default();
+    ops_kill_at_level(&state, &symbol, 4, &reason).await
+}
+
+async fn ops_disconnect(
+    State(state): State<DashboardState>,
+    Path(symbol): Path<String>,
+    body: Option<Json<OpsRequest>>,
+) -> Json<OpsResponse> {
+    let reason = body.map(|b| b.reason.clone()).unwrap_or_default();
+    ops_kill_at_level(&state, &symbol, 5, &reason).await
+}
+
+async fn ops_kill_reset(
+    State(state): State<DashboardState>,
+    Path(symbol): Path<String>,
+    body: Option<Json<OpsRequest>>,
+) -> Json<OpsResponse> {
+    let reason = body
+        .map(|b| b.reason.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "dashboard operator".to_string());
+    let ok = state.send_config_override(
+        &symbol,
+        ConfigOverride::ManualKillSwitchReset { reason },
+    );
+    Json(OpsResponse {
+        symbol,
+        level: 0,
+        applied: ok,
+    })
+}
+
+// ── Connectivity matrix ─────────────────────────────────────
+//
+// GET /api/v1/venues/status — returns a snapshot of every
+// tracked venue/symbol connection: WS state, last update age,
+// accumulated reconnects, sequence-gap count. Operators see this
+// as a grid in the dashboard's connectivity panel.
+
+#[derive(serde::Serialize)]
+struct VenueStatusRow {
+    symbol: String,
+    /// `true` when the engine has a live mid price on this
+    /// symbol — proxy for "WS feed healthy enough to quote".
+    has_data: bool,
+    /// Current mid price (empty string when has_data is false).
+    mid_price: String,
+    kill_level: u8,
+    /// Human-readable kill-switch label derived from kill_level
+    /// (NORMAL / WIDEN_SPREADS / STOP_NEW_ORDERS / CANCEL_ALL /
+    /// FLATTEN_ALL / DISCONNECT) so the UI does not have to
+    /// hardcode the mapping.
+    kill_label: &'static str,
+    live_orders: u32,
+    total_fills: u64,
+    /// SLA uptime % over the current SLA window.
+    sla_uptime_pct: String,
+    /// True when kill level >= StopNewOrders — the engine is
+    /// currently refusing to place new orders.
+    quoting_halted: bool,
+}
+
+fn kill_label(level: u8) -> &'static str {
+    match level {
+        0 => "NORMAL",
+        1 => "WIDEN_SPREADS",
+        2 => "STOP_NEW_ORDERS",
+        3 => "CANCEL_ALL",
+        4 => "FLATTEN_ALL",
+        5 => "DISCONNECT",
+        _ => "UNKNOWN",
+    }
+}
+
+async fn venues_status(State(state): State<DashboardState>) -> Json<Vec<VenueStatusRow>> {
+    let rows: Vec<VenueStatusRow> = state
+        .get_all()
+        .into_iter()
+        .map(|s| VenueStatusRow {
+            has_data: s.mid_price > rust_decimal::Decimal::ZERO,
+            mid_price: s.mid_price.to_string(),
+            kill_label: kill_label(s.kill_level),
+            kill_level: s.kill_level,
+            live_orders: s.live_orders as u32,
+            total_fills: s.total_fills,
+            sla_uptime_pct: s.sla_uptime_pct.to_string(),
+            quoting_halted: s.kill_level >= 2,
+            symbol: s.symbol,
+        })
+        .collect();
+    Json(rows)
 }

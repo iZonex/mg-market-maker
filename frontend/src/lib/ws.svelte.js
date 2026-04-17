@@ -1,9 +1,15 @@
 /**
  * WebSocket reactive store for real-time market maker data.
  * Connects to Rust backend at /ws and keeps state updated.
+ *
+ * As of Epic 1 security hardening the backend rejects WS
+ * upgrades without a valid session token passed as `?token=`.
+ * The store now takes an `auth` argument and reconnects
+ * whenever the token changes (logout → login) instead of
+ * permanently failing with 401.
  */
 
-export function createWsStore() {
+export function createWsStore(auth) {
   // Reactive state using Svelte 5 runes approach — we use plain objects
   // and let components poll / use $effect.
   const state = $state({
@@ -25,8 +31,17 @@ export function createWsStore() {
   let reconnectTimer = null
 
   function connect() {
+    // Backend rejects WS upgrades without a valid token. Skip
+    // the connect attempt entirely if there is no session yet —
+    // App.svelte only mounts us after login, but a logout-in-
+    // another-tab can race this.
+    const token = auth?.state?.token || ''
+    if (!token) {
+      reconnectTimer = setTimeout(connect, 1000)
+      return
+    }
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const url = `${protocol}//${window.location.host}/ws`
+    const url = `${protocol}//${window.location.host}/ws?token=${encodeURIComponent(token)}`
 
     ws = new WebSocket(url)
 
@@ -117,7 +132,10 @@ export function createWsStore() {
   setInterval(async () => {
     if (!state.connected) {
       try {
-        const resp = await fetch('/api/status')
+        const token = auth?.state?.token || ''
+        const resp = await fetch('/api/status', {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        })
         if (resp.ok) {
           const symbols = await resp.json()
           state.symbols = symbols.map(s => s.symbol)

@@ -2849,6 +2849,44 @@ impl MarketMakerEngine {
                 info!(symbol = %self.symbol, mult = %v, "hot-reload: portfolio risk spread multiplier");
                 self.portfolio_risk_mult = v;
             }
+            ConfigOverride::ManualKillSwitch { level, reason } => {
+                let kl = match level {
+                    1 => mm_risk::KillLevel::WidenSpreads,
+                    2 => mm_risk::KillLevel::StopNewOrders,
+                    3 => mm_risk::KillLevel::CancelAll,
+                    4 => mm_risk::KillLevel::FlattenAll,
+                    5 => mm_risk::KillLevel::Disconnect,
+                    _ => {
+                        warn!(level, "ignoring manual kill-switch with invalid level");
+                        return;
+                    }
+                };
+                info!(symbol = %self.symbol, level, reason = %reason, "manual kill switch from ops API");
+                self.kill_switch.manual_trigger(kl, &reason);
+                self.audit.risk_event(
+                    &self.symbol,
+                    mm_risk::audit::AuditEventType::KillSwitchEscalated,
+                    &format!("manual L{level}: {reason}"),
+                );
+                self.record_incident(
+                    match level {
+                        1 | 2 => "warning",
+                        _ => "critical",
+                    },
+                    &format!("Manual kill switch L{level}: {reason}"),
+                );
+                return;
+            }
+            ConfigOverride::ManualKillSwitchReset { reason } => {
+                info!(symbol = %self.symbol, reason = %reason, "manual kill switch reset from ops API");
+                self.kill_switch.reset();
+                self.audit.risk_event(
+                    &self.symbol,
+                    mm_risk::audit::AuditEventType::KillSwitchReset,
+                    &format!("manual reset: {reason}"),
+                );
+                return;
+            }
         }
         self.audit.risk_event(
             &self.symbol,

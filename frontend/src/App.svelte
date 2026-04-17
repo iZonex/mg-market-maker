@@ -9,6 +9,8 @@
   import FillHistory from './lib/components/FillHistory.svelte'
   import Controls from './lib/components/Controls.svelte'
   import AlertLog from './lib/components/AlertLog.svelte'
+  import ConnectivityPanel from './lib/components/ConnectivityPanel.svelte'
+  import AuditStream from './lib/components/AuditStream.svelte'
   import Login from './lib/components/Login.svelte'
   import { createWsStore } from './lib/ws.svelte.js'
   import { createAuthStore } from './lib/auth.svelte.js'
@@ -16,7 +18,7 @@
 
   const demo = isDemoMode()
   const auth = createAuthStore()
-  const ws = demo ? createDemoStore() : createWsStore()
+  const ws = demo ? createDemoStore() : createWsStore(auth)
 
   if (demo && !auth.state.loggedIn) {
     auth.state.loggedIn = true
@@ -60,7 +62,7 @@
 
       <div class="panel">
         {#if auth.canControl()}
-          <Controls data={ws} />
+          <Controls data={ws} {auth} />
         {:else}
           <div class="viewer-pnl">
             <h3>PnL Attribution</h3>
@@ -90,6 +92,15 @@
           </div>
         {/if}
       </div>
+
+      {#if auth.canViewInternals() && !demo}
+        <div class="panel span-2">
+          <AuditStream {auth} />
+        </div>
+        <div class="panel">
+          <ConnectivityPanel {auth} />
+        </div>
+      {/if}
     </div>
 
     <footer>
