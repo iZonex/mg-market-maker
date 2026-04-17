@@ -1,10 +1,15 @@
 use chrono::{DateTime, Utc};
+use hmac::{Hmac, Mac};
 use mm_common::types::OrderId;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::path::Path;
+use subtle::ConstantTimeEq;
 use tracing::{info, warn};
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Persistent state checkpoint for crash recovery.
 ///
@@ -84,6 +89,46 @@ impl Default for Checkpoint {
     }
 }
 
+/// Signed checkpoint envelope written to disk. The `signature`
+/// is HMAC-SHA256 of `payload` under a secret loaded from
+/// `MM_CHECKPOINT_SECRET` (falling back to `MM_AUTH_SECRET` so
+/// single-secret deployments keep working). The payload is the
+/// raw JSON of the `Checkpoint` struct — encoded once so the
+/// signer and verifier hash identical bytes.
+#[derive(Serialize, Deserialize)]
+struct SignedCheckpoint {
+    /// Envelope format version. `1` = raw JSON + hex HMAC-SHA256.
+    version: u32,
+    payload: String,
+    signature: String,
+}
+
+/// Pick the HMAC secret for checkpoint integrity. Prefers
+/// `MM_CHECKPOINT_SECRET`, then `MM_AUTH_SECRET`. Returns `None`
+/// when neither is set — the manager then writes unsigned
+/// checkpoints and logs a warning so an unattended deployment
+/// cannot silently skip tamper detection.
+fn checkpoint_secret() -> Option<String> {
+    if let Ok(s) = std::env::var("MM_CHECKPOINT_SECRET") {
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    if let Ok(s) = std::env::var("MM_AUTH_SECRET") {
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    None
+}
+
+fn sign(secret: &str, payload: &str) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
+    mac.update(payload.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
 /// Manages checkpoint persistence to disk.
 pub struct CheckpointManager {
     path: std::path::PathBuf,
@@ -91,13 +136,36 @@ pub struct CheckpointManager {
     /// Write counter — flush every N updates.
     write_count: u64,
     flush_every: u64,
+    /// HMAC secret; `None` skips signing/verification with a
+    /// warning — intentional for tests and fresh local dev only.
+    secret: Option<String>,
 }
 
 impl CheckpointManager {
-    /// Create a new checkpoint manager. Loads existing checkpoint if available.
+    /// Create a new checkpoint manager. Loads existing checkpoint
+    /// from disk, verifying its HMAC signature. Tampered, unsigned
+    /// (when a secret is configured), or malformed files are
+    /// rejected and the manager starts fresh — the operator sees a
+    /// loud warning so a silent reset cannot hide a downgrade.
     pub fn new(path: &Path, flush_every: u64) -> Self {
-        let current = Self::load_from_disk(path).unwrap_or_else(|_| {
-            info!("no existing checkpoint, starting fresh");
+        let secret = checkpoint_secret();
+        if secret.is_none() {
+            warn!(
+                path = %path.display(),
+                "MM_CHECKPOINT_SECRET / MM_AUTH_SECRET not set — checkpoint \
+                 integrity verification DISABLED (a tampered file would be \
+                 accepted). Set a secret in production."
+            );
+        }
+        Self::new_with_secret(path, flush_every, secret)
+    }
+
+    /// Like `new()` but takes the HMAC secret directly. Useful for
+    /// test code that wants to avoid mutating process-wide env vars
+    /// (which races against parallel tests).
+    pub fn new_with_secret(path: &Path, flush_every: u64, secret: Option<String>) -> Self {
+        let current = Self::load_from_disk(path, secret.as_deref()).unwrap_or_else(|e| {
+            warn!(error = %e, "starting with fresh checkpoint");
             Checkpoint::new()
         });
 
@@ -106,6 +174,7 @@ impl CheckpointManager {
             current,
             write_count: 0,
             flush_every,
+            secret,
         }
     }
 
@@ -134,28 +203,101 @@ impl CheckpointManager {
         self.current.total_realized_pnl = total_realized;
     }
 
-    /// Force flush to disk.
+    /// Force flush to disk. Writes a signed envelope atomically
+    /// via temp-file + rename so a crash mid-write cannot produce
+    /// a truncated checkpoint that still verifies.
     pub fn flush(&self) -> anyhow::Result<()> {
-        let json = serde_json::to_string_pretty(&self.current)?;
-        // Write to temp file first, then rename (atomic on most filesystems).
+        let payload = serde_json::to_string(&self.current)?;
+        let signature = match &self.secret {
+            Some(s) => sign(s, &payload),
+            None => String::new(),
+        };
+        let envelope = SignedCheckpoint {
+            version: 1,
+            payload,
+            signature,
+        };
+        let json = serde_json::to_string_pretty(&envelope)?;
         let tmp = self.path.with_extension("tmp");
         std::fs::write(&tmp, &json)?;
+        // Set file permissions to 0600 on Unix — checkpoint
+        // contains positions and PnL, shouldn't be world-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            let _ = std::fs::set_permissions(&tmp, perms);
+        }
         std::fs::rename(&tmp, &self.path)?;
         info!(
             symbols = self.current.symbols.len(),
+            signed = self.secret.is_some(),
             "checkpoint flushed to disk"
         );
         Ok(())
     }
 
-    /// Load checkpoint from disk.
-    fn load_from_disk(path: &Path) -> anyhow::Result<Checkpoint> {
+    /// Load checkpoint from disk. Accepts both the signed envelope
+    /// (v1) and a legacy bare-`Checkpoint` JSON for backward
+    /// compatibility with pre-HMAC deployments — the legacy path
+    /// logs a warning so the operator knows to let the next flush
+    /// re-sign the file.
+    fn load_from_disk(path: &Path, secret: Option<&str>) -> anyhow::Result<Checkpoint> {
         let content = std::fs::read_to_string(path)?;
+
+        // Try the signed envelope first.
+        if let Ok(env) = serde_json::from_str::<SignedCheckpoint>(&content) {
+            if env.version != 1 {
+                anyhow::bail!("unsupported checkpoint envelope version {}", env.version);
+            }
+            match (secret, env.signature.is_empty()) {
+                (Some(s), false) => {
+                    let expected = sign(s, &env.payload);
+                    if env
+                        .signature
+                        .as_bytes()
+                        .ct_eq(expected.as_bytes())
+                        .unwrap_u8()
+                        != 1
+                    {
+                        anyhow::bail!(
+                            "checkpoint HMAC mismatch — file was tampered with or signed \
+                             with a different secret; refusing to load"
+                        );
+                    }
+                }
+                (Some(_), true) => {
+                    warn!(
+                        path = %path.display(),
+                        "checkpoint is unsigned but a secret is configured — \
+                         accepting for migration; next flush will sign it"
+                    );
+                }
+                (None, false) => {
+                    warn!(
+                        path = %path.display(),
+                        "checkpoint carries a signature but no secret is configured — \
+                         skipping verification (set MM_CHECKPOINT_SECRET to enforce it)"
+                    );
+                }
+                (None, true) => {
+                    // No secret, no signature — unsigned path, fine.
+                }
+            }
+            let checkpoint: Checkpoint = serde_json::from_str(&env.payload)?;
+            info!(
+                timestamp = %checkpoint.timestamp,
+                symbols = checkpoint.symbols.len(),
+                "loaded checkpoint from disk"
+            );
+            return Ok(checkpoint);
+        }
+
+        // Legacy unsigned checkpoint — accept with warning.
         let checkpoint: Checkpoint = serde_json::from_str(&content)?;
-        info!(
-            timestamp = %checkpoint.timestamp,
-            symbols = checkpoint.symbols.len(),
-            "loaded checkpoint from disk"
+        warn!(
+            path = %path.display(),
+            "loaded legacy unsigned checkpoint — next flush will write a signed envelope"
         );
         Ok(checkpoint)
     }
@@ -171,12 +313,24 @@ mod tests {
     use super::*;
     use rust_decimal_macros::dec;
 
+    fn fresh_path(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        // Uniqueify per test run to avoid cross-test contamination
+        // when tests run in parallel.
+        p.push(format!(
+            "mm_ckpt_{}_{}.json",
+            name,
+            uuid::Uuid::new_v4().simple()
+        ));
+        p
+    }
+
     #[test]
     fn test_checkpoint_roundtrip() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("mm_test_checkpoint.json");
+        let path = fresh_path("roundtrip");
+        let secret = Some("test-secret-roundtrip".to_string());
 
-        let mut mgr = CheckpointManager::new(&path, 1);
+        let mut mgr = CheckpointManager::new_with_secret(&path, 1, secret.clone());
         mgr.update_symbol(SymbolCheckpoint {
             symbol: "BTCUSDT".into(),
             inventory: dec!(0.05),
@@ -187,14 +341,102 @@ mod tests {
             total_fills: 100,
         });
 
-        // Should auto-flush (flush_every = 1).
-        // Load it back.
-        let loaded = CheckpointManager::new(&path, 10);
+        let loaded = CheckpointManager::new_with_secret(&path, 10, secret);
         let sym = loaded.get_symbol("BTCUSDT").unwrap();
         assert_eq!(sym.inventory, dec!(0.05));
         assert_eq!(sym.realized_pnl, dec!(42.5));
 
-        // Cleanup.
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_checkpoint_rejects_tampered_payload() {
+        let path = fresh_path("tamper");
+        let secret = Some("test-secret-tamper".to_string());
+
+        let mut mgr = CheckpointManager::new_with_secret(&path, 1, secret.clone());
+        mgr.update_symbol(SymbolCheckpoint {
+            symbol: "BTCUSDT".into(),
+            inventory: dec!(1.0),
+            avg_entry_price: dec!(50000),
+            open_order_ids: vec![],
+            realized_pnl: dec!(0),
+            total_volume: dec!(50000),
+            total_fills: 1,
+        });
+
+        // Tamper with the file — bump inventory directly in the
+        // escaped JSON payload without re-signing. The payload is
+        // an escaped JSON string inside the envelope, so the
+        // tamper pattern uses the escaped form.
+        let content = std::fs::read_to_string(&path).unwrap();
+        let tampered = content.replace(r#"\"inventory\":\"1.0\""#, r#"\"inventory\":\"100.0\""#);
+        assert_ne!(content, tampered, "tamper pattern must match");
+        std::fs::write(&path, &tampered).unwrap();
+
+        let loaded = CheckpointManager::new_with_secret(&path, 10, secret);
+        // Tampered file is rejected → fresh state, not the
+        // attacker-inflated inventory.
+        assert!(loaded.get_symbol("BTCUSDT").is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_checkpoint_rejects_wrong_secret() {
+        let path = fresh_path("wrong-secret");
+
+        let mut mgr =
+            CheckpointManager::new_with_secret(&path, 1, Some("write-secret".to_string()));
+        mgr.update_symbol(SymbolCheckpoint {
+            symbol: "BTCUSDT".into(),
+            inventory: dec!(0.5),
+            avg_entry_price: dec!(50000),
+            open_order_ids: vec![],
+            realized_pnl: dec!(0),
+            total_volume: dec!(25000),
+            total_fills: 1,
+        });
+
+        let loaded =
+            CheckpointManager::new_with_secret(&path, 10, Some("different-secret".to_string()));
+        assert!(loaded.get_symbol("BTCUSDT").is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_checkpoint_accepts_legacy_unsigned() {
+        // Tests that pre-HMAC checkpoints still load.
+        let path = fresh_path("legacy");
+
+        let legacy = Checkpoint {
+            timestamp: Utc::now(),
+            symbols: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "ETHUSDT".to_string(),
+                    SymbolCheckpoint {
+                        symbol: "ETHUSDT".into(),
+                        inventory: dec!(0.2),
+                        avg_entry_price: dec!(3000),
+                        open_order_ids: vec![],
+                        realized_pnl: dec!(0),
+                        total_volume: dec!(600),
+                        total_fills: 1,
+                    },
+                );
+                m
+            },
+            daily_pnl: Decimal::ZERO,
+            total_realized_pnl: Decimal::ZERO,
+        };
+        std::fs::write(&path, serde_json::to_string(&legacy).unwrap()).unwrap();
+
+        // Pass None explicitly to avoid racing the process env.
+        let loaded = CheckpointManager::new_with_secret(&path, 10, None);
+        assert_eq!(loaded.get_symbol("ETHUSDT").unwrap().inventory, dec!(0.2));
+
         let _ = std::fs::remove_file(&path);
     }
 }

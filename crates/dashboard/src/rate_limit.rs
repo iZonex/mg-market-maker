@@ -3,9 +3,17 @@
 //! Protects admin endpoints from abuse. Each API key gets its
 //! own bucket; unauthenticated requests share a global bucket.
 
+use axum::extract::{ConnectInfo, Request, State};
+use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tracing::warn;
+
+use crate::auth::TokenClaims;
 
 /// Token bucket rate limiter.
 #[derive(Debug, Clone)]
@@ -87,6 +95,31 @@ impl RateLimiter {
     pub fn tracked_keys(&self) -> usize {
         self.inner.lock().unwrap().buckets.len()
     }
+}
+
+/// Axum middleware: throttle by authenticated user id when claims
+/// are present, otherwise by source IP. Returns `429 Too Many
+/// Requests` when the per-key bucket is empty. Keep buckets
+/// generous for admin use (e.g., 300 req/min is fine for normal
+/// operator activity but stops a runaway loop).
+pub async fn rate_limit_middleware(
+    State(limiter): State<RateLimiter>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    // Prefer user id so a malicious IP behind a shared NAT cannot
+    // starve other users, and so a legitimate user on a rotating
+    // IP is still rate-limited consistently.
+    let key = match req.extensions().get::<TokenClaims>() {
+        Some(c) => format!("user:{}", c.user_id),
+        None => format!("ip:{}", addr.ip()),
+    };
+    if !limiter.check(&key) {
+        warn!(key = %key, path = %req.uri().path(), "rate-limited");
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
+    }
+    next.run(req).await
 }
 
 #[cfg(test)]

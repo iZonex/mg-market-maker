@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use subtle::ConstantTimeEq;
 use tracing::warn;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -35,7 +36,7 @@ impl Role {
 }
 
 /// A registered API user.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ApiUser {
     pub id: String,
     pub name: String,
@@ -49,6 +50,19 @@ pub struct ApiUser {
     /// admin/operator users who see everything.
     #[serde(default)]
     pub client_id: Option<String>,
+}
+
+impl std::fmt::Debug for ApiUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiUser")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("role", &self.role)
+            .field("api_key", &"<redacted>")
+            .field("allowed_symbols", &self.allowed_symbols)
+            .field("client_id", &self.client_id)
+            .finish()
+    }
 }
 
 /// JWT-like token claims (simplified, HMAC-signed).
@@ -68,15 +82,37 @@ pub struct TokenClaims {
 pub struct AuthState {
     /// API key → user mapping.
     users: Arc<RwLock<HashMap<String, ApiUser>>>,
-    /// HMAC secret for token signing.
-    secret: String,
+    /// HMAC secret for token signing. Hidden from Debug output.
+    secret: Arc<String>,
+}
+
+impl std::fmt::Debug for AuthState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthState")
+            .field("users", &"<hidden>")
+            .field("secret", &"<redacted>")
+            .finish()
+    }
 }
 
 impl AuthState {
     pub fn new(secret: &str) -> Self {
+        if secret.len() < 32 {
+            warn!(
+                secret_len = secret.len(),
+                "MM_AUTH_SECRET is shorter than 32 bytes — token forgery is easier; \
+                 set a 32+ byte random secret in production"
+            );
+        }
+        if secret == "change-me-in-production" {
+            warn!(
+                "MM_AUTH_SECRET is the default placeholder — set a real random \
+                 secret before exposing the dashboard to any network"
+            );
+        }
         Self {
             users: Arc::new(RwLock::new(HashMap::new())),
-            secret: secret.to_string(),
+            secret: Arc::new(secret.to_string()),
         }
     }
 
@@ -114,7 +150,8 @@ impl AuthState {
         }
         let payload = base64_decode(parts[0])?;
         let expected_sig = self.sign(&payload);
-        if parts[1] != expected_sig {
+        // Constant-time comparison to prevent timing attacks.
+        if parts[1].as_bytes().ct_eq(expected_sig.as_bytes()).unwrap_u8() != 1 {
             return None;
         }
         let claims: TokenClaims = serde_json::from_str(&payload).ok()?;
@@ -248,7 +285,11 @@ impl Base64Reader {
     }
 }
 
-/// Axum middleware: extract auth from `Authorization: Bearer <token>` or `X-API-Key: <key>`.
+/// Axum middleware: extract auth from `Authorization: Bearer <token>`
+/// or `X-API-Key: <key>` header. Rejects requests with tokens in
+/// URL query strings — those leak into logs, browser history, and
+/// proxy caches (WebSocket upgrade uses a separate auth path that
+/// accepts `?token=` via `verify_token_param` in the handler).
 pub async fn auth_middleware(
     axum::extract::State(auth): axum::extract::State<AuthState>,
     mut req: Request,
@@ -282,20 +323,53 @@ pub async fn auth_middleware(
         }
     }
 
-    // Try query parameter (for WebSocket connections from browser).
-    if let Some(query) = req.uri().query() {
-        for pair in query.split('&') {
-            if let Some(token) = pair.strip_prefix("token=") {
-                if let Some(claims) = auth.verify_token(token) {
-                    req.extensions_mut().insert(claims);
-                    return next.run(req).await;
-                }
-            }
-        }
-    }
-
-    warn!("unauthorized request to {}", req.uri());
+    warn!(path = %req.uri().path(), "unauthorized request");
     StatusCode::UNAUTHORIZED.into_response()
+}
+
+/// Role gate: require `Role::Admin`. Place after `auth_middleware`
+/// via `.route_layer(admin_middleware).route_layer(auth_middleware)`
+/// so claims are populated by the time this runs.
+pub async fn admin_middleware(req: Request, next: Next) -> Response {
+    match req.extensions().get::<TokenClaims>() {
+        Some(c) if c.role == Role::Admin => next.run(req).await,
+        Some(c) => {
+            warn!(
+                user_id = %c.user_id,
+                role = ?c.role,
+                path = %req.uri().path(),
+                "admin-only endpoint blocked"
+            );
+            StatusCode::FORBIDDEN.into_response()
+        }
+        None => StatusCode::UNAUTHORIZED.into_response(),
+    }
+}
+
+/// Role gate: require internal-view permission (Admin or Operator).
+/// Blocks `Viewer` roles from seeing Prometheus metrics + internal
+/// diagnostics that expose position sizes and PnL.
+pub async fn internal_view_middleware(req: Request, next: Next) -> Response {
+    match req.extensions().get::<TokenClaims>() {
+        Some(c) if c.role.can_view_internals() => next.run(req).await,
+        Some(c) => {
+            warn!(
+                user_id = %c.user_id,
+                role = ?c.role,
+                path = %req.uri().path(),
+                "internal-view endpoint blocked"
+            );
+            StatusCode::FORBIDDEN.into_response()
+        }
+        None => StatusCode::UNAUTHORIZED.into_response(),
+    }
+}
+
+/// Verify a token supplied as a query parameter. Used by the
+/// WebSocket upgrade handler where browsers cannot set request
+/// headers — never accept this path on regular HTTP routes.
+pub fn verify_token_param(auth: &AuthState, token: &str) -> Option<TokenClaims> {
+    auth.verify_token(token)
 }
 
 /// Login endpoint: POST /api/auth/login { "api_key": "..." } → { "token": "...", "role": "..." }
@@ -313,6 +387,11 @@ pub async fn login_handler(
         })
         .into_response()
     } else {
+        // Timing-equalization: run verify_token on a dummy input
+        // so a failed login takes a comparable amount of time to
+        // a valid one, avoiding a trivial timing oracle on api_key
+        // membership. Cheap.
+        let _ = auth.verify_token(&body.api_key);
         StatusCode::UNAUTHORIZED.into_response()
     }
 }

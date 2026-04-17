@@ -1,11 +1,14 @@
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
-use axum::response::IntoResponse;
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
+use crate::auth::{AuthState, TokenClaims};
 use crate::state::DashboardState;
 
 /// WebSocket broadcast channel — engine pushes updates, all WS clients receive.
@@ -32,20 +35,42 @@ impl WsBroadcast {
     }
 }
 
-/// WebSocket upgrade handler.
-pub async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<(DashboardState, Arc<WsBroadcast>)>,
-) -> impl IntoResponse {
-    let (dashboard, broadcast) = state;
-    ws.on_upgrade(move |socket| handle_socket(socket, dashboard, broadcast))
+#[derive(Deserialize)]
+pub struct WsAuthQuery {
+    #[serde(default)]
+    token: Option<String>,
 }
 
-async fn handle_socket(socket: WebSocket, dashboard: DashboardState, broadcast: Arc<WsBroadcast>) {
+/// WebSocket upgrade handler. Browsers cannot set request headers
+/// on the WS upgrade, so we accept the session token as a `?token=`
+/// query parameter and verify it here. Unauthenticated upgrades
+/// return 401 before any socket state is allocated.
+pub async fn ws_handler(
+    ws: WebSocketUpgrade,
+    Query(q): Query<WsAuthQuery>,
+    State((dashboard, broadcast, auth)): State<(DashboardState, Arc<WsBroadcast>, AuthState)>,
+) -> Response {
+    let Some(token) = q.token.as_deref() else {
+        warn!("WS upgrade without token");
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(claims) = auth.verify_token(token) else {
+        warn!("WS upgrade with invalid token");
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    ws.on_upgrade(move |socket| handle_socket(socket, dashboard, broadcast, claims))
+}
+
+async fn handle_socket(
+    socket: WebSocket,
+    dashboard: DashboardState,
+    broadcast: Arc<WsBroadcast>,
+    claims: TokenClaims,
+) {
     let (mut sender, mut receiver) = socket.split();
     let mut rx = broadcast.subscribe();
 
-    info!("WebSocket client connected");
+    info!(user_id = %claims.user_id, role = ?claims.role, "WebSocket client connected");
 
     // Send initial state snapshot.
     if let Ok(json) = serde_json::to_string(&serde_json::json!({
@@ -84,5 +109,5 @@ async fn handle_socket(socket: WebSocket, dashboard: DashboardState, broadcast: 
         _ = &mut recv_task => { send_task.abort(); }
     }
 
-    info!("WebSocket client disconnected");
+    info!(user_id = %claims.user_id, "WebSocket client disconnected");
 }

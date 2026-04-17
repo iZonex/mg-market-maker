@@ -1,30 +1,39 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
+use axum::http::{header, HeaderValue, Method};
 use axum::middleware;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use prometheus::TextEncoder;
 use std::net::SocketAddr;
-use tower_http::cors::CorsLayer;
-use tracing::info;
+use tower_http::cors::{AllowOrigin, CorsLayer};
+use tracing::{info, warn};
 
-use crate::auth::{auth_middleware, login_handler, ApiUser, AuthState, Role};
+use crate::auth::{
+    admin_middleware, auth_middleware, internal_view_middleware, login_handler, ApiUser,
+    AuthState, Role,
+};
+use crate::rate_limit::{rate_limit_middleware, RateLimiter};
 use crate::state::{ConfigOverride, DashboardState, SymbolState};
 use crate::websocket::{ws_handler, WsBroadcast};
 
 /// Start the dashboard HTTP + WebSocket server with authentication.
 ///
-/// Public (no auth):
-///   GET  /health
-///   POST /api/auth/login
-///
-/// Protected (require auth):
-///   GET  /api/status
-///   GET  /api/v1/*           — operator/client API
-///   GET  /api/v1/client/*    — client portal
-///   GET  /metrics            — Prometheus (admin/operator only)
-///   WS   /ws                 — real-time updates
+/// Layer cake per route group:
+///   - public (`/health`, `/api/auth/login`): no auth; login is
+///     IP-rate-limited to blunt brute-force.
+///   - k8s probes (`/ready`, `/startup`): no auth — must be
+///     callable by the orchestrator.
+///   - protected operator/client API (`/api/status`, `/api/v1/*`):
+///     requires valid Bearer token or `X-API-Key` header.
+///   - metrics (`/metrics`): auth + `Admin|Operator` role (Viewer
+///     cannot see inventory/PnL gauges).
+///   - admin (`/api/admin/*`): auth + `Admin` role only + per-user
+///     rate limit.
+///   - WebSocket (`/ws`): token passed as `?token=` query param,
+///     verified inside `ws_handler` (browsers cannot set headers on
+///     the WS upgrade request).
 pub async fn start(
     state: DashboardState,
     ws_broadcast: Arc<WsBroadcast>,
@@ -33,10 +42,22 @@ pub async fn start(
 ) -> anyhow::Result<()> {
     crate::metrics::init();
 
-    // Public routes — no auth required.
+    // Rate limiters — admin gets a stricter budget; login is
+    // throttled by source IP to slow credential-stuffing.
+    let admin_rl = RateLimiter::new(300); // 300 req/min per user
+    let login_rl = RateLimiter::new(20); // 20/min per source IP
+
+    // Public routes — no auth. Login is IP-rate-limited.
     let public = Router::new()
         .route("/health", get(health))
+        .with_state(auth_state.clone());
+
+    let login = Router::new()
         .route("/api/auth/login", post(login_handler))
+        .route_layer(middleware::from_fn_with_state(
+            login_rl,
+            rate_limit_middleware,
+        ))
         .with_state(auth_state.clone());
 
     // K8s probes (no auth, need DashboardState).
@@ -45,10 +66,9 @@ pub async fn start(
         .route("/startup", get(readiness))
         .with_state(state.clone());
 
-    // Protected API routes — require auth.
+    // Protected API routes — any authenticated role.
     let protected_api = Router::new()
         .route("/api/status", get(get_status))
-        .route("/metrics", get(prometheus_metrics))
         .merge(crate::client_api::client_routes())
         .merge(crate::client_portal::client_portal_routes())
         .route_layer(middleware::from_fn_with_state(
@@ -57,8 +77,18 @@ pub async fn start(
         ))
         .with_state(state.clone());
 
-    // Admin config routes — hot-reload config per symbol or
-    // broadcast to all.
+    // Prometheus metrics — auth + internal-view role gate.
+    let metrics_route = Router::new()
+        .route("/metrics", get(prometheus_metrics))
+        .route_layer(middleware::from_fn(internal_view_middleware))
+        .route_layer(middleware::from_fn_with_state(
+            auth_state.clone(),
+            auth_middleware,
+        ));
+
+    // Admin config routes — hot-reload, symbol control, webhooks,
+    // alerts, loans, optimization, clients. Admin role ONLY plus
+    // user-scoped rate limit.
     let admin_config = Router::new()
         .route("/api/admin/config/{symbol}", post(admin_config_override))
         .route("/api/admin/config", post(admin_config_broadcast))
@@ -84,36 +114,112 @@ pub async fn start(
         .merge(crate::admin_clients::admin_client_routes())
         .with_state(state.clone());
 
-    // WebSocket — auth via query param (?token=...).
-    let ws_routes = Router::new()
-        .route("/ws", get(ws_handler))
-        .with_state((state.clone(), ws_broadcast));
-
-    // Admin routes — user management.
-    let admin = Router::new()
+    // Admin user-management — also admin-only.
+    let admin_users = Router::new()
         .route("/api/admin/users", get(list_users))
         .route("/api/admin/users", post(create_user))
+        .with_state(auth_state.clone());
+
+    let admin = admin_config
+        .merge(admin_users)
+        .route_layer(middleware::from_fn_with_state(
+            admin_rl,
+            rate_limit_middleware,
+        ))
+        .route_layer(middleware::from_fn(admin_middleware))
         .route_layer(middleware::from_fn_with_state(
             auth_state.clone(),
             auth_middleware,
-        ))
-        .with_state(auth_state);
+        ));
+
+    // WebSocket — auth via query param, verified inside handler.
+    let ws_routes = Router::new()
+        .route("/ws", get(ws_handler))
+        .with_state((state.clone(), ws_broadcast, auth_state));
+
+    let cors = build_cors_layer();
 
     let app = Router::new()
         .merge(public)
+        .merge(login)
         .merge(probes)
         .merge(protected_api)
-        .merge(ws_routes)
+        .merge(metrics_route)
         .merge(admin)
-        .merge(admin_config)
-        .layer(CorsLayer::permissive());
+        .merge(ws_routes)
+        .layer(cors);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!(%addr, "dashboard server starting");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
+}
+
+/// Build a CORS layer from `MM_DASHBOARD_CORS_ORIGINS` — a
+/// comma-separated list of allowed origins (e.g.,
+/// `https://dash.example.com,https://admin.example.com`). Unset
+/// defaults to localhost dev origins only; `*` enables wildcard
+/// (dangerous — only for closed networks). Allowing credentials
+/// together with `*` is illegal per the CORS spec and we refuse
+/// to configure it that way.
+fn build_cors_layer() -> CorsLayer {
+    let raw = std::env::var("MM_DASHBOARD_CORS_ORIGINS").unwrap_or_default();
+    let origins: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let allow = if raw.trim() == "*" {
+        warn!(
+            "MM_DASHBOARD_CORS_ORIGINS=* enables wildcard CORS — \
+             do NOT use this outside closed/dev networks"
+        );
+        AllowOrigin::any()
+    } else if origins.is_empty() {
+        // Dev default: Vite + common local ports. Production
+        // deployments MUST set MM_DASHBOARD_CORS_ORIGINS.
+        let defaults = [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+        ];
+        info!(
+            defaults = ?defaults,
+            "MM_DASHBOARD_CORS_ORIGINS not set — using localhost dev defaults"
+        );
+        AllowOrigin::list(
+            defaults
+                .iter()
+                .filter_map(|o| HeaderValue::from_str(o).ok())
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        info!(allowed = ?origins, "CORS allowed origins");
+        AllowOrigin::list(
+            origins
+                .iter()
+                .filter_map(|o| HeaderValue::from_str(o).ok())
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    CorsLayer::new()
+        .allow_origin(allow)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::HeaderName::from_static("x-api-key"),
+        ])
+        .allow_credentials(false)
 }
 
 async fn health() -> &'static str {
@@ -201,21 +307,14 @@ async fn create_user(
     })
 }
 
+/// Generate a 64-char hex API key backed by the OS CSPRNG (256
+/// bits of entropy). `getrandom` pulls from `/dev/urandom`,
+/// `getentropy`, or `BCryptGenRandom` depending on the platform —
+/// each is cryptographically strong and non-blocking after boot.
 fn generate_api_key() -> String {
-    // Generate a 32-char hex API key.
-    let bytes: Vec<u8> = (0..16).map(|_| rand_byte()).collect();
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).expect("OS CSPRNG must be available");
     hex::encode(bytes)
-}
-
-fn rand_byte() -> u8 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static CTR: AtomicU64 = AtomicU64::new(0);
-    let c = CTR.fetch_add(1, Ordering::Relaxed);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    ((c.wrapping_mul(6364136223846793005).wrapping_add(now)) >> 32) as u8
 }
 
 #[derive(serde::Serialize)]

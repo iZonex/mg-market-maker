@@ -26,4 +26,6 @@ uuid = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+getrandom = { workspace = true }
+subtle = { workspace = true }
 once_cell = "1"

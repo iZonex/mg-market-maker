@@ -72,6 +72,8 @@ async-trait = "0.1"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+getrandom = "0.2"
+subtle = "2"
 
 # HyperLiquid signing (EIP-712 over secp256k1)
 k256 = { version = "0.13", features = ["ecdsa"] }
