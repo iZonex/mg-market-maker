@@ -249,4 +249,96 @@ mod tests {
         assert_eq!(bk.gap_count(), 0);
         assert!(!bk.needs_resync());
     }
+
+    // ── Property-based tests (Epic 10) ───────────────────────
+    //
+    // BookKeeper sequence-gap invariants. The handwritten tests
+    // pin specific shapes; these widen the net with random
+    // start points, random in-range deltas, and random jump
+    // sizes to catch off-by-one mistakes in the `1 < jump <
+    // 1000` guard.
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Strictly increasing sequence by 1 never trips the
+        /// gap detector.
+        #[test]
+        fn monotonic_stream_never_trips(
+            start in 0u64..1_000_000u64,
+            count in 0u64..100u64,
+        ) {
+            let mut bk = BookKeeper::new("BTCUSDT");
+            bk.on_event(&snapshot(start));
+            for i in 1..=count {
+                bk.on_event(&delta(start + i));
+            }
+            prop_assert_eq!(bk.gap_count(), 0);
+            prop_assert!(!bk.needs_resync());
+        }
+
+        /// A single jump of 2..=999 always trips the gap
+        /// detector. Anchors the lower + upper edges of the
+        /// guard so a regression in the range check is caught.
+        #[test]
+        fn in_range_jump_always_trips(
+            start in 0u64..1_000_000u64,
+            jump in 2u64..1000u64,
+        ) {
+            let mut bk = BookKeeper::new("BTCUSDT");
+            bk.on_event(&snapshot(start));
+            bk.on_event(&delta(start + jump));
+            prop_assert_eq!(bk.gap_count(), 1);
+            prop_assert!(bk.needs_resync());
+        }
+
+        /// Out-of-order / duplicate deltas (<=last_seq) are
+        /// silently dropped and do NOT count as gaps.
+        #[test]
+        fn out_of_order_never_trips(
+            start in 1u64..1_000_000u64,
+            back in 0u64..100u64,
+        ) {
+            let mut bk = BookKeeper::new("BTCUSDT");
+            bk.on_event(&snapshot(start));
+            bk.on_event(&delta(start + 10));
+            // Replay a delta with seq ≤ last (start + 10 - back
+            // clamped to ≤ start + 10).
+            let replay = (start + 10).saturating_sub(back);
+            let updated = bk.on_event(&delta(replay));
+            prop_assert!(!updated, "out-of-order delta must be dropped");
+            // Gap counter reflects only the 10-step jump.
+            prop_assert_eq!(bk.gap_count(), 1);
+        }
+
+        /// A snapshot always clears the resync flag regardless
+        /// of what state we entered it from.
+        #[test]
+        fn snapshot_always_clears_resync(
+            start in 0u64..1_000_000u64,
+            new_seq in 0u64..2_000_000u64,
+        ) {
+            let mut bk = BookKeeper::new("BTCUSDT");
+            bk.on_event(&snapshot(start));
+            bk.on_event(&delta(start + 10)); // definitely trips
+            prop_assert!(bk.needs_resync());
+            bk.on_event(&snapshot(new_seq));
+            prop_assert!(!bk.needs_resync(),
+                "snapshot at seq {} failed to clear resync", new_seq);
+        }
+
+        /// Jumps >= 1000 (stream re-anchor on reconnect) never
+        /// trip — permanent resync would block quoting forever.
+        #[test]
+        fn huge_jump_is_stream_restart(
+            start in 0u64..1_000_000u64,
+            jump in 1000u64..10_000_000u64,
+        ) {
+            let mut bk = BookKeeper::new("BTCUSDT");
+            bk.on_event(&snapshot(start));
+            bk.on_event(&delta(start + jump));
+            prop_assert_eq!(bk.gap_count(), 0);
+            prop_assert!(!bk.needs_resync());
+        }
+    }
 }

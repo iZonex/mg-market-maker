@@ -247,4 +247,144 @@ mod tests {
 
         assert_eq!(tracker.attribution.round_trips, 1);
     }
+
+    // ── Property-based tests (Epic 10) ───────────────────────
+    //
+    // PnL attribution invariants: the accounting identity must
+    // hold regardless of fill order, mid path, or fee rates.
+
+    use proptest::prelude::*;
+    use proptest::sample::select;
+
+    fn mk_fill(side: Side, price: Decimal, qty: Decimal, is_maker: bool) -> Fill {
+        Fill {
+            trade_id: 1,
+            order_id: Uuid::new_v4(),
+            symbol: "TEST".into(),
+            side,
+            price,
+            qty,
+            is_maker,
+            timestamp: Utc::now(),
+        }
+    }
+
+    prop_compose! {
+        fn price_strat()(cents in 100i64..10_000_000i64) -> Decimal {
+            Decimal::new(cents, 2)
+        }
+    }
+    prop_compose! {
+        fn qty_strat()(units in 1i64..100_000i64) -> Decimal {
+            Decimal::new(units, 4)
+        }
+    }
+    fn side_strat() -> impl Strategy<Value = Side> {
+        select(vec![Side::Buy, Side::Sell])
+    }
+    fn bool_strat() -> impl Strategy<Value = bool> {
+        select(vec![true, false])
+    }
+    prop_compose! {
+        fn fill_strat()(
+            side in side_strat(),
+            price in price_strat(),
+            qty in qty_strat(),
+            is_maker in bool_strat(),
+        ) -> Fill {
+            mk_fill(side, price, qty, is_maker)
+        }
+    }
+
+    proptest! {
+        /// total_pnl() identity must hold after any sequence of
+        /// fills: total = spread + inventory + rebates − fees
+        /// − loan_cost. If this drifts, dashboards and MiCA
+        /// reports show a different number than sum-of-parts.
+        #[test]
+        fn total_pnl_identity_holds(
+            fills in proptest::collection::vec(fill_strat(), 0..30),
+            mid in price_strat(),
+        ) {
+            let mut tracker = PnlTracker::new(dec!(-0.0001), dec!(0.001));
+            for f in &fills {
+                tracker.on_fill(f, mid);
+            }
+            tracker.mark_to_market(mid);
+            let a = &tracker.attribution;
+            let expected = a.spread_pnl + a.inventory_pnl + a.rebate_income
+                - a.fees_paid - a.loan_cost_amortized;
+            prop_assert_eq!(a.total_pnl(), expected);
+        }
+
+        /// Fees and rebates are non-negative accumulators — they
+        /// only grow. Spread and inventory pnl can be negative.
+        #[test]
+        fn fees_and_rebates_are_monotonic_non_negative(
+            fills in proptest::collection::vec(fill_strat(), 0..30),
+            mid in price_strat(),
+        ) {
+            let mut tracker = PnlTracker::new(dec!(-0.0001), dec!(0.001));
+            let mut prev_fees = dec!(0);
+            let mut prev_rebates = dec!(0);
+            for f in &fills {
+                tracker.on_fill(f, mid);
+                prop_assert!(tracker.attribution.fees_paid >= prev_fees);
+                prop_assert!(tracker.attribution.rebate_income >= prev_rebates);
+                prop_assert!(tracker.attribution.fees_paid >= dec!(0));
+                prop_assert!(tracker.attribution.rebate_income >= dec!(0));
+                prev_fees = tracker.attribution.fees_paid;
+                prev_rebates = tracker.attribution.rebate_income;
+            }
+        }
+
+        /// total_volume strictly sums the per-fill notional — a
+        /// rounding or cast error here is how attribution bps
+        /// numbers silently drift.
+        #[test]
+        fn volume_equals_sum_of_notionals(
+            fills in proptest::collection::vec(fill_strat(), 0..30),
+            mid in price_strat(),
+        ) {
+            let mut tracker = PnlTracker::new(dec!(-0.0001), dec!(0.001));
+            let mut expected = dec!(0);
+            for f in &fills {
+                tracker.on_fill(f, mid);
+                expected += f.price * f.qty;
+            }
+            prop_assert_eq!(tracker.attribution.total_volume, expected);
+        }
+
+        /// A single maker fill with a non-positive maker fee
+        /// (rebate) never increases fees_paid — only rebate.
+        /// Catches a sign-flip regression in the fee branch.
+        #[test]
+        fn maker_rebate_goes_to_rebate_income(
+            fill in fill_strat(),
+            mid in price_strat(),
+        ) {
+            // Force is_maker = true so we hit the maker branch.
+            let f = Fill { is_maker: true, ..fill };
+            let mut tracker = PnlTracker::new(dec!(-0.0001), dec!(0.001));
+            tracker.on_fill(&f, mid);
+            prop_assert!(tracker.attribution.fees_paid.is_zero(),
+                "maker rebate leaked into fees_paid");
+            prop_assert!(tracker.attribution.rebate_income >= dec!(0));
+        }
+
+        /// A single taker fill (positive taker fee) never
+        /// increases rebate_income.
+        #[test]
+        fn taker_fee_goes_to_fees_paid(
+            fill in fill_strat(),
+            mid in price_strat(),
+        ) {
+            let f = Fill { is_maker: false, ..fill };
+            let mut tracker = PnlTracker::new(dec!(-0.0001), dec!(0.001));
+            tracker.on_fill(&f, mid);
+            prop_assert!(tracker.attribution.rebate_income.is_zero(),
+                "taker fee leaked into rebate_income");
+            prop_assert!(tracker.attribution.fees_paid >= dec!(0));
+        }
+    }
 }

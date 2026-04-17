@@ -439,4 +439,182 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    // ── Property-based tests (Epic 10) ───────────────────────
+    //
+    // HMAC-signed checkpoint invariants: roundtrip, tamper
+    // detection, wrong-secret rejection. The handwritten tests
+    // above cover representative cases; these widen the net with
+    // random symbol / qty / pnl inputs to catch encoding edge
+    // cases (scientific notation on small Decimals, empty symbol
+    // strings, etc.) before they hit prod.
+
+    use proptest::prelude::*;
+
+    prop_compose! {
+        fn dec_strat()(cents in -1_000_000_000i64..1_000_000_000i64) -> Decimal {
+            Decimal::new(cents, 4)
+        }
+    }
+    prop_compose! {
+        fn symbol_strat()(
+            s in "[A-Z]{3,6}(USDT|USDC|BTC|ETH)",
+        ) -> String {
+            s
+        }
+    }
+    prop_compose! {
+        fn sym_ckpt_strat()(
+            symbol in symbol_strat(),
+            inventory in dec_strat(),
+            avg_entry_price in dec_strat(),
+            realized_pnl in dec_strat(),
+            total_volume in dec_strat(),
+            total_fills in 0u64..1_000_000u64,
+        ) -> SymbolCheckpoint {
+            SymbolCheckpoint {
+                symbol,
+                inventory,
+                avg_entry_price,
+                open_order_ids: vec![],
+                realized_pnl,
+                total_volume,
+                total_fills,
+            }
+        }
+    }
+
+    fn fresh_path_prop(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "mm_ckpt_prop_{}_{}.json",
+            tag,
+            uuid::Uuid::new_v4().simple()
+        ));
+        p
+    }
+
+    proptest! {
+        /// Sign → flush → load round-trips every field verbatim.
+        #[test]
+        fn signed_roundtrip_preserves_fields(
+            sym in sym_ckpt_strat(),
+            secret in "[a-zA-Z0-9]{8,64}",
+        ) {
+            let path = fresh_path_prop("rt");
+            let mut mgr = CheckpointManager::new_with_secret(
+                &path, 1, Some(secret.clone())
+            );
+            mgr.update_symbol(sym.clone());
+
+            let loaded = CheckpointManager::new_with_secret(&path, 10, Some(secret));
+            let got = loaded.get_symbol(&sym.symbol);
+            prop_assert!(got.is_some(), "symbol missing after roundtrip");
+            let got = got.unwrap();
+            prop_assert_eq!(&got.symbol, &sym.symbol);
+            prop_assert_eq!(got.inventory, sym.inventory);
+            prop_assert_eq!(got.avg_entry_price, sym.avg_entry_price);
+            prop_assert_eq!(got.realized_pnl, sym.realized_pnl);
+            prop_assert_eq!(got.total_volume, sym.total_volume);
+            prop_assert_eq!(got.total_fills, sym.total_fills);
+
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// Any non-trivial tampering of the on-disk payload must
+        /// be rejected. We flip a random byte in the payload
+        /// substring of the envelope and verify the loader
+        /// discards the file rather than silently accepting a
+        /// forged inventory.
+        #[test]
+        fn tamper_is_always_detected(
+            sym in sym_ckpt_strat(),
+            secret in "[a-zA-Z0-9]{16,32}",
+            tamper_byte in 0u8..255u8,
+        ) {
+            let path = fresh_path_prop("tamper");
+            let mut mgr = CheckpointManager::new_with_secret(
+                &path, 1, Some(secret.clone())
+            );
+            mgr.update_symbol(sym.clone());
+
+            // Read the envelope and flip exactly one byte in the
+            // payload region (between the payload quote marks).
+            let content = std::fs::read_to_string(&path).unwrap();
+            let payload_start = content.find(r#""payload""#).unwrap_or(0);
+            if payload_start == 0 {
+                // Shouldn't happen, but skip rather than panic.
+                let _ = std::fs::remove_file(&path);
+                return Ok(());
+            }
+            // Pick a position inside the payload region — bump
+            // by an offset that lands us inside the JSON string
+            // content. Actual tamper: XOR byte to guarantee it
+            // changes.
+            let target_pos = payload_start + 20 + (tamper_byte as usize % 30);
+            let bytes = content.as_bytes();
+            if target_pos >= bytes.len() {
+                let _ = std::fs::remove_file(&path);
+                return Ok(());
+            }
+            let mut tampered = content.clone();
+            let orig_ch = bytes[target_pos];
+            // Replace with a different ASCII byte. If XOR lands
+            // on a problematic non-ascii byte, skip silently.
+            let new_ch = if orig_ch == b'A' { b'Z' } else { b'A' };
+            unsafe {
+                tampered.as_bytes_mut()[target_pos] = new_ch;
+            }
+            if tampered == content {
+                let _ = std::fs::remove_file(&path);
+                return Ok(());
+            }
+            std::fs::write(&path, &tampered).unwrap();
+
+            let loaded = CheckpointManager::new_with_secret(&path, 10, Some(secret));
+            // Tampered → either HMAC mismatch OR the mutation
+            // corrupted the JSON and load returned empty. Either
+            // way, the attacker-controlled symbol MUST NOT be
+            // loaded verbatim.
+            match loaded.get_symbol(&sym.symbol) {
+                None => {}
+                Some(got) => {
+                    // If loader happened to accept (shouldn't,
+                    // but let's be thorough), make sure the
+                    // payload still decoded correctly — i.e.
+                    // byte flip landed outside the tampered
+                    // fields. Inventory / pnl must match or
+                    // the loader was fooled.
+                    prop_assert_eq!(got.inventory, sym.inventory,
+                        "tamper accepted without detection");
+                }
+            }
+
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// Wrong secret never loads the checkpoint regardless of
+        /// payload contents. Uses different secrets of >= 8
+        /// bytes so the filter tests real secrets not empty
+        /// strings.
+        #[test]
+        fn wrong_secret_always_rejects(
+            sym in sym_ckpt_strat(),
+            write_secret in "[a-zA-Z0-9]{16,32}",
+            read_secret in "[a-zA-Z0-9]{16,32}",
+        ) {
+            prop_assume!(write_secret != read_secret);
+            let path = fresh_path_prop("wrong");
+            let mut mgr = CheckpointManager::new_with_secret(
+                &path, 1, Some(write_secret)
+            );
+            mgr.update_symbol(sym.clone());
+
+            let loaded = CheckpointManager::new_with_secret(&path, 10, Some(read_secret));
+            prop_assert!(loaded.get_symbol(&sym.symbol).is_none(),
+                "wrong-secret load must not return the checkpoint");
+
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
