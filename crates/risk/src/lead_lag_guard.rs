@@ -1004,4 +1004,90 @@ mod tests {
         g.on_leader_mid(dec!(47500)); // down
         assert_eq!(g.ask_multiplier(), g.current_multiplier());
     }
+
+    // ── Property-based tests (Epic 13) ───────────────────────
+
+    use proptest::prelude::*;
+
+    prop_compose! {
+        fn mid_step_strat()(raw in 1i64..1_000_000i64) -> Decimal {
+            Decimal::new(raw, 2)
+        }
+    }
+
+    proptest! {
+        /// current_multiplier() is bounded in [1, max_mult] for
+        /// any sequence of leader mids. The guard only widens
+        /// spreads — a value below 1 would tighten them under
+        /// stress, the opposite of risk reduction. Upper bound
+        /// saturates at config.max_mult regardless of |z|.
+        #[test]
+        fn multiplier_bounded_in_one_to_max(
+            mids in proptest::collection::vec(mid_step_strat(), 1..40),
+        ) {
+            let cfg = fixture_config();
+            let max = cfg.max_mult;
+            let mut g = LeadLagGuard::new(cfg);
+            for m in &mids {
+                g.on_leader_mid(*m);
+                let mult = g.current_multiplier();
+                prop_assert!(mult >= dec!(1), "mult {} < 1", mult);
+                prop_assert!(mult <= max, "mult {} > max {}", mult, max);
+            }
+        }
+
+        /// bid_multiplier and ask_multiplier both stay in the
+        /// same bounded range. Catches a regression where one
+        /// side's helper would leak a negative scalar from the
+        /// signed-z path.
+        #[test]
+        fn side_multipliers_also_bounded(
+            mids in proptest::collection::vec(mid_step_strat(), 1..40),
+        ) {
+            let cfg = fixture_config();
+            let max = cfg.max_mult;
+            let mut g = LeadLagGuard::new(cfg);
+            for m in &mids {
+                g.on_leader_mid(*m);
+                let bid = g.bid_multiplier();
+                let ask = g.ask_multiplier();
+                prop_assert!(bid >= dec!(1));
+                prop_assert!(bid <= max);
+                prop_assert!(ask >= dec!(1));
+                prop_assert!(ask <= max);
+            }
+        }
+
+        /// A constant leader mid produces zero z-score on every
+        /// tick, so the multiplier stays at 1.0 — no spurious
+        /// widening on a static feed.
+        #[test]
+        fn constant_mid_never_widens(
+            mid in mid_step_strat(),
+            n in 5usize..40usize,
+        ) {
+            let mut g = LeadLagGuard::new(fixture_config());
+            for _ in 0..n {
+                g.on_leader_mid(mid);
+            }
+            prop_assert_eq!(g.current_multiplier(), dec!(1));
+            prop_assert!(!g.is_active());
+        }
+
+        /// reset() wipes the guard to its initial state from
+        /// any configuration of observed events.
+        #[test]
+        fn reset_restores_initial_state(
+            mids in proptest::collection::vec(mid_step_strat(), 1..30),
+        ) {
+            let mut g = LeadLagGuard::new(fixture_config());
+            for m in &mids {
+                g.on_leader_mid(*m);
+            }
+            g.reset();
+            prop_assert_eq!(g.current_multiplier(), dec!(1));
+            prop_assert!(!g.is_active());
+            prop_assert_eq!(g.obs_count(), 0);
+        }
+    }
 }

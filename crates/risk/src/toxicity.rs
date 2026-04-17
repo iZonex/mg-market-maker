@@ -1001,6 +1001,86 @@ mod tests {
         }
     }
 
+    // ── Kyle Lambda ──────────────────────────────────────────
+
+    proptest! {
+        /// Fewer than 10 observations always returns None — the
+        /// estimator refuses to produce λ without enough samples
+        /// for a meaningful regression.
+        #[test]
+        fn kyle_requires_10_samples(n in 0usize..10usize) {
+            let mut kl = KyleLambda::new(100);
+            for i in 0..n {
+                kl.update(Decimal::new(i as i64, 2), Decimal::new(i as i64, 0));
+            }
+            prop_assert!(kl.lambda().is_none());
+        }
+
+        /// Zero OFI variance always returns None — the linear
+        /// regression has no slope to compute. Catches a
+        /// regression where divide-by-zero would surface as a
+        /// spurious λ = 0.
+        #[test]
+        fn zero_variance_ofi_returns_none(
+            n in 10usize..50usize,
+            constant_ofi in -1000i64..1000i64,
+            price_changes in proptest::collection::vec(
+                -100_000i64..100_000i64,
+                10..50,
+            ),
+        ) {
+            let mut kl = KyleLambda::new(100);
+            let ofi = Decimal::from(constant_ofi);
+            for dp in price_changes.iter().take(n).copied() {
+                kl.update(Decimal::new(dp, 4), ofi);
+            }
+            prop_assert!(kl.lambda().is_none(),
+                "constant OFI should yield no λ");
+        }
+
+        /// With a perfect linear relationship ΔP = α·OFI (α > 0),
+        /// the estimator recovers λ ≈ α. Verifies the covariance
+        /// / variance arithmetic is correctly assembled.
+        #[test]
+        fn kyle_recovers_linear_coefficient(
+            alpha_raw in 1i64..100i64,
+            ofis in proptest::collection::vec(-100i64..100i64, 10..30),
+        ) {
+            // Require OFI variance > 0 — otherwise lambda() returns None
+            // (handled in a separate property above).
+            prop_assume!(ofis.iter().collect::<std::collections::HashSet<_>>().len() >= 2);
+            let alpha = Decimal::new(alpha_raw, 4);  // 0.0001 .. 0.0100
+            let mut kl = KyleLambda::new(100);
+            for ofi_raw in &ofis {
+                let ofi = Decimal::from(*ofi_raw);
+                let dp = alpha * ofi;
+                kl.update(dp, ofi);
+            }
+            let lambda = kl.lambda().expect("lambda should be defined for varied OFI");
+            let diff = (lambda - alpha).abs();
+            prop_assert!(diff < dec!(0.0001),
+                "recovered λ={} far from α={} (diff={})", lambda, alpha, diff);
+        }
+
+        /// Window is bounded — feeding more than window_size
+        /// observations does not overflow or break the estimator.
+        /// Returns a finite Decimal when window is full.
+        #[test]
+        fn window_bounded(
+            n in 20usize..300usize,
+        ) {
+            let mut kl = KyleLambda::new(50);
+            for i in 0..n {
+                let ofi = Decimal::from(((i as i64) % 7) - 3);  // -3..3 cycle
+                let dp = ofi * Decimal::new(2, 3);  // 0.002·ofi
+                kl.update(dp, ofi);
+            }
+            // Window keeps only the last 50.
+            let lambda = kl.lambda();
+            prop_assert!(lambda.is_some(), "full window should give λ");
+        }
+    }
+
     // ── AdverseSelection ─────────────────────────────────────
 
     proptest! {

@@ -23,6 +23,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.5"
+proptest = "1"
 
 [[bench]]
 name = "strategy_bench"

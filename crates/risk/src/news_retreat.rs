@@ -939,4 +939,125 @@ mod tests {
             mult_crit
         );
     }
+
+    // ── Property-based tests (Epic 13) ───────────────────────
+
+    use proptest::prelude::*;
+    use proptest::sample::select;
+
+    fn news_class_strat() -> impl Strategy<Value = NewsClass> {
+        select(vec![NewsClass::Low, NewsClass::High, NewsClass::Critical])
+    }
+
+    fn news_retreat_cfg() -> NewsRetreatConfig {
+        NewsRetreatConfig {
+            critical_keywords: vec!["hack".into(), "fraud".into()],
+            high_keywords: vec!["delist".into(), "halt".into()],
+            low_keywords: vec!["rumor".into()],
+            critical_cooldown_ms: 1_800_000,
+            high_cooldown_ms: 300_000,
+            low_cooldown_ms: 0,
+            high_multiplier: dec!(2),
+            critical_multiplier: dec!(3),
+        }
+    }
+
+    proptest! {
+        /// Every transition type respects its invariant:
+        /// Promoted → strictly higher rank;
+        /// Refreshed → same state;
+        /// Suppressed → incoming class strictly below current.
+        /// Evaluated against a small sequence so cooldown
+        /// expiries + state auto-reversions are exercised too.
+        #[test]
+        fn transition_invariants_hold(
+            headlines in proptest::collection::vec(news_class_strat(), 1..8),
+        ) {
+            let mut sm = NewsRetreatStateMachine::new(news_retreat_cfg())
+                .expect("config compiles");
+            for (i, c) in headlines.iter().enumerate() {
+                let kw = match c {
+                    NewsClass::Low => "rumor",
+                    NewsClass::High => "delist",
+                    NewsClass::Critical => "hack",
+                };
+                let t = sm.on_headline(kw, i as i64);
+                match t {
+                    NewsRetreatTransition::Promoted { from, to } => {
+                        prop_assert!(to.rank() > from.rank(),
+                            "Promoted with to<=from: {:?}→{:?}", from, to);
+                    }
+                    NewsRetreatTransition::Refreshed(_) => { /* state preserved */ }
+                    NewsRetreatTransition::Suppressed { class, current } => {
+                        prop_assert!(
+                            NewsRetreatState::from(class).rank() < current.rank(),
+                            "Suppressed with class {:?} >= current {:?}", class, current);
+                    }
+                    NewsRetreatTransition::NoMatch => unreachable!(),
+                }
+            }
+        }
+
+        /// Multiplier is always >= 1.0 — the retreat only widens
+        /// spreads, never tightens them. A value < 1 would narrow
+        /// quotes under stress, the opposite of risk reduction.
+        #[test]
+        fn multiplier_is_never_below_one(
+            headlines in proptest::collection::vec(news_class_strat(), 0..10),
+        ) {
+            let mut sm = NewsRetreatStateMachine::new(news_retreat_cfg())
+                .expect("config compiles");
+            for (i, c) in headlines.iter().enumerate() {
+                let kw = match c {
+                    NewsClass::Low => "rumor",
+                    NewsClass::High => "delist",
+                    NewsClass::Critical => "hack",
+                };
+                sm.on_headline(kw, i as i64);
+            }
+            let mult = sm.current_multiplier(1000);
+            prop_assert!(mult >= dec!(1),
+                "multiplier {} < 1 under headline mix {:?}", mult, headlines);
+        }
+
+        /// Force-clear always returns to Normal — operator
+        /// override must be unconditional.
+        #[test]
+        fn force_clear_always_returns_to_normal(
+            class in news_class_strat(),
+        ) {
+            let mut sm = NewsRetreatStateMachine::new(news_retreat_cfg())
+                .expect("config compiles");
+            let kw = match class {
+                NewsClass::Low => "rumor",
+                NewsClass::High => "delist",
+                NewsClass::Critical => "hack",
+            };
+            sm.on_headline(kw, 0);
+            sm.force_clear();
+            prop_assert_eq!(sm.current_state(1000), NewsRetreatState::Normal);
+            prop_assert_eq!(sm.current_multiplier(1000), dec!(1));
+        }
+
+        /// After full cooldown elapsed the state returns to
+        /// Normal. Critical cooldown is the longest — if the
+        /// timer logic is wrong the state sticks in Critical
+        /// forever.
+        #[test]
+        fn cooldown_expiry_returns_to_normal_prop(
+            class in news_class_strat(),
+        ) {
+            let mut sm = NewsRetreatStateMachine::new(news_retreat_cfg())
+                .expect("config compiles");
+            let kw = match class {
+                NewsClass::Low => "rumor",
+                NewsClass::High => "delist",
+                NewsClass::Critical => "hack",
+            };
+            sm.on_headline(kw, 0);
+            // Jump past the critical cooldown (longest of the
+            // three). Any lower-class state has expired too.
+            prop_assert_eq!(sm.current_state(2_000_000), NewsRetreatState::Normal);
+        }
+    }
 }

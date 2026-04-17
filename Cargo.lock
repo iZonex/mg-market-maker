@@ -1687,6 +1687,7 @@ dependencies = [
  "mm-exchange-core",
  "mm-indicators",
  "mm-persistence",
+ "proptest",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",

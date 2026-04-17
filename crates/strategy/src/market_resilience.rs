@@ -769,4 +769,83 @@ mod tests {
         assert_eq!(cfg.warmup_samples, 200);
         assert!((cfg.recovery_target - 0.9).abs() < 1e-9);
     }
+
+    // ── Property-based tests (Epic 13) ───────────────────────
+
+    use proptest::prelude::*;
+
+    prop_compose! {
+        fn trade_size_strat()(units in 1i64..1_000_000i64) -> Decimal {
+            Decimal::new(units, 4)
+        }
+    }
+
+    proptest! {
+        /// score() always lies in [0, 1] — this is the
+        /// dashboard-gauge contract. Tested against random trade
+        /// streams + random elapsed times, including the
+        /// no-events-yet case where score must default to 1.0.
+        #[test]
+        fn score_is_bounded_in_0_1(
+            sizes in proptest::collection::vec(trade_size_strat(), 0..40),
+            query_delay_ns in 0i64..10_000_000_000i64,
+        ) {
+            let mut mr = MarketResilienceCalculator::with_defaults();
+            let mut now = 0i64;
+            for s in &sizes {
+                now += 1_000_000;  // 1ms per trade
+                mr.on_trade(*s, now);
+            }
+            let s = mr.score(now + query_delay_ns);
+            prop_assert!(s >= dec!(0), "score {} < 0", s);
+            prop_assert!(s <= dec!(1), "score {} > 1", s);
+        }
+
+        /// Fresh calculator (no events) always reports score 1.0
+        /// regardless of the query time. Catches a regression
+        /// where a division-by-zero in the decay window would
+        /// surface as NaN or 0 on a cold engine.
+        #[test]
+        fn fresh_calculator_is_full_resilience(
+            now_ns in 0i64..1_000_000_000_000i64,
+        ) {
+            let mr = MarketResilienceCalculator::with_defaults();
+            prop_assert_eq!(mr.score(now_ns), dec!(1));
+        }
+
+        /// After enough time past the last event, score decays
+        /// back to exactly 1.0. The calculator models a
+        /// self-healing market — a sustained low score would
+        /// get stuck under a bug that forgot to reset the
+        /// anchor timestamp.
+        #[test]
+        fn score_decays_to_one_after_decay_window(
+            sizes in proptest::collection::vec(trade_size_strat(), 1..30),
+            extra_time_ns in 0i64..1_000_000_000i64,
+        ) {
+            let mut mr = MarketResilienceCalculator::with_defaults();
+            let mut now = 0i64;
+            for s in &sizes {
+                now += 1_000_000;
+                mr.on_trade(*s, now);
+            }
+            // Jump past the full decay window + any extra time.
+            let far_future = now + 10_000_000_000 + extra_time_ns;
+            prop_assert_eq!(mr.score(far_future), dec!(1));
+        }
+
+        /// Zero / negative trade size is silently ignored —
+        /// never produces a NaN or crashes the detector.
+        /// Defensive against connectors that forward malformed
+        /// trades.
+        #[test]
+        fn zero_or_negative_size_is_ignored(
+            now_ns in 1i64..1_000_000_000_000i64,
+        ) {
+            let mut mr = MarketResilienceCalculator::with_defaults();
+            mr.on_trade(dec!(0), now_ns);
+            mr.on_trade(-dec!(5), now_ns);
+            prop_assert_eq!(mr.score(now_ns), dec!(1));
+        }
+    }
 }
