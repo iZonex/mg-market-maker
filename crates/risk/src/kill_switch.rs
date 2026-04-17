@@ -465,4 +465,133 @@ mod tests {
         // would ignore a lower level anyway.
         assert_eq!(ks.level(), KillLevel::CancelAll);
     }
+
+    // ── Property-based tests (Epic 12) ───────────────────────
+
+    use proptest::prelude::*;
+    use proptest::sample::select;
+
+    fn level_strat() -> impl Strategy<Value = KillLevel> {
+        select(vec![
+            KillLevel::Normal,
+            KillLevel::WidenSpreads,
+            KillLevel::StopNewOrders,
+            KillLevel::CancelAll,
+            KillLevel::FlattenAll,
+            KillLevel::Disconnect,
+        ])
+    }
+
+    prop_compose! {
+        fn pnl_strat()(cents in -1_000_000i64..1_000_000i64) -> Decimal {
+            Decimal::new(cents, 2)
+        }
+    }
+
+    proptest! {
+        /// Automatic escalation via `update_pnl` / `update_position_value`
+        /// / `on_error` / `on_message_sent` only ever raises the
+        /// level — never lowers it. This is the core safety
+        /// invariant: a momentary recovery does not quietly roll
+        /// back the kill switch. Only `reset` or `manual_trigger`
+        /// can move it down.
+        #[test]
+        fn auto_escalation_is_monotonic(
+            pnls in proptest::collection::vec(pnl_strat(), 0..30),
+            errors in 0u32..100u32,
+        ) {
+            let mut ks = KillSwitch::new(KillSwitchConfig::default());
+            let mut prev = ks.level();
+            for p in pnls {
+                ks.update_pnl(p);
+                let now = ks.level();
+                prop_assert!(now >= prev, "auto path lowered {:?} → {:?}", prev, now);
+                prev = now;
+            }
+            for _ in 0..errors {
+                ks.on_error();
+                let now = ks.level();
+                prop_assert!(now >= prev, "on_error lowered {:?} → {:?}", prev, now);
+                prev = now;
+            }
+        }
+
+        /// allow_new_orders is exactly equivalent to
+        /// `level < StopNewOrders`. Any other mapping would let
+        /// a CancelAll / FlattenAll escalation keep placing
+        /// orders, which is the nightmare scenario the kill
+        /// switch exists to prevent.
+        #[test]
+        fn allow_new_orders_matches_level_predicate(level in level_strat()) {
+            let mut ks = KillSwitch::new(KillSwitchConfig::default());
+            ks.manual_trigger(level, "proptest");
+            prop_assert_eq!(ks.allow_new_orders(), level < KillLevel::StopNewOrders);
+        }
+
+        /// Manual reset from any level always returns to Normal.
+        /// Operator ack path must be unconditional so a fat-
+        /// finger cannot leave the switch stuck.
+        #[test]
+        fn reset_always_returns_to_normal(level in level_strat()) {
+            let mut ks = KillSwitch::new(KillSwitchConfig::default());
+            ks.manual_trigger(level, "proptest");
+            ks.reset();
+            prop_assert_eq!(ks.level(), KillLevel::Normal);
+            prop_assert!(ks.allow_new_orders());
+        }
+
+        /// spread_multiplier and size_multiplier are non-negative
+        /// and bounded. A negative multiplier would flip the
+        /// strategy's spread direction inside itself — property
+        /// catches a sign regression.
+        #[test]
+        fn multipliers_bounded(level in level_strat()) {
+            let mut ks = KillSwitch::new(KillSwitchConfig::default());
+            ks.manual_trigger(level, "proptest");
+            let sm = ks.spread_multiplier();
+            let szm = ks.size_multiplier();
+            prop_assert!(sm >= dec!(0), "spread_mul {} < 0", sm);
+            prop_assert!(sm <= dec!(100), "spread_mul {} > 100", sm);
+            prop_assert!(szm >= dec!(0), "size_mul {} < 0", szm);
+            prop_assert!(szm <= dec!(1), "size_mul {} > 1", szm);
+        }
+
+        /// `on_error` escalation is bounded: after N errors we
+        /// reach at most StopNewOrders via the error path (the
+        /// config's max_consecutive_errors threshold). Subsequent
+        /// errors do NOT keep escalating past StopNewOrders — the
+        /// error path is a one-shot trigger.
+        #[test]
+        fn error_path_caps_at_stop_new_orders(n_errors in 10u32..1000u32) {
+            let mut ks = KillSwitch::new(KillSwitchConfig::default());
+            for _ in 0..n_errors {
+                ks.on_error();
+            }
+            // The threshold is 10 errors → StopNewOrders. More
+            // errors never push past that level from this path
+            // alone.
+            prop_assert!(ks.level() >= KillLevel::StopNewOrders);
+            prop_assert!(ks.level() <= KillLevel::StopNewOrders);
+        }
+
+        /// Fills reset the consecutive-error counter but never
+        /// de-escalate the level. Catches a regression where
+        /// on_fill was used to try to clear a previous error
+        /// escalation.
+        #[test]
+        fn on_fill_never_de_escalates(
+            n_errors in 0u32..30u32,
+            n_fills in 1u32..30u32,
+        ) {
+            let mut ks = KillSwitch::new(KillSwitchConfig::default());
+            for _ in 0..n_errors {
+                ks.on_error();
+            }
+            let before = ks.level();
+            for _ in 0..n_fills {
+                ks.on_fill();
+            }
+            prop_assert_eq!(ks.level(), before);
+        }
+    }
 }

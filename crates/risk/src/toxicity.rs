@@ -49,26 +49,33 @@ impl VpinEstimator {
         }
         self.current_total_vol += vol;
 
-        // If bucket is full, finalize it.
+        // If bucket is full, finalize it. The bucket's imbalance
+        // must be computed on the portion of volume attributed
+        // to THIS bucket (= bucket_size), not on the full
+        // current_total_vol — otherwise a single trade that
+        // overflows multiple buckets would record an imbalance
+        // > bucket_size and violate the mathematical bound
+        // |buy - sell| ≤ buy + sell, driving vpin() > 1.
+        // Property-based test `vpin_is_bounded_in_0_1` caught
+        // this latent bug.
         while self.current_total_vol >= self.bucket_size {
-            let overflow = self.current_total_vol - self.bucket_size;
-            let imbalance = (self.current_buy_vol - self.current_sell_vol).abs();
-
+            let buy_ratio = if self.current_total_vol > dec!(0) {
+                self.current_buy_vol / self.current_total_vol
+            } else {
+                dec!(0.5)
+            };
+            let bucket_buy = self.bucket_size * buy_ratio;
+            let bucket_sell = self.bucket_size - bucket_buy;
+            let imbalance = (bucket_buy - bucket_sell).abs();
             self.buckets.push_back((imbalance, self.bucket_size));
             if self.buckets.len() > self.num_buckets {
                 self.buckets.pop_front();
             }
 
-            // Carry overflow into next bucket.
-            // Approximate: attribute overflow proportionally.
-            if self.current_total_vol > dec!(0) {
-                let buy_ratio = self.current_buy_vol / self.current_total_vol;
-                self.current_buy_vol = overflow * buy_ratio;
-                self.current_sell_vol = overflow * (dec!(1) - buy_ratio);
-            } else {
-                self.current_buy_vol = dec!(0);
-                self.current_sell_vol = dec!(0);
-            }
+            // Carry overflow into next bucket using the same ratio.
+            let overflow = self.current_total_vol - self.bucket_size;
+            self.current_buy_vol = overflow * buy_ratio;
+            self.current_sell_vol = overflow - self.current_buy_vol;
             self.current_total_vol = overflow;
         }
     }
@@ -906,5 +913,151 @@ mod tests {
         let symmetric = t.adverse_selection_bps().unwrap();
         let bid = t.adverse_selection_bps_bid().unwrap();
         assert_eq!(symmetric, bid);
+    }
+
+    // ── Property-based tests (Epic 12) ───────────────────────
+
+    use proptest::prelude::*;
+    use proptest::sample::select;
+
+    fn side_strat() -> impl Strategy<Value = Side> {
+        select(vec![Side::Buy, Side::Sell])
+    }
+    prop_compose! {
+        fn price_strat_tox()(cents in 100i64..100_000_000i64) -> Decimal {
+            Decimal::new(cents, 2)
+        }
+    }
+    prop_compose! {
+        fn qty_strat_tox()(units in 1i64..1_000_000i64) -> Decimal {
+            Decimal::new(units, 4)
+        }
+    }
+
+    fn make_trade(side: Side, price: Decimal, qty: Decimal) -> Trade {
+        Trade {
+            trade_id: 1,
+            symbol: "TEST".into(),
+            price,
+            qty,
+            taker_side: side,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    // ── VPIN ─────────────────────────────────────────────────
+
+    proptest! {
+        // Heavier than the default — proptest runs 256 cases of
+        // up-to-60-trade sequences. 32 cases keep CI under
+        // 10 seconds while still covering enough random shapes
+        // to exercise the overflow math.
+        #![proptest_config(ProptestConfig { cases: 32, .. ProptestConfig::default() })]
+
+        /// VPIN is bounded in [0, 1] for any trade sequence. A
+        /// value > 1 would be mathematically impossible (the
+        /// imbalance can't exceed the volume). This property
+        /// caught a real bug in the bucket-overflow path where
+        /// imbalance was computed against current_total_vol
+        /// instead of bucket_size, letting VPIN exceed 1 on
+        /// one-sided flow.
+        #[test]
+        fn vpin_is_bounded_in_0_1(
+            trades in proptest::collection::vec(
+                (side_strat(), price_strat_tox(), qty_strat_tox()),
+                10..60,
+            ),
+        ) {
+            let mut v = VpinEstimator::new(dec!(10_000), 20);
+            for (side, p, q) in &trades {
+                v.on_trade(&make_trade(*side, *p, *q));
+            }
+            if let Some(vpin) = v.vpin() {
+                prop_assert!(vpin >= dec!(0), "VPIN {} < 0", vpin);
+                prop_assert!(vpin <= dec!(1), "VPIN {} > 1", vpin);
+            }
+        }
+
+        /// A completely one-sided flow (all buys) saturates
+        /// toward VPIN = 1. Verifies the imbalance is picked
+        /// up as toxic.
+        #[test]
+        fn one_sided_flow_has_high_vpin(
+            qty in qty_strat_tox(),
+            price in price_strat_tox(),
+            n_trades in 30usize..60usize,
+        ) {
+            // Bucket size = one-trade notional so each trade
+            // finalises its own bucket.
+            let bucket_size = price * qty;
+            let mut v = VpinEstimator::new(bucket_size, 20);
+            for _ in 0..n_trades {
+                v.on_trade(&make_trade(Side::Buy, price, qty));
+            }
+            if let Some(vpin) = v.vpin() {
+                prop_assert!(vpin >= dec!(0.5),
+                    "all-buy flow produced VPIN {} < 0.5", vpin);
+            }
+        }
+    }
+
+    // ── AdverseSelection ─────────────────────────────────────
+
+    proptest! {
+        /// Fewer than 5 completed fills on a side always returns
+        /// None — the estimator refuses to report until the
+        /// window has enough samples for a meaningful average.
+        #[test]
+        fn per_side_requires_5_fills(
+            n in 0usize..5usize,
+            side in side_strat(),
+            fill_price in price_strat_tox(),
+        ) {
+            let mut t = AdverseSelectionTracker::new(50);
+            for _ in 0..n {
+                seed_completed_fill(&mut t, side, fill_price, fill_price, fill_price);
+            }
+            prop_assert!(t.adverse_selection_bps_for_side(side).is_none());
+        }
+
+        /// Zero adverse selection — when mid_after equals the
+        /// fill's benchmark, bps should be zero. Exact equality
+        /// after averaging — catches rounding drift.
+        #[test]
+        fn no_price_move_yields_zero_bps(
+            side in side_strat(),
+            price in price_strat_tox(),
+            n in 5usize..20usize,
+        ) {
+            let mut t = AdverseSelectionTracker::new(50);
+            for _ in 0..n {
+                seed_completed_fill(&mut t, side, price, price, price);
+            }
+            let bps = t.adverse_selection_bps_for_side(side).unwrap();
+            prop_assert_eq!(bps, dec!(0));
+        }
+
+        /// The symmetric average is bounded by the per-side
+        /// averages — i.e., the overall figure cannot exceed the
+        /// worse of the two sides when both are populated.
+        /// Catches weighting errors across the bid/ask split.
+        #[test]
+        fn symmetric_between_per_side(
+            price in price_strat_tox(),
+            n in 5usize..15usize,
+        ) {
+            let mut t = AdverseSelectionTracker::new(50);
+            for _ in 0..n {
+                seed_completed_fill(&mut t, Side::Buy, price, price, price - dec!(1));
+                seed_completed_fill(&mut t, Side::Sell, price, price, price + dec!(2));
+            }
+            let bid = t.adverse_selection_bps_bid().unwrap();
+            let ask = t.adverse_selection_bps_ask().unwrap();
+            let sym = t.adverse_selection_bps().unwrap();
+            let lo = bid.min(ask);
+            let hi = bid.max(ask);
+            prop_assert!(sym >= lo - dec!(0.01) && sym <= hi + dec!(0.01),
+                "symmetric {} outside [{}, {}]", sym, lo, hi);
+        }
     }
 }
