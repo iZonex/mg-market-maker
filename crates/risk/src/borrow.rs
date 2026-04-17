@@ -225,4 +225,86 @@ mod tests {
         assert_eq!(mgr.max_borrow(), dec!(0.5));
         assert_eq!(mgr.buffer(), dec!(0.05));
     }
+
+    // ── Property-based tests (Epic 16) ───────────────────────
+
+    use proptest::prelude::*;
+
+    prop_compose! {
+        fn apr_strat()(raw in 0i64..200_000i64) -> Decimal {
+            // 0 .. 2.0 APR (0% .. 200%)
+            Decimal::new(raw, 4)
+        }
+    }
+
+    proptest! {
+        /// apr_to_hourly_bps is linear — doubling the APR doubles
+        /// the hourly bps. Catches a regression in the constant
+        /// denominator. Tolerance of 1 ulp accommodates unavoidable
+        /// Decimal rounding when the denominator does not divide
+        /// the numerator cleanly.
+        #[test]
+        fn apr_to_hourly_bps_is_linear(
+            apr in apr_strat(),
+            scale in 2i64..10i64,
+        ) {
+            prop_assume!(!apr.is_zero());
+            let bps1 = apr_to_hourly_bps(apr);
+            let bps2 = apr_to_hourly_bps(apr * Decimal::from(scale));
+            let expected = bps1 * Decimal::from(scale);
+            let diff = (bps2 - expected).abs();
+            // 1e-25 absolute (Decimal carries 28 significant digits
+            // of precision — one ulp at this magnitude).
+            prop_assert!(diff < Decimal::new(1, 25),
+                "nonlinearity {} between {} and {}", diff, bps2, expected);
+        }
+
+        /// Zero APR always produces zero hourly bps regardless of
+        /// the holding window.
+        #[test]
+        fn zero_apr_yields_zero_carry(
+            holding in 60u64..86_400u64,
+        ) {
+            let mut mgr = BorrowManager::new("BTC", dec!(1), dec!(0), holding);
+            mgr.apply_rate_refresh(dec!(0));
+            prop_assert_eq!(mgr.effective_carry_bps(), dec!(0));
+        }
+
+        /// effective_carry_bps is linear in holding seconds for a
+        /// fixed APR. The same property the `scales_linearly`
+        /// hand test pins, now for randomised holding windows.
+        #[test]
+        fn carry_bps_is_linear_in_holding_seconds(
+            apr in apr_strat(),
+            base_holding in 60u64..10_000u64,
+            scale in 2u32..10u32,
+        ) {
+            prop_assume!(!apr.is_zero());
+            let mut short = BorrowManager::new("BTC", dec!(1), dec!(0), base_holding);
+            short.apply_rate_refresh(apr);
+            let mut long = BorrowManager::new(
+                "BTC", dec!(1), dec!(0), base_holding * scale as u64
+            );
+            long.apply_rate_refresh(apr);
+            let ratio = long.effective_carry_bps() / short.effective_carry_bps();
+            let expected = Decimal::from(scale);
+            // Some rounding is unavoidable with decimal division —
+            // allow 1% deviation on the ratio.
+            let diff = (ratio - expected).abs();
+            prop_assert!(diff < expected * dec!(0.01),
+                "ratio {} diverged from {}", ratio, expected);
+        }
+
+        /// effective_carry_bps is non-negative for any APR ≥ 0.
+        /// Sign-flip regression guard.
+        #[test]
+        fn carry_bps_is_non_negative(
+            apr in apr_strat(),
+            holding in 60u64..86_400u64,
+        ) {
+            let mut mgr = BorrowManager::new("BTC", dec!(1), dec!(0), holding);
+            mgr.apply_rate_refresh(apr);
+            prop_assert!(mgr.effective_carry_bps() >= dec!(0));
+        }
+    }
 }

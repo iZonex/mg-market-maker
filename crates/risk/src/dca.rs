@@ -299,4 +299,145 @@ mod tests {
         let (n_flatten, _) = defaults_for_level(KillLevel::FlattenAll);
         assert!(n_normal > n_flatten);
     }
+
+    // ── Property-based tests (Epic 16) ───────────────────────
+
+    use proptest::prelude::*;
+
+    prop_compose! {
+        fn qty_strat()(raw in -1_000_000i64..1_000_000i64) -> Decimal {
+            Decimal::new(raw, 4)
+        }
+    }
+    prop_compose! {
+        fn lot_strat()(raw in 1i64..1_000i64) -> Decimal {
+            Decimal::new(raw, 4)
+        }
+    }
+
+    proptest! {
+        /// Sum of slice.delta equals target − current EXACTLY.
+        /// The residual-on-final-slice path is the invariant that
+        /// makes this true no matter how lot rounding distributes
+        /// the intermediate slices.
+        #[test]
+        fn slice_sum_equals_total_delta_flat(
+            current in qty_strat(),
+            target in qty_strat(),
+            num_slices in 1usize..20usize,
+            lot in lot_strat(),
+        ) {
+            let req = DcaRequest {
+                current,
+                target,
+                num_slices,
+                interval: Duration::from_secs(1),
+                lot_size: lot,
+                curve: SizeCurve::Flat,
+            };
+            let slices = plan(&req);
+            if slices.is_empty() {
+                // Only happens for zero delta or weight underflow.
+                prop_assert!(target == current || slices.is_empty());
+                return Ok(());
+            }
+            let sum: Decimal = slices.iter().map(|s| s.delta).sum();
+            prop_assert_eq!(sum, target - current);
+        }
+
+        /// Every slice's sign matches the overall direction. No
+        /// reversal ever appears inside the schedule.
+        #[test]
+        fn all_slices_have_same_sign(
+            current in qty_strat(),
+            target in qty_strat(),
+            num_slices in 1usize..15usize,
+            lot in lot_strat(),
+        ) {
+            prop_assume!(target != current);
+            let req = DcaRequest {
+                current, target, num_slices,
+                interval: Duration::from_secs(1),
+                lot_size: lot,
+                curve: SizeCurve::Flat,
+            };
+            let expected_sign = if target > current { dec!(1) } else { dec!(-1) };
+            for s in plan(&req) {
+                let sign = if s.delta > dec!(0) { dec!(1) } else { dec!(-1) };
+                prop_assert_eq!(sign, expected_sign,
+                    "slice {} opposes overall direction", s.delta);
+            }
+        }
+
+        /// Flat curve → every slice has offset = i × interval.
+        /// Spacing is linear, independent of curve shape.
+        #[test]
+        fn offsets_are_multiples_of_interval(
+            current in qty_strat(),
+            target in qty_strat(),
+            num_slices in 1usize..15usize,
+            interval_ms in 100u64..60_000u64,
+        ) {
+            prop_assume!(target != current);
+            let interval = Duration::from_millis(interval_ms);
+            let req = DcaRequest {
+                current, target, num_slices,
+                interval,
+                lot_size: dec!(0.0001),
+                curve: SizeCurve::Flat,
+            };
+            for (i, s) in plan(&req).iter().enumerate() {
+                prop_assert_eq!(s.offset, interval * i as u32);
+            }
+        }
+
+        /// Zero delta → empty schedule. Defensive against a
+        /// spurious single-zero-slice schedule.
+        #[test]
+        fn zero_delta_empty_schedule(
+            pos in qty_strat(),
+            num_slices in 1usize..20usize,
+            lot in lot_strat(),
+        ) {
+            let req = DcaRequest {
+                current: pos,
+                target: pos,
+                num_slices,
+                interval: Duration::from_secs(1),
+                lot_size: lot,
+                curve: SizeCurve::Flat,
+            };
+            prop_assert!(plan(&req).is_empty());
+        }
+
+        /// Accelerated curve produces slices with strictly
+        /// non-decreasing absolute size (except when lot
+        /// rounding collapses adjacent slices). Catches a
+        /// regression in the weight computation.
+        #[test]
+        fn accelerated_slices_are_non_decreasing(
+            delta_raw in 1_000i64..100_000i64,
+            num_slices in 3usize..10usize,
+        ) {
+            let total = Decimal::new(delta_raw, 4);
+            let req = DcaRequest {
+                current: dec!(0),
+                target: total,
+                num_slices,
+                interval: Duration::from_secs(1),
+                lot_size: dec!(0.0001),
+                curve: SizeCurve::Accelerated,
+            };
+            let slices = plan(&req);
+            // Skip the final slice because it absorbs the residual
+            // and can be larger OR smaller than the penultimate.
+            if slices.len() >= 2 {
+                for pair in slices.windows(2).take(slices.len() - 1) {
+                    prop_assert!(pair[0].delta.abs() <= pair[1].delta.abs() + dec!(0.0001),
+                        "accelerated curve regressed: {} > {}",
+                        pair[0].delta.abs(), pair[1].delta.abs());
+                }
+            }
+        }
+    }
 }

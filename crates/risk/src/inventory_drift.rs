@@ -290,4 +290,98 @@ mod tests {
         r.check(dec!(1), dec!(0));
         assert!(r.check(dec!(1.0001), dec!(0)).is_some());
     }
+
+    // ── Property-based tests (Epic 16) ───────────────────────
+
+    use proptest::prelude::*;
+
+    prop_compose! {
+        fn amt_strat()(raw in -100_000_000i64..100_000_000i64) -> Decimal {
+            Decimal::new(raw, 4)
+        }
+    }
+    prop_compose! {
+        fn pos_amt_strat()(raw in 0i64..100_000_000i64) -> Decimal {
+            Decimal::new(raw, 4)
+        }
+    }
+
+    proptest! {
+        /// First call always returns None and captures baseline
+        /// regardless of inputs.
+        #[test]
+        fn first_call_always_none_and_captures(
+            wallet in amt_strat(),
+            tracked in amt_strat(),
+        ) {
+            let mut r = reconciler();
+            prop_assert!(r.check(wallet, tracked).is_none());
+            prop_assert_eq!(r.baseline_wallet(), Some(wallet));
+        }
+
+        /// A perfectly in-sync stream produces NO reports at any
+        /// step. Wallet delta exactly matches tracked inventory.
+        #[test]
+        fn in_sync_stream_never_drifts(
+            baseline in amt_strat(),
+            deltas in proptest::collection::vec(amt_strat(), 0..20),
+        ) {
+            let mut r = reconciler();
+            r.check(baseline, dec!(0));
+            let mut tracked = dec!(0);
+            let mut wallet = baseline;
+            for d in &deltas {
+                tracked += *d;
+                wallet += *d;
+                prop_assert!(r.check(wallet, tracked).is_none(),
+                    "in-sync stream produced a drift report");
+            }
+        }
+
+        /// drift = (wallet_now − baseline) − tracked, exactly.
+        /// Catches a sign-flip regression in the formula.
+        #[test]
+        fn drift_equals_wallet_minus_tracker_formula(
+            baseline in amt_strat(),
+            current in amt_strat(),
+            tracked in amt_strat(),
+        ) {
+            let mut r = InventoryDriftReconciler::new("BTC", dec!(0), false);
+            r.check(baseline, dec!(0));
+            let expected_drift = (current - baseline) - tracked;
+            match r.check(current, tracked) {
+                Some(report) => prop_assert_eq!(report.drift, expected_drift),
+                None => prop_assert_eq!(expected_drift, dec!(0)),
+            }
+        }
+
+        /// |drift| ≤ tolerance → no report. Tolerance upper
+        /// bound of the silent band.
+        #[test]
+        fn within_tolerance_silent(
+            tolerance_raw in 0i64..1_000_000i64,
+            drift_raw in -1_000_000i64..1_000_000i64,
+        ) {
+            let tolerance = Decimal::new(tolerance_raw, 4);
+            prop_assume!(drift_raw.unsigned_abs() <= tolerance_raw as u64);
+            let mut r = InventoryDriftReconciler::new("BTC", tolerance, false);
+            r.check(dec!(0), dec!(0));
+            // Wallet = drift, tracked = 0 → drift = drift_raw.
+            prop_assert!(r.check(Decimal::new(drift_raw, 4), dec!(0)).is_none());
+        }
+
+        /// auto_correct flag propagates to every report exactly.
+        #[test]
+        fn auto_correct_flag_on_all_reports(
+            tracked in amt_strat(),
+            wallet in amt_strat(),
+            auto in proptest::bool::ANY,
+        ) {
+            let mut r = InventoryDriftReconciler::new("BTC", dec!(0), auto);
+            r.check(dec!(0), dec!(0));
+            if let Some(report) = r.check(wallet, tracked) {
+                prop_assert_eq!(report.corrected, auto);
+            }
+        }
+    }
 }
