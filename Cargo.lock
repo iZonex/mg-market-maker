@@ -1562,6 +1562,7 @@ dependencies = [
 name = "mm-indicators"
 version = "0.4.0"
 dependencies = [
+ "proptest",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",

@@ -224,4 +224,68 @@ mod tests {
         let v = r.value().unwrap();
         assert!(v >= Decimal::ZERO && v <= dec!(100));
     }
+
+    // ── Property-based tests (Epic 18) ───────────────────────
+
+    use proptest::prelude::*;
+
+    prop_compose! {
+        fn price_strat()(raw in 1i64..10_000_000i64) -> Decimal {
+            Decimal::new(raw, 2)
+        }
+    }
+
+    proptest! {
+        /// RSI always lies in [0, 100] post-warmup. The core
+        /// definition bounds it there via the `100 - 100/(1+RS)`
+        /// form — any implementation bug shows up here.
+        #[test]
+        fn rsi_is_bounded_in_0_100(
+            prices in proptest::collection::vec(price_strat(), 16..40),
+        ) {
+            let mut r = Rsi::new(14);
+            for p in &prices {
+                r.update(*p);
+            }
+            if let Some(v) = r.value() {
+                prop_assert!(v >= dec!(0));
+                prop_assert!(v <= dec!(100));
+            }
+        }
+
+        /// Flat prices — no gains, no losses — produce RSI=100
+        /// by the "no divide-by-zero" convention.
+        #[test]
+        fn flat_sequence_yields_100(
+            price in price_strat(),
+            n in 15usize..30usize,
+        ) {
+            let mut r = Rsi::new(14);
+            for _ in 0..n {
+                r.update(price);
+            }
+            prop_assert_eq!(r.value(), Some(dec!(100)));
+        }
+
+        /// Warmup is exactly `period` changes (i.e., `period + 1`
+        /// prices). is_ready() flips precisely at that point.
+        #[test]
+        fn rsi_warmup_is_exactly_period_changes(
+            prices in proptest::collection::vec(price_strat(), 1..25),
+            period in 2usize..15usize,
+        ) {
+            let mut r = Rsi::new(period);
+            let mut changes = 0usize;
+            let mut prev_price = None;
+            for p in &prices {
+                r.update(*p);
+                if prev_price.is_some() {
+                    changes += 1;
+                }
+                prev_price = Some(*p);
+                let ready = changes >= period;
+                prop_assert_eq!(r.is_ready(), ready);
+            }
+        }
+    }
 }

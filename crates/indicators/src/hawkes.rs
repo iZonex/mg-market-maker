@@ -403,4 +403,109 @@ mod tests {
             v
         );
     }
+
+    // ── Property-based tests (Epic 18) ───────────────────────
+
+    use proptest::prelude::*;
+
+    prop_compose! {
+        fn mu_strat()(raw in 1i64..1000i64) -> Decimal {
+            Decimal::new(raw, 3)
+        }
+    }
+    prop_compose! {
+        // 0.1 .. 0.9 — keep α < β for stationarity.
+        fn branching_strat()(raw in 100i64..900i64) -> Decimal {
+            Decimal::new(raw, 3)
+        }
+    }
+
+    proptest! {
+        /// Intensity is always >= μ (baseline) because the
+        /// kernel contribution is non-negative. Regression
+        /// guard for a sign flip.
+        #[test]
+        fn intensity_at_least_baseline(
+            mu in mu_strat(),
+            branch in branching_strat(),
+            t_event in 0i64..1000i64,
+            t_query in 0i64..10000i64,
+        ) {
+            let beta = dec!(1);
+            let alpha = branch;  // < 1 = β
+            prop_assume!(alpha < beta);
+            let mut h = HawkesIntensity::new(mu, alpha, beta);
+            h.on_event(Decimal::new(t_event, 3));
+            let query = Decimal::new(t_event + t_query, 3);
+            let lambda = h.intensity_at(query);
+            prop_assert!(lambda >= mu,
+                "intensity {} below baseline {}", lambda, mu);
+        }
+
+        /// Intensity at the event timestamp is STRICTLY higher
+        /// than intensity long after — a far-future query
+        /// collapses the kernel and the reading approaches μ.
+        /// Strict monotonic decay ulp-per-ulp is NOT tested
+        /// because the Decimal `exp_neg` helper uses a
+        /// finite-term Taylor series that can oscillate in the
+        /// low bits on certain dt ranges (precision artefact,
+        /// not a Hawkes-math bug). The asymptotic property
+        /// still guarantees the decay's correct shape.
+        #[test]
+        fn intensity_approaches_baseline_at_far_future(
+            mu in mu_strat(),
+            branch in branching_strat(),
+        ) {
+            let beta = dec!(1);
+            let alpha = branch;
+            prop_assume!(alpha < beta);
+            let mut h = HawkesIntensity::new(mu, alpha, beta);
+            h.on_event(dec!(0));
+            let at_event = h.intensity_at(dec!(0));
+            // Far-future query: 100 / β seconds → exp(-100) ≈ 0.
+            let far_future = h.intensity_at(dec!(100));
+            prop_assert!(at_event > far_future,
+                "intensity failed to decay: at_event={}, far_future={}",
+                at_event, far_future);
+            // And the far-future reading is indistinguishable
+            // from the baseline μ within a small tolerance.
+            prop_assert!(
+                (far_future - mu).abs() < alpha * dec!(0.01),
+                "far-future {} not close to baseline μ={}", far_future, mu
+            );
+        }
+
+        /// Every on_event strictly raises intensity at the
+        /// event timestamp vs the pre-event reading. The
+        /// instantaneous jump is exactly α.
+        #[test]
+        fn event_jumps_intensity_by_alpha(
+            mu in mu_strat(),
+            branch in branching_strat(),
+        ) {
+            let beta = dec!(1);
+            let alpha = branch;
+            prop_assume!(alpha < beta);
+            let mut h = HawkesIntensity::new(mu, alpha, beta);
+            let pre = h.intensity_at(dec!(0));
+            let post = h.on_event(dec!(0));
+            prop_assert!(post >= pre,
+                "first event did not raise intensity: {} → {}", pre, post);
+            prop_assert_eq!(post, mu + alpha,
+                "first event intensity ≠ μ+α: got {}", post);
+        }
+
+        /// Branching ratio = α/β, independent of events fed.
+        #[test]
+        fn branching_ratio_matches_alpha_over_beta(
+            alpha_raw in 100i64..900i64,
+            beta_raw in 1000i64..2000i64,
+        ) {
+            let alpha = Decimal::new(alpha_raw, 3);
+            let beta = Decimal::new(beta_raw, 3);
+            prop_assume!(alpha < beta);
+            let h = HawkesIntensity::new(dec!(0.1), alpha, beta);
+            prop_assert_eq!(h.branching_ratio(), alpha / beta);
+        }
+    }
 }

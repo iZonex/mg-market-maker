@@ -102,4 +102,67 @@ mod tests {
         s.update(dec!(99));
         assert_eq!(s.value(), Some(dec!(99)));
     }
+
+    // ── Property-based tests (Epic 18) ───────────────────────
+
+    use proptest::prelude::*;
+
+    prop_compose! {
+        fn val_strat()(raw in -1_000_000i64..1_000_000i64) -> Decimal {
+            Decimal::new(raw, 2)
+        }
+    }
+
+    proptest! {
+        /// Constant stream → SMA converges to exactly the
+        /// constant once warmup completes.
+        #[test]
+        fn sma_of_constant_is_constant(
+            v in val_strat(),
+            period in 1usize..30usize,
+        ) {
+            let mut s = Sma::new(period);
+            for _ in 0..period {
+                s.update(v);
+            }
+            prop_assert_eq!(s.value(), Some(v));
+        }
+
+        /// Post-warmup, SMA is bounded by min and max of the
+        /// window. A moving average can never exceed its own
+        /// inputs.
+        #[test]
+        fn sma_bounded_by_window_extrema(
+            vals in proptest::collection::vec(val_strat(), 10..30),
+        ) {
+            let period = 5usize;
+            let mut s = Sma::new(period);
+            for (i, v) in vals.iter().enumerate() {
+                s.update(*v);
+                if i + 1 >= period {
+                    let window_min = vals[i + 1 - period..=i].iter().copied().min().unwrap();
+                    let window_max = vals[i + 1 - period..=i].iter().copied().max().unwrap();
+                    let avg = s.value().unwrap();
+                    prop_assert!(avg >= window_min, "avg {} < min {}", avg, window_min);
+                    prop_assert!(avg <= window_max, "avg {} > max {}", avg, window_max);
+                }
+            }
+        }
+
+        /// Warmup period returns None; the step when sample
+        /// count reaches period is the first Some.
+        #[test]
+        fn sma_warmup_precisely_period_samples(
+            vals in proptest::collection::vec(val_strat(), 1..30),
+            period in 1usize..30usize,
+        ) {
+            let mut s = Sma::new(period);
+            for (i, v) in vals.iter().enumerate() {
+                s.update(*v);
+                let ready = i + 1 >= period;
+                prop_assert_eq!(s.is_ready(), ready);
+                prop_assert_eq!(s.value().is_some(), ready);
+            }
+        }
+    }
 }
