@@ -247,6 +247,7 @@ mod tests {
             var_guard_limit_99: None,
             var_guard_ewma_lambda: None,
             cross_venue_basis_max_staleness_ms: 1500,
+            cross_exchange_min_profit_bps: dec!(5),
             sor_inline_enabled: false,
         }
     }

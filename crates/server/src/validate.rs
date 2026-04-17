@@ -206,6 +206,25 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
                 ));
             }
         }
+        StrategyType::CrossExchange => {
+            if config.hedge.is_none() {
+                errors.push(
+                    "strategy=cross_exchange requires a [hedge] section — the \
+                     strategy quotes on the primary venue only when a round-trip \
+                     hedge on the hedge venue nets ≥ cross_exchange_min_profit_bps \
+                     after fees"
+                        .to_string(),
+                );
+            }
+            if mm.cross_exchange_min_profit_bps <= dec!(0) {
+                errors.push(
+                    "market_maker.cross_exchange_min_profit_bps must be > 0 — a \
+                     non-positive profit floor would quote unconditionally and \
+                     burn fees on every round trip"
+                        .to_string(),
+                );
+            }
+        }
     }
 
     // --- VaR guard ---

@@ -1501,6 +1501,7 @@ name = "mm-server"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "mm-backtester",
  "mm-common",
  "mm-dashboard",
  "mm-engine",
@@ -1509,6 +1510,7 @@ dependencies = [
  "mm-exchange-client",
  "mm-exchange-core",
  "mm-exchange-hyperliquid",
+ "mm-hyperopt",
  "mm-persistence",
  "mm-portfolio",
  "mm-risk",

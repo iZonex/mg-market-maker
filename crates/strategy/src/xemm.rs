@@ -24,6 +24,34 @@
 //! [`XemmExecutor::on_maker_fill`] with the maker leg's fill and it
 //! returns an `XemmDecision`. The engine turns that into a real
 //! venue call.
+//!
+//! ## Integration status
+//!
+//! `XemmExecutor` is library-complete and re-exported from
+//! `mm_strategy` for SDK consumers. It is **not** currently driven
+//! by the live engine because the shipping `CrossExchangeStrategy`
+//! (which *does* run end-to-end once wired via
+//! `StrategyType::CrossExchange`) does not yet observe hedge-leg
+//! fills through the engine's event loop — the dual-connector
+//! fill router threads primary fills into the `OrderManager` but
+//! a hedge dispatch on a separate connector requires the SOR
+//! inline dispatch plumbing from Epic A stage-2 (see
+//! `docs/research/production-mm-state-of-the-art.md`).
+//!
+//! When that stage-2 lands, the wire-up becomes:
+//!
+//! 1. On `MarketEvent::Fill` from the primary connector, call
+//!    `executor.on_maker_fill(fill)`.
+//! 2. Translate `XemmDecision::Hedge { side, qty, .. }` into a
+//!    `NewOrder` on the hedge connector and place it.
+//! 3. On `MarketEvent::Fill` from the hedge connector, call
+//!    `executor.on_hedge_fill(fill)` to close the per-leg
+//!    bookkeeping.
+//!
+//! Until then, operators running `StrategyType::CrossExchange`
+//! rely on the strategy's profit-floor quoting to avoid fills
+//! that cannot be profitably hedged synchronously — the executor
+//! is the upgrade path, not a prerequisite.
 
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;

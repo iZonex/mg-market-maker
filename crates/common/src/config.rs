@@ -222,6 +222,20 @@ pub enum StrategyType {
     /// Binance perp, etc.) — same-venue pairs should still
     /// pick `Basis`.
     CrossVenueBasis,
+    /// Cross-Exchange Market Making. Make on venue A (primary)
+    /// with prices that guarantee profit vs venue B (hedge) after
+    /// fees. Unlike `Basis` which *prices* against the hedge mid,
+    /// this strategy only quotes when a fill-then-hedge round
+    /// trip nets ≥ `min_profit_bps` after both legs' fees and the
+    /// `hedge_taker_fee`. Requires `AppConfig.hedge` to be set.
+    ///
+    /// Different from `CrossVenueBasis` in that we *guarantee*
+    /// profit on each round trip instead of riding a mean-reverting
+    /// basis spread. Use when the two venues have persistent price
+    /// dislocations and our hedge-side taker costs are the only
+    /// drag on the opportunity (e.g. Binance spot ↔ Bybit linear
+    /// perp when the funding path is exhausted).
+    CrossExchange,
 }
 
 /// Which exchange to connect to.
@@ -605,6 +619,20 @@ pub struct MarketMakerConfig {
     /// `StrategyType::CrossVenueBasis` is selected.
     #[serde(default = "default_cross_venue_basis_max_staleness_ms")]
     pub cross_venue_basis_max_staleness_ms: i64,
+
+    /// Minimum round-trip profit (bps) required before the
+    /// `CrossExchange` strategy is willing to quote. Applied on
+    /// top of the expected taker fee on the hedge venue + our
+    /// maker rebate on the primary. Default `5` bps — tight
+    /// enough to catch most dislocations on BTC/ETH, wide enough
+    /// that stale-book wiggle does not fake a profitable quote.
+    /// Ignored when strategy is not `CrossExchange`.
+    #[serde(default = "default_cross_exchange_min_profit_bps")]
+    pub cross_exchange_min_profit_bps: Decimal,
+}
+
+fn default_cross_exchange_min_profit_bps() -> Decimal {
+    dec!(5)
 }
 
 fn default_cross_venue_basis_max_staleness_ms() -> i64 {
@@ -1080,6 +1108,7 @@ impl Default for AppConfig {
                 var_guard_ewma_lambda: None,
                 cross_venue_basis_max_staleness_ms: 1500,
                 sor_inline_enabled: false,
+                cross_exchange_min_profit_bps: dec!(5),
             },
             kill_switch: KillSwitchCfg::default(),
             risk: RiskConfig {

@@ -17,6 +17,32 @@
 //! `ExecAction::Cancel { id }` — they own no I/O and no clock. The
 //! caller (engine) is responsible for turning those into venue
 //! requests via the existing connector layer.
+//!
+//! ## Integration status
+//!
+//! All four algorithms are library-complete with their own unit
+//! test suites and are re-exported from the `mm_strategy` crate
+//! root for external consumers. They are not currently driven by
+//! the live engine's hot path because the shipping
+//! `FundingArbExecutor` / `BasisStrategy` / `PairedUnwindExecutor`
+//! use synchronous market-take entry to keep both legs of a
+//! cross-product pair filled atomically — slicing via TWAP during
+//! entry would leak basis during the slice window. The algorithms
+//! are the right tool for:
+//!
+//! 1. Offline / replay tuning through `mm-hyperopt` — already
+//!    compatible with the `Simulator`'s tick model.
+//! 2. Stage-2 of the SOR inline dispatch (ROADMAP.md Epic A,
+//!    item "Real leg-execution dispatch via ExecAlgorithm::TwapAlgo
+//!    on entry") once per-venue fill observation is plumbed into
+//!    the `PairDispatch` loop.
+//! 3. Operator-triggered manual execution from the dashboard — a
+//!    future ops endpoint `POST /api/v1/ops/twap/{symbol}` can
+//!    instantiate a `TwapAlgo` and slice a user-supplied quantity.
+//!
+//! Treat the code here as **ready-to-wire**, not dead. The hooks
+//! exist intentionally — they're held back until the atomic-
+//! dispatch invariants above are preserved by the caller.
 
 use std::time::{Duration, Instant};
 

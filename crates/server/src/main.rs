@@ -11,7 +11,9 @@ use mm_engine::MarketMakerEngine;
 use mm_exchange_core::connector::ExchangeConnector;
 use mm_exchange_core::events::MarketEvent;
 use mm_persistence::checkpoint::CheckpointManager;
-use mm_strategy::{AvellanedaStoikov, BasisStrategy, GlftStrategy, GridStrategy, Strategy};
+use mm_strategy::{
+    AvellanedaStoikov, BasisStrategy, CrossExchangeStrategy, GlftStrategy, GridStrategy, Strategy,
+};
 use rust_decimal_macros::dec;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -447,6 +449,28 @@ async fn run_symbol(
                 "using CrossVenueBasis strategy — requires hedge connector on a different venue"
             );
             Box::new(BasisStrategy::cross_venue(shift, max_basis_bps, stale_ms))
+        }
+        StrategyType::CrossExchange => {
+            let min_profit_bps = config.market_maker.cross_exchange_min_profit_bps;
+            // Seed the strategy's fee expectations from the
+            // primary product so a fresh connector does not quote
+            // through its own rebate/taker assumptions. A hedge
+            // connector is required — the factory falls through to
+            // an Err at subscribe time if `config.hedge` is unset
+            // (validate.rs enforces the check at startup).
+            let mut s = CrossExchangeStrategy::new(min_profit_bps);
+            // Primary venue: we're the maker, fee is typically a
+            // rebate. Use the configured maker fee from product
+            // spec resolved above.
+            s.set_fees(product.maker_fee, product.taker_fee);
+            info!(
+                symbol = %symbol,
+                %min_profit_bps,
+                maker_fee = %product.maker_fee,
+                hedge_taker_fee = %product.taker_fee,
+                "using CrossExchange strategy — make on primary, hedge on hedge venue"
+            );
+            Box::new(s)
         }
     };
 

@@ -71,12 +71,18 @@ impl Strategy for CrossExchangeStrategy {
     }
 
     fn compute_quotes(&self, ctx: &StrategyContext) -> Vec<QuotePair> {
-        if self.hedge_mid.is_zero() {
-            // No hedge reference — can't quote.
-            return vec![];
-        }
-
-        let hedge_mid = self.hedge_mid;
+        // Prefer the engine-threaded hedge book mid (`ctx.ref_price`,
+        // populated from `hedge_book.book.mid_price()` in
+        // market_maker::refresh_quotes) so the strategy sees live
+        // cross-venue prices without the engine having to mutate
+        // our private `hedge_mid` field. Fall back to the manual
+        // setter value for unit tests that construct a strategy
+        // directly and call `set_hedge_mid`.
+        let hedge_mid = match ctx.ref_price {
+            Some(p) if !p.is_zero() => p,
+            _ if !self.hedge_mid.is_zero() => self.hedge_mid,
+            _ => return vec![],
+        };
         let min_profit = bps_to_frac(self.min_profit_bps) * hedge_mid;
         let total_fees = self.hedge_taker_fee + self.maker_fee.abs();
         let fee_cost = total_fees * hedge_mid;
@@ -232,6 +238,7 @@ mod tests {
             var_guard_limit_99: None,
             var_guard_ewma_lambda: None,
             cross_venue_basis_max_staleness_ms: 1500,
+            cross_exchange_min_profit_bps: dec!(5),
             sor_inline_enabled: false,
         };
         let mut book = LocalOrderBook::new("BTCUSDT".into());
@@ -343,6 +350,7 @@ mod tests {
             var_guard_limit_99: None,
             var_guard_ewma_lambda: None,
             cross_venue_basis_max_staleness_ms: 1500,
+            cross_exchange_min_profit_bps: dec!(5),
             sor_inline_enabled: false,
         };
         let mut book = LocalOrderBook::new("BTCUSDT".into());

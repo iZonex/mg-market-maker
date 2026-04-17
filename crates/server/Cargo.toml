@@ -16,6 +16,8 @@ mm-engine = { workspace = true }
 mm-dashboard = { workspace = true }
 mm-persistence = { workspace = true }
 mm-portfolio = { workspace = true }
+mm-backtester = { workspace = true }
+mm-hyperopt = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

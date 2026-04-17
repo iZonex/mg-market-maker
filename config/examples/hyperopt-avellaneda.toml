@@ -1,0 +1,50 @@
+# Example hyperopt search space for Avellaneda-Stoikov.
+#
+# Usage:
+#   cargo run --release --bin mm-hyperopt -- \
+#       --events data/recorded/BTCUSDT.jsonl \
+#       --space  config/examples/hyperopt-avellaneda.toml \
+#       --trials 200 \
+#       --loss   sharpe \
+#       --out    data/hyperopt/btcusdt-avl.jsonl
+#
+# Events file is produced by the live engine when you set
+# `record_market_data = true` in config/default.toml. Run the
+# engine in paper mode overnight to collect enough book+trade
+# events, then tune against them offline.
+
+strategy = "avellaneda_stoikov"
+base_config = "config/default.toml"
+
+# Risk aversion γ. Sweep 2 orders of magnitude — MM literature
+# converges anywhere from 0.01 to 1.0 depending on how inventory-
+# averse the operator is.
+[[param]]
+name = "gamma"
+kind = "log_uniform"
+low  = 0.01
+high = 1.0
+
+# Order-arrival intensity κ. Log-uniform so both tight and loose
+# quoting regimes get sampled.
+[[param]]
+name = "kappa"
+kind = "log_uniform"
+low  = 0.1
+high = 10.0
+
+# Minimum spread floor (bps). 1 bp catches stablecoin-quality
+# spreads; 20 bp is what you'd run on a long-tail alt.
+[[param]]
+name = "min_spread_bps"
+kind = "uniform"
+low  = 1.0
+high = 20.0
+
+# Ladder depth. Typical MM runs 1-5 levels per side; larger
+# ladders capture more flow but also book more inventory.
+[[param]]
+name = "num_levels"
+kind = "int_uniform"
+low  = 1
+high = 5

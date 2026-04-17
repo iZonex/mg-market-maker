@@ -10,6 +10,19 @@ pub trait LossFn: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
+// Blanket impl so `Box<dyn LossFn>` itself counts as a `LossFn`.
+// Lets the CLI hyperopt binary pick a loss fn at runtime and
+// thread it through `RandomSearch<Box<dyn LossFn>>` without
+// code-gen per variant.
+impl LossFn for Box<dyn LossFn> {
+    fn evaluate(&self, metrics: &Metrics) -> f64 {
+        (**self).evaluate(metrics)
+    }
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+}
+
 /// Maximise Sharpe. Loss = `-sharpe`.
 pub struct SharpeLoss;
 
