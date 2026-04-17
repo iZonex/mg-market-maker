@@ -59,6 +59,21 @@ pub struct PerClientLossCircuit {
     clients: Mutex<HashMap<String, Inner>>,
 }
 
+impl std::fmt::Debug for PerClientLossCircuit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.clients.try_lock() {
+            Ok(m) => f
+                .debug_struct("PerClientLossCircuit")
+                .field("clients", &m.len())
+                .finish(),
+            Err(_) => f
+                .debug_struct("PerClientLossCircuit")
+                .field("clients", &"<locked>")
+                .finish(),
+        }
+    }
+}
+
 impl Default for PerClientLossCircuit {
     fn default() -> Self {
         Self::new()

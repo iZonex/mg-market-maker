@@ -186,6 +186,16 @@ pub struct MarketMakerEngine {
     /// to suppress duplicate audit events on consecutive trips
     /// and to log a single "resumed" line when the gap closes.
     cross_venue_divergence_tripped: bool,
+    /// Shared per-client daily-loss circuit (Epic 6). The engine
+    /// reports its per-symbol PnL each summary tick and checks
+    /// `is_tripped(client_id)` in `refresh_quotes`. `None`
+    /// disables the integration — single-client setups and
+    /// tests typically run without one.
+    per_client_circuit: Option<Arc<mm_risk::PerClientLossCircuit>>,
+    /// Set once the client circuit has fired for this engine's
+    /// client. Used to emit a single audit line per transition
+    /// instead of one per tick.
+    per_client_trip_noted: bool,
     /// Per-strategy VaR guard (Epic C sub-component #4).
     /// Rolling 24 h ring buffer of PnL samples, parametric
     /// Gaussian VaR, composes into the effective size
@@ -457,6 +467,8 @@ impl MarketMakerEngine {
             lifecycle_paused: false,
             stale_book_paused: false,
             cross_venue_divergence_tripped: false,
+            per_client_circuit: None,
+            per_client_trip_noted: false,
             var_guard: if config.market_maker.var_guard_enabled {
                 Some(VarGuard::new(VarGuardConfig {
                     limit_95: config.market_maker.var_guard_limit_95,
@@ -641,6 +653,21 @@ impl MarketMakerEngine {
     /// tags every `FillRecord` and audit event with this client.
     pub fn with_client_id(mut self, client_id: String) -> Self {
         self.client_id = Some(client_id);
+        self
+    }
+
+    /// Attach a shared [`PerClientLossCircuit`] (Epic 6). The
+    /// engine reports its daily PnL to the circuit on every
+    /// summary tick and refuses to place new orders while the
+    /// circuit is tripped for its client. Without this the
+    /// per-client loss aggregate still shows up on the dashboard
+    /// but no enforcement happens — tests and single-client
+    /// deployments do not need the circuit wired.
+    pub fn with_per_client_circuit(
+        mut self,
+        circuit: Arc<mm_risk::PerClientLossCircuit>,
+    ) -> Self {
+        self.per_client_circuit = Some(circuit);
         self
     }
 
@@ -1251,6 +1278,22 @@ impl MarketMakerEngine {
                     }
                     self.log_periodic_summary();
                     self.update_dashboard();
+                    // Epic 6: report this engine's daily PnL
+                    // share to the per-client circuit so the
+                    // aggregate across sibling engines can trip
+                    // the breaker when the client's budget is
+                    // exhausted. Absolute value — the circuit
+                    // expects a replace-not-add semantics.
+                    if let (Some(client_id), Some(circuit)) = (
+                        self.client_id.as_ref(),
+                        self.per_client_circuit.as_ref(),
+                    ) {
+                        circuit.report_symbol_pnl(
+                            client_id,
+                            &self.symbol,
+                            self.pnl_tracker.attribution.total_pnl(),
+                        );
+                    }
                     // Epic F sub-component #2: drive the
                     // news retreat cooldown forward so an
                     // expired Critical state drops the
@@ -2169,6 +2212,62 @@ impl MarketMakerEngine {
 
     async fn refresh_quotes(&mut self) -> Result<()> {
         self.tick_count += 1;
+
+        // Per-client loss circuit (Epic 6). When the aggregate
+        // daily PnL across this client's symbols has breached
+        // the configured limit, STOP quoting everywhere for that
+        // client. Local kill switch is escalated to CancelAll on
+        // the first trip so every sibling engine follows the
+        // same path via its own check; the trip is sticky and
+        // requires operator reset via
+        // `POST /api/v1/ops/client-reset/{client_id}`.
+        if let (Some(client_id), Some(circuit)) =
+            (self.client_id.as_ref(), self.per_client_circuit.as_ref())
+        {
+            if circuit.is_tripped(client_id) {
+                if !self.per_client_trip_noted {
+                    warn!(
+                        symbol = %self.symbol,
+                        client_id = %client_id,
+                        "per-client loss circuit tripped — escalating kill switch to CancelAll"
+                    );
+                    self.audit.risk_event(
+                        &self.symbol,
+                        AuditEventType::KillSwitchEscalated,
+                        &format!("per-client loss circuit for client={client_id}"),
+                    );
+                    self.record_incident(
+                        "critical",
+                        &format!("Per-client loss circuit tripped (client={client_id})"),
+                    );
+                    // Use the existing manual_trigger path so
+                    // reset semantics match operator intent —
+                    // auto-recovery is NOT allowed until the
+                    // client circuit is explicitly reset.
+                    self.kill_switch.manual_trigger(
+                        mm_risk::KillLevel::CancelAll,
+                        "per-client loss circuit",
+                    );
+                    self.per_client_trip_noted = true;
+                }
+                // Fall through — the kill switch will cancel
+                // every open order and block new orders on the
+                // next tick's `!allow_new_orders()` guard.
+            } else if self.per_client_trip_noted {
+                // Client was reset. Clear local noted flag so a
+                // subsequent trip on the same client audits
+                // again. The kill switch itself is NOT auto-
+                // reset here — operators reset each engine's
+                // kill switch through the existing ops endpoint
+                // so every post-incident escalation is ack'd.
+                info!(
+                    symbol = %self.symbol,
+                    client_id = %client_id,
+                    "per-client loss circuit cleared — operator should POST /api/v1/ops/reset/<symbol> to resume quoting"
+                );
+                self.per_client_trip_noted = false;
+            }
+        }
 
         // P2.3: lifecycle paused (halt / pre-trading / break /
         // delisted) — refuse to quote until the lifecycle

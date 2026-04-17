@@ -110,6 +110,11 @@ struct StateInner {
     /// Portfolio risk summary (Epic 3). Updated by the
     /// portfolio risk background task.
     portfolio_risk_summary: Option<mm_risk::portfolio_risk::PortfolioRiskSummary>,
+    /// Shared per-client loss circuit (Epic 6). Set at startup so
+    /// the `/api/v1/clients/loss-state` endpoint and the ops
+    /// reset endpoint can snapshot / mutate the same instance
+    /// every engine reports into.
+    per_client_circuit: Option<std::sync::Arc<mm_risk::PerClientLossCircuit>>,
 }
 
 const MAX_DAILY_REPORTS: usize = 90;
@@ -572,6 +577,21 @@ impl DashboardState {
     /// Set the webhook dispatcher (legacy — sets on "default" client).
     pub fn set_webhook_dispatcher(&self, wh: crate::webhooks::WebhookDispatcher) {
         self.set_client_webhook_dispatcher("default", wh);
+    }
+
+    /// Attach the process-wide per-client loss circuit (Epic 6).
+    /// Called once at startup; the dashboard API reads from and
+    /// resets through it.
+    pub fn set_per_client_circuit(&self, circuit: std::sync::Arc<mm_risk::PerClientLossCircuit>) {
+        self.inner.write().unwrap().per_client_circuit = Some(circuit);
+    }
+
+    /// Read-only handle to the per-client loss circuit. `None`
+    /// when the server did not register one (test harness /
+    /// legacy single-client mode that only tracks aggregate on
+    /// the dashboard).
+    pub fn per_client_circuit(&self) -> Option<std::sync::Arc<mm_risk::PerClientLossCircuit>> {
+        self.inner.read().unwrap().per_client_circuit.clone()
     }
 
     /// Get the webhook dispatcher for a specific client.

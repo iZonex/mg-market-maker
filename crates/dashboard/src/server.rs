@@ -70,6 +70,7 @@ pub async fn start(
     let protected_api = Router::new()
         .route("/api/status", get(get_status))
         .route("/api/v1/venues/status", get(venues_status))
+        .route("/api/v1/clients/loss-state", get(clients_loss_state))
         .merge(crate::client_api::client_routes())
         .merge(crate::client_portal::client_portal_routes())
         .route_layer(middleware::from_fn_with_state(
@@ -97,6 +98,7 @@ pub async fn start(
         .route("/api/v1/ops/flatten/{symbol}", post(ops_flatten))
         .route("/api/v1/ops/disconnect/{symbol}", post(ops_disconnect))
         .route("/api/v1/ops/reset/{symbol}", post(ops_kill_reset))
+        .route("/api/v1/ops/client-reset/{client_id}", post(ops_client_reset))
         .route("/api/admin/config/{symbol}", post(admin_config_override))
         .route("/api/admin/config", post(admin_config_broadcast))
         .route("/api/admin/config/bulk", post(admin_config_bulk))
@@ -832,4 +834,63 @@ async fn venues_status(State(state): State<DashboardState>) -> Json<Vec<VenueSta
         })
         .collect();
     Json(rows)
+}
+
+// ── Per-client loss circuit (Epic 6/7) ───────────────────────
+//
+// GET /api/v1/clients/loss-state — snapshot every registered
+// client's aggregate daily PnL, configured limit, and trip flag.
+// Powers the dashboard's client-circuit panel.
+
+#[derive(serde::Serialize)]
+struct ClientLossRow {
+    client_id: String,
+    daily_pnl: String,
+    limit_usd: Option<String>,
+    tripped: bool,
+}
+
+async fn clients_loss_state(State(state): State<DashboardState>) -> Json<Vec<ClientLossRow>> {
+    let circuit = match state.per_client_circuit() {
+        Some(c) => c,
+        None => return Json(Vec::new()),
+    };
+    let snap = circuit.snapshot_all();
+    let mut rows: Vec<ClientLossRow> = snap
+        .into_iter()
+        .map(|(client_id, s)| ClientLossRow {
+            client_id,
+            daily_pnl: s.daily_pnl.to_string(),
+            limit_usd: s.limit.map(|l| l.to_string()),
+            tripped: s.tripped,
+        })
+        .collect();
+    rows.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+    Json(rows)
+}
+
+/// Manual reset of a client's loss circuit — operator ack after
+/// investigating the breach. The individual engines' kill
+/// switches are NOT reset here; operators call the existing
+/// `POST /api/v1/ops/reset/{symbol}` for each sibling engine so
+/// every post-incident escalation is acknowledged.
+async fn ops_client_reset(
+    State(state): State<DashboardState>,
+    Path(client_id): Path<String>,
+) -> Json<serde_json::Value> {
+    match state.per_client_circuit() {
+        Some(circuit) => {
+            circuit.reset_client(&client_id);
+            Json(serde_json::json!({
+                "client_id": client_id,
+                "status": "reset",
+                "note": "each engine's kill switch must also be reset via /api/v1/ops/reset/{symbol}"
+            }))
+        }
+        None => Json(serde_json::json!({
+            "client_id": client_id,
+            "status": "no_circuit",
+            "error": "per-client loss circuit not registered on this server"
+        })),
+    }
 }

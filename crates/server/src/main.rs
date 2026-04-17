@@ -208,6 +208,26 @@ async fn main() -> Result<()> {
         mm_risk::hedge_optimizer::FactorCovarianceEstimator::new(vec![], 1440),
     ));
 
+    // Shared per-client daily-loss circuit (Epic 6). Registered
+    // with every configured client's limit at startup; each
+    // engine holds an Arc clone and reports/checks on every
+    // summary + refresh tick. The synthetic "default" client
+    // (legacy single-client mode) always registers with `None`
+    // so existing deployments see the aggregate on the
+    // dashboard without enforcement changing behaviour.
+    let per_client_circuit = Arc::new(mm_risk::PerClientLossCircuit::new());
+    for client in config.effective_clients() {
+        per_client_circuit.register(&client.id, client.daily_loss_limit_usd);
+        info!(
+            client_id = %client.id,
+            limit = ?client.daily_loss_limit_usd,
+            "per-client loss circuit registered"
+        );
+    }
+    // Share the circuit with the dashboard state so the
+    // `/api/v1/clients/loss-state` endpoint can snapshot it.
+    dashboard_state.set_per_client_circuit(per_client_circuit.clone());
+
     // P2.1 — build the shared per-asset-class kill switches
     // up-front so every engine that maps to the same class
     // receives the SAME `Arc<Mutex<KillSwitch>>` and a
@@ -261,6 +281,7 @@ async fn main() -> Result<()> {
             .and_then(|c| asset_class_switches.get(c).cloned());
         let wh = webhook_dispatcher.clone();
         let shared_cov = shared_factor_cov.clone();
+        let circuit = per_client_circuit.clone();
 
         let handle = tokio::spawn(async move {
             if let Err(e) = run_symbol(
@@ -275,6 +296,7 @@ async fn main() -> Result<()> {
                 asset_class_switch,
                 wh,
                 shared_cov,
+                circuit,
             )
             .await
             {
@@ -403,6 +425,7 @@ async fn run_symbol(
     asset_class_switch: Option<Arc<std::sync::Mutex<mm_risk::KillSwitch>>>,
     webhook_dispatcher: mm_dashboard::webhooks::WebhookDispatcher,
     shared_factor_cov: Arc<std::sync::Mutex<mm_risk::hedge_optimizer::FactorCovarianceEstimator>>,
+    per_client_circuit: Arc<mm_risk::PerClientLossCircuit>,
 ) -> Result<()> {
     let product = product_for_symbol(&symbol, &connector).await;
 
@@ -573,7 +596,8 @@ async fn run_symbol(
     .with_portfolio(portfolio)
     .with_config_overrides(config_rx)
     .with_webhooks(webhook_dispatcher)
-    .with_shared_factor_covariance(shared_factor_cov);
+    .with_shared_factor_covariance(shared_factor_cov)
+    .with_per_client_circuit(per_client_circuit);
     if let Some(arc) = asset_class_switch {
         engine_builder = engine_builder.with_asset_class_switch(arc);
     }

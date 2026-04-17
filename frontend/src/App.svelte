@@ -11,6 +11,7 @@
   import AlertLog from './lib/components/AlertLog.svelte'
   import ConnectivityPanel from './lib/components/ConnectivityPanel.svelte'
   import AuditStream from './lib/components/AuditStream.svelte'
+  import ClientCircuitPanel from './lib/components/ClientCircuitPanel.svelte'
   import Login from './lib/components/Login.svelte'
   import { createWsStore } from './lib/ws.svelte.js'
   import { createAuthStore } from './lib/auth.svelte.js'
@@ -100,6 +101,9 @@
         <div class="panel">
           <ConnectivityPanel {auth} />
         </div>
+        <div class="panel span-3">
+          <ClientCircuitPanel {auth} />
+        </div>
       {/if}
     </div>
 
@@ -135,6 +139,7 @@
     border-radius: 6px; padding: 12px; min-height: 250px;
   }
   .span-2 { grid-column: span 2; }
+  .span-3 { grid-column: span 3; }
   footer {
     display: flex; justify-content: space-between; align-items: center;
     padding: 8px 12px; margin-top: 8px;
