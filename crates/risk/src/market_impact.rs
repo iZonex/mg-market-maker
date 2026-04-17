@@ -267,4 +267,112 @@ mod tests {
         assert!(r.adverse_fill_pct > dec!(60));
         assert!(r.adverse_fill_pct < dec!(70));
     }
+
+    // ── Property-based tests (Epic 11) ───────────────────────
+
+    use proptest::prelude::*;
+    use proptest::sample::select;
+
+    prop_compose! {
+        fn mid_strat()(cents in 100i64..10_000_000i64) -> Decimal {
+            Decimal::new(cents, 2)
+        }
+    }
+    fn side_sign_strat() -> impl Strategy<Value = Decimal> {
+        select(vec![dec!(1), dec!(-1)])
+    }
+
+    proptest! {
+        /// adverse_fill_pct is always in [0, 100] regardless of
+        /// fill mix. No fill sequence should push it outside
+        /// this bound — a regression there would break the
+        /// dashboard gauge semantics.
+        #[test]
+        fn adverse_pct_is_bounded(
+            fills in proptest::collection::vec(
+                (mid_strat(), side_sign_strat(), mid_strat()),
+                1..30,
+            ),
+        ) {
+            let mut est = MarketImpactEstimator::new(1);
+            for (mid0, side, mid1) in &fills {
+                est.on_fill(*mid0, *side);
+                est.on_mid_update(*mid1);
+            }
+            let r = est.report();
+            prop_assert!(r.adverse_fill_pct >= Decimal::ZERO);
+            prop_assert!(r.adverse_fill_pct <= dec!(100));
+        }
+
+        /// measured_fills always matches the completed count —
+        /// adverse + favorable + neutral fills == measured.
+        #[test]
+        fn measured_fills_equals_completed(
+            fills in proptest::collection::vec(
+                (mid_strat(), side_sign_strat(), mid_strat()),
+                0..30,
+            ),
+        ) {
+            let mut est = MarketImpactEstimator::new(1);
+            for (mid0, side, mid1) in &fills {
+                est.on_fill(*mid0, *side);
+                est.on_mid_update(*mid1);
+            }
+            let r = est.report();
+            prop_assert_eq!(r.measured_fills, fills.len());
+            prop_assert_eq!(r.pending_fills, 0);
+        }
+
+        /// mean impact stays between the min and max per-fill
+        /// impact when both extrema are well-defined. Failing
+        /// this would mean our aggregator is summing buggily.
+        #[test]
+        fn mean_bounded_by_extrema(
+            fills in proptest::collection::vec(
+                (mid_strat(), side_sign_strat(), mid_strat()),
+                1..30,
+            ),
+        ) {
+            let mut est = MarketImpactEstimator::new(1);
+            let mut impacts: Vec<Decimal> = Vec::new();
+            for (mid0, side, mid1) in &fills {
+                est.on_fill(*mid0, *side);
+                est.on_mid_update(*mid1);
+                if *mid0 > dec!(0) {
+                    let impact = (*mid1 - *mid0) / *mid0 * dec!(10_000) * *side;
+                    impacts.push(impact);
+                }
+            }
+            if impacts.is_empty() {
+                return Ok(());
+            }
+            let min = *impacts.iter().min().unwrap();
+            let max = *impacts.iter().max().unwrap();
+            let r = est.report();
+            prop_assert!(r.mean_impact_bps >= min,
+                "mean {} below min {}", r.mean_impact_bps, min);
+            prop_assert!(r.mean_impact_bps <= max,
+                "mean {} above max {}", r.mean_impact_bps, max);
+        }
+
+        /// Horizon semantics: a fill fed N-1 mid updates stays
+        /// pending, N-th completes. Catches off-by-one in the
+        /// ticks_remaining decrement.
+        #[test]
+        fn horizon_n_completes_on_nth_tick(
+            horizon in 1usize..20usize,
+            mid in mid_strat(),
+        ) {
+            let mut est = MarketImpactEstimator::new(horizon);
+            est.on_fill(mid, dec!(1));
+            for _ in 1..horizon {
+                est.on_mid_update(mid);
+                prop_assert_eq!(est.report().pending_fills, 1);
+                prop_assert_eq!(est.report().measured_fills, 0);
+            }
+            est.on_mid_update(mid);
+            prop_assert_eq!(est.report().pending_fills, 0);
+            prop_assert_eq!(est.report().measured_fills, 1);
+        }
+    }
 }

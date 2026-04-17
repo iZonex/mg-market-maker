@@ -688,4 +688,104 @@ mod tests {
         assert_eq!(summary.minutes_with_data, 0);
         assert!(summary.worst_spread_bps.is_none());
     }
+
+    // ── Property-based tests (Epic 11) ───────────────────────
+
+    use proptest::prelude::*;
+    use proptest::sample::select;
+
+    prop_compose! {
+        fn spread_bps_strat()(raw in 0i64..100_000i64) -> Decimal {
+            Decimal::new(raw, 2)
+        }
+    }
+    prop_compose! {
+        fn depth_strat()(raw in 0i64..10_000_000i64) -> Decimal {
+            Decimal::new(raw, 2)
+        }
+    }
+    fn bool_strat() -> impl Strategy<Value = bool> {
+        select(vec![true, false])
+    }
+
+    proptest! {
+        /// uptime_pct is bounded in [0, 100] for any tick sequence.
+        /// Fresh tracker returns 100 (convention: no data → full
+        /// compliance so we don't false-alarm at startup). Any
+        /// mix of ticks thereafter must land in the closed range.
+        #[test]
+        fn uptime_pct_is_bounded(
+            samples in proptest::collection::vec(
+                (bool_strat(), bool_strat(), spread_bps_strat(),
+                 depth_strat(), depth_strat()),
+                0..50,
+            ),
+        ) {
+            let mut t = default_tracker();
+            for (has_bid, has_ask, spread, bid_depth, ask_depth) in &samples {
+                t.update_quotes(*has_bid, *has_ask, Some(*spread), *bid_depth, *ask_depth);
+                t.tick();
+            }
+            let up = t.uptime_pct();
+            prop_assert!(up >= dec!(0), "uptime {} < 0", up);
+            prop_assert!(up <= dec!(100), "uptime {} > 100", up);
+        }
+
+        /// spread_compliance_pct ≥ uptime_pct for any sequence.
+        /// Uptime requires ALL checks to pass (two-sided + spread
+        /// + depth + requote); spread-only compliance is a
+        /// strict subset of those gates. A regression that
+        /// crossed the counts would flip this inequality.
+        #[test]
+        fn spread_compliance_is_at_least_uptime(
+            samples in proptest::collection::vec(
+                (bool_strat(), bool_strat(), spread_bps_strat(),
+                 depth_strat(), depth_strat()),
+                1..50,
+            ),
+        ) {
+            let mut t = default_tracker();
+            for (has_bid, has_ask, spread, bid_depth, ask_depth) in &samples {
+                t.update_quotes(*has_bid, *has_ask, Some(*spread), *bid_depth, *ask_depth);
+                t.tick();
+            }
+            prop_assert!(t.spread_compliance_pct() >= t.uptime_pct());
+        }
+
+        /// All-compliant sequence: spread always within limit,
+        /// depth always >= min, both sides quoted — uptime must
+        /// be exactly 100.
+        #[test]
+        fn all_compliant_yields_full_uptime(
+            n in 1usize..100usize,
+            spread_raw in 0i64..9_900i64,  // below max_spread_bps=100 (100_00 raw units at 2dp)
+        ) {
+            let mut t = default_tracker();
+            let spread = Decimal::new(spread_raw, 2);
+            for _ in 0..n {
+                t.update_quotes(true, true, Some(spread), dec!(5000), dec!(5000));
+                t.tick();
+            }
+            prop_assert_eq!(t.uptime_pct(), dec!(100),
+                "{} ticks with compliant state produced uptime {}", n, t.uptime_pct());
+        }
+
+        /// One-sided quoting always fails compliance under
+        /// two_sided_required=true. Verifies the gate is not
+        /// accidentally bypassed.
+        #[test]
+        fn one_sided_always_fails_compliance(
+            n in 1usize..50usize,
+            only_bid in bool_strat(),
+        ) {
+            let mut t = default_tracker();
+            let (bid, ask) = if only_bid { (true, false) } else { (false, true) };
+            for _ in 0..n {
+                t.update_quotes(bid, ask, Some(dec!(10)), dec!(5000), dec!(5000));
+                t.tick();
+            }
+            prop_assert_eq!(t.uptime_pct(), dec!(0),
+                "one-sided quoting produced non-zero uptime {}", t.uptime_pct());
+        }
+    }
 }

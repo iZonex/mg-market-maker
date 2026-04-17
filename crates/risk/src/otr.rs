@@ -205,4 +205,87 @@ mod tests {
         assert_eq!(c.trades(), 0);
         assert_eq!(c.ratio(), Decimal::ZERO);
     }
+
+    // ── Property-based tests (Epic 11) ───────────────────────
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Counters always reflect exactly the number of `on_*`
+        /// calls — no off-by-one in the increment path.
+        #[test]
+        fn counters_equal_call_counts(
+            adds in 0u64..1000u64,
+            updates in 0u64..1000u64,
+            cancels in 0u64..1000u64,
+            trades in 0u64..1000u64,
+        ) {
+            let mut c = OrderToTradeRatio::new();
+            for _ in 0..adds { c.on_add(); }
+            for _ in 0..updates { c.on_update(); }
+            for _ in 0..cancels { c.on_cancel(); }
+            for _ in 0..trades { c.on_trade(); }
+            prop_assert_eq!(c.adds(), adds);
+            prop_assert_eq!(c.updates(), updates);
+            prop_assert_eq!(c.cancels(), cancels);
+            prop_assert_eq!(c.trades(), trades);
+        }
+
+        /// weighted_events() = adds + 2·updates + cancels for
+        /// any counter state.
+        #[test]
+        fn weighted_events_formula_holds(
+            adds in 0u64..1000u64,
+            updates in 0u64..1000u64,
+            cancels in 0u64..1000u64,
+        ) {
+            let mut c = OrderToTradeRatio::new();
+            for _ in 0..adds { c.on_add(); }
+            for _ in 0..updates { c.on_update(); }
+            for _ in 0..cancels { c.on_cancel(); }
+            prop_assert_eq!(c.weighted_events(), adds + 2 * updates + cancels);
+        }
+
+        /// reset() zeroes the counter regardless of prior state.
+        #[test]
+        fn reset_is_idempotent_zeroing(
+            adds in 0u64..1000u64,
+            updates in 0u64..1000u64,
+            cancels in 0u64..1000u64,
+            trades in 0u64..1000u64,
+        ) {
+            let mut c = OrderToTradeRatio::new();
+            for _ in 0..adds { c.on_add(); }
+            for _ in 0..updates { c.on_update(); }
+            for _ in 0..cancels { c.on_cancel(); }
+            for _ in 0..trades { c.on_trade(); }
+            c.reset();
+            prop_assert_eq!(c.weighted_events(), 0);
+            prop_assert_eq!(c.trades(), 0);
+            prop_assert_eq!(c.ratio(), Decimal::ZERO);
+        }
+
+        /// When trades ≥ weighted_events, ratio ≤ 0 (MM is
+        /// keeping the quote-stuffing in check — venue should
+        /// like us). When trades = 0 and weighted > 0, ratio =
+        /// weighted - 1 (denominator clamped at 1).
+        #[test]
+        fn zero_trades_edge_case_matches_formula(
+            adds in 0u64..1000u64,
+            updates in 0u64..1000u64,
+            cancels in 0u64..1000u64,
+        ) {
+            let mut c = OrderToTradeRatio::new();
+            for _ in 0..adds { c.on_add(); }
+            for _ in 0..updates { c.on_update(); }
+            for _ in 0..cancels { c.on_cancel(); }
+            let weighted = c.weighted_events();
+            if weighted == 0 {
+                prop_assert_eq!(c.ratio(), Decimal::ZERO);
+            } else {
+                let expected = Decimal::from(weighted) - dec!(1);
+                prop_assert_eq!(c.ratio(), expected);
+            }
+        }
+    }
 }
