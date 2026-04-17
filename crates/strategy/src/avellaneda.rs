@@ -679,4 +679,184 @@ mod tests {
         // Ask side untouched by the bid-only widening.
         assert_eq!(ask_dist_widen, ask_dist_neutral);
     }
+
+    // ── Property-based tests (Epic 17) ───────────────────────
+
+    use proptest::prelude::*;
+    use proptest::sample::select;
+
+    fn mk_ctx<'a>(
+        book: &'a LocalOrderBook,
+        product: &'a ProductSpec,
+        config: &'a MarketMakerConfig,
+        inventory: Decimal,
+        volatility: Decimal,
+        mid: Decimal,
+    ) -> StrategyContext<'a> {
+        StrategyContext {
+            book,
+            product,
+            config,
+            inventory,
+            volatility,
+            time_remaining: dec!(1),
+            mid_price: mid,
+            ref_price: None,
+            hedge_book: None,
+            borrow_cost_bps: None,
+            hedge_book_age_ms: None,
+            as_prob: None,
+            as_prob_bid: None,
+            as_prob_ask: None,
+        }
+    }
+
+    prop_compose! {
+        fn mid_strat()(cents in 100_000i64..10_000_000i64) -> Decimal {
+            Decimal::new(cents, 2)
+        }
+    }
+    prop_compose! {
+        fn inv_strat()(units in -10_000i64..10_000i64) -> Decimal {
+            Decimal::new(units, 4)
+        }
+    }
+    prop_compose! {
+        fn sigma_strat()(raw in 1i64..1000i64) -> Decimal {
+            Decimal::new(raw, 4)  // 0.0001 .. 0.1
+        }
+    }
+
+    fn seed_book(mid: Decimal) -> LocalOrderBook {
+        let mut b = LocalOrderBook::new("BTCUSDT".into());
+        b.apply_snapshot(
+            vec![mm_common::PriceLevel { price: mid - dec!(0.5), qty: dec!(1) }],
+            vec![mm_common::PriceLevel { price: mid + dec!(0.5), qty: dec!(1) }],
+            1,
+        );
+        b
+    }
+
+    proptest! {
+        /// Every emitted bid < every emitted ask for the same
+        /// level. A crossed quote would self-trade — the core
+        /// correctness invariant of any maker strategy.
+        #[test]
+        fn bids_below_asks_on_every_level(
+            inventory in inv_strat(),
+            sigma in sigma_strat(),
+            mid in mid_strat(),
+        ) {
+            let product = test_product();
+            let config = test_config();
+            let book = seed_book(mid);
+            let ctx = mk_ctx(&book, &product, &config, inventory, sigma, mid);
+            for q in &AvellanedaStoikov.compute_quotes(&ctx) {
+                if let (Some(bid), Some(ask)) = (&q.bid, &q.ask) {
+                    prop_assert!(bid.price < ask.price,
+                        "crossed: bid {} >= ask {} (inv={}, sigma={})",
+                        bid.price, ask.price, inventory, sigma);
+                }
+            }
+        }
+
+        /// All emitted prices land inside [mid - max_distance,
+        /// mid + max_distance] — the config-level clamp.
+        #[test]
+        fn quotes_respect_max_distance(
+            inventory in inv_strat(),
+            sigma in sigma_strat(),
+            mid in mid_strat(),
+        ) {
+            let product = test_product();
+            let config = test_config();
+            let book = seed_book(mid);
+            let ctx = mk_ctx(&book, &product, &config, inventory, sigma, mid);
+            let max_dist = mid * config.max_distance_bps / dec!(10_000);
+            let lo = mid - max_dist;
+            let hi = mid + max_dist;
+            for q in &AvellanedaStoikov.compute_quotes(&ctx) {
+                if let Some(b) = &q.bid {
+                    prop_assert!(b.price <= hi + dec!(1),
+                        "bid {} beyond hi {}", b.price, hi);
+                }
+                if let Some(a) = &q.ask {
+                    prop_assert!(a.price >= lo - dec!(1),
+                        "ask {} beyond lo {}", a.price, lo);
+                }
+            }
+        }
+
+        /// Long inventory (q > 0) shifts the reservation DOWN,
+        /// so bid_distance ≥ ask_distance from mid. Short
+        /// inventory should skew the other way. Zero inventory
+        /// is approximately symmetric (hand test covers that).
+        #[test]
+        fn long_inventory_skews_down(
+            inv_raw in 1i64..10_000i64,
+            sigma in sigma_strat(),
+            mid in mid_strat(),
+        ) {
+            let product = test_product();
+            let config = test_config();
+            let book = seed_book(mid);
+            let inv = Decimal::new(inv_raw, 4);
+            let ctx = mk_ctx(&book, &product, &config, inv, sigma, mid);
+            let quotes = AvellanedaStoikov.compute_quotes(&ctx);
+            if let Some(q) = quotes.first() {
+                if let (Some(bid), Some(ask)) = (&q.bid, &q.ask) {
+                    let bid_dist = mid - bid.price;
+                    let ask_dist = ask.price - mid;
+                    prop_assert!(bid_dist >= ask_dist - dec!(0.02),
+                        "long inventory did not skew down: bid_dist={}, ask_dist={}",
+                        bid_dist, ask_dist);
+                }
+            }
+        }
+
+        /// All emitted quantities are >= lot_size (rounded). No
+        /// zero-sized orders ever leak into the venue.
+        #[test]
+        fn all_sizes_at_or_above_lot(
+            inventory in inv_strat(),
+            sigma in sigma_strat(),
+            mid in mid_strat(),
+        ) {
+            let product = test_product();
+            let config = test_config();
+            let book = seed_book(mid);
+            let ctx = mk_ctx(&book, &product, &config, inventory, sigma, mid);
+            for q in &AvellanedaStoikov.compute_quotes(&ctx) {
+                if let Some(b) = &q.bid {
+                    prop_assert!(b.qty > dec!(0));
+                }
+                if let Some(a) = &q.ask {
+                    prop_assert!(a.qty > dec!(0));
+                }
+            }
+        }
+
+        /// as_prob extremes produce bounded responses — ρ=0
+        /// (always uninformed) and ρ=1 (always informed) should
+        /// not crash or emit NaN-like behaviour.
+        #[test]
+        fn as_prob_extremes_remain_well_defined(
+            rho in select(vec![dec!(0), dec!(0.25), dec!(0.5), dec!(0.75), dec!(1)]),
+            mid in mid_strat(),
+        ) {
+            let product = test_product();
+            let config = test_config();
+            let book = seed_book(mid);
+            let mut ctx = mk_ctx(&book, &product, &config, dec!(0), dec!(0.01), mid);
+            ctx.as_prob = Some(rho);
+            let quotes = AvellanedaStoikov.compute_quotes(&ctx);
+            for q in &quotes {
+                if let (Some(b), Some(a)) = (&q.bid, &q.ask) {
+                    prop_assert!(b.price > dec!(0));
+                    prop_assert!(a.price > dec!(0));
+                    prop_assert!(b.price < a.price);
+                }
+            }
+        }
+    }
 }

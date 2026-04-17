@@ -832,4 +832,161 @@ mod tests {
         // Allow tick rounding tolerance.
         assert!((bid_dist_widen - bid_dist_neutral).abs() < dec!(50));
     }
+
+    // ── Property-based tests (Epic 17) ───────────────────────
+
+    use proptest::prelude::*;
+
+    fn pt_product() -> ProductSpec {
+        ProductSpec {
+            symbol: "BTCUSDT".into(),
+            base_asset: "BTC".into(),
+            quote_asset: "USDT".into(),
+            tick_size: dec!(0.01),
+            lot_size: dec!(0.00001),
+            min_notional: dec!(10),
+            maker_fee: dec!(0.001),
+            taker_fee: dec!(0.002),
+            trading_status: Default::default(),
+        }
+    }
+
+    fn pt_config() -> MarketMakerConfig {
+        MarketMakerConfig {
+            gamma: dec!(0.1),
+            kappa: dec!(1.5),
+            sigma: dec!(0.02),
+            time_horizon_secs: 300,
+            num_levels: 3,
+            order_size: dec!(0.001),
+            refresh_interval_ms: 500,
+            min_spread_bps: dec!(5),
+            max_distance_bps: dec!(100),
+            strategy: mm_common::config::StrategyType::Glft,
+            momentum_enabled: false,
+            momentum_window: 200,
+            basis_shift: dec!(0.5),
+            market_resilience_enabled: true,
+            otr_enabled: true,
+            hma_enabled: true,
+            hma_window: 9,
+            momentum_ofi_enabled: false,
+            momentum_learned_microprice_path: None,
+            momentum_learned_microprice_pair_paths: std::collections::HashMap::new(),
+            user_stream_enabled: true,
+            inventory_drift_tolerance: dec!(0.0001),
+            inventory_drift_auto_correct: false,
+            amend_enabled: true,
+            amend_max_ticks: 2,
+            fee_tier_refresh_enabled: true,
+            fee_tier_refresh_secs: 600,
+            borrow_enabled: false,
+            borrow_rate_refresh_secs: 1800,
+            borrow_holding_secs: 3600,
+            borrow_max_base: dec!(0),
+            borrow_buffer_base: dec!(0),
+            pair_lifecycle_enabled: true,
+            pair_lifecycle_refresh_secs: 300,
+            var_guard_enabled: false,
+            var_guard_limit_95: None,
+            var_guard_limit_99: None,
+            var_guard_ewma_lambda: None,
+            cross_venue_basis_max_staleness_ms: 1500,
+            cross_exchange_min_profit_bps: dec!(5),
+            max_cross_venue_divergence_pct: None,
+            sor_inline_enabled: false,
+        }
+    }
+
+    prop_compose! {
+        fn mid_strat()(cents in 100_000i64..10_000_000i64) -> Decimal {
+            Decimal::new(cents, 2)
+        }
+    }
+    prop_compose! {
+        fn inv_strat()(units in -10_000i64..10_000i64) -> Decimal {
+            Decimal::new(units, 4)
+        }
+    }
+
+    fn seed_book(mid: Decimal) -> LocalOrderBook {
+        let mut b = LocalOrderBook::new("BTCUSDT".into());
+        b.apply_snapshot(
+            vec![mm_common::PriceLevel { price: mid - dec!(0.5), qty: dec!(1) }],
+            vec![mm_common::PriceLevel { price: mid + dec!(0.5), qty: dec!(1) }],
+            1,
+        );
+        b
+    }
+
+    proptest! {
+        /// Every bid < every ask for the same level. Core
+        /// correctness invariant — a crossed quote self-trades.
+        #[test]
+        fn glft_bids_below_asks(
+            inv in inv_strat(),
+            mid in mid_strat(),
+        ) {
+            let product = pt_product();
+            let config = pt_config();
+            let book = seed_book(mid);
+            let ctx = test_ctx(&book, &product, &config, inv);
+            let strat = GlftStrategy::new();
+            for q in &strat.compute_quotes(&ctx) {
+                if let (Some(bid), Some(ask)) = (&q.bid, &q.ask) {
+                    prop_assert!(bid.price < ask.price,
+                        "crossed: bid {} >= ask {}", bid.price, ask.price);
+                }
+            }
+        }
+
+        /// All emitted quantities > 0. No zero-sized orders.
+        #[test]
+        fn glft_positive_sizes(
+            inv in inv_strat(),
+            mid in mid_strat(),
+        ) {
+            let product = pt_product();
+            let config = pt_config();
+            let book = seed_book(mid);
+            let ctx = test_ctx(&book, &product, &config, inv);
+            let strat = GlftStrategy::new();
+            for q in &strat.compute_quotes(&ctx) {
+                if let Some(b) = &q.bid {
+                    prop_assert!(b.qty > dec!(0));
+                    prop_assert!(b.price > dec!(0));
+                }
+                if let Some(a) = &q.ask {
+                    prop_assert!(a.qty > dec!(0));
+                    prop_assert!(a.price > dec!(0));
+                }
+            }
+        }
+
+        /// Long inventory skews the quote ladder DOWN
+        /// (bid_dist ≥ ask_dist). Same invariant as Avellaneda
+        /// — both strategies share the reservation-price shape.
+        #[test]
+        fn glft_long_inventory_skews_down(
+            inv_raw in 1i64..10_000i64,
+            mid in mid_strat(),
+        ) {
+            let product = pt_product();
+            let config = pt_config();
+            let book = seed_book(mid);
+            let inv = Decimal::new(inv_raw, 4);
+            let ctx = test_ctx(&book, &product, &config, inv);
+            let strat = GlftStrategy::new();
+            let quotes = strat.compute_quotes(&ctx);
+            if let Some(q) = quotes.first() {
+                if let (Some(bid), Some(ask)) = (&q.bid, &q.ask) {
+                    let bid_dist = mid - bid.price;
+                    let ask_dist = ask.price - mid;
+                    prop_assert!(bid_dist >= ask_dist - dec!(0.1),
+                        "long inventory did not skew down: bid_dist={}, ask_dist={}",
+                        bid_dist, ask_dist);
+                }
+            }
+        }
+    }
 }

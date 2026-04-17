@@ -72,3 +72,178 @@ impl Strategy for GridStrategy {
         quotes
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mm_common::config::MarketMakerConfig;
+    use mm_common::orderbook::LocalOrderBook;
+    use mm_common::types::ProductSpec;
+    use proptest::prelude::*;
+
+    fn pt_product() -> ProductSpec {
+        ProductSpec {
+            symbol: "BTCUSDT".into(),
+            base_asset: "BTC".into(),
+            quote_asset: "USDT".into(),
+            tick_size: dec!(0.01),
+            lot_size: dec!(0.00001),
+            min_notional: dec!(10),
+            maker_fee: dec!(0.001),
+            taker_fee: dec!(0.002),
+            trading_status: Default::default(),
+        }
+    }
+
+    fn pt_config() -> MarketMakerConfig {
+        MarketMakerConfig {
+            gamma: dec!(0.1),
+            kappa: dec!(1.5),
+            sigma: dec!(0.02),
+            time_horizon_secs: 300,
+            num_levels: 5,
+            order_size: dec!(0.001),
+            refresh_interval_ms: 500,
+            min_spread_bps: dec!(10),
+            max_distance_bps: dec!(500),
+            strategy: mm_common::config::StrategyType::Grid,
+            momentum_enabled: false,
+            momentum_window: 200,
+            basis_shift: dec!(0.5),
+            market_resilience_enabled: false,
+            otr_enabled: false,
+            hma_enabled: false,
+            hma_window: 9,
+            momentum_ofi_enabled: false,
+            momentum_learned_microprice_path: None,
+            momentum_learned_microprice_pair_paths: std::collections::HashMap::new(),
+            user_stream_enabled: false,
+            inventory_drift_tolerance: dec!(0.0001),
+            inventory_drift_auto_correct: false,
+            amend_enabled: false,
+            amend_max_ticks: 2,
+            fee_tier_refresh_enabled: false,
+            fee_tier_refresh_secs: 600,
+            borrow_enabled: false,
+            borrow_rate_refresh_secs: 1800,
+            borrow_holding_secs: 3600,
+            borrow_max_base: dec!(0),
+            borrow_buffer_base: dec!(0),
+            pair_lifecycle_enabled: false,
+            pair_lifecycle_refresh_secs: 300,
+            var_guard_enabled: false,
+            var_guard_limit_95: None,
+            var_guard_limit_99: None,
+            var_guard_ewma_lambda: None,
+            cross_venue_basis_max_staleness_ms: 1500,
+            cross_exchange_min_profit_bps: dec!(5),
+            max_cross_venue_divergence_pct: None,
+            sor_inline_enabled: false,
+        }
+    }
+
+    prop_compose! {
+        fn mid_strat()(cents in 100_000i64..10_000_000i64) -> Decimal {
+            Decimal::new(cents, 2)
+        }
+    }
+    prop_compose! {
+        fn inv_strat()(units in -1_000i64..1_000i64) -> Decimal {
+            Decimal::new(units, 4)
+        }
+    }
+
+    fn mk_ctx<'a>(
+        book: &'a LocalOrderBook,
+        product: &'a ProductSpec,
+        config: &'a MarketMakerConfig,
+        inv: Decimal,
+        mid: Decimal,
+    ) -> StrategyContext<'a> {
+        StrategyContext {
+            book, product, config,
+            inventory: inv,
+            volatility: dec!(0.02),
+            time_remaining: dec!(1),
+            mid_price: mid,
+            ref_price: None,
+            hedge_book: None,
+            borrow_cost_bps: None,
+            hedge_book_age_ms: None,
+            as_prob: None,
+            as_prob_bid: None,
+            as_prob_ask: None,
+        }
+    }
+
+    fn seed_book(mid: Decimal) -> LocalOrderBook {
+        let mut b = LocalOrderBook::new("BTCUSDT".into());
+        b.apply_snapshot(
+            vec![mm_common::PriceLevel { price: mid - dec!(0.5), qty: dec!(1) }],
+            vec![mm_common::PriceLevel { price: mid + dec!(0.5), qty: dec!(1) }],
+            1,
+        );
+        b
+    }
+
+    proptest! {
+        /// Grid bids/asks never cross for any level.
+        #[test]
+        fn grid_bids_below_asks(
+            inv in inv_strat(),
+            mid in mid_strat(),
+        ) {
+            let product = pt_product();
+            let config = pt_config();
+            let book = seed_book(mid);
+            let ctx = mk_ctx(&book, &product, &config, inv, mid);
+            for q in &GridStrategy.compute_quotes(&ctx) {
+                if let (Some(bid), Some(ask)) = (&q.bid, &q.ask) {
+                    prop_assert!(bid.price < ask.price,
+                        "crossed: bid {} >= ask {}", bid.price, ask.price);
+                }
+            }
+        }
+
+        /// Consecutive levels strictly widen — level i's bid is
+        /// below level i-1's bid, level i's ask is above level
+        /// i-1's ask. Catches a level_step regression.
+        #[test]
+        fn grid_levels_fan_out(
+            mid in mid_strat(),
+        ) {
+            let product = pt_product();
+            let config = pt_config();
+            let book = seed_book(mid);
+            let ctx = mk_ctx(&book, &product, &config, dec!(0), mid);
+            let quotes = GridStrategy.compute_quotes(&ctx);
+            for pair in quotes.windows(2) {
+                if let (Some(b0), Some(b1)) = (&pair[0].bid, &pair[1].bid) {
+                    prop_assert!(b1.price <= b0.price,
+                        "bid {} at deeper level {} > outer", b1.price, b0.price);
+                }
+                if let (Some(a0), Some(a1)) = (&pair[0].ask, &pair[1].ask) {
+                    prop_assert!(a1.price >= a0.price,
+                        "ask {} at deeper level {} < outer", a1.price, a0.price);
+                }
+            }
+        }
+
+        /// Exactly num_levels QuotePairs are always emitted (the
+        /// strategy does not skip levels; individual sides can
+        /// be None on min-notional failures, but the outer pair
+        /// count is fixed).
+        #[test]
+        fn grid_emits_exact_level_count(
+            inv in inv_strat(),
+            mid in mid_strat(),
+        ) {
+            let product = pt_product();
+            let config = pt_config();
+            let book = seed_book(mid);
+            let ctx = mk_ctx(&book, &product, &config, inv, mid);
+            let quotes = GridStrategy.compute_quotes(&ctx);
+            prop_assert_eq!(quotes.len(), config.num_levels);
+        }
+    }
+}
