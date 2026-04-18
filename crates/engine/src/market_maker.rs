@@ -192,6 +192,30 @@ impl InflightAtomicBundle {
     }
 }
 
+/// Short tag for surveillance pattern kinds, used as a Prometheus
+/// label value and in audit rows. Returns `None` for non-detector
+/// node kinds so callers can `continue` cleanly in a loop.
+pub(crate) fn surveillance_pattern_tag(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "Surveillance.SpoofingScore" => "spoofing",
+        "Surveillance.LayeringScore" => "layering",
+        "Surveillance.QuoteStuffingScore" => "quote_stuffing",
+        "Surveillance.WashScore" => "wash",
+        "Surveillance.MomentumIgnitionScore" => "momentum_ignition",
+        "Surveillance.FakeLiquidityScore" => "fake_liquidity",
+        "Surveillance.MarkingCloseScore" => "marking_close",
+        "Surveillance.CrossMarketScore" => "cross_market",
+        "Surveillance.LatencyExploitScore" => "latency_exploit",
+        "Surveillance.RebateAbuseScore" => "rebate_abuse",
+        "Surveillance.ImbalanceManipulationScore" => "imbalance_manipulation",
+        "Surveillance.CancelOnReactionScore" => "cancel_on_reaction",
+        "Surveillance.OneSidedQuotingScore" => "one_sided_quoting",
+        "Surveillance.InventoryPushingScore" => "inventory_pushing",
+        "Surveillance.StrategicNonFillingScore" => "strategic_non_filling",
+        _ => return None,
+    })
+}
+
 pub struct MarketMakerEngine {
     symbol: String,
     /// Owning client ID (Epic 1). `None` in legacy single-client
@@ -1918,7 +1942,15 @@ impl MarketMakerEngine {
         mut self,
         graph: &mm_strategy_graph::Graph,
     ) -> Result<Self, mm_strategy_graph::ValidationError> {
-        let ev = mm_strategy_graph::Evaluator::build(graph)?;
+        let ev = match mm_strategy_graph::Evaluator::build(graph) {
+            Ok(ev) => ev,
+            Err(e) => {
+                mm_dashboard::metrics::STRATEGY_GRAPH_DEPLOYS_TOTAL
+                    .with_label_values(&["rejected"])
+                    .inc();
+                return Err(e);
+            }
+        };
         self.strategy_graph = Some(ev);
         self.strategy_graph_name = Some(graph.name.clone());
         self.strategy_graph_hash = Some(graph.content_hash());
@@ -1930,6 +1962,12 @@ impl MarketMakerEngine {
         // consume a stale bundle and place quotes the new graph
         // never authored.
         self.graph_quotes_override = None;
+        mm_dashboard::metrics::STRATEGY_GRAPH_DEPLOYS_TOTAL
+            .with_label_values(&["accepted"])
+            .inc();
+        mm_dashboard::metrics::STRATEGY_GRAPH_NODES
+            .with_label_values(&[&graph.name])
+            .set(graph.nodes.len() as f64);
         Ok(self)
     }
 
@@ -1942,7 +1980,15 @@ impl MarketMakerEngine {
         &mut self,
         graph: &mm_strategy_graph::Graph,
     ) -> Result<(), mm_strategy_graph::ValidationError> {
-        let ev = mm_strategy_graph::Evaluator::build(graph)?;
+        let ev = match mm_strategy_graph::Evaluator::build(graph) {
+            Ok(ev) => ev,
+            Err(e) => {
+                mm_dashboard::metrics::STRATEGY_GRAPH_DEPLOYS_TOTAL
+                    .with_label_values(&["rejected"])
+                    .inc();
+                return Err(e);
+            }
+        };
         self.strategy_graph = Some(ev);
         self.strategy_graph_name = Some(graph.name.clone());
         self.strategy_graph_hash = Some(graph.content_hash());
@@ -1963,6 +2009,12 @@ impl MarketMakerEngine {
                 graph.content_hash()
             ),
         );
+        mm_dashboard::metrics::STRATEGY_GRAPH_DEPLOYS_TOTAL
+            .with_label_values(&["accepted"])
+            .inc();
+        mm_dashboard::metrics::STRATEGY_GRAPH_NODES
+            .with_label_values(&[&graph.name])
+            .set(graph.nodes.len() as f64);
         info!(symbol = %self.symbol, graph = %graph.name, hash = %graph.content_hash(), "strategy graph swapped");
         Ok(())
     }
@@ -2041,9 +2093,21 @@ impl MarketMakerEngine {
             }
         }
         // Fully-acked bundles graduate out of the inflight table —
-        // the watchdog doesn't need to watch them any more.
+        // the watchdog doesn't need to watch them any more. Count
+        // the graduations so Prometheus can report a success ratio
+        // against the watchdog's rollback counter.
+        let before = self.inflight_atomic_bundles.len();
         self.inflight_atomic_bundles
             .retain(|_, b| !b.both_legs_acked());
+        let completed = before - self.inflight_atomic_bundles.len();
+        if completed > 0 {
+            mm_dashboard::metrics::ATOMIC_BUNDLES_COMPLETED_TOTAL
+                .with_label_values(&[&self.symbol])
+                .inc_by(completed as u64);
+        }
+        mm_dashboard::metrics::ATOMIC_BUNDLES_INFLIGHT
+            .with_label_values(&[&self.symbol])
+            .set(self.inflight_atomic_bundles.len() as f64);
     }
 
     /// Multi-Venue 3.E.2 watchdog: checks every inflight atomic
@@ -2077,12 +2141,18 @@ impl MarketMakerEngine {
                         b.maker_venue, b.maker_symbol, b.hedge_venue, b.hedge_symbol,
                     ),
                 );
+                mm_dashboard::metrics::ATOMIC_BUNDLES_ROLLED_BACK_TOTAL
+                    .with_label_values(&[&self.symbol])
+                    .inc();
                 // Clear any pending override that was created by
                 // this bundle — on the next tick the order diff
                 // cancels the survived leg naturally.
                 self.graph_quotes_override = None;
             }
         }
+        mm_dashboard::metrics::ATOMIC_BUNDLES_INFLIGHT
+            .with_label_values(&[&self.symbol])
+            .set(self.inflight_atomic_bundles.len() as f64);
         rolled_back
     }
 
@@ -3000,6 +3070,23 @@ impl MarketMakerEngine {
             }
         }
 
+        // Sprint 4 — per-detector score gauge. Read from the
+        // same `src` map the evaluator consumes so the gauge
+        // never drifts from what a downstream node sees.
+        use rust_decimal::prelude::ToPrimitive;
+        for (id, kind) in graph.nodes_by_kind().iter() {
+            let Some(tag) = surveillance_pattern_tag(kind) else {
+                continue;
+            };
+            if let Some(mm_strategy_graph::Value::Number(score)) =
+                src.get(&(*id, "value".to_string()))
+            {
+                mm_dashboard::metrics::SURVEILLANCE_SCORE
+                    .with_label_values(&[tag, &self.symbol])
+                    .set(score.to_f64().unwrap_or(0.0));
+            }
+        }
+
         let actions = match graph.tick(&ctx, &src) {
             Ok(a) => a,
             Err(e) => {
@@ -3304,6 +3391,9 @@ impl MarketMakerEngine {
                             hedge_acked: false,
                         },
                     );
+                    mm_dashboard::metrics::ATOMIC_BUNDLES_INFLIGHT
+                        .with_label_values(&[&self.symbol])
+                        .set(self.inflight_atomic_bundles.len() as f64);
                     let _ = json; // payload available for future diagnostic
                 }
                 SinkAction::Flatten { policy } => {
@@ -3401,22 +3491,18 @@ impl MarketMakerEngine {
                     .map(|r| r.to_string())
                     .unwrap_or_else(|| "-".into()),
             );
-            let pattern_tag = match pattern.as_str() {
-                "Surveillance.SpoofingScore" => "spoofing",
-                "Surveillance.LayeringScore" => "layering",
-                "Surveillance.QuoteStuffingScore" => "quote_stuffing",
-                "Surveillance.WashScore" => "wash",
-                "Surveillance.MomentumIgnitionScore" => "momentum_ignition",
-                "Surveillance.FakeLiquidityScore" => "fake_liquidity",
-                "Surveillance.MarkingCloseScore" => "marking_close",
-                _ => "unknown",
-            };
+            let pattern_tag = surveillance_pattern_tag(&pattern).unwrap_or("unknown");
             self.audit.surveillance_alert(
                 &self.symbol,
                 pattern_tag,
                 out.score,
                 &extra,
             );
+            // Sprint 4 — per-pattern alert counter, incremented
+            // once per audit row so the dedupe is honoured.
+            mm_dashboard::metrics::SURVEILLANCE_ALERTS_TOTAL
+                .with_label_values(&[pattern_tag, &self.symbol])
+                .inc();
         }
     }
 
@@ -7310,6 +7396,195 @@ mod dual_connector_tests {
             engine.graph_quotes_override.is_none(),
             "pending Out.Quotes override from graph A dropped on swap"
         );
+    }
+
+    /// Sprint 4 — watchdog path bumps the rolled-back counter +
+    /// drops inflight gauge to zero.
+    #[test]
+    fn sprint4_atomic_bundle_rollback_metrics() {
+        use mm_common::types::Side;
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        let mut engine = MarketMakerEngine::new(
+            "SP4RB".to_string(),
+            sample_config(),
+            sample_product("SP4RB"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        let rolled_before = mm_dashboard::metrics::ATOMIC_BUNDLES_ROLLED_BACK_TOTAL
+            .with_label_values(&["SP4RB"])
+            .get();
+        let past = chrono::Utc::now() - chrono::Duration::seconds(10);
+        engine.inflight_atomic_bundles.insert(
+            "stale".into(),
+            InflightAtomicBundle {
+                dispatched_at: past,
+                timeout_ms: 1_000,
+                maker_venue: "binance".into(),
+                maker_symbol: "SP4RB".into(),
+                maker_side: Side::Buy,
+                maker_price: dec!(100),
+                maker_acked: false,
+                hedge_venue: "bybit".into(),
+                hedge_symbol: "SP4RB".into(),
+                hedge_side: Side::Sell,
+                hedge_price: dec!(100),
+                hedge_acked: false,
+            },
+        );
+        assert_eq!(engine.tick_atomic_bundle_watchdog(), 1);
+        let rolled_after = mm_dashboard::metrics::ATOMIC_BUNDLES_ROLLED_BACK_TOTAL
+            .with_label_values(&["SP4RB"])
+            .get();
+        assert_eq!(rolled_after - rolled_before, 1);
+        assert_eq!(
+            mm_dashboard::metrics::ATOMIC_BUNDLES_INFLIGHT
+                .with_label_values(&["SP4RB"])
+                .get(),
+            0.0
+        );
+    }
+
+    /// Sprint 4 — ack-sweep path bumps the completed counter
+    /// when a bundle graduates out of inflight with both legs
+    /// acked.
+    #[test]
+    fn sprint4_atomic_bundle_completion_metrics() {
+        use mm_common::types::Side;
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        let mut engine = MarketMakerEngine::new(
+            "SP4OK".to_string(),
+            sample_config(),
+            sample_product("SP4OK"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        let done_before = mm_dashboard::metrics::ATOMIC_BUNDLES_COMPLETED_TOTAL
+            .with_label_values(&["SP4OK"])
+            .get();
+        engine.inflight_atomic_bundles.insert(
+            "done".into(),
+            InflightAtomicBundle {
+                dispatched_at: chrono::Utc::now(),
+                timeout_ms: 5_000,
+                maker_venue: "custom".into(),
+                maker_symbol: "SP4OK".into(),
+                maker_side: Side::Buy,
+                maker_price: dec!(100),
+                maker_acked: true,
+                hedge_venue: "custom".into(),
+                hedge_symbol: "SP4OK".into(),
+                hedge_side: Side::Sell,
+                hedge_price: dec!(101),
+                hedge_acked: true,
+            },
+        );
+        engine.sweep_atomic_bundle_acks();
+        let done_after = mm_dashboard::metrics::ATOMIC_BUNDLES_COMPLETED_TOTAL
+            .with_label_values(&["SP4OK"])
+            .get();
+        assert_eq!(done_after - done_before, 1);
+        assert_eq!(
+            mm_dashboard::metrics::ATOMIC_BUNDLES_INFLIGHT
+                .with_label_values(&["SP4OK"])
+                .get(),
+            0.0
+        );
+    }
+
+    /// Sprint 4 — deploy counters tick on accepted + rejected.
+    #[test]
+    fn sprint4_strategy_graph_deploy_metrics() {
+        use mm_strategy_graph::{Graph, GraphNode, NodeId, Scope};
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        let mut engine = MarketMakerEngine::new(
+            "SP4DEP".to_string(),
+            sample_config(),
+            sample_product("SP4DEP"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        let acc_before = mm_dashboard::metrics::STRATEGY_GRAPH_DEPLOYS_TOTAL
+            .with_label_values(&["accepted"])
+            .get();
+        let rej_before = mm_dashboard::metrics::STRATEGY_GRAPH_DEPLOYS_TOTAL
+            .with_label_values(&["rejected"])
+            .get();
+        let mut g = Graph::empty("sp4dep-good", Scope::Symbol("SP4DEP".into()));
+        let strat = NodeId::new();
+        let qout = NodeId::new();
+        let cst = NodeId::new();
+        let mult = NodeId::new();
+        g.nodes.push(GraphNode {
+            id: strat,
+            kind: "Strategy.Avellaneda".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(GraphNode {
+            id: qout,
+            kind: "Out.Quotes".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(GraphNode {
+            id: cst,
+            kind: "Math.Const".into(),
+            config: serde_json::json!({ "value": "1" }),
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(GraphNode {
+            id: mult,
+            kind: "Out.SpreadMult".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        g.edges.push(mm_strategy_graph::Edge {
+            from: mm_strategy_graph::PortRef { node: strat, port: "quotes".into() },
+            to: mm_strategy_graph::PortRef { node: qout, port: "quotes".into() },
+        });
+        g.edges.push(mm_strategy_graph::Edge {
+            from: mm_strategy_graph::PortRef { node: cst, port: "value".into() },
+            to: mm_strategy_graph::PortRef { node: mult, port: "mult".into() },
+        });
+        engine.swap_strategy_graph(&g).expect("clean graph compiles");
+        let acc_after = mm_dashboard::metrics::STRATEGY_GRAPH_DEPLOYS_TOTAL
+            .with_label_values(&["accepted"])
+            .get();
+        assert_eq!(acc_after - acc_before, 1);
+        assert_eq!(
+            mm_dashboard::metrics::STRATEGY_GRAPH_NODES
+                .with_label_values(&["sp4dep-good"])
+                .get(),
+            4.0
+        );
+
+        // Dangling edge → Evaluator::build rejects → rejected counter ticks.
+        let mut bad = Graph::empty("sp4dep-bad", Scope::Symbol("SP4DEP".into()));
+        bad.nodes.push(GraphNode {
+            id: NodeId::new(),
+            kind: "Out.Quotes".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        bad.edges.push(mm_strategy_graph::Edge {
+            from: mm_strategy_graph::PortRef { node: NodeId::new(), port: "quotes".into() },
+            to: mm_strategy_graph::PortRef { node: bad.nodes[0].id, port: "quotes".into() },
+        });
+        assert!(engine.swap_strategy_graph(&bad).is_err());
+        let rej_after = mm_dashboard::metrics::STRATEGY_GRAPH_DEPLOYS_TOTAL
+            .with_label_values(&["rejected"])
+            .get();
+        assert_eq!(rej_after - rej_before, 1);
     }
 }
 

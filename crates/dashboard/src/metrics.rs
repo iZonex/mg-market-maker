@@ -417,6 +417,107 @@ pub static PORTFOLIO_STRATEGY_PNL: Lazy<GaugeVec> = Lazy::new(|| {
     .unwrap()
 });
 
+// ── Epic R Sprint 4 — surveillance observability ───────────
+
+/// Last-computed surveillance detector score (0.0 … 1.0) per
+/// (pattern, symbol). Written every engine tick by the per-node
+/// sweep in `tick_strategy_graph`, so the timeseries reflects
+/// the real-time signal even when the score hasn't crossed the
+/// alert threshold. Alert-grade scores (`>= 0.8`) additionally
+/// increment `mm_surveillance_alerts_total`.
+pub static SURVEILLANCE_SCORE: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_surveillance_score",
+        "Last-computed surveillance detector score (0–1, ≥0.8 trips an alert)",
+        &["pattern", "symbol"]
+    )
+    .unwrap()
+});
+
+/// Counter of post-dedupe surveillance alerts, labelled by
+/// (pattern, symbol). One increment per audit row — the 60s
+/// per-(pattern, node_id) dedupe is honoured so bursty scores
+/// don't inflate the counter.
+pub static SURVEILLANCE_ALERTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "mm_surveillance_alerts_total",
+        "Post-dedupe surveillance alerts (one increment per audit row)",
+        &["pattern", "symbol"]
+    )
+    .unwrap()
+});
+
+// ── Multi-Venue 3.E — atomic-bundle observability ──────────
+
+/// Number of atomic-bundle dispatches currently awaiting
+/// both-leg ack. Set every time the inflight map mutates
+/// (dispatch, ack sweep, watchdog rollback). Persistent
+/// non-zero values mean legs are ack'ing slowly — check venue
+/// ack latency.
+pub static ATOMIC_BUNDLES_INFLIGHT: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_atomic_bundles_inflight",
+        "Atomic-bundles awaiting both-leg ack (Multi-Venue 3.E.2 watchdog input)",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
+/// Counter of atomic-bundles that hit the watchdog timeout
+/// without both legs acked. Non-zero = the cross-venue hedge
+/// leg is late; pair with `mm_atomic_bundles_completed_total`
+/// to derive a success ratio.
+pub static ATOMIC_BUNDLES_ROLLED_BACK_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "mm_atomic_bundles_rolled_back_total",
+        "Atomic-bundles rolled back by the 3.E.2 watchdog (timeout without both acks)",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
+/// Counter of atomic-bundles that graduated out of the
+/// inflight table with both legs acked (Multi-Venue 3.E.3 ack
+/// sweep). Pair with the rollback counter for success ratio.
+pub static ATOMIC_BUNDLES_COMPLETED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "mm_atomic_bundles_completed_total",
+        "Atomic-bundles that graduated out of inflight with both legs acked",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
+// ── Epic H — strategy-graph deploy observability ───────────
+
+/// Counter of strategy-graph deploy attempts, labelled by
+/// outcome (`accepted`, `rejected`). Rejections pair with the
+/// `StrategyGraphDeployRejected` audit row carrying the
+/// validation error; this counter lets Prometheus key an alert
+/// off a rejection burst without reading the audit log.
+pub static STRATEGY_GRAPH_DEPLOYS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "mm_strategy_graph_deploys_total",
+        "Strategy-graph deploy attempts, labelled by outcome",
+        &["outcome"]
+    )
+    .unwrap()
+});
+
+/// Current node count of the deployed strategy graph,
+/// labelled by graph name. A sharp drop mid-session likely
+/// means a rollback landed — corroborate with the
+/// `mm_strategy_graph_deploys_total{outcome="accepted"}`
+/// counter.
+pub static STRATEGY_GRAPH_NODES: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_strategy_graph_nodes",
+        "Node count of the currently-deployed strategy graph",
+        &["graph"]
+    )
+    .unwrap()
+});
+
 /// Initialize all metrics (call once at startup).
 pub fn init() {
     // Force lazy initialization.
@@ -477,6 +578,13 @@ pub fn init() {
     let _ = &*SOCIAL_KILL_TRIGGERS_TOTAL;
     let _ = &*SOCIAL_SPREAD_MULT;
     let _ = &*SOCIAL_SIZE_MULT;
+    let _ = &*SURVEILLANCE_SCORE;
+    let _ = &*SURVEILLANCE_ALERTS_TOTAL;
+    let _ = &*ATOMIC_BUNDLES_INFLIGHT;
+    let _ = &*ATOMIC_BUNDLES_ROLLED_BACK_TOTAL;
+    let _ = &*ATOMIC_BUNDLES_COMPLETED_TOTAL;
+    let _ = &*STRATEGY_GRAPH_DEPLOYS_TOTAL;
+    let _ = &*STRATEGY_GRAPH_NODES;
 }
 
 // ── Block B / C — archive + scheduler observability ────────
