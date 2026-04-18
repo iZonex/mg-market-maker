@@ -14,6 +14,7 @@ pub mod funding_arb_driver;
 pub mod glft;
 pub mod grid;
 pub mod ignite;
+pub mod layer;
 pub mod mark;
 pub mod inventory_skew;
 pub mod learned_microprice;

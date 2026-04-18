@@ -392,7 +392,78 @@ macro_rules! pentest_placeholder {
     };
 }
 
-pentest_placeholder!(Layer, "Strategy.Layer", "Layer burst size");
+/// `Strategy.Layer` — structured multi-level layering exploit.
+/// Real behaviour wired in engine via `LayerStrategy`.
+#[derive(Debug, Default)]
+pub struct Layer;
+
+impl NodeKind for Layer {
+    fn kind(&self) -> &'static str {
+        "Strategy.Layer"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &[]
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUOTES_OUT
+    }
+    fn restricted(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<ConfigField> {
+        vec![
+            ConfigField {
+                name: "push_side",
+                label: "Push side",
+                hint: None,
+                default: serde_json::json!("buy"),
+                widget: ConfigWidget::Enum {
+                    options: vec![
+                        ConfigEnumOption { value: "buy", label: "Buy" },
+                        ConfigEnumOption { value: "sell", label: "Sell" },
+                    ],
+                },
+            },
+            ConfigField {
+                name: "levels",
+                label: "Layers",
+                hint: Some("How many stacked levels per cycle"),
+                default: serde_json::json!(5),
+                widget: ConfigWidget::Integer { min: Some(2), max: Some(20) },
+            },
+            ConfigField {
+                name: "cluster_bps",
+                label: "Cluster spacing (bps)",
+                hint: Some("Tight = clear layering signal"),
+                default: serde_json::json!("1"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: Some(100.0), step: Some(0.5) },
+            },
+            ConfigField {
+                name: "offset_bps",
+                label: "Innermost offset (bps)",
+                hint: None,
+                default: serde_json::json!("5"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: Some(200.0), step: Some(1.0) },
+            },
+            ConfigField {
+                name: "leg_size",
+                label: "Per-level size",
+                hint: None,
+                default: serde_json::json!("0.001"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+        ]
+    }
+}
+
 pentest_placeholder!(Stuff, "Strategy.Stuff", "Stuff burst size");
 pentest_placeholder!(CrossMarket, "Strategy.CrossMarket", "Cross-market qty");
 pentest_placeholder!(LatencyHunt, "Strategy.LatencyHunt", "Latency-hunt qty");
