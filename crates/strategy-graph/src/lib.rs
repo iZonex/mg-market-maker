@@ -336,4 +336,91 @@ mod integration_tests {
         let b = Graph::empty("y", GScope::Global);
         assert_ne!(a.content_hash(), b.content_hash());
     }
+
+    /// Sprint 5 — unknown config field triggers rejection.
+    #[test]
+    fn rejects_unknown_config_field() {
+        let cast = NodeId::new();
+        let sink = NodeId::new();
+        let mut g = Graph::empty("bad-cfg", GScope::Global);
+        g.nodes.push(graph::Node {
+            id: cast,
+            kind: "Cast.ToBool".into(),
+            config: serde_json::json!({ "threshold": "3", "typo_field": "oops" }),
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(graph::Node {
+            id: sink,
+            kind: "Out.SpreadMult".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        let err = Evaluator::build(&g).expect_err("should reject");
+        assert!(matches!(err, ValidationError::UnknownConfigField { .. }), "got {err:?}");
+    }
+
+    /// Sprint 5 — wrong-type config field (bool where number expected).
+    #[test]
+    fn rejects_wrong_type_config_field() {
+        let cast = NodeId::new();
+        let sink = NodeId::new();
+        let mut g = Graph::empty("wrong-type", GScope::Global);
+        g.nodes.push(graph::Node {
+            id: cast,
+            kind: "Cast.ToBool".into(),
+            config: serde_json::json!({ "threshold": true }),
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(graph::Node {
+            id: sink,
+            kind: "Out.SpreadMult".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        let err = Evaluator::build(&g).expect_err("should reject");
+        assert!(matches!(err, ValidationError::InvalidConfigFieldType { .. }), "got {err:?}");
+    }
+
+    /// Sprint 5 — enum value outside allowed options.
+    #[test]
+    fn rejects_invalid_enum_value() {
+        let cast = NodeId::new();
+        let sink = NodeId::new();
+        let mut g = Graph::empty("bad-enum", GScope::Global);
+        g.nodes.push(graph::Node {
+            id: cast,
+            kind: "Cast.ToBool".into(),
+            config: serde_json::json!({ "cmp": "does-not-exist" }),
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(graph::Node {
+            id: sink,
+            kind: "Out.SpreadMult".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        let err = Evaluator::build(&g).expect_err("should reject");
+        assert!(matches!(err, ValidationError::InvalidConfigEnumValue { .. }), "got {err:?}");
+    }
+
+    /// Sprint 5 — clean config that matches schema passes.
+    #[test]
+    fn accepts_valid_config() {
+        let cast = NodeId::new();
+        let sink = NodeId::new();
+        let mut g = Graph::empty("good-cfg", GScope::Global);
+        g.nodes.push(graph::Node {
+            id: cast,
+            kind: "Cast.ToBool".into(),
+            config: serde_json::json!({ "threshold": "5.0", "cmp": "gt" }),
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(graph::Node {
+            id: sink,
+            kind: "Out.SpreadMult".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        Evaluator::build(&g).expect("clean config passes validation");
+    }
 }

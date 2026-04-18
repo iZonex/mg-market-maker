@@ -323,6 +323,7 @@ pub fn shape(kind: &str) -> Option<KindShape> {
             .map(|p| (p.name.clone(), p.ty))
             .collect(),
         restricted: node.restricted(),
+        config_schema: node.config_schema(),
     })
 }
 

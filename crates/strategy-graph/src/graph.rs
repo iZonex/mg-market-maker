@@ -6,6 +6,7 @@
 //! serialised representation too so unknown kinds fail loudly at
 //! validation time instead of silently evaluating as no-op.
 
+use crate::node::{ConfigField, ConfigWidget};
 use crate::types::{Edge, NodeId, PortType};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -120,6 +121,38 @@ pub enum ValidationError {
          unless MM_RESTRICTED_ALLOW=1 is set on the server"
     )]
     RestrictedNotAllowed(String),
+    #[error(
+        "node \"{kind}\" config contains unknown field \"{field}\" — \
+         typo? allowed fields: {allowed:?}"
+    )]
+    UnknownConfigField {
+        node: NodeId,
+        kind: String,
+        field: String,
+        allowed: Vec<String>,
+    },
+    #[error(
+        "node \"{kind}\" config field \"{field}\" has wrong type: \
+         expected {expected}, got {got}"
+    )]
+    InvalidConfigFieldType {
+        node: NodeId,
+        kind: String,
+        field: String,
+        expected: &'static str,
+        got: String,
+    },
+    #[error(
+        "node \"{kind}\" config field \"{field}\" enum value \
+         \"{value}\" not in allowed options {options:?}"
+    )]
+    InvalidConfigEnumValue {
+        node: NodeId,
+        kind: String,
+        field: String,
+        value: String,
+        options: Vec<String>,
+    },
 }
 
 /// Result of a full topological sort — nodes in evaluation order
@@ -181,7 +214,9 @@ impl Graph {
         }
 
         // 2. resolve every node's kind up-front so we can look up
-        //    port shapes below.
+        //    port shapes below. Also run per-node-kind config-schema
+        //    validation here — catches typos + wrong-type fields
+        //    before the graph is compiled.
         let mut shapes: HashMap<NodeId, KindShape> = HashMap::with_capacity(self.nodes.len());
         for n in &self.nodes {
             let Some(shape) = resolve_kind(&n.kind) else {
@@ -190,6 +225,7 @@ impl Graph {
             if shape.restricted && !allow_restricted_env() {
                 return Err(ValidationError::RestrictedNotAllowed(n.kind.clone()));
             }
+            validate_node_config(n, &shape)?;
             shapes.insert(n.id, shape);
         }
 
@@ -321,6 +357,7 @@ pub struct KindShape {
     pub inputs: Vec<(String, PortType)>,
     pub outputs: Vec<(String, PortType)>,
     pub restricted: bool,
+    pub config_schema: Vec<ConfigField>,
 }
 
 impl KindShape {
@@ -358,5 +395,109 @@ fn allow_restricted_env() -> bool {
     std::env::var("MM_ALLOW_RESTRICTED")
         .map(|v| v == "yes-pentest-mode")
         .unwrap_or(false)
+}
+
+/// Walk the node's `config` JSON against the schema's declared
+/// fields. Rejects unknown fields (typos → silent drop) and
+/// wrong-type values (string instead of bool, non-option enum
+/// value, etc.). Missing fields are allowed because consumers
+/// always fall back to `ConfigField::default` on the read side.
+fn validate_node_config(
+    node: &Node,
+    shape: &KindShape,
+) -> std::result::Result<(), ValidationError> {
+    // Null / absent config is always fine — the engine reads
+    // individual keys with `.get().unwrap_or(default)`.
+    let cfg = match &node.config {
+        serde_json::Value::Null => return Ok(()),
+        serde_json::Value::Object(m) => m,
+        _ => return Ok(()),
+    };
+    // Opt-in: nodes that haven't declared a schema yet skip
+    // validation. This keeps the check non-breaking while the
+    // migration of every node to a declared schema lands
+    // incrementally. Once a node has any `ConfigField` declared,
+    // the full check fires — unknown fields + wrong types are
+    // refused.
+    if shape.config_schema.is_empty() {
+        return Ok(());
+    }
+    let allowed: HashSet<&str> = shape.config_schema.iter().map(|f| f.name).collect();
+    for key in cfg.keys() {
+        if !allowed.contains(key.as_str()) {
+            return Err(ValidationError::UnknownConfigField {
+                node: node.id,
+                kind: node.kind.clone(),
+                field: key.clone(),
+                allowed: allowed.iter().map(|s| s.to_string()).collect(),
+            });
+        }
+    }
+    for field in &shape.config_schema {
+        let Some(v) = cfg.get(field.name) else { continue };
+        if v.is_null() {
+            continue;
+        }
+        let ok = match &field.widget {
+            ConfigWidget::Number { .. } => {
+                v.is_number() || v.as_str().map(|s| s.parse::<f64>().is_ok()).unwrap_or(false)
+            }
+            ConfigWidget::Integer { .. } => {
+                v.is_i64() || v.is_u64()
+                    || v.as_str().map(|s| s.parse::<i64>().is_ok()).unwrap_or(false)
+            }
+            ConfigWidget::Text => v.is_string(),
+            ConfigWidget::Bool => v.is_boolean(),
+            ConfigWidget::Enum { options } => {
+                let Some(s) = v.as_str() else {
+                    return Err(ValidationError::InvalidConfigFieldType {
+                        node: node.id,
+                        kind: node.kind.clone(),
+                        field: field.name.to_string(),
+                        expected: "enum string",
+                        got: describe_json_type(v),
+                    });
+                };
+                if !options.iter().any(|o| o.value == s) {
+                    return Err(ValidationError::InvalidConfigEnumValue {
+                        node: node.id,
+                        kind: node.kind.clone(),
+                        field: field.name.to_string(),
+                        value: s.to_string(),
+                        options: options.iter().map(|o| o.value.to_string()).collect(),
+                    });
+                }
+                true
+            }
+        };
+        if !ok {
+            return Err(ValidationError::InvalidConfigFieldType {
+                node: node.id,
+                kind: node.kind.clone(),
+                field: field.name.to_string(),
+                expected: match &field.widget {
+                    ConfigWidget::Number { .. } => "number",
+                    ConfigWidget::Integer { .. } => "integer",
+                    ConfigWidget::Text => "string",
+                    ConfigWidget::Bool => "bool",
+                    ConfigWidget::Enum { .. } => "enum",
+                },
+                got: describe_json_type(v),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn describe_json_type(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+    .to_string()
 }
 
