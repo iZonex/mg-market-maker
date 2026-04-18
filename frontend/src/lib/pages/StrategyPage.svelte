@@ -50,6 +50,72 @@
   let rollbackFrom = $state(null)
   let previewBusy = $state(false)
 
+  // ─── Local draft persistence ──────────────────────────────
+  // Canvas work is checkpointed into localStorage on every change so
+  // F5 / tab crashes never lose the WIP. Deploy is still the single
+  // source of truth for "live" — draft only restores the *editor*
+  // state, never activates a graph.
+  const DRAFT_KEY = 'mm.strategy.draft.v1'
+
+  function saveDraft() {
+    try {
+      const draft = {
+        graphName, scopeKind, scopeValue,
+        nodes: nodes.map((n) => ({
+          id: n.id, kind: n.data.kind, config: n.data.config,
+          pos: [n.position.x, n.position.y],
+        })),
+        edges: edges.map((e) => ({
+          id: e.id,
+          source: e.source, sourceHandle: e.sourceHandle,
+          target: e.target, targetHandle: e.targetHandle,
+        })),
+        savedAt: Date.now(),
+      }
+      localStorage.setItem(DRAFT_KEY, JSON.stringify(draft))
+    } catch {
+      // Storage disabled / quota — silently skip.
+    }
+  }
+
+  function restoreDraft() {
+    try {
+      const raw = localStorage.getItem(DRAFT_KEY)
+      if (!raw) return false
+      const d = JSON.parse(raw)
+      if (!Array.isArray(d.nodes) || d.nodes.length === 0) return false
+      graphName = d.graphName ?? 'untitled'
+      scopeKind = d.scopeKind ?? 'symbol'
+      scopeValue = d.scopeValue ?? ''
+      nodes = d.nodes.map((n) => ({
+        id: n.id,
+        type: 'graphNode',
+        position: { x: n.pos?.[0] ?? 0, y: n.pos?.[1] ?? 0 },
+        data: nodeData(n.kind, n.config),
+      }))
+      edges = (d.edges ?? []).map((e, i) => ({
+        id: e.id ?? `e${i}`,
+        source: e.source, sourceHandle: e.sourceHandle,
+        target: e.target, targetHandle: e.targetHandle,
+      }))
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  // Autosave: fires on any mutation of the observed state.
+  // Debounced via a micro-task so a 10-node load triggers one save
+  // at the end, not ten.
+  let saveScheduled = false
+  $effect(() => {
+    // Subscribe to the reactive state.
+    nodes.length; edges.length; graphName; scopeKind; scopeValue
+    if (saveScheduled) return
+    saveScheduled = true
+    queueMicrotask(() => { saveScheduled = false; saveDraft() })
+  })
+
   async function loadCatalog() {
     try {
       catalog = await api.getJson('/api/v1/strategy/catalog')
@@ -65,7 +131,21 @@
       templates = []
     }
   }
-  $effect(() => { loadCatalog(); loadTemplates() })
+  let restored = $state(false)
+  $effect(() => {
+    // Catalog/templates/draft all load once on mount. Draft wakes
+    // after catalog so node metadata (label/summary) resolves
+    // correctly during hydrate.
+    loadCatalog().then(() => {
+      if (!restored) {
+        restored = true
+        if (restoreDraft()) {
+          deployStatus = 'restored local draft'
+        }
+      }
+    })
+    loadTemplates()
+  })
 
   async function loadTemplate(name) {
     if (!name) return

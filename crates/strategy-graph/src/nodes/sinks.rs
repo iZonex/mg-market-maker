@@ -110,6 +110,38 @@ impl NodeKind for KillEscalate {
     }
 }
 
+static QUOTES_INPUTS: Lazy<Vec<Port>> =
+    Lazy::new(|| vec![Port::new("quotes", PortType::Quotes)]);
+
+/// Phase 4 — `Out.Quotes`. The graph took full authorship of the
+/// quoting pipeline: every tick the incoming `Quotes` bundle is
+/// what the engine places, replacing the built-in strategy.tick()
+/// output entirely. If the upstream is `Missing` on a tick the
+/// engine falls back to its default strategy for that tick (no
+/// silent self-destruction when a sentiment feed drops out).
+#[derive(Debug, Default)]
+pub struct Quotes;
+
+impl NodeKind for Quotes {
+    fn kind(&self) -> &'static str {
+        "Out.Quotes"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &QUOTES_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &UNIT_OUT
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Unit])
+    }
+}
+
 static FLATTEN_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
     vec![
         Port::new("trigger", PortType::Bool),

@@ -407,6 +407,13 @@ pub struct MarketMakerEngine {
     /// audit row so regulators can join a live kill-switch escalation
     /// back to the canonical graph snapshot in `history/{hash}.json`.
     strategy_graph_hash: Option<String>,
+    /// Epic H Phase 4 — full graph-authored quote bundle, set by the
+    /// `Out.Quotes` sink on the last graph tick. Consumed (and
+    /// cleared) at the start of the next quoting pass. `None`
+    /// delegates to `self.strategy.compute_quotes(&ctx)` like the
+    /// classic pipeline, so switching between graph-authored and
+    /// hand-wired mid-run is seamless.
+    graph_quotes_override: Option<Vec<mm_common::types::QuotePair>>,
     /// Epic H — graph scope cached at `with_strategy_graph` /
     /// `swap_strategy_graph` so the per-tick source marshaller
     /// knows which asset to pull sentiment for without re-reading
@@ -774,6 +781,7 @@ impl MarketMakerEngine {
             strategy_graph: None,
             strategy_graph_name: None,
             strategy_graph_hash: None,
+            graph_quotes_override: None,
             strategy_graph_scope: None,
             margin_guard: config.margin.as_ref().map(|m| {
                 MarginGuard::new(MarginGuardThresholds::from_config(m))
@@ -1658,6 +1666,48 @@ impl MarketMakerEngine {
                         reason = %reason,
                         "strategy graph escalated kill switch"
                     );
+                }
+                SinkAction::Quotes(qs) => {
+                    // Phase 4 — graph fully authored the quoting
+                    // pipeline. Group GraphQuotes into QuotePairs by
+                    // index of their side: the N-th buy pairs with
+                    // the N-th sell. The classic `num_levels × pair`
+                    // shape is preserved so downstream
+                    // (inventory_manager, balance_cache, order_manager)
+                    // consumers need no changes.
+                    use mm_common::types::{Quote, QuotePair, Side};
+                    use mm_strategy_graph::QuoteSide;
+                    let mut bids: Vec<Quote> = qs
+                        .iter()
+                        .filter(|q| q.side == QuoteSide::Buy)
+                        .map(|q| Quote {
+                            side: Side::Buy,
+                            price: self.product.round_price(q.price),
+                            qty: self.product.round_qty(q.qty),
+                        })
+                        .collect();
+                    let mut asks: Vec<Quote> = qs
+                        .iter()
+                        .filter(|q| q.side == QuoteSide::Sell)
+                        .map(|q| Quote {
+                            side: Side::Sell,
+                            price: self.product.round_price(q.price),
+                            qty: self.product.round_qty(q.qty),
+                        })
+                        .collect();
+                    // Deeper levels last: sort so level 0 is closest
+                    // to mid on both sides (inner-first).
+                    bids.sort_by(|a, b| b.price.cmp(&a.price));
+                    asks.sort_by(|a, b| a.price.cmp(&b.price));
+                    let n = bids.len().max(asks.len());
+                    let mut pairs = Vec::with_capacity(n);
+                    for i in 0..n {
+                        pairs.push(QuotePair {
+                            bid: bids.get(i).cloned(),
+                            ask: asks.get(i).cloned(),
+                        });
+                    }
+                    self.graph_quotes_override = Some(pairs);
                 }
                 SinkAction::Flatten { policy } => {
                     // Graph-authored flatten. Escalates kill L4 with
@@ -3938,7 +3988,14 @@ impl MarketMakerEngine {
             as_prob_ask,
         };
 
-        let mut quotes = self.strategy.compute_quotes(&ctx);
+        // Phase 4 — if the graph authored a quote bundle on the last
+        // tick via `Out.Quotes`, use it instead of the hand-wired
+        // strategy. Override is consumed (take) so the next tick
+        // either re-authors or falls back cleanly.
+        let mut quotes = match self.graph_quotes_override.take() {
+            Some(q) => q,
+            None => self.strategy.compute_quotes(&ctx),
+        };
 
         // Inventory limits + urgency + dynamic sizing.
         self.inventory_manager

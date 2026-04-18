@@ -1082,6 +1082,7 @@ fn render_value(v: &mm_strategy_graph::Value) -> String {
         Value::String(s) => s.clone(),
         Value::KillLevel(l) => format!("L{l}"),
         Value::StrategyKind(s) | Value::PairClass(s) => s.clone(),
+        Value::Quotes(qs) => format!("{} quotes", qs.len()),
         Value::Missing => "—".to_string(),
     }
 }

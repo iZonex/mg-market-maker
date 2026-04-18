@@ -29,6 +29,7 @@ pub struct BuiltinTemplate {
 static MAJOR_SPOT_BASIC: &str = include_str!("../templates/major-spot-basic.json");
 static MEME_SPOT_GUARDED: &str = include_str!("../templates/meme-spot-guarded.json");
 static CROSS_ASSET_REGIME: &str = include_str!("../templates/cross-asset-regime.json");
+static GRID_VIA_GRAPH: &str = include_str!("../templates/grid-via-graph.json");
 
 const BUILTIN: &[BuiltinTemplate] = &[
     BuiltinTemplate {
@@ -45,6 +46,11 @@ const BUILTIN: &[BuiltinTemplate] = &[
         name: "cross-asset-regime",
         description: "Volatility regime gate: 1.5× spread when vol > 60 %, 1.0× otherwise.",
         body: CROSS_ASSET_REGIME,
+    },
+    BuiltinTemplate {
+        name: "grid-via-graph",
+        description: "Phase 4 reference: full graph-authored symmetric grid via Quote.Grid + Out.Quotes.",
+        body: GRID_VIA_GRAPH,
     },
 ];
 

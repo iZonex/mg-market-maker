@@ -15,7 +15,7 @@
 
 use crate::graph::KindShape;
 use crate::node::NodeKind;
-use crate::nodes::{exec, indicators, logic, math, risk, sinks, sources, stats};
+use crate::nodes::{exec, indicators, logic, math, quotes, risk, sinks, sources, stats};
 use serde_json::Value as Json;
 
 /// Construct a node by its catalog key + raw config JSON.
@@ -105,6 +105,10 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
             exec::IcebergConfig::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
         }
         "Out.Flatten" => Some(Box::new(sinks::Flatten)),
+        // Phase 4 — graph-authored quoting
+        "Quote.Grid" => Some(Box::new(quotes::Grid)),
+        "Quote.Mux" => Some(Box::new(quotes::Mux)),
+        "Out.Quotes" => Some(Box::new(sinks::Quotes)),
         // Sinks
         "Out.SpreadMult" => Some(Box::new(sinks::SpreadMult)),
         "Out.SizeMult" => Some(Box::new(sinks::SizeMult)),
@@ -185,11 +189,16 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Exec.PovConfig"       => NodeMeta { label: "POV policy",          summary: "Percentage-of-volume execution", group: "Exec" },
         "Exec.IcebergConfig"   => NodeMeta { label: "Iceberg policy",      summary: "Iceberg execution (display qty)", group: "Exec" },
 
+        // Phase 4 — graph-authored quoting.
+        "Quote.Grid"           => NodeMeta { label: "Grid quotes",         summary: "Symmetric bid/ask grid around a mid (step + levels + size)", group: "Quotes" },
+        "Quote.Mux"            => NodeMeta { label: "Quote mux",           summary: "Pick quote bundle a or b by a boolean selector", group: "Quotes" },
+
         // Sinks — always fire on a trigger, consumed by the engine.
         "Out.SpreadMult"       => NodeMeta { label: "Spread multiplier",   summary: "Final spread scalar applied to quotes", group: "Sinks" },
         "Out.SizeMult"         => NodeMeta { label: "Size multiplier",     summary: "Final size scalar applied to quotes", group: "Sinks" },
         "Out.KillEscalate"     => NodeMeta { label: "Kill-switch escalate",summary: "Raise kill level with a reason", group: "Sinks" },
         "Out.Flatten"          => NodeMeta { label: "Flatten position",    summary: "Fire L4 flatten with the given exec policy", group: "Sinks" },
+        "Out.Quotes"           => NodeMeta { label: "Quotes",              summary: "Replace strategy output with a graph-authored quote bundle", group: "Sinks" },
 
         // Defensive fallback — every catalog kind should have its own
         // arm above. If a new kind sneaks in without a meta entry,
@@ -263,6 +272,9 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Exec.PovConfig",
         "Exec.IcebergConfig",
         "Out.Flatten",
+        "Quote.Grid",
+        "Quote.Mux",
+        "Out.Quotes",
         "Out.SpreadMult",
         "Out.SizeMult",
         "Out.KillEscalate",
@@ -341,10 +353,9 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_43_nodes_after_wave_d() {
-        // MVP 16 + Wave A (4) + Wave B (6) + Wave C (11) +
-        // Wave D (Logic.StringMux + 4 Exec.*Config + Out.Flatten
-        // = 6) = 43.
-        assert_eq!(kinds().len(), 43, "catalog drift");
+    fn catalog_has_46_nodes_after_phase_4_quotes() {
+        // Phase 2 landed 43. Phase 4 adds Quote.Grid + Quote.Mux +
+        // Out.Quotes = 3 → 46.
+        assert_eq!(kinds().len(), 46, "catalog drift");
     }
 }

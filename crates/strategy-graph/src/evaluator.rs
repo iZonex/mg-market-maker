@@ -17,7 +17,7 @@
 use crate::catalog;
 use crate::graph::{Graph, ValidationError};
 use crate::node::{EvalCtx, NodeKind, NodeOutputs, NodeState};
-use crate::types::{NodeId, Value};
+use crate::types::{GraphQuote, NodeId, Value};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 
@@ -44,6 +44,13 @@ pub enum SinkAction {
     Flatten {
         policy: String,
     },
+    /// Phase 4 — the graph fully authored the quoting output. Engine
+    /// replaces its `strategy.compute_quotes()` result with this
+    /// bundle. If the bundle is empty the engine interprets it as
+    /// "cancel everything" (same semantics as an explicit empty
+    /// `QuotePair` list from a strategy). Missing / absent `Out.Quotes`
+    /// falls back to the hard-wired strategy.
+    Quotes(Vec<GraphQuote>),
 }
 
 /// Pre-compiled graph ready for per-tick evaluation. Holds the
@@ -286,6 +293,15 @@ impl Evaluator {
                             .unwrap_or("twap:120:5")
                             .to_string();
                         sinks.push(SinkAction::Flatten { policy });
+                    }
+                }
+                "Out.Quotes" => {
+                    // Propagate a Quotes bundle to the engine. An
+                    // absent input (`Missing`) skips the sink so the
+                    // engine falls back to its own strategy tick —
+                    // a stale feed never poisons the order placement.
+                    if let Some(qs) = input_vec.first().and_then(Value::as_quotes) {
+                        sinks.push(SinkAction::Quotes(qs.clone()));
                     }
                 }
                 _ => {}

@@ -66,6 +66,33 @@ pub enum PortType {
     /// alt-perp, etc.). The engine's classifier assigns one at
     /// startup; a graph can branch on it.
     PairClass,
+    /// Phase 4 — a quote bundle. A `Vec<GraphQuote>` carrying the
+    /// full set of levels the graph wants the engine to place. The
+    /// engine consumes `Out.Quotes` by swapping its strategy.tick()
+    /// result with these quotes, so a graph can author the whole
+    /// pipeline not just overlay the multipliers.
+    Quotes,
+}
+
+/// Phase 4 — a single quote level authored by a graph. Kept decoupled
+/// from `mm_common::Quote` so the strategy-graph crate stays free of
+/// engine types; the engine maps these into its own `Quote` on
+/// consumption.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GraphQuote {
+    /// Buy or sell.
+    pub side: QuoteSide,
+    /// Limit price.
+    pub price: Decimal,
+    /// Quantity in base asset.
+    pub qty: Decimal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuoteSide {
+    Buy,
+    Sell,
 }
 
 /// A value riding on an edge during evaluation. Exactly one variant
@@ -81,6 +108,9 @@ pub enum Value {
     StrategyKind(String),
     /// Phase 2 — pair-class tag.
     PairClass(String),
+    /// Phase 4 — a quote bundle: the set of buy + sell levels the
+    /// graph wants placed this tick. Consumed by `Out.Quotes`.
+    Quotes(Vec<GraphQuote>),
     /// A source that had no observation this tick. Propagates through
     /// transforms as "hold last good" or "pass-through" depending on
     /// the node; sinks fall back to their neutral output after the
@@ -98,6 +128,14 @@ impl Value {
             Value::KillLevel(_) => PortType::KillLevel,
             Value::StrategyKind(_) => PortType::StrategyKind,
             Value::PairClass(_) => PortType::PairClass,
+            Value::Quotes(_) => PortType::Quotes,
+        }
+    }
+
+    pub fn as_quotes(&self) -> Option<&Vec<GraphQuote>> {
+        match self {
+            Value::Quotes(q) => Some(q),
+            _ => None,
         }
     }
 

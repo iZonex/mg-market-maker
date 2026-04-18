@@ -27,7 +27,7 @@ pub use evaluator::{Evaluator, SinkAction};
 pub use graph::{Graph, Node as GraphNode, Scope, ValidationError, CURRENT_SCHEMA_VERSION};
 pub use node::{EvalCtx, NodeKind, NodeState};
 pub use storage::{DeployRecord, GraphStore};
-pub use types::{Edge, NodeId, Port, PortRef, PortType, Value};
+pub use types::{Edge, GraphQuote, NodeId, Port, PortRef, PortType, QuoteSide, Value};
 
 #[cfg(test)]
 mod integration_tests {
