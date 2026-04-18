@@ -20,6 +20,15 @@ pub struct AuditLog {
     sequence: std::sync::atomic::AtomicU64,
 }
 
+impl std::fmt::Debug for AuditLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Opaque on purpose — the inner mutex holds a BufWriter that
+        // is neither Debug nor cheap to format, and the only field
+        // the reader cares about is the file path that owns us.
+        f.debug_struct("AuditLog").finish_non_exhaustive()
+    }
+}
+
 struct AuditLogInner {
     writer: std::io::BufWriter<std::fs::File>,
     /// Base path (e.g. `data/audit.jsonl`). Rolled files live next
@@ -287,6 +296,24 @@ pub enum AuditEventType {
     /// compliance exports can join on the hash to reconstruct the
     /// graph that was live at any point in time.
     StrategyGraphDeployed,
+    /// An operator loaded a previous version of a graph from the
+    /// per-hash history store and redeployed it. `detail` carries
+    /// `graph={name} from_hash={sha256} to_hash={sha256}` so the
+    /// backwards-transition is as visible as forward deploys.
+    StrategyGraphRolledBack,
+    /// A deploy attempt was refused because the graph contained a
+    /// restricted (pentest-only) node kind and the runtime was not
+    /// started with `MM_RESTRICTED_ALLOW=true`. `detail` carries the
+    /// offending kind(s) so the regulator can confirm the gate
+    /// actually fired rather than being silently suppressed.
+    StrategyGraphDeployRejected,
+    /// A sink node (`Out.Flatten`, `Out.KillEscalate`, `Out.SpreadMult`,
+    /// `Out.SizeMult`) fired on a tick of a live graph. `detail`
+    /// carries `action=... hash={sha256}` so the regulator can trace
+    /// a kill-switch escalation back to the exact authored graph.
+    /// Only emitted for high-consequence sinks (flatten, kill); the
+    /// multipliers fire every tick and would spam the log.
+    StrategyGraphSinkFired,
 
     // Epic F — Listing sniper (stage-3 engine integration).
     /// Listing sniper discovered a new symbol on a venue.
@@ -627,6 +654,117 @@ impl AuditLog {
         });
     }
 
+    /// Convenience: log a strategy-graph deploy. `scope_key` is the
+    /// string form the engine's `DashboardState::broadcast_config_override`
+    /// uses (`"Symbol(BTCUSDT)"`, `"Global"`, …) so the regulator can
+    /// tell *which* engines picked this graph up on this tick.
+    pub fn strategy_graph_deployed(
+        &self,
+        graph_name: &str,
+        hash: &str,
+        scope_key: &str,
+        operator: &str,
+        recipients: usize,
+    ) {
+        let detail = format!(
+            "graph={graph_name} hash={hash} scope={scope_key} operator={operator} recipients={recipients}"
+        );
+        self.log(AuditEvent {
+            seq: 0,
+            timestamp: Utc::now(),
+            event_type: AuditEventType::StrategyGraphDeployed,
+            symbol: String::new(),
+            client_id: None,
+            order_id: None,
+            side: None,
+            price: None,
+            qty: None,
+            detail: Some(detail),
+            prev_hash: None,
+        });
+    }
+
+    /// Convenience: log a strategy-graph rollback (an operator
+    /// loaded a previous hash from `history/` and deployed it). The
+    /// deploy itself still emits [`StrategyGraphDeployed`] on the
+    /// following line — this event sits alongside so the regulator
+    /// sees the *intent* as well as the result.
+    pub fn strategy_graph_rolled_back(
+        &self,
+        graph_name: &str,
+        from_hash: &str,
+        to_hash: &str,
+        operator: &str,
+    ) {
+        let detail = format!(
+            "graph={graph_name} from_hash={from_hash} to_hash={to_hash} operator={operator}"
+        );
+        self.log(AuditEvent {
+            seq: 0,
+            timestamp: Utc::now(),
+            event_type: AuditEventType::StrategyGraphRolledBack,
+            symbol: String::new(),
+            client_id: None,
+            order_id: None,
+            side: None,
+            price: None,
+            qty: None,
+            detail: Some(detail),
+            prev_hash: None,
+        });
+    }
+
+    /// Convenience: log a refused deploy. Fires when a graph
+    /// references a restricted node kind (pentest-only strategies)
+    /// and the runtime was not started with the explicit opt-in.
+    pub fn strategy_graph_deploy_rejected(
+        &self,
+        graph_name: &str,
+        reason: &str,
+        operator: &str,
+    ) {
+        let detail = format!("graph={graph_name} reason={reason} operator={operator}");
+        self.log(AuditEvent {
+            seq: 0,
+            timestamp: Utc::now(),
+            event_type: AuditEventType::StrategyGraphDeployRejected,
+            symbol: String::new(),
+            client_id: None,
+            order_id: None,
+            side: None,
+            price: None,
+            qty: None,
+            detail: Some(detail),
+            prev_hash: None,
+        });
+    }
+
+    /// Convenience: log a high-consequence sink firing on a live
+    /// tick. `action` is the `Debug`-form of the `SinkAction` enum
+    /// variant (`Flatten { policy }` / `KillEscalate { level, reason }`),
+    /// `hash` is the active graph's content hash.
+    pub fn strategy_graph_sink_fired(
+        &self,
+        symbol: &str,
+        action: &str,
+        hash: &str,
+    ) {
+        let detail = format!("action={action} hash={hash}");
+        self.log(AuditEvent {
+            seq: 0,
+            timestamp: Utc::now(),
+            event_type: AuditEventType::StrategyGraphSinkFired,
+            symbol: symbol.to_string(),
+            client_id: None,
+            order_id: None,
+            side: None,
+            price: None,
+            qty: None,
+            detail: Some(detail),
+            prev_hash: None,
+        });
+    }
+
     /// Flush buffer to disk.
     pub fn flush(&self) {
         if let Ok(mut state) = self.state.lock() {
@@ -766,6 +904,15 @@ fn is_critical(ty: &AuditEventType) -> bool {
         AuditEventType::OrderFilled
             | AuditEventType::KillSwitchEscalated
             | AuditEventType::CircuitBreakerTripped
+            // Strategy-graph mutations rewrite the quoting behaviour
+            // of the engine — a regulator reconstructing a given
+            // minute of trades needs to know which graph was live,
+            // so the deploy/rollback/reject rows fsync same as a
+            // kill-switch event.
+            | AuditEventType::StrategyGraphDeployed
+            | AuditEventType::StrategyGraphRolledBack
+            | AuditEventType::StrategyGraphDeployRejected
+            | AuditEventType::StrategyGraphSinkFired
     )
 }
 

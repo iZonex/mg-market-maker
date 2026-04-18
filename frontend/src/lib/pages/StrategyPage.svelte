@@ -43,6 +43,11 @@
   let deployStatus = $state('')
   let deployBusy = $state(false)
   let previewResult = $state(null)
+  // Epic H Phase 3 — set when the operator loads a historical hash
+  // from the deploy-history panel. Passed as `?rollback_from=` on
+  // the next deploy so the audit row records intent (rollback vs.
+  // accidental hash match). Cleared after a successful deploy.
+  let rollbackFrom = $state(null)
   let previewBusy = $state(false)
 
   async function loadCatalog() {
@@ -71,21 +76,12 @@
       graphName = g.name
       scopeKind = g.scope.kind
       scopeValue = g.scope.value ?? ''
-      nodes = g.nodes.map((n) => {
-        const entry = catalog.find((c) => c.kind === n.kind)
-        return {
-          id: n.id,
-          type: 'graphNode',
-          position: { x: n.pos?.[0] ?? 0, y: n.pos?.[1] ?? 0 },
-          data: {
-            kind: n.kind,
-            config: n.config ?? {},
-            inputs: entry?.inputs ?? [],
-            outputs: entry?.outputs ?? [],
-            restricted: entry?.restricted ?? false,
-          },
-        }
-      })
+      nodes = g.nodes.map((n) => ({
+        id: n.id,
+        type: 'graphNode',
+        position: { x: n.pos?.[0] ?? 0, y: n.pos?.[1] ?? 0 },
+        data: nodeData(n.kind, n.config),
+      }))
       edges = g.edges.map((e, i) => ({
         id: `e${i}`,
         source: e.from.node,
@@ -112,23 +108,34 @@
     return s
   }
 
+  // Build the `data` blob svelte-flow hands to StrategyNode.svelte.
+  // Centralised so every path that materialises a node (drag/click,
+  // template load, backend reload, rollback) attaches the same
+  // label/group/summary fields and doesn't drift.
+  function nodeData(kind, config) {
+    const entry = catalog.find((c) => c.kind === kind)
+    return {
+      kind,
+      label: entry?.label ?? kind,
+      summary: entry?.summary ?? '',
+      group: entry?.group ?? kind.split('.')[0],
+      config: config ?? {},
+      inputs: entry?.inputs ?? [],
+      outputs: entry?.outputs ?? [],
+      restricted: entry?.restricted ?? false,
+    }
+  }
+
   function addNode(kind, pos) {
-    const id = uuid()
-    const entry = catalog.find(c => c.kind === kind)
+    const entry = catalog.find((c) => c.kind === kind)
     if (!entry) return
     nodes = [
       ...nodes,
       {
-        id,
+        id: uuid(),
         type: 'graphNode',
         position: pos,
-        data: {
-          kind,
-          config: defaultConfigFor(kind),
-          inputs: entry.inputs,
-          outputs: entry.outputs,
-          restricted: entry.restricted,
-        },
+        data: nodeData(kind, defaultConfigFor(kind)),
       },
     ]
   }
@@ -189,8 +196,14 @@
     deployStatus = ''
     try {
       const body = toBackendGraph()
-      const r = await api.postJson('/api/admin/strategy/graph', body)
-      deployStatus = `deployed · hash ${r.hash?.slice(0, 12)}… · ${r.recipients} engines`
+      const path = rollbackFrom
+        ? `/api/admin/strategy/graph?rollback_from=${encodeURIComponent(rollbackFrom)}`
+        : '/api/admin/strategy/graph'
+      const r = await api.postJson(path, body)
+      deployStatus = rollbackFrom
+        ? `rolled back · hash ${r.hash?.slice(0, 12)}… · ${r.recipients} engines`
+        : `deployed · hash ${r.hash?.slice(0, 12)}… · ${r.recipients} engines`
+      rollbackFrom = null
     } catch (e) {
       deployStatus = `deploy failed: ${e}`
     } finally {
@@ -244,21 +257,12 @@
       graphName = g.name
       scopeKind = g.scope.kind
       scopeValue = g.scope.value ?? ''
-      nodes = g.nodes.map(n => {
-        const entry = catalog.find(c => c.kind === n.kind)
-        return {
-          id: n.id,
-          type: 'graphNode',
-          position: { x: n.pos?.[0] ?? 0, y: n.pos?.[1] ?? 0 },
-          data: {
-            kind: n.kind,
-            config: n.config ?? {},
-            inputs: entry?.inputs ?? [],
-            outputs: entry?.outputs ?? [],
-            restricted: entry?.restricted ?? false,
-          },
-        }
-      })
+      nodes = g.nodes.map((n) => ({
+        id: n.id,
+        type: 'graphNode',
+        position: { x: n.pos?.[0] ?? 0, y: n.pos?.[1] ?? 0 },
+        data: nodeData(n.kind, n.config),
+      }))
       edges = g.edges.map((e, i) => ({
         id: `e${i}`,
         source: e.from.node,
@@ -386,7 +390,12 @@
         bind:edges
         {nodeTypes}
         fitView
+        fitViewOptions={{ padding: 0.3, maxZoom: 1, minZoom: 0.85 }}
+        minZoom={0.85}
+        maxZoom={1.5}
+        colorMode="dark"
         onselectionchange={onSelectionChange}
+        proOptions={{ hideAttribution: true }}
       >
         <Background />
         <Controls />
@@ -414,21 +423,12 @@
         graphName = g.name
         scopeKind = g.scope.kind
         scopeValue = g.scope.value ?? ''
-        nodes = g.nodes.map((n) => {
-          const entry = catalog.find((c) => c.kind === n.kind)
-          return {
-            id: n.id,
-            type: 'graphNode',
-            position: { x: n.pos?.[0] ?? 0, y: n.pos?.[1] ?? 0 },
-            data: {
-              kind: n.kind,
-              config: n.config ?? {},
-              inputs: entry?.inputs ?? [],
-              outputs: entry?.outputs ?? [],
-              restricted: entry?.restricted ?? false,
-            },
-          }
-        })
+        nodes = g.nodes.map((n) => ({
+          id: n.id,
+          type: 'graphNode',
+          position: { x: n.pos?.[0] ?? 0, y: n.pos?.[1] ?? 0 },
+          data: nodeData(n.kind, n.config),
+        }))
         edges = g.edges.map((e, i) => ({
           id: `e${i}`,
           source: e.from.node,
@@ -436,6 +436,7 @@
           target: e.to.node,
           targetHandle: e.to.port,
         }))
+        rollbackFrom = hash
         deployStatus = `loaded hash ${hash.slice(0, 8)}… — click Deploy to roll back`
       } catch (e) {
         deployStatus = `rollback fetch failed: ${e}`
@@ -451,38 +452,79 @@
     height: calc(100vh - 57px);
   }
 
+  /* ─── Top bar: one row, one height, one typography scale.
+   *    Every control (input/select/button) is exactly 30px tall,
+   *    every label is 10px monospace uppercase, every gap is s-2.
+   *    That's why nothing "jumps" between fields anymore. ────── */
   .top {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    padding: var(--s-3) var(--s-4);
+    padding: var(--s-2) var(--s-4);
     border-bottom: 1px solid var(--border-subtle);
     background: var(--bg-raised);
-    gap: var(--s-4);
+    gap: var(--s-3);
+    height: 48px;
+    flex-shrink: 0;
   }
-  .left-chunk { display: flex; gap: var(--s-3); align-items: flex-end; }
-  .right-chunk { display: flex; gap: var(--s-3); align-items: center; }
-  .field { display: flex; flex-direction: column; gap: 2px; font-size: var(--fs-xs); color: var(--fg-secondary); }
-  .field.inline select { min-width: 180px; }
-  .field-label { font-size: var(--fs-xs); color: var(--fg-muted); text-transform: uppercase; letter-spacing: var(--tracking-label); }
+  .left-chunk, .right-chunk {
+    display: flex; gap: var(--s-2); align-items: center; flex: 0 0 auto;
+  }
+  .divider {
+    width: 1px; height: 22px;
+    background: var(--border-subtle); margin: 0 var(--s-2);
+  }
+  .field {
+    display: flex; align-items: center; gap: var(--s-2);
+    height: 30px;
+  }
+  .field-label {
+    font-family: var(--font-mono);
+    font-size: 10px; line-height: 1;
+    color: var(--fg-muted);
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-label);
+  }
   .field input, .field select {
-    padding: var(--s-2) var(--s-3);
+    height: 30px;
+    padding: 0 var(--s-3);
     background: var(--bg-base); border: 1px solid var(--border-subtle);
-    border-radius: var(--r-md); color: var(--fg-primary);
-    font-family: var(--font-sans); font-size: var(--fs-sm);
-    min-width: 160px;
+    border-radius: var(--r-sm); color: var(--fg-primary);
+    font-family: var(--font-mono); font-size: 12px; line-height: 30px;
   }
-  .status { font-size: var(--fs-xs); color: var(--fg-muted); font-family: var(--font-mono); }
+  .field input { width: 140px; }
+  .field select { min-width: 120px; }
+  .field input:focus, .field select:focus {
+    outline: none; border-color: var(--accent);
+  }
+  .status {
+    height: 30px; display: flex; align-items: center;
+    padding: 0 var(--s-3);
+    font-family: var(--font-mono); font-size: 11px;
+    color: var(--fg-muted);
+    max-width: 260px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   .btn {
-    display: inline-flex; align-items: center; gap: var(--s-2);
-    padding: var(--s-2) var(--s-4);
+    display: inline-flex; align-items: center; justify-content: center;
+    gap: var(--s-2);
+    height: 30px;
+    padding: 0 var(--s-3);
     background: var(--accent-dim); color: var(--accent);
     border: 1px solid var(--accent);
-    border-radius: var(--r-md); cursor: pointer;
-    font-size: var(--fs-sm); font-weight: 500;
+    border-radius: var(--r-sm); cursor: pointer;
+    font-family: var(--font-sans); font-size: 12px; font-weight: 500;
+    line-height: 1;
+  }
+  .btn.ghost {
+    background: transparent; color: var(--fg-secondary);
+    border-color: var(--border-strong);
+  }
+  .btn.ghost:hover:not(:disabled) {
+    color: var(--accent); border-color: var(--accent);
   }
   .btn:hover:not(:disabled) { background: var(--accent); color: var(--bg-base); }
-  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
   .preview-bar {
     display: flex; align-items: center; flex-wrap: wrap; gap: var(--s-2);

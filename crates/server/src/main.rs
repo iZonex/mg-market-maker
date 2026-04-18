@@ -311,6 +311,10 @@ async fn main() -> Result<()> {
     // `AuditLog::new` path used when the engine initialises
     // its risk subsystem.
     dashboard_state.set_audit_log_path(std::path::PathBuf::from("data/audit.jsonl"));
+    // Epic H Phase 3 — shared AuditLog instance for the dashboard's
+    // deploy / rollback / reject rows. Reuses the same Arc auth uses
+    // so writers stay on one hash-chained timeline.
+    dashboard_state.set_audit_log(shared_audit.clone());
     // A1 — HMAC secret for report manifests. Sourced from
     // `MM_REPORT_SECRET` env; falls back to a process-scoped
     // default (marked unsigned) when unset.

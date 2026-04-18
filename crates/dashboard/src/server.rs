@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderValue, Method};
 use axum::middleware;
 use axum::routing::{get, post};
@@ -864,13 +864,37 @@ async fn admin_sentiment_headline(
 //      engines that don't match silently skip.
 //   4. respond with `{ hash, recipients }`.
 
+/// `?rollback_from=<prev_hash>` query parameter distinguishes a
+/// rollback-to-a-known-historical-version from a fresh forward
+/// deploy. The server can derive the fact itself (prev live hash
+/// != new hash) but rollback is *intent* — the UI flags it so the
+/// audit row tells regulators it was a deliberate reversion rather
+/// than a rewrite that happened to match an old hash.
+#[derive(serde::Deserialize)]
+struct DeployQuery {
+    #[serde(default)]
+    rollback_from: Option<String>,
+}
+
 async fn admin_deploy_strategy_graph(
     State(state): State<DashboardState>,
+    Query(q): Query<DeployQuery>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
+
+    // Operator identity from the auth layer's request header
+    // (set by the auth middleware). Falls back to "unknown" if
+    // the header is absent — the admin router enforces admin
+    // role via a layer so the endpoint shouldn't reach this point
+    // anonymously, but we don't want a panic on header drift.
+    let operator = headers
+        .get("X-MM-User")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
 
     // Parse + validate.
     let graph = match mm_strategy_graph::Graph::from_json(&body) {
@@ -898,6 +922,45 @@ async fn admin_deploy_strategy_graph(
             .into_response();
     }
 
+    // Restricted-kind gate. `MM_RESTRICTED_ALLOW=1` opts in
+    // deploying graphs that reference pentest-only nodes; any
+    // other value (including the default absent case) refuses the
+    // deploy and emits an audit row so regulators can confirm the
+    // gate actually fired. Intentional no-config default: prod
+    // must be explicit about enabling.
+    let allow_restricted = std::env::var("MM_RESTRICTED_ALLOW")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !allow_restricted {
+        let offenders: Vec<String> = graph
+            .nodes
+            .iter()
+            .filter(|n| {
+                mm_strategy_graph::catalog::shape(&n.kind)
+                    .map(|s| s.restricted)
+                    .unwrap_or(false)
+            })
+            .map(|n| n.kind.clone())
+            .collect();
+        if !offenders.is_empty() {
+            let reason = format!(
+                "restricted nodes without MM_RESTRICTED_ALLOW: {}",
+                offenders.join(",")
+            );
+            if let Some(audit) = state.audit_log() {
+                audit.strategy_graph_deploy_rejected(&graph.name, &reason, &operator);
+            }
+            return (
+                StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({
+                    "error": "restricted",
+                    "detail": reason,
+                })),
+            )
+                .into_response();
+        }
+    }
+
     let Some(store) = state.strategy_graph_store() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -907,17 +970,6 @@ async fn admin_deploy_strategy_graph(
         )
             .into_response();
     };
-
-    // Operator identity from the auth layer's request header
-    // (set by the auth middleware). Falls back to "unknown" if
-    // the header is absent — the admin router enforces admin
-    // role via a layer so the endpoint shouldn't reach this point
-    // anonymously, but we don't want a panic on header drift.
-    let operator = headers
-        .get("X-MM-User")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
 
     let hash = match store.save(&graph, Some(&operator)) {
         Ok(h) => h,
@@ -933,15 +985,42 @@ async fn admin_deploy_strategy_graph(
         }
     };
 
+    // Scope key string — compact, matches the form the engine uses
+    // when routing ConfigOverride messages.
+    let scope_key = match &graph.scope {
+        mm_strategy_graph::Scope::Symbol(s) => format!("Symbol({s})"),
+        mm_strategy_graph::Scope::AssetClass(c) => format!("AssetClass({c})"),
+        mm_strategy_graph::Scope::Client(c) => format!("Client({c})"),
+        mm_strategy_graph::Scope::Global => "Global".to_string(),
+    };
+
     // Broadcast. ConfigOverride clones are cheap (String body).
     let recipients = state.broadcast_config_override(
         crate::state::ConfigOverride::StrategyGraphSwap(body.clone()),
     );
+
+    // Audit trail — rollback (if flagged by the UI) precedes the
+    // deploy row so a grepper who reads top-to-bottom sees intent
+    // before result.
+    if let Some(audit) = state.audit_log() {
+        if let Some(from_hash) = q.rollback_from.as_deref() {
+            audit.strategy_graph_rolled_back(&graph.name, from_hash, &hash, &operator);
+        }
+        audit.strategy_graph_deployed(
+            &graph.name,
+            &hash,
+            &scope_key,
+            &operator,
+            recipients,
+        );
+    }
+
     tracing::info!(
         name = %graph.name,
         hash = %hash,
         recipients,
         operator = %operator,
+        rollback_from = ?q.rollback_from,
         "strategy graph deployed"
     );
 

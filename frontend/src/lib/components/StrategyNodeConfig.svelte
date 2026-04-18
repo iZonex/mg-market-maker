@@ -12,7 +12,22 @@
   let { node, onUpdate, onDelete } = $props()
 
   const kind = $derived(node?.data?.kind ?? '')
+  const label = $derived(node?.data?.label ?? kind)
+  const summary = $derived(node?.data?.summary ?? '')
   const cfg = $derived(node?.data?.config ?? {})
+  const hasConfig = $derived(configurableKinds.has(kind))
+
+  // Kinds whose `from_config` accepts user-authored fields; anything
+  // else just shows the header + delete so the panel doesn't fake
+  // configurability the node can't honour.
+  const configurableKinds = new Set([
+    'Stats.EWMA', 'Math.Const', 'Cast.ToBool', 'Cast.StrategyEq',
+    'Cast.PairClassEq', 'Risk.ToxicityWiden', 'Risk.InventoryUrgency',
+    'Risk.CircuitBreaker', 'Indicator.SMA', 'Indicator.EMA',
+    'Indicator.HMA', 'Indicator.RSI', 'Indicator.ATR',
+    'Indicator.Bollinger', 'Exec.TwapConfig', 'Exec.VwapConfig',
+    'Exec.PovConfig', 'Exec.IcebergConfig',
+  ])
 
   function update(field, v) {
     const next = { ...cfg, [field]: v }
@@ -21,21 +36,16 @@
 </script>
 
 <div class="pane">
-  <header>
-    <span class="label">Node config</span>
-  </header>
-
   {#if !node}
+    <header>
+      <span class="title">Node config</span>
+    </header>
     <div class="empty">Select a node on the canvas to edit its config.</div>
   {:else}
-    <div class="meta">
-      <div class="meta-row"><span>Kind</span><code>{kind}</code></div>
-      <div class="meta-row"><span>ID</span><code class="small">{node.id.slice(0, 8)}…</code></div>
-      <div class="meta-row">
-        <span>Ports</span>
-        <code class="small">{node.data.inputs.length} in · {node.data.outputs.length} out</code>
-      </div>
-    </div>
+    <header class="node-head">
+      <span class="kind-label">{label}</span>
+      {#if summary}<span class="kind-summary">{summary}</span>{/if}
+    </header>
 
     {#if kind === 'Stats.EWMA'}
       <label class="field">
@@ -194,33 +204,39 @@
         <input type="text" value={cfg.display_qty ?? '0.1'}
           oninput={(e) => update('display_qty', e.currentTarget.value)} />
       </label>
-    {:else}
-      <div class="muted small">This node has no config parameters.</div>
+    {:else if !hasConfig}
+      <div class="muted small">No parameters — this node takes its values from the engine.</div>
     {/if}
 
     <div class="actions">
-      <button type="button" class="btn danger" onclick={onDelete}>Delete node</button>
+      <button type="button" class="btn danger" onclick={onDelete}>
+        Delete node
+      </button>
     </div>
   {/if}
 </div>
 
 <style>
   .pane { padding: var(--s-3); display: flex; flex-direction: column; gap: var(--s-3); }
-  header .label {
-    font-size: var(--fs-xs); text-transform: uppercase;
-    letter-spacing: var(--tracking-label); color: var(--fg-primary); font-weight: 600;
+  header .title {
+    font-size: 11px; text-transform: uppercase;
+    letter-spacing: var(--tracking-label); color: var(--fg-muted); font-weight: 600;
+  }
+  .node-head {
+    display: flex; flex-direction: column; gap: 3px;
+    padding-bottom: var(--s-2);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .kind-label {
+    font-family: var(--font-sans); font-size: 14px; font-weight: 600;
+    color: var(--fg-primary);
+  }
+  .kind-summary {
+    font-family: var(--font-sans); font-size: 11px; line-height: 1.4;
+    color: var(--fg-muted);
   }
   .empty, .muted { color: var(--fg-muted); font-size: var(--fs-xs); }
   .small { font-size: var(--fs-2xs); }
-  .meta { display: flex; flex-direction: column; gap: 2px; padding: var(--s-2) 0; }
-  .meta-row {
-    display: flex; justify-content: space-between; align-items: center;
-    font-size: var(--fs-xs); color: var(--fg-muted);
-    padding: var(--s-2) 0;
-    border-bottom: 1px solid var(--border-subtle);
-  }
-  .meta-row span { text-transform: uppercase; letter-spacing: var(--tracking-label); }
-  .meta-row code { font-family: var(--font-mono); color: var(--fg-primary); }
 
   .field { display: flex; flex-direction: column; gap: 2px; }
   .field span { font-size: var(--fs-2xs); color: var(--fg-muted); text-transform: uppercase; letter-spacing: var(--tracking-label); }

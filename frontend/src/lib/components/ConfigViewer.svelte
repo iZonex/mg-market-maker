@@ -19,6 +19,7 @@
   const api = createApiClient(auth)
 
   let snapshot = $state(null)
+  let activeGraphs = $state([])
   let error = $state('')
   let loading = $state(true)
   let expanded = $state(false)
@@ -34,9 +35,26 @@
     } finally {
       loading = false
     }
+    // Graph-store may be disabled (503) on deployments without
+    // strategy graphs — swallow that cleanly so the main config
+    // viewer still renders.
+    try {
+      activeGraphs = await api.getJson('/api/v1/strategy/active')
+    } catch {
+      activeGraphs = []
+    }
   }
 
   $effect(() => { load() })
+
+  function fmtTs(t) {
+    if (!t) return '—'
+    try {
+      return new Date(t).toLocaleString()
+    } catch {
+      return t
+    }
+  }
 
   // Optional top-level sections we surface as "wired / not wired"
   // chips. Each entry is [label, key, hint]. The backend hands
@@ -131,6 +149,25 @@
           <span class="row-value">{loansCount()} configured</span>
         </div>
       </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Active strategy graphs</div>
+      {#if activeGraphs.length === 0}
+        <div class="note">No live graphs — engine is running default strategy config.</div>
+      {:else}
+        <div class="rows">
+          {#each activeGraphs as g (g.hash)}
+            <div class="row">
+              <span class="row-label">{g.name}</span>
+              <span class="row-value">
+                <code class="mono">{g.scope}</code>
+                <span class="muted"> · {g.hash.slice(0, 12)}… · {fmtTs(g.deployed_at)} · {g.operator}</span>
+              </span>
+            </div>
+          {/each}
+        </div>
+      {/if}
     </div>
 
     <div class="section">

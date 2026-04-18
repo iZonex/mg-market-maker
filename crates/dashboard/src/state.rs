@@ -172,6 +172,13 @@ struct StateInner {
     /// HTTP handlers treat `None` as "strategy graphs
     /// disabled on this deployment" and return 503.
     strategy_graph_store: Option<std::sync::Arc<mm_strategy_graph::GraphStore>>,
+    /// Epic H Phase 3 — shared audit sink the dashboard uses to
+    /// record deploy / rollback / reject events on the same
+    /// hash-chained timeline as order-lifecycle + risk rows.
+    /// `None` for tests / headless callers; real boot registers
+    /// the `Arc<AuditLog>` that `AuthState` and the engines also
+    /// share, so all writers append into one file.
+    audit_log: Option<std::sync::Arc<mm_risk::audit::AuditLog>>,
     /// Latest per-symbol margin ratio (Epic 40.4). Published by
     /// the engine's `MarginGuard` poll each
     /// `refresh_interval_secs`. Surfaced on the dashboard so
@@ -763,6 +770,14 @@ impl DashboardState {
 
     /// Epic H — register the disk-backed graph store. Called once
     /// from server boot. HTTP handlers 503 until this is set.
+    pub fn set_audit_log(&self, log: std::sync::Arc<mm_risk::audit::AuditLog>) {
+        self.inner.write().unwrap().audit_log = Some(log);
+    }
+
+    pub fn audit_log(&self) -> Option<std::sync::Arc<mm_risk::audit::AuditLog>> {
+        self.inner.read().unwrap().audit_log.clone()
+    }
+
     pub fn set_strategy_graph_store(&self, store: std::sync::Arc<mm_strategy_graph::GraphStore>) {
         self.inner.write().unwrap().strategy_graph_store = Some(store);
     }

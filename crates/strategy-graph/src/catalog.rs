@@ -113,6 +113,92 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
     }
 }
 
+/// Human-facing metadata for a catalog kind — used by the UI
+/// palette + the in-canvas node label. Keeping this next to the
+/// existing `build`/`shape` switch means any new kind added to the
+/// catalog gets a compile-time shove to fill in its `meta` arm
+/// too, because the `kinds()` snapshot test below flags missing
+/// entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeMeta {
+    /// Short readable name, no prefix (`"Constant"`, not `"Math.Const"`).
+    pub label: &'static str,
+    /// One-line description of what the node produces / does.
+    pub summary: &'static str,
+    /// Palette grouping bucket — broader than `kind.split('.').0`:
+    /// e.g. `"Sources"` bundles Book + Sentiment + Volatility so the
+    /// operator sees them in one place.
+    pub group: &'static str,
+}
+
+/// Lookup for [`NodeMeta`]. Unknown kinds fall back to a synthesised
+/// meta derived from the kind name (used only if a catalog entry was
+/// added without updating this table — defensive).
+pub fn meta(kind: &str) -> NodeMeta {
+    match kind {
+        // Sources — pull live data from the engine.
+        "Book.L1"              => NodeMeta { label: "L1 book",             summary: "Top-of-book bid/ask price + size", group: "Sources" },
+        "Sentiment.Rate"       => NodeMeta { label: "Sentiment rate",      summary: "Social mentions per minute (source asset)", group: "Sources" },
+        "Sentiment.Score"      => NodeMeta { label: "Sentiment score",     summary: "Weighted polarity score [-1..1]", group: "Sources" },
+        "Volatility.Realised"  => NodeMeta { label: "Realised volatility", summary: "EWMA realised vol (annualised)", group: "Sources" },
+        "Toxicity.VPIN"        => NodeMeta { label: "VPIN",                summary: "Volume-synchronised probability of informed trading", group: "Sources" },
+        "Momentum.OFIZ"        => NodeMeta { label: "OFI z-score",         summary: "Order-flow imbalance standardised", group: "Sources" },
+        "Signal.ImbalanceDepth"=> NodeMeta { label: "Book imbalance",      summary: "L1 depth imbalance [-1..1]", group: "Sources" },
+        "Signal.TradeFlow"     => NodeMeta { label: "Trade flow",          summary: "Signed volume over a rolling window", group: "Sources" },
+        "Signal.Microprice"    => NodeMeta { label: "Microprice",          summary: "Quantity-weighted mid-price", group: "Sources" },
+        "Toxicity.KyleLambda"  => NodeMeta { label: "Kyle's lambda",       summary: "Price impact per unit signed volume", group: "Sources" },
+        "Regime.Detector"      => NodeMeta { label: "Regime",              summary: "Current market regime (trend / mean-revert / chop)", group: "Sources" },
+        "Strategy.Active"      => NodeMeta { label: "Active strategy",     summary: "Which strategy is running (Avellaneda / GLFT / …)", group: "Sources" },
+        "PairClass.Current"    => NodeMeta { label: "Pair class",          summary: "Major / meme / stable / perp classification", group: "Sources" },
+        "Risk.MarginRatio"     => NodeMeta { label: "Margin ratio",        summary: "Used-margin / equity", group: "Sources" },
+        "Risk.OTR"             => NodeMeta { label: "Order-to-trade ratio",summary: "Surveillance OTR metric", group: "Sources" },
+        "Inventory.Level"      => NodeMeta { label: "Inventory level",     summary: "Current net position size", group: "Sources" },
+
+        // Indicators — technical.
+        "Indicator.SMA"        => NodeMeta { label: "SMA",                 summary: "Simple moving average over N samples", group: "Indicators" },
+        "Indicator.EMA"        => NodeMeta { label: "EMA",                 summary: "Exponential moving average", group: "Indicators" },
+        "Indicator.HMA"        => NodeMeta { label: "HMA",                 summary: "Hull moving average", group: "Indicators" },
+        "Indicator.RSI"        => NodeMeta { label: "RSI",                 summary: "Relative strength index [0..100]", group: "Indicators" },
+        "Indicator.ATR"        => NodeMeta { label: "ATR",                 summary: "Average true range", group: "Indicators" },
+        "Indicator.Bollinger"  => NodeMeta { label: "Bollinger bands",     summary: "SMA ± k·stddev envelope", group: "Indicators" },
+
+        // Math / stats / logic — generic combinators.
+        "Math.Add"             => NodeMeta { label: "Add",                 summary: "a + b", group: "Math" },
+        "Math.Mul"             => NodeMeta { label: "Multiply",            summary: "a × b", group: "Math" },
+        "Math.Const"           => NodeMeta { label: "Constant",            summary: "Literal number", group: "Math" },
+        "Stats.EWMA"           => NodeMeta { label: "EWMA",                summary: "Exponential moving average (α)", group: "Math" },
+        "Logic.And"             => NodeMeta { label: "AND",                summary: "Boolean AND", group: "Logic" },
+        "Logic.Mux"             => NodeMeta { label: "Mux (number)",       summary: "Pick a or b by a boolean selector", group: "Logic" },
+        "Logic.StringMux"       => NodeMeta { label: "Mux (string)",       summary: "Pick a or b (string) by a boolean selector", group: "Logic" },
+        "Cast.ToBool"          => NodeMeta { label: "To bool",             summary: "Threshold a number into a bool", group: "Logic" },
+        "Cast.StrategyEq"      => NodeMeta { label: "Strategy == ?",       summary: "True when active strategy matches target", group: "Logic" },
+        "Cast.PairClassEq"     => NodeMeta { label: "Pair class == ?",     summary: "True when pair class matches target", group: "Logic" },
+
+        // Risk layer — attenuators/amplifiers applied to downstream sinks.
+        "Risk.ToxicityWiden"   => NodeMeta { label: "Widen on toxicity",   summary: "Scale spread by 1 + scale·vpin", group: "Risk" },
+        "Risk.InventoryUrgency"=> NodeMeta { label: "Inventory urgency",   summary: "Power-scale by |inv|/cap", group: "Risk" },
+        "Risk.CircuitBreaker"  => NodeMeta { label: "Wide-spread breaker", summary: "Fire if spread exceeds threshold (bps)", group: "Risk" },
+
+        // Exec policies — feed Out.Flatten's policy port.
+        "Exec.TwapConfig"      => NodeMeta { label: "TWAP policy",         summary: "Time-weighted execution (duration + slices)", group: "Exec" },
+        "Exec.VwapConfig"      => NodeMeta { label: "VWAP policy",         summary: "Volume-weighted execution (duration)", group: "Exec" },
+        "Exec.PovConfig"       => NodeMeta { label: "POV policy",          summary: "Percentage-of-volume execution", group: "Exec" },
+        "Exec.IcebergConfig"   => NodeMeta { label: "Iceberg policy",      summary: "Iceberg execution (display qty)", group: "Exec" },
+
+        // Sinks — always fire on a trigger, consumed by the engine.
+        "Out.SpreadMult"       => NodeMeta { label: "Spread multiplier",   summary: "Final spread scalar applied to quotes", group: "Sinks" },
+        "Out.SizeMult"         => NodeMeta { label: "Size multiplier",     summary: "Final size scalar applied to quotes", group: "Sinks" },
+        "Out.KillEscalate"     => NodeMeta { label: "Kill-switch escalate",summary: "Raise kill level with a reason", group: "Sinks" },
+        "Out.Flatten"          => NodeMeta { label: "Flatten position",    summary: "Fire L4 flatten with the given exec policy", group: "Sinks" },
+
+        // Defensive fallback — every catalog kind should have its own
+        // arm above. If a new kind sneaks in without a meta entry,
+        // the kinds-snapshot test `every_kind_has_nontrivial_meta`
+        // catches it in CI.
+        _ => NodeMeta { label: "Unknown", summary: "", group: "Misc" },
+    }
+}
+
 /// Shape-only lookup. We instantiate a default version of the node
 /// just to read its declared ports; configurable nodes provide a
 /// `Default` that has the canonical shape.
@@ -235,6 +321,21 @@ mod tests {
             assert!(
                 build(k, &null).is_some(),
                 "catalog key {k} failed to build"
+            );
+        }
+    }
+
+    #[test]
+    fn every_kind_has_nontrivial_meta() {
+        for (kind, _) in kinds() {
+            let m = meta(kind);
+            assert!(
+                !m.label.is_empty() && m.label != "Unknown",
+                "kind {kind} is missing a human label in catalog::meta"
+            );
+            assert!(
+                !m.group.is_empty() && m.group != "Misc",
+                "kind {kind} is missing a palette group in catalog::meta"
             );
         }
     }

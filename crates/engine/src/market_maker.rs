@@ -402,6 +402,11 @@ pub struct MarketMakerEngine {
     /// Epic H — stable name of the deployed graph (for audit + metrics
     /// labels). `None` when no graph is attached.
     strategy_graph_name: Option<String>,
+    /// Epic H Phase 3 — content hash (SHA-256) of the active graph,
+    /// cached at deploy time. Attached to every sink-provenance
+    /// audit row so regulators can join a live kill-switch escalation
+    /// back to the canonical graph snapshot in `history/{hash}.json`.
+    strategy_graph_hash: Option<String>,
     /// Epic H — graph scope cached at `with_strategy_graph` /
     /// `swap_strategy_graph` so the per-tick source marshaller
     /// knows which asset to pull sentiment for without re-reading
@@ -768,6 +773,7 @@ impl MarketMakerEngine {
             social_skew_bps: Decimal::ZERO,
             strategy_graph: None,
             strategy_graph_name: None,
+            strategy_graph_hash: None,
             strategy_graph_scope: None,
             margin_guard: config.margin.as_ref().map(|m| {
                 MarginGuard::new(MarginGuardThresholds::from_config(m))
@@ -1365,6 +1371,7 @@ impl MarketMakerEngine {
         let ev = mm_strategy_graph::Evaluator::build(graph)?;
         self.strategy_graph = Some(ev);
         self.strategy_graph_name = Some(graph.name.clone());
+        self.strategy_graph_hash = Some(graph.content_hash());
         self.strategy_graph_scope = Some(graph.scope.clone());
         Ok(self)
     }
@@ -1381,6 +1388,7 @@ impl MarketMakerEngine {
         let ev = mm_strategy_graph::Evaluator::build(graph)?;
         self.strategy_graph = Some(ev);
         self.strategy_graph_name = Some(graph.name.clone());
+        self.strategy_graph_hash = Some(graph.content_hash());
         self.strategy_graph_scope = Some(graph.scope.clone());
         self.audit.risk_event(
             &self.symbol,
@@ -1633,6 +1641,16 @@ impl MarketMakerEngine {
                         mm_risk::audit::AuditEventType::KillSwitchEscalated,
                         &format!("graph L{level}: {reason}"),
                     );
+                    // Phase 3 — provenance row with the graph hash so
+                    // regulators can join this kill back to the exact
+                    // authored JSON in history/{hash}.json.
+                    if let Some(hash) = self.strategy_graph_hash.as_deref() {
+                        self.audit.strategy_graph_sink_fired(
+                            &self.symbol,
+                            &format!("KillEscalate {{ level: {level}, reason: {reason:?} }}"),
+                            hash,
+                        );
+                    }
                     error!(
                         symbol = %self.symbol,
                         graph = self.strategy_graph_name.as_deref().unwrap_or("?"),
@@ -1657,6 +1675,13 @@ impl MarketMakerEngine {
                         mm_risk::audit::AuditEventType::KillSwitchEscalated,
                         &format!("graph L4 flatten policy={policy}"),
                     );
+                    if let Some(hash) = self.strategy_graph_hash.as_deref() {
+                        self.audit.strategy_graph_sink_fired(
+                            &self.symbol,
+                            &format!("Flatten {{ policy: {policy:?} }}"),
+                            hash,
+                        );
+                    }
                     error!(
                         symbol = %self.symbol,
                         graph = self.strategy_graph_name.as_deref().unwrap_or("?"),

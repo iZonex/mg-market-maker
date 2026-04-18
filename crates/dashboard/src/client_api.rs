@@ -56,6 +56,7 @@ pub fn client_routes() -> Router<DashboardState> {
         .route("/api/v1/strategy/graphs", get(list_strategy_graphs))
         .route("/api/v1/strategy/graphs/{name}", get(get_strategy_graph))
         .route("/api/v1/strategy/deploys", get(list_strategy_deploys))
+        .route("/api/v1/strategy/active", get(list_strategy_active))
         .route("/api/v1/strategy/templates", get(list_strategy_templates))
         .route("/api/v1/strategy/templates/{name}", get(get_strategy_template))
         .route(
@@ -855,6 +856,9 @@ async fn get_monthly_pdf(
 #[derive(Serialize)]
 struct CatalogEntry {
     kind: String,
+    label: String,
+    summary: String,
+    group: String,
     inputs: Vec<CatalogPort>,
     outputs: Vec<CatalogPort>,
     restricted: bool,
@@ -869,25 +873,31 @@ struct CatalogPort {
 async fn get_strategy_catalog() -> Json<Vec<CatalogEntry>> {
     let entries = mm_strategy_graph::catalog::kinds()
         .into_iter()
-        .map(|(kind, shape)| CatalogEntry {
-            kind: kind.to_string(),
-            inputs: shape
-                .inputs
-                .into_iter()
-                .map(|(name, ty)| CatalogPort {
-                    name,
-                    ty: format!("{ty:?}"),
-                })
-                .collect(),
-            outputs: shape
-                .outputs
-                .into_iter()
-                .map(|(name, ty)| CatalogPort {
-                    name,
-                    ty: format!("{ty:?}"),
-                })
-                .collect(),
-            restricted: shape.restricted,
+        .map(|(kind, shape)| {
+            let m = mm_strategy_graph::catalog::meta(kind);
+            CatalogEntry {
+                kind: kind.to_string(),
+                label: m.label.to_string(),
+                summary: m.summary.to_string(),
+                group: m.group.to_string(),
+                inputs: shape
+                    .inputs
+                    .into_iter()
+                    .map(|(name, ty)| CatalogPort {
+                        name,
+                        ty: format!("{ty:?}"),
+                    })
+                    .collect(),
+                outputs: shape
+                    .outputs
+                    .into_iter()
+                    .map(|(name, ty)| CatalogPort {
+                        name,
+                        ty: format!("{ty:?}"),
+                    })
+                    .collect(),
+                restricted: shape.restricted,
+            }
         })
         .collect();
     Json(entries)
@@ -1105,6 +1115,45 @@ async fn list_strategy_deploys(
         Ok(records) => (StatusCode::OK, Json(records)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// `/api/v1/strategy/active` — a compliance-flavoured view of
+/// [`list_strategy_deploys`] that folds the log down to **one row
+/// per (name, scope)** showing the latest hash. Regulators and the
+/// Settings UI care about "what's live *right now*" — full history
+/// is already at `/deploys`. Folding happens server-side so the UI
+/// never misrepresents the ground truth.
+async fn list_strategy_active(
+    State(state): State<DashboardState>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let Some(store) = state.strategy_graph_store() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "strategy graphs not configured")
+            .into_response();
+    };
+    let records = match store.deploys() {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let mut active: std::collections::HashMap<
+        (String, String),
+        mm_strategy_graph::DeployRecord,
+    > = std::collections::HashMap::new();
+    for rec in records {
+        let key = (rec.name.clone(), rec.scope.clone());
+        active
+            .entry(key)
+            .and_modify(|cur| {
+                if rec.deployed_at > cur.deployed_at {
+                    *cur = rec.clone();
+                }
+            })
+            .or_insert(rec);
+    }
+    let mut out: Vec<_> = active.into_values().collect();
+    out.sort_by(|a, b| b.deployed_at.cmp(&a.deployed_at));
+    (StatusCode::OK, Json(out)).into_response()
 }
 
 // ── Epic G — sentiment snapshot for UI ─────────────────────

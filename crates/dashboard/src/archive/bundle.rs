@@ -89,6 +89,53 @@ pub fn build_zip(req: BundleRequest<'_>) -> anyhow::Result<BundleOutput> {
             zip.write_all(b"\n")?;
         }
 
+        // Epic H Phase 3 — strategy-graph provenance. Regulators
+        // reconstructing a minute of trades need the authored graph
+        // for every hash that ever went live in the period. We ship:
+        //   strategy_graphs/deploys.jsonl     — DeployRecords in range
+        //   strategy_graphs/snapshots/{hash}.json — canonical JSON
+        // so a single bundle is enough to join audit events (which
+        // carry the same hash) back to the intent.
+        if let Some(store) = req.state.strategy_graph_store() {
+            if let Ok(records) = store.deploys() {
+                let from_ts = req.from.and_hms_opt(0, 0, 0)
+                    .map(|dt| dt.and_utc());
+                let to_ts = req.to
+                    .succ_opt()
+                    .and_then(|d| d.and_hms_opt(0, 0, 0))
+                    .map(|dt| dt.and_utc());
+                let in_range: Vec<_> = records
+                    .into_iter()
+                    .filter(|r| {
+                        from_ts.is_some_and(|f| r.deployed_at >= f)
+                            && to_ts.is_some_and(|t| r.deployed_at < t)
+                    })
+                    .collect();
+                zip.start_file("strategy_graphs/deploys.jsonl", opt)?;
+                for rec in &in_range {
+                    zip.write_all(serde_json::to_string(rec)?.as_bytes())?;
+                    zip.write_all(b"\n")?;
+                }
+                // Deduplicate hashes so the bundle is compact.
+                let mut seen = std::collections::HashSet::new();
+                for rec in &in_range {
+                    if !seen.insert((rec.name.clone(), rec.hash.clone())) {
+                        continue;
+                    }
+                    if let Ok(graph) = store.load_by_hash(&rec.name, &rec.hash) {
+                        let body = serde_json::to_string_pretty(&graph)
+                            .unwrap_or_default();
+                        let path = format!(
+                            "strategy_graphs/snapshots/{hash}.json",
+                            hash = rec.hash
+                        );
+                        zip.start_file(path, opt)?;
+                        zip.write_all(body.as_bytes())?;
+                    }
+                }
+            }
+        }
+
         zip.start_file("manifest.json", opt)?;
         zip.write_all(serde_json::to_string_pretty(&manifest)?.as_bytes())?;
 
