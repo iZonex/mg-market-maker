@@ -1520,6 +1520,47 @@ impl MarketMakerEngine {
                     };
                     Some(Box::new(mm_strategy::spoof::SpoofStrategy::with_config(spoof_cfg)))
                 }
+                "Strategy.Wash" => {
+                    let cfg = &n.config;
+                    let parse_dec = |k: &str, default: rust_decimal::Decimal| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(default)
+                    };
+                    let wash_cfg = mm_strategy::wash::WashConfig {
+                        leg_size: parse_dec("leg_size", dec!(0.001)),
+                        offset_bps: parse_dec("offset_bps", dec!(0)),
+                    };
+                    Some(Box::new(mm_strategy::wash::WashStrategy::with_config(wash_cfg)))
+                }
+                "Strategy.Ignite" => {
+                    use mm_common::types::Side;
+                    let cfg = &n.config;
+                    let parse_dec = |k: &str, default: rust_decimal::Decimal| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(default)
+                    };
+                    let parse_i64 = |k: &str, default: i64| {
+                        cfg.get(k).and_then(|v| v.as_i64()).unwrap_or(default)
+                    };
+                    let push_side = match cfg.get("push_side").and_then(|v| v.as_str()) {
+                        Some("sell") => Side::Sell,
+                        _ => Side::Buy,
+                    };
+                    let ignite_cfg = mm_strategy::ignite::IgniteConfig {
+                        push_side,
+                        burst_size: parse_dec("burst_size", dec!(0.001)),
+                        cross_depth_bps: parse_dec("cross_depth_bps", dec!(30)),
+                        burst_ticks: parse_i64("burst_ticks", 5) as u64,
+                        rest_ticks: parse_i64("rest_ticks", 3) as u64,
+                    };
+                    Some(Box::new(
+                        mm_strategy::ignite::IgniteStrategy::with_config(ignite_cfg),
+                    ))
+                }
                 _ => None,
             };
             if let Some(s) = built {

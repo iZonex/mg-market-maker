@@ -165,6 +165,124 @@ impl NodeKind for BasisArb {
     }
 }
 
+/// `Strategy.Wash` — pentest, emits buy+sell pair at the same
+/// price every tick.
+#[derive(Debug, Default)]
+pub struct Wash;
+
+impl NodeKind for Wash {
+    fn kind(&self) -> &'static str {
+        "Strategy.Wash"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &[]
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUOTES_OUT
+    }
+    fn restricted(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<ConfigField> {
+        vec![
+            ConfigField {
+                name: "leg_size",
+                label: "Leg size",
+                hint: Some("Per-leg order qty (same on buy + sell)"),
+                default: serde_json::json!("0.001"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+            ConfigField {
+                name: "offset_bps",
+                label: "Offset from mid (bps)",
+                hint: Some("0 = trade at mid (most visible)"),
+                default: serde_json::json!("0"),
+                widget: ConfigWidget::Number { min: Some(-200.0), max: Some(200.0), step: Some(1.0) },
+            },
+        ]
+    }
+}
+
+/// `Strategy.Ignite` — pentest, burst aggressive cross-through
+/// orders for N ticks then rest.
+#[derive(Debug, Default)]
+pub struct Ignite;
+
+impl NodeKind for Ignite {
+    fn kind(&self) -> &'static str {
+        "Strategy.Ignite"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &[]
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUOTES_OUT
+    }
+    fn restricted(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<ConfigField> {
+        vec![
+            ConfigField {
+                name: "push_side",
+                label: "Push side",
+                hint: Some("Buy forces price up, Sell forces it down"),
+                default: serde_json::json!("buy"),
+                widget: ConfigWidget::Enum {
+                    options: vec![
+                        ConfigEnumOption { value: "buy", label: "Buy (up)" },
+                        ConfigEnumOption { value: "sell", label: "Sell (down)" },
+                    ],
+                },
+            },
+            ConfigField {
+                name: "burst_size",
+                label: "Burst size",
+                hint: Some("Per-burst order qty"),
+                default: serde_json::json!("0.001"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+            ConfigField {
+                name: "cross_depth_bps",
+                label: "Cross depth (bps)",
+                hint: Some("How far past the opposite touch to cross"),
+                default: serde_json::json!("30"),
+                widget: ConfigWidget::Number { min: Some(1.0), max: Some(500.0), step: Some(1.0) },
+            },
+            ConfigField {
+                name: "burst_ticks",
+                label: "Burst ticks",
+                hint: Some("Consecutive ticks to push per cycle"),
+                default: serde_json::json!(5),
+                widget: ConfigWidget::Integer { min: Some(1), max: Some(100) },
+            },
+            ConfigField {
+                name: "rest_ticks",
+                label: "Rest ticks",
+                hint: Some("Flat ticks between bursts"),
+                default: serde_json::json!(3),
+                widget: ConfigWidget::Integer { min: Some(0), max: Some(100) },
+            },
+        ]
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Spoof;
 

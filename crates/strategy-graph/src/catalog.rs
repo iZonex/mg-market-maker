@@ -128,6 +128,8 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Strategy.BasisArb" => Some(Box::new(strategies::BasisArb)),
         // Epic R — exploit strategies (pentest-only, restricted)
         "Strategy.Spoof" => Some(Box::new(strategies::Spoof)),
+        "Strategy.Wash" => Some(Box::new(strategies::Wash)),
+        "Strategy.Ignite" => Some(Box::new(strategies::Ignite)),
         // Epic R — surveillance detectors (engine overlays per tick)
         "Surveillance.SpoofingScore" => Some(Box::new(sources::SpoofingScore)),
         "Surveillance.LayeringScore" => Some(Box::new(sources::LayeringScore)),
@@ -233,6 +235,8 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Strategy.CrossExchange"=>NodeMeta { label: "Cross-exchange",      summary: "Make on venue A, hedge on venue B", group: "Strategies" },
         "Strategy.BasisArb"    => NodeMeta { label: "Basis arb (spot/perp)",summary: "Maker-post basis carry across venues with net-delta guard", group: "Strategies" },
         "Strategy.Spoof"       => NodeMeta { label: "Spoof (pentest)",     summary: "⚠ RESTRICTED — large fake order pulled on tick N+1 while real opposite-side captures reaction", group: "Exploit" },
+        "Strategy.Wash"        => NodeMeta { label: "Wash (pentest)",      summary: "⚠ RESTRICTED — buy + sell at the same price every tick (self-trade)", group: "Exploit" },
+        "Strategy.Ignite"      => NodeMeta { label: "Ignite (pentest)",    summary: "⚠ RESTRICTED — burst cross-through orders for N ticks, rest M, repeat", group: "Exploit" },
 
         // Epic R — surveillance detectors (safe, defaults-on)
         "Surveillance.SpoofingScore" => NodeMeta { label: "Spoofing score", summary: "Likelihood our own flow looks like spoofing [0..1] + cancel_ratio + lifetime", group: "Surveillance" },
@@ -340,6 +344,8 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Strategy.CrossExchange",
         "Strategy.BasisArb",
         "Strategy.Spoof",
+        "Strategy.Wash",
+        "Strategy.Ignite",
         "Surveillance.SpoofingScore",
         "Surveillance.LayeringScore",
         "Surveillance.QuoteStuffingScore",
@@ -423,10 +429,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_66_nodes_after_epic_r_week_4() {
-        // 64 after 3.E + WashScore + MomentumIgnitionScore = 66.
-        // Exploit halves (Strategy.Wash + Strategy.Ignite) in the
-        // next commit of the same week.
-        assert_eq!(kinds().len(), 66, "catalog drift");
+    fn catalog_has_68_nodes_after_epic_r_week_4_exploits() {
+        // 66 after Week 4a + Strategy.Wash + Strategy.Ignite = 68.
+        assert_eq!(kinds().len(), 68, "catalog drift");
     }
 }
