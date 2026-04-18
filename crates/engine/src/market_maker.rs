@@ -5447,6 +5447,26 @@ impl MarketMakerEngine {
                     chrono::Duration::from_std(rate.interval)
                         .unwrap_or_else(|_| chrono::Duration::hours(8)),
                 );
+                // RS-1 — publish to the DataBus so the graph
+                // `Funding` source can read `(rate, seconds_to_next)`
+                // without another round-trip. Key matches the form
+                // the overlay uses when looking up (venue, symbol,
+                // product).
+                if let Some(dash) = &self.dashboard {
+                    let key = (
+                        format!("{:?}", self.config.exchange.exchange_type)
+                            .to_lowercase(),
+                        self.symbol.clone(),
+                        self.config.exchange.product,
+                    );
+                    dash.data_bus().publish_funding(
+                        key,
+                        mm_dashboard::data_bus::FundingRate {
+                            rate: Some(rate.rate),
+                            next_funding_ts: Some(rate.next_funding_time),
+                        },
+                    );
+                }
             }
             Err(mm_exchange_core::connector::FundingRateError::NotSupported) => {
                 // Capability mismatch — connector claims
