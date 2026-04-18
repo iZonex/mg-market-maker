@@ -3,6 +3,7 @@ pub mod adaptive;
 pub mod autotune;
 pub mod avellaneda;
 pub mod basis;
+pub mod basis_arb;
 pub mod cartea_spread;
 pub mod cks_ofi;
 pub mod cross_exchange;

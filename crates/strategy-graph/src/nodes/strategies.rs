@@ -86,6 +86,85 @@ strategy_node!(CrossExchange, "Strategy.CrossExchange");
 // config schema — one per-knob row the frontend renders
 // automatically.
 
+/// Multi-Venue 3.D — cross-venue basis arbitrage composite. Emits
+/// a `Quotes`-typed output (engine overlay materialises it as
+/// `Value::VenueQuotes` when reading the strategy pool).
+#[derive(Debug, Default)]
+pub struct BasisArb;
+
+impl NodeKind for BasisArb {
+    fn kind(&self) -> &'static str {
+        "Strategy.BasisArb"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &[]
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUOTES_OUT
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<ConfigField> {
+        vec![
+            ConfigField {
+                name: "spot_venue",
+                label: "Spot venue",
+                hint: Some("e.g. binance"),
+                default: serde_json::json!("binance"),
+                widget: ConfigWidget::Text,
+            },
+            ConfigField {
+                name: "perp_venue",
+                label: "Perp venue",
+                hint: Some("e.g. bybit"),
+                default: serde_json::json!("bybit"),
+                widget: ConfigWidget::Text,
+            },
+            ConfigField {
+                name: "symbol",
+                label: "Symbol",
+                hint: Some("Same symbol on both legs"),
+                default: serde_json::json!("BTCUSDT"),
+                widget: ConfigWidget::Text,
+            },
+            ConfigField {
+                name: "leg_size",
+                label: "Leg size",
+                hint: Some("Per-leg order qty in base asset"),
+                default: serde_json::json!("0.001"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+            ConfigField {
+                name: "maker_offset_bps",
+                label: "Maker offset (bps)",
+                hint: Some("How far behind mid the maker-post leg sits"),
+                default: serde_json::json!("2"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: Some(200.0), step: Some(0.5) },
+            },
+            ConfigField {
+                name: "min_basis_bps",
+                label: "Min basis (bps)",
+                hint: Some("Don't enter if basis is below this"),
+                default: serde_json::json!("10"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: Some(1000.0), step: Some(1.0) },
+            },
+            ConfigField {
+                name: "max_delta",
+                label: "Max net delta",
+                hint: Some("Drop the long / short leg when over this"),
+                default: serde_json::json!("0.05"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+        ]
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Spoof;
 

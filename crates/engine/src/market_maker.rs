@@ -2078,6 +2078,98 @@ impl MarketMakerEngine {
                         pending_alerts.push((kind.clone(), *id, out));
                     }
                 }
+                // Multi-Venue 3.D — BasisArb reads its snapshot off
+                // the DataBus (spot + perp mids) and the portfolio
+                // tracker (net delta), then composes a
+                // `Value::VenueQuotes` output via the pure
+                // `mm_strategy::basis_arb::compute_basis_arb_legs`
+                // helper. Written inline here rather than going
+                // through `strategy_pool` because the computation
+                // doesn't need a `Strategy` trait impl — there's no
+                // per-instance state worth pooling.
+                "Strategy.BasisArb" => {
+                    let cfg = graph.node_configs().get(id);
+                    let getstr = |k: &str, default: &str| -> String {
+                        cfg.and_then(|c| c.get(k))
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(default)
+                            .to_string()
+                    };
+                    let getdec = |k: &str, default: rust_decimal::Decimal| {
+                        cfg.and_then(|c| c.get(k))
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
+                            .unwrap_or(default)
+                    };
+                    let spot_venue = getstr("spot_venue", "binance");
+                    let perp_venue = getstr("perp_venue", "bybit");
+                    let symbol = getstr("symbol", &self.symbol);
+                    let leg_size = getdec("leg_size", rust_decimal_macros::dec!(0.001));
+                    let maker_offset = getdec("maker_offset_bps", rust_decimal_macros::dec!(2));
+                    let min_basis = getdec("min_basis_bps", rust_decimal_macros::dec!(10));
+                    let max_delta = getdec("max_delta", rust_decimal_macros::dec!(0.05));
+                    let bus = self.dashboard.as_ref().map(|d| d.data_bus());
+                    let spot_mid = bus
+                        .as_ref()
+                        .and_then(|b| {
+                            b.get_l1(&(
+                                spot_venue.clone(),
+                                symbol.clone(),
+                                mm_common::config::ProductType::Spot,
+                            ))
+                        })
+                        .and_then(|s| s.mid)
+                        .unwrap_or(rust_decimal::Decimal::ZERO);
+                    let perp_mid = bus
+                        .as_ref()
+                        .and_then(|b| {
+                            b.get_l1(&(
+                                perp_venue.clone(),
+                                symbol.clone(),
+                                mm_common::config::ProductType::LinearPerp,
+                            ))
+                        })
+                        .and_then(|s| s.mid)
+                        .unwrap_or(rust_decimal::Decimal::ZERO);
+                    let (base, _) = split_symbol_bq(&symbol);
+                    let net_delta = build_portfolio(self.dashboard.as_ref()).net_delta(base);
+                    let snap = mm_strategy::basis_arb::BasisSnapshot {
+                        spot_venue: spot_venue.clone(),
+                        spot_symbol: symbol.clone(),
+                        spot_mid,
+                        perp_venue: perp_venue.clone(),
+                        perp_symbol: symbol.clone(),
+                        perp_mid,
+                        net_delta,
+                    };
+                    let arb_cfg = mm_strategy::basis_arb::BasisArbConfig {
+                        leg_size,
+                        maker_offset_bps: maker_offset,
+                        min_basis_bps: min_basis,
+                        max_delta,
+                    };
+                    let legs = mm_strategy::basis_arb::compute_basis_arb_legs(&snap, &arb_cfg);
+                    let vqs: Vec<mm_strategy_graph::VenueQuote> = legs
+                        .into_iter()
+                        .map(|l| mm_strategy_graph::VenueQuote {
+                            venue: l.venue,
+                            symbol: l.symbol,
+                            product: l.product,
+                            side: match l.side {
+                                mm_strategy::basis_arb::Side::Buy => {
+                                    mm_strategy_graph::QuoteSide::Buy
+                                }
+                                mm_strategy::basis_arb::Side::Sell => {
+                                    mm_strategy_graph::QuoteSide::Sell
+                                }
+                            },
+                            price: l.price,
+                            qty: l.qty,
+                        })
+                        .collect();
+                    src.insert((*id, "quotes".into()), Value::VenueQuotes(vqs));
+                }
                 // Phase 5 — composite strategies with per-node pool.
                 // Each `Strategy.*` node reads its own pool instance's
                 // last-tick output (computed with the node's own

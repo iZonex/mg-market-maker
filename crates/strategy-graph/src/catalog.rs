@@ -124,6 +124,7 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Strategy.Grid" => Some(Box::new(strategies::Grid)),
         "Strategy.Basis" => Some(Box::new(strategies::Basis)),
         "Strategy.CrossExchange" => Some(Box::new(strategies::CrossExchange)),
+        "Strategy.BasisArb" => Some(Box::new(strategies::BasisArb)),
         // Epic R — exploit strategies (pentest-only, restricted)
         "Strategy.Spoof" => Some(Box::new(strategies::Spoof)),
         // Epic R — surveillance detectors (engine overlays per tick)
@@ -227,6 +228,7 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Strategy.Grid"        => NodeMeta { label: "Grid",                summary: "Symmetric grid around mid (engine-config driven)", group: "Strategies" },
         "Strategy.Basis"       => NodeMeta { label: "Basis",               summary: "Basis-shifted reservation price (spot + ref)", group: "Strategies" },
         "Strategy.CrossExchange"=>NodeMeta { label: "Cross-exchange",      summary: "Make on venue A, hedge on venue B", group: "Strategies" },
+        "Strategy.BasisArb"    => NodeMeta { label: "Basis arb (spot/perp)",summary: "Maker-post basis carry across venues with net-delta guard", group: "Strategies" },
         "Strategy.Spoof"       => NodeMeta { label: "Spoof (pentest)",     summary: "⚠ RESTRICTED — large fake order pulled on tick N+1 while real opposite-side captures reaction", group: "Exploit" },
 
         // Epic R — surveillance detectors (safe, defaults-on)
@@ -329,6 +331,7 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Strategy.Grid",
         "Strategy.Basis",
         "Strategy.CrossExchange",
+        "Strategy.BasisArb",
         "Strategy.Spoof",
         "Surveillance.SpoofingScore",
         "Surveillance.LayeringScore",
@@ -411,9 +414,10 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_62_nodes_after_multi_venue_3c() {
-        // 60 after 3.A + Portfolio.NetDelta + Portfolio.QuoteAvailable
-        // = 62.
-        assert_eq!(kinds().len(), 62, "catalog drift");
+    fn catalog_has_63_nodes_after_multi_venue_3d() {
+        // 62 after 3.C + Strategy.BasisArb = 63. Composite
+        // cross-venue strategies ship as new kinds; overlay
+        // materialises their Value::VenueQuotes output.
+        assert_eq!(kinds().len(), 63, "catalog drift");
     }
 }
