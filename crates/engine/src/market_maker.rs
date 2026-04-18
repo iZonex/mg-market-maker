@@ -1631,12 +1631,55 @@ impl MarketMakerEngine {
         for (id, kind) in graph.nodes_by_kind().iter() {
             match kind.as_str() {
                 "Book.L1" => {
-                    src.insert((*id, "bid_px".into()), bid_px.clone());
-                    src.insert((*id, "bid_qty".into()), bid_qty.clone());
-                    src.insert((*id, "ask_px".into()), ask_px.clone());
-                    src.insert((*id, "ask_qty".into()), ask_qty.clone());
-                    src.insert((*id, "mid".into()), mid.clone());
-                    src.insert((*id, "spread_bps".into()), spread_bps.clone());
+                    // Multi-Venue Level 2.B — if the node's config
+                    // names a different (venue, symbol, product)
+                    // tuple, read that stream off the DataBus.
+                    // Empty config → default to this engine's own
+                    // view (current behaviour).
+                    let cfg = graph.node_configs().get(id);
+                    let v = cfg.and_then(|c| c.get("venue")).and_then(|v| v.as_str()).unwrap_or("");
+                    let s = cfg.and_then(|c| c.get("symbol")).and_then(|v| v.as_str()).unwrap_or("");
+                    let p_str = cfg.and_then(|c| c.get("product")).and_then(|v| v.as_str()).unwrap_or("");
+                    let cross = !v.is_empty() || !s.is_empty() || !p_str.is_empty();
+                    if cross {
+                        let venue = if v.is_empty() {
+                            format!("{:?}", self.config.exchange.exchange_type).to_lowercase()
+                        } else { v.to_string() };
+                        let symbol = if s.is_empty() { self.symbol.clone() } else { s.to_string() };
+                        let product = match p_str {
+                            "spot" => mm_common::config::ProductType::Spot,
+                            "linear_perp" => mm_common::config::ProductType::LinearPerp,
+                            "inverse_perp" => mm_common::config::ProductType::InversePerp,
+                            _ => self.config.exchange.product,
+                        };
+                        let key = (venue, symbol, product);
+                        let snap = self
+                            .dashboard
+                            .as_ref()
+                            .and_then(|d| d.data_bus().get_l1(&key));
+                        let (b, a, m_mid, sb) = match snap {
+                            Some(s) => (
+                                s.bid_px.map(Value::Number).unwrap_or(Value::Missing),
+                                s.ask_px.map(Value::Number).unwrap_or(Value::Missing),
+                                s.mid.map(Value::Number).unwrap_or(Value::Missing),
+                                s.spread_bps.map(Value::Number).unwrap_or(Value::Missing),
+                            ),
+                            None => (Value::Missing, Value::Missing, Value::Missing, Value::Missing),
+                        };
+                        src.insert((*id, "bid_px".into()), b);
+                        src.insert((*id, "bid_qty".into()), Value::Missing);
+                        src.insert((*id, "ask_px".into()), a);
+                        src.insert((*id, "ask_qty".into()), Value::Missing);
+                        src.insert((*id, "mid".into()), m_mid);
+                        src.insert((*id, "spread_bps".into()), sb);
+                    } else {
+                        src.insert((*id, "bid_px".into()), bid_px.clone());
+                        src.insert((*id, "bid_qty".into()), bid_qty.clone());
+                        src.insert((*id, "ask_px".into()), ask_px.clone());
+                        src.insert((*id, "ask_qty".into()), ask_qty.clone());
+                        src.insert((*id, "mid".into()), mid.clone());
+                        src.insert((*id, "spread_bps".into()), spread_bps.clone());
+                    }
                 }
                 "Volatility.Realised" => {
                     src.insert((*id, "value".into()), realised_vol.clone());
@@ -4044,6 +4087,30 @@ impl MarketMakerEngine {
             self.kill_switch.update_market_resilience(mr_score, mr_now);
         } else {
             self.auto_tuner.clear_market_resilience();
+        }
+
+        // Multi-Venue Level 2.A — publish this engine's L1 snapshot
+        // to the shared DataBus. Graphs with parameterised
+        // `Book.L1(venue, symbol, product)` nodes pick it up during
+        // the same tick's `tick_strategy_graph` pass below.
+        if let Some(dash) = self.dashboard.as_ref() {
+            let bus = dash.data_bus();
+            let key = (
+                format!("{:?}", self.config.exchange.exchange_type).to_lowercase(),
+                self.symbol.clone(),
+                self.config.exchange.product,
+            );
+            let book = &self.book_keeper.book;
+            bus.publish_l1(
+                key,
+                mm_dashboard::data_bus::BookL1Snapshot {
+                    bid_px: book.best_bid(),
+                    ask_px: book.best_ask(),
+                    mid: book.mid_price(),
+                    spread_bps: book.spread_bps(),
+                    ts: Some(chrono::Utc::now()),
+                },
+            );
         }
 
         // Epic H — evaluate the attached strategy graph (if any)

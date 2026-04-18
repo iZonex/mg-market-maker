@@ -47,6 +47,43 @@ impl NodeKind for BookL1 {
     fn output_ports(&self) -> &[Port] {
         &BOOK_L1_OUTPUTS
     }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        // Multi-Venue Level 2.B — optional venue/symbol/product
+        // pick a specific stream off the DataBus. All empty → the
+        // node reads from the engine it's attached to (current
+        // behaviour). Any one set → cross-stream read.
+        use crate::node::{ConfigEnumOption, ConfigField, ConfigWidget};
+        vec![
+            ConfigField {
+                name: "venue",
+                label: "Venue (optional)",
+                hint: Some("Leave empty to read from this engine's venue"),
+                default: serde_json::json!(""),
+                widget: ConfigWidget::Text,
+            },
+            ConfigField {
+                name: "symbol",
+                label: "Symbol (optional)",
+                hint: Some("Leave empty to read from this engine's symbol"),
+                default: serde_json::json!(""),
+                widget: ConfigWidget::Text,
+            },
+            ConfigField {
+                name: "product",
+                label: "Product (optional)",
+                hint: Some("Leave empty for engine default"),
+                default: serde_json::json!(""),
+                widget: ConfigWidget::Enum {
+                    options: vec![
+                        ConfigEnumOption { value: "", label: "(engine default)" },
+                        ConfigEnumOption { value: "spot", label: "Spot" },
+                        ConfigEnumOption { value: "linear_perp", label: "Linear perp" },
+                        ConfigEnumOption { value: "inverse_perp", label: "Inverse perp" },
+                    ],
+                },
+            },
+        ]
+    }
     fn evaluate(
         &self,
         _ctx: &EvalCtx,
