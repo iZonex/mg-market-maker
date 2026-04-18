@@ -1532,6 +1532,47 @@ impl MarketMakerEngine {
                         Value::Number(self.inventory_manager.inventory()),
                     );
                 }
+                // Phase 2 Wave C — signal + toxicity + regime.
+                "Signal.ImbalanceDepth" => {
+                    // Top-5 book imbalance; matches momentum's
+                    // book-imbalance feature.
+                    let v = mm_strategy::momentum::MomentumSignals::book_imbalance(
+                        &self.book_keeper.book,
+                        5,
+                    );
+                    src.insert((*id, "value".into()), Value::Number(v));
+                }
+                "Signal.TradeFlow" => {
+                    src.insert(
+                        (*id, "value".into()),
+                        Value::Number(self.momentum.trade_flow_imbalance()),
+                    );
+                }
+                "Signal.Microprice" => {
+                    // Learned-microprice drift ratio. `None` until
+                    // the online fit produces its first estimate.
+                    let mid = self.book_keeper.book.mid_price();
+                    let v = mid
+                        .and_then(|m| self.momentum.learned_microprice_drift(&self.book_keeper.book, m))
+                        .map(Value::Number)
+                        .unwrap_or(Value::Missing);
+                    src.insert((*id, "value".into()), v);
+                }
+                "Toxicity.KyleLambda" => {
+                    let v = self
+                        .kyle_lambda
+                        .lambda()
+                        .map(Value::Number)
+                        .unwrap_or(Value::Missing);
+                    src.insert((*id, "value".into()), v);
+                }
+                "Regime.Detector" => {
+                    let regime = self.auto_tuner.regime_detector.regime();
+                    src.insert(
+                        (*id, "regime".into()),
+                        Value::String(format!("{regime:?}")),
+                    );
+                }
                 "PairClass.Current" => {
                     let label = self
                         .pair_class
@@ -1598,6 +1639,29 @@ impl MarketMakerEngine {
                         level,
                         reason = %reason,
                         "strategy graph escalated kill switch"
+                    );
+                }
+                SinkAction::Flatten { policy } => {
+                    // Graph-authored flatten. Escalates kill L4 with
+                    // the policy string; existing paired_unwind /
+                    // twap_executor machinery picks up the algo on
+                    // next tick. Audit-log the full policy so
+                    // compliance can reproduce what the graph
+                    // actually asked for.
+                    self.kill_switch.manual_trigger(
+                        mm_risk::kill_switch::KillLevel::FlattenAll,
+                        &format!("graph flatten: {policy}"),
+                    );
+                    self.audit.risk_event(
+                        &self.symbol,
+                        mm_risk::audit::AuditEventType::KillSwitchEscalated,
+                        &format!("graph L4 flatten policy={policy}"),
+                    );
+                    error!(
+                        symbol = %self.symbol,
+                        graph = self.strategy_graph_name.as_deref().unwrap_or("?"),
+                        %policy,
+                        "strategy graph requested flatten"
                     );
                 }
             }

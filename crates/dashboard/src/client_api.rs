@@ -56,6 +56,16 @@ pub fn client_routes() -> Router<DashboardState> {
         .route("/api/v1/strategy/graphs", get(list_strategy_graphs))
         .route("/api/v1/strategy/graphs/{name}", get(get_strategy_graph))
         .route("/api/v1/strategy/deploys", get(list_strategy_deploys))
+        .route("/api/v1/strategy/templates", get(list_strategy_templates))
+        .route("/api/v1/strategy/templates/{name}", get(get_strategy_template))
+        .route(
+            "/api/v1/strategy/graphs/{name}/history/{hash}",
+            get(get_strategy_graph_version),
+        )
+        .route(
+            "/api/v1/strategy/preview",
+            axum::routing::post(preview_strategy_graph),
+        )
         .route("/api/v1/loans", get(get_loans))
         .route("/api/v1/loans/{symbol}", get(get_loan_by_symbol))
         .route(
@@ -912,6 +922,171 @@ async fn get_strategy_graph(
             .into_response();
     };
     match store.load(&name) {
+        Ok(g) => (StatusCode::OK, Json(g)).into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Serialize)]
+struct TemplateMeta {
+    name: String,
+    description: String,
+}
+
+async fn list_strategy_templates() -> Json<Vec<TemplateMeta>> {
+    let list = mm_strategy_graph::templates::list()
+        .into_iter()
+        .map(|t| TemplateMeta {
+            name: t.name.to_string(),
+            description: t.description.to_string(),
+        })
+        .collect();
+    Json(list)
+}
+
+async fn get_strategy_template(
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    match mm_strategy_graph::templates::load(&name) {
+        Some(Ok(g)) => (StatusCode::OK, Json(g)).into_response(),
+        Some(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        None => (StatusCode::NOT_FOUND, "unknown template").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct PreviewRequest {
+    graph: mm_strategy_graph::Graph,
+    /// Optional per-(node, port) source overrides. Keys look like
+    /// `"NODE_ID:PORT_NAME"`. Values are simple strings parsed as
+    /// `Decimal` for Number ports, `"true" / "false"` for Bool, or
+    /// passed through as strings otherwise.
+    #[serde(default)]
+    source_inputs: std::collections::HashMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct PreviewResponse {
+    /// Per-edge values: key = `"NODE_ID:PORT_NAME"`, value =
+    /// formatted value representation (`"7.5"`, `"true"`, `"—"`).
+    edges: std::collections::HashMap<String, String>,
+    /// Sinks that would fire. Operator reads this to confirm the
+    /// graph behaves as expected before clicking Deploy.
+    sinks: Vec<serde_json::Value>,
+    /// Validation / evaluation errors, if any. Empty when OK.
+    errors: Vec<String>,
+}
+
+async fn preview_strategy_graph(
+    axum::Json(req): axum::Json<PreviewRequest>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use mm_strategy_graph::{EvalCtx, Evaluator, NodeId, Value};
+    use std::collections::HashMap;
+    use std::str::FromStr;
+
+    let mut ev = match Evaluator::build(&req.graph) {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::OK,
+                Json(PreviewResponse {
+                    edges: HashMap::new(),
+                    sinks: vec![],
+                    errors: vec![format!("{e:?}")],
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // Parse source_inputs overrides: `"node_id:port" → "raw"` into
+    // `(NodeId, port) → Value`. Try Number first, then Bool, then
+    // String as the pragmatic fallback.
+    let mut inputs: HashMap<(NodeId, String), Value> = HashMap::new();
+    for (key, raw) in &req.source_inputs {
+        let Some((id_str, port)) = key.split_once(':') else {
+            continue;
+        };
+        let Ok(node_id) = NodeId::parse(id_str) else {
+            continue;
+        };
+        let v = if let Ok(d) = rust_decimal::Decimal::from_str(raw) {
+            Value::Number(d)
+        } else if raw == "true" {
+            Value::Bool(true)
+        } else if raw == "false" {
+            Value::Bool(false)
+        } else {
+            Value::String(raw.clone())
+        };
+        inputs.insert((node_id, port.to_string()), v);
+    }
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let ctx = EvalCtx { now_ms };
+    let (sinks, trace) = match ev.tick_with_trace(&ctx, &inputs) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::OK,
+                Json(PreviewResponse {
+                    edges: HashMap::new(),
+                    sinks: vec![],
+                    errors: vec![e.to_string()],
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let edges: HashMap<String, String> = trace
+        .into_iter()
+        .map(|((id, port), v)| (format!("{id}:{port}"), render_value(&v)))
+        .collect();
+    let sinks: Vec<serde_json::Value> = sinks
+        .into_iter()
+        .map(|s| serde_json::to_value(format!("{s:?}")).unwrap_or(serde_json::Value::Null))
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(PreviewResponse {
+            edges,
+            sinks,
+            errors: vec![],
+        }),
+    )
+        .into_response()
+}
+
+fn render_value(v: &mm_strategy_graph::Value) -> String {
+    use mm_strategy_graph::Value;
+    match v {
+        Value::Number(n) => n.normalize().to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Unit => "()".to_string(),
+        Value::String(s) => s.clone(),
+        Value::KillLevel(l) => format!("L{l}"),
+        Value::StrategyKind(s) | Value::PairClass(s) => s.clone(),
+        Value::Missing => "—".to_string(),
+    }
+}
+
+async fn get_strategy_graph_version(
+    State(state): State<DashboardState>,
+    Path((name, hash)): Path<(String, String)>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let Some(store) = state.strategy_graph_store() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "strategy graphs not configured")
+            .into_response();
+    };
+    match store.load_by_hash(&name, &hash) {
         Ok(g) => (StatusCode::OK, Json(g)).into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     }

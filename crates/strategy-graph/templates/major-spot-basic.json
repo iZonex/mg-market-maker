@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "name": "major-spot-basic",
+  "scope": { "kind": "symbol", "value": "BTCUSDT" },
+  "stale_hold_ms": 30000,
+  "nodes": [
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "kind": "Toxicity.VPIN",
+      "config": null,
+      "pos": [40, 80]
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000002",
+      "kind": "Risk.ToxicityWiden",
+      "config": { "scale": "2" },
+      "pos": [240, 80]
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000003",
+      "kind": "Out.SpreadMult",
+      "config": null,
+      "pos": [480, 80]
+    }
+  ],
+  "edges": [
+    {
+      "from": {
+        "node": "00000000-0000-4000-8000-000000000001",
+        "port": "value"
+      },
+      "to": {
+        "node": "00000000-0000-4000-8000-000000000002",
+        "port": "vpin"
+      }
+    },
+    {
+      "from": {
+        "node": "00000000-0000-4000-8000-000000000002",
+        "port": "mult"
+      },
+      "to": {
+        "node": "00000000-0000-4000-8000-000000000003",
+        "port": "mult"
+      }
+    }
+  ]
+}

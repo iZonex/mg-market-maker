@@ -9,6 +9,8 @@
 //! Phases 2–4 fill in the rest of the catalog from the architecture
 //! doc.
 
+pub mod exec;
+pub mod indicators;
 pub mod logic;
 pub mod math;
 pub mod risk;

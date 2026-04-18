@@ -87,6 +87,48 @@ impl NodeKind for Mux {
     }
 }
 
+// ── Logic.StringMux — ternary for String values ────────────
+
+/// Same ternary shape as [`Mux`] but passes `String` values
+/// through. Needed for piping exec-algo policy strings
+/// (`Exec.*Config`) through a condition without round-tripping
+/// via Number.
+#[derive(Debug, Default)]
+pub struct StringMux;
+
+static STRING_MUX_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
+    vec![
+        Port::new("cond", PortType::Bool),
+        Port::new("then", PortType::String),
+        Port::new("else", PortType::String),
+    ]
+});
+static STRING_MUX_OUTPUTS: Lazy<Vec<Port>> =
+    Lazy::new(|| vec![Port::new("out", PortType::String)]);
+
+impl NodeKind for StringMux {
+    fn kind(&self) -> &'static str {
+        "Logic.StringMux"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &STRING_MUX_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &STRING_MUX_OUTPUTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        let cond = inputs.first().and_then(Value::as_bool).unwrap_or(false);
+        let pick = if cond { 1 } else { 2 };
+        let v = inputs.get(pick).cloned().unwrap_or(Value::Missing);
+        Ok(vec![v])
+    }
+}
+
 // ── Enum equality helpers ──────────────────────────────────
 
 /// `Cast.StrategyEq` — compares the `Strategy.Active` output to a

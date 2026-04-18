@@ -3272,6 +3272,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "hex",
+ "mm-indicators",
  "once_cell",
  "rust_decimal",
  "rust_decimal_macros",

@@ -35,12 +35,15 @@
   let nodes = $state.raw([])
   let edges = $state.raw([])
   let catalog = $state([])
+  let templates = $state([])
   let graphName = $state('untitled')
   let scopeKind = $state('symbol')
   let scopeValue = $state('BTCUSDT')
   let selected = $state(null)
   let deployStatus = $state('')
   let deployBusy = $state(false)
+  let previewResult = $state(null)
+  let previewBusy = $state(false)
 
   async function loadCatalog() {
     try {
@@ -49,7 +52,52 @@
       deployStatus = `catalog fetch failed: ${e}`
     }
   }
-  $effect(() => { loadCatalog() })
+  async function loadTemplates() {
+    try {
+      templates = await api.getJson('/api/v1/strategy/templates')
+    } catch (e) {
+      // Non-fatal — operator can still compose from scratch.
+      templates = []
+    }
+  }
+  $effect(() => { loadCatalog(); loadTemplates() })
+
+  async function loadTemplate(name) {
+    if (!name) return
+    try {
+      const g = await api.getJson(
+        `/api/v1/strategy/templates/${encodeURIComponent(name)}`
+      )
+      graphName = g.name
+      scopeKind = g.scope.kind
+      scopeValue = g.scope.value ?? ''
+      nodes = g.nodes.map((n) => {
+        const entry = catalog.find((c) => c.kind === n.kind)
+        return {
+          id: n.id,
+          type: 'graphNode',
+          position: { x: n.pos?.[0] ?? 0, y: n.pos?.[1] ?? 0 },
+          data: {
+            kind: n.kind,
+            config: n.config ?? {},
+            inputs: entry?.inputs ?? [],
+            outputs: entry?.outputs ?? [],
+            restricted: entry?.restricted ?? false,
+          },
+        }
+      })
+      edges = g.edges.map((e, i) => ({
+        id: `e${i}`,
+        source: e.from.node,
+        sourceHandle: e.from.port,
+        target: e.to.node,
+        targetHandle: e.to.port,
+      }))
+      deployStatus = `loaded template '${name}'`
+    } catch (e) {
+      deployStatus = `template load failed: ${e}`
+    }
+  }
 
   function uuid() {
     // Simple v4 UUID without adding a dep.
@@ -94,6 +142,12 @@
     if (kind === 'Risk.ToxicityWiden') return { scale: '2' }
     if (kind === 'Risk.InventoryUrgency') return { cap: '1', exponent: '2' }
     if (kind === 'Risk.CircuitBreaker') return { wide_bps: '100' }
+    if (kind === 'Indicator.SMA' || kind === 'Indicator.EMA' || kind === 'Indicator.HMA' || kind === 'Indicator.RSI' || kind === 'Indicator.ATR') return { period: 14 }
+    if (kind === 'Indicator.Bollinger') return { period: 20, k_stddev: '2' }
+    if (kind === 'Exec.TwapConfig') return { duration_secs: 120, slice_count: 5 }
+    if (kind === 'Exec.VwapConfig') return { duration_secs: 300 }
+    if (kind === 'Exec.PovConfig') return { target_pct: 10 }
+    if (kind === 'Exec.IcebergConfig') return { display_qty: '0.1' }
     return {}
   }
 
@@ -142,6 +196,46 @@
     } finally {
       deployBusy = false
     }
+  }
+
+  async function simulate() {
+    previewBusy = true
+    previewResult = null
+    try {
+      const body = {
+        graph: toBackendGraph(),
+        source_inputs: {},
+      }
+      previewResult = await api.postJson('/api/v1/strategy/preview', body)
+      decorateEdges()
+    } catch (e) {
+      previewResult = { errors: [String(e)], edges: {}, sinks: [] }
+    } finally {
+      previewBusy = false
+    }
+  }
+
+  // Decorate canvas edges with live values from the preview trace.
+  // svelte-flow supports `label` + `labelStyle` per edge, so we
+  // materialise the value the upstream node produced on the edge's
+  // `sourceHandle`. Edges without a trace hit stay unlabelled.
+  function decorateEdges() {
+    const lookup = previewResult?.edges ?? null
+    edges = edges.map((e) => {
+      if (!lookup) return { ...e, label: undefined }
+      const key = `${e.source}:${e.sourceHandle}`
+      const label = lookup[key]
+      return label !== undefined
+        ? {
+            ...e,
+            label,
+            labelStyle: 'font-family: var(--font-mono); font-size: 10px; fill: var(--fg-primary);',
+            labelBgStyle: 'fill: var(--bg-raised); stroke: var(--accent); stroke-width: 1;',
+            labelBgPadding: [4, 2],
+            labelBgBorderRadius: 4,
+          }
+        : { ...e, label: undefined }
+    })
   }
 
   async function loadGraph(name) {
@@ -226,13 +320,48 @@
       {/if}
     </div>
     <div class="right-chunk">
+      {#if templates.length > 0}
+        <label class="field inline">
+          <span class="field-label">Template</span>
+          <select onchange={(e) => { loadTemplate(e.currentTarget.value); e.currentTarget.value = '' }}>
+            <option value="">—</option>
+            {#each templates as t (t.name)}
+              <option value={t.name} title={t.description}>{t.name}</option>
+            {/each}
+          </select>
+        </label>
+      {/if}
       <span class="status">{deployStatus}</span>
+      <button type="button" class="btn ghost" onclick={simulate} disabled={previewBusy || nodes.length === 0} title="Evaluate graph without deploying">
+        <Icon name="pulse" size={14} />
+        <span>{previewBusy ? 'Simulating…' : 'Simulate'}</span>
+      </button>
       <button type="button" class="btn" onclick={deploy} disabled={deployBusy || nodes.length === 0}>
         <Icon name="bolt" size={14} />
         <span>{deployBusy ? 'Deploying…' : 'Deploy'}</span>
       </button>
     </div>
   </div>
+
+  {#if previewResult}
+    <div class="preview-bar" class:has-error={previewResult.errors?.length > 0}>
+      {#if previewResult.errors?.length > 0}
+        <span class="preview-label">Simulate · errors</span>
+        {#each previewResult.errors as err}
+          <code class="preview-err">{err}</code>
+        {/each}
+      {:else}
+        <span class="preview-label">Simulate · {previewResult.sinks?.length ?? 0} sink{previewResult.sinks?.length === 1 ? '' : 's'}</span>
+        {#each previewResult.sinks ?? [] as sink}
+          <code class="preview-sink">{sink}</code>
+        {/each}
+        {#if (previewResult.sinks?.length ?? 0) === 0}
+          <span class="muted">no sinks fired — values shown on edges</span>
+        {/if}
+      {/if}
+      <button type="button" class="preview-close" onclick={() => { previewResult = null; decorateEdges() }}>×</button>
+    </div>
+  {/if}
 
   <div class="body">
     <aside class="palette">
@@ -274,7 +403,45 @@
     </aside>
   </div>
 
-  <StrategyDeployHistory {auth} onReload={(n) => loadGraph(n)} />
+  <StrategyDeployHistory
+    {auth}
+    onReload={(n) => loadGraph(n)}
+    onRollback={async (name, hash) => {
+      try {
+        const g = await api.getJson(
+          `/api/v1/strategy/graphs/${encodeURIComponent(name)}/history/${encodeURIComponent(hash)}`
+        )
+        graphName = g.name
+        scopeKind = g.scope.kind
+        scopeValue = g.scope.value ?? ''
+        nodes = g.nodes.map((n) => {
+          const entry = catalog.find((c) => c.kind === n.kind)
+          return {
+            id: n.id,
+            type: 'graphNode',
+            position: { x: n.pos?.[0] ?? 0, y: n.pos?.[1] ?? 0 },
+            data: {
+              kind: n.kind,
+              config: n.config ?? {},
+              inputs: entry?.inputs ?? [],
+              outputs: entry?.outputs ?? [],
+              restricted: entry?.restricted ?? false,
+            },
+          }
+        })
+        edges = g.edges.map((e, i) => ({
+          id: `e${i}`,
+          source: e.from.node,
+          sourceHandle: e.from.port,
+          target: e.to.node,
+          targetHandle: e.to.port,
+        }))
+        deployStatus = `loaded hash ${hash.slice(0, 8)}… — click Deploy to roll back`
+      } catch (e) {
+        deployStatus = `rollback fetch failed: ${e}`
+      }
+    }}
+  />
 </div>
 
 <style>
@@ -296,6 +463,7 @@
   .left-chunk { display: flex; gap: var(--s-3); align-items: flex-end; }
   .right-chunk { display: flex; gap: var(--s-3); align-items: center; }
   .field { display: flex; flex-direction: column; gap: 2px; font-size: var(--fs-xs); color: var(--fg-secondary); }
+  .field.inline select { min-width: 180px; }
   .field-label { font-size: var(--fs-xs); color: var(--fg-muted); text-transform: uppercase; letter-spacing: var(--tracking-label); }
   .field input, .field select {
     padding: var(--s-2) var(--s-3);
@@ -315,6 +483,33 @@
   }
   .btn:hover:not(:disabled) { background: var(--accent); color: var(--bg-base); }
   .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .preview-bar {
+    display: flex; align-items: center; flex-wrap: wrap; gap: var(--s-2);
+    padding: var(--s-2) var(--s-4);
+    background: var(--bg-raised);
+    border-bottom: 1px solid var(--accent);
+    font-size: var(--fs-xs);
+  }
+  .preview-bar.has-error { border-bottom-color: var(--neg); }
+  .preview-label {
+    font-family: var(--font-mono); font-size: var(--fs-2xs);
+    color: var(--accent); text-transform: uppercase; letter-spacing: var(--tracking-label);
+  }
+  .preview-bar.has-error .preview-label { color: var(--neg); }
+  .preview-sink, .preview-err {
+    padding: 2px var(--s-2);
+    background: var(--bg-chip); border: 1px solid var(--border-subtle);
+    border-radius: var(--r-sm); font-family: var(--font-mono); font-size: var(--fs-2xs);
+    color: var(--fg-primary);
+  }
+  .preview-err { color: var(--neg); border-color: var(--neg); }
+  .preview-close {
+    margin-left: auto;
+    background: transparent; border: none; color: var(--fg-muted);
+    font-size: var(--fs-md); cursor: pointer; padding: 0 var(--s-2);
+  }
+  .preview-close:hover { color: var(--fg-primary); }
 
   .body {
     display: grid;

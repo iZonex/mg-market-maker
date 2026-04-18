@@ -9,7 +9,7 @@
   import { createApiClient } from '../api.svelte.js'
   import Icon from './Icon.svelte'
 
-  let { auth, onReload } = $props()
+  let { auth, onReload, onRollback } = $props()
   const api = createApiClient(auth)
 
   let entries = $state([])
@@ -65,7 +65,7 @@
           {:else}
             <table>
               <thead>
-                <tr><th>When</th><th>Name</th><th>Hash</th><th>Operator</th><th>Scope</th></tr>
+                <tr><th>When</th><th>Name</th><th>Hash</th><th>Operator</th><th>Scope</th><th></th></tr>
               </thead>
               <tbody>
                 {#each entries.slice().reverse() as rec (rec.hash + rec.deployed_at)}
@@ -75,6 +75,11 @@
                     <td class="num">{rec.hash.slice(0, 12)}…</td>
                     <td>{rec.operator}</td>
                     <td><code class="small">{rec.scope}</code></td>
+                    <td>
+                      <button type="button" class="rb-btn" onclick={() => onRollback?.(rec.name, rec.hash)} title="Load this version and redeploy">
+                        Rollback
+                      </button>
+                    </td>
                   </tr>
                 {/each}
               </tbody>
@@ -118,4 +123,11 @@
   .num, .small { font-family: var(--font-mono); font-size: var(--fs-2xs); }
   .muted { color: var(--fg-muted); font-size: var(--fs-xs); }
   .error { color: var(--neg); font-size: var(--fs-xs); }
+  .rb-btn {
+    padding: 2px var(--s-2);
+    background: var(--bg-chip); border: 1px solid var(--border-subtle);
+    border-radius: var(--r-sm); color: var(--fg-secondary);
+    font-size: var(--fs-2xs); cursor: pointer;
+  }
+  .rb-btn:hover { border-color: var(--warn); color: var(--warn); }
 </style>

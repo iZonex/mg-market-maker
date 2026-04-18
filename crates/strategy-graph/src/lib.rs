@@ -20,6 +20,7 @@ pub mod graph;
 pub mod node;
 pub mod nodes;
 pub mod storage;
+pub mod templates;
 pub mod types;
 
 pub use evaluator::{Evaluator, SinkAction};

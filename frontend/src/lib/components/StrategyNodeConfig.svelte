@@ -135,6 +135,65 @@
           oninput={(e) => update('wide_bps', e.currentTarget.value)}
         />
       </label>
+    {:else if kind === 'Indicator.SMA' || kind === 'Indicator.EMA' || kind === 'Indicator.HMA' || kind === 'Indicator.RSI' || kind === 'Indicator.ATR'}
+      <label class="field">
+        <span>period</span>
+        <input
+          type="number"
+          min="1"
+          max="10000"
+          value={cfg.period ?? 14}
+          oninput={(e) => update('period', Number(e.currentTarget.value))}
+        />
+      </label>
+    {:else if kind === 'Indicator.Bollinger'}
+      <label class="field">
+        <span>period</span>
+        <input
+          type="number"
+          min="1"
+          max="10000"
+          value={cfg.period ?? 20}
+          oninput={(e) => update('period', Number(e.currentTarget.value))}
+        />
+      </label>
+      <label class="field">
+        <span>k (std dev)</span>
+        <input
+          type="text"
+          value={cfg.k_stddev ?? '2'}
+          oninput={(e) => update('k_stddev', e.currentTarget.value)}
+        />
+      </label>
+    {:else if kind === 'Exec.TwapConfig'}
+      <label class="field">
+        <span>duration (sec)</span>
+        <input type="number" min="1" value={cfg.duration_secs ?? 120}
+          oninput={(e) => update('duration_secs', Number(e.currentTarget.value))} />
+      </label>
+      <label class="field">
+        <span>slice count</span>
+        <input type="number" min="1" max="1000" value={cfg.slice_count ?? 5}
+          oninput={(e) => update('slice_count', Number(e.currentTarget.value))} />
+      </label>
+    {:else if kind === 'Exec.VwapConfig'}
+      <label class="field">
+        <span>duration (sec)</span>
+        <input type="number" min="1" value={cfg.duration_secs ?? 300}
+          oninput={(e) => update('duration_secs', Number(e.currentTarget.value))} />
+      </label>
+    {:else if kind === 'Exec.PovConfig'}
+      <label class="field">
+        <span>target participation (%)</span>
+        <input type="number" min="1" max="100" value={cfg.target_pct ?? 10}
+          oninput={(e) => update('target_pct', Number(e.currentTarget.value))} />
+      </label>
+    {:else if kind === 'Exec.IcebergConfig'}
+      <label class="field">
+        <span>display qty</span>
+        <input type="text" value={cfg.display_qty ?? '0.1'}
+          oninput={(e) => update('display_qty', e.currentTarget.value)} />
+      </label>
     {:else}
       <div class="muted small">This node has no config parameters.</div>
     {/if}

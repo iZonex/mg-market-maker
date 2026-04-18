@@ -81,8 +81,16 @@ impl GraphStore {
     }
 
     /// Save `graph` under its declared name. Atomic: writes to a tmp
-    /// file in the same directory, then renames. If `operator` is
-    /// provided a `DeployRecord` is appended to `.deploys.jsonl`.
+    /// file in the same directory, then renames.
+    ///
+    /// Every save also writes a historical snapshot at
+    /// `history/{name}/{hash}.json`. The current pointer at
+    /// `{name}.json` is always the latest; the history snapshot
+    /// is the audit-friendly immutable record. Rollback reads the
+    /// historical file keyed by hash.
+    ///
+    /// If `operator` is provided a `DeployRecord` is appended to
+    /// `.deploys.jsonl`.
     pub fn save(&self, graph: &Graph, operator: Option<&str>) -> Result<String> {
         let path = self.path_for(&graph.name)?;
         let body = graph.to_json_pretty()?;
@@ -97,6 +105,24 @@ impl GraphStore {
             .with_context(|| format!("atomic rename into {}", path.display()))?;
 
         let hash = graph.content_hash();
+
+        // Historical snapshot — immutable, keyed by hash. Lets
+        // operators roll back to an earlier deploy without
+        // depending on external backups.
+        let history_dir = self.root.join("history").join(&graph.name);
+        std::fs::create_dir_all(&history_dir)
+            .with_context(|| format!("create history dir {}", history_dir.display()))?;
+        let history_path = history_dir.join(format!("{hash}.json"));
+        if !history_path.exists() {
+            let tmp = history_path.with_extension("json.tmp");
+            {
+                let mut f = std::fs::File::create(&tmp)?;
+                f.write_all(body.as_bytes())?;
+                f.sync_data()?;
+            }
+            std::fs::rename(&tmp, &history_path)?;
+        }
+
         if let Some(op) = operator {
             self.append_deploy_log(&DeployRecord {
                 name: graph.name.clone(),
@@ -107,6 +133,28 @@ impl GraphStore {
             })?;
         }
         Ok(hash)
+    }
+
+    /// Load a specific historical version by name + hash.
+    /// Used by the rollback UI: click a prior deploy in the
+    /// history table, the frontend fetches this, re-deploys via
+    /// the admin endpoint. Returns `None` if the hash isn't in
+    /// history (e.g. history predates the versioning feature).
+    pub fn load_by_hash(&self, name: &str, hash: &str) -> Result<Graph> {
+        validate_name(name)?;
+        // Hash is hex; reject anything else so a malicious hash
+        // can't escape the history dir.
+        if !hash.chars().all(|c| c.is_ascii_hexdigit()) || hash.len() > 128 {
+            anyhow::bail!("invalid hash");
+        }
+        let path = self
+            .root
+            .join("history")
+            .join(name)
+            .join(format!("{hash}.json"));
+        let body = std::fs::read_to_string(&path)
+            .with_context(|| format!("read {}", path.display()))?;
+        Graph::from_json(&body)
     }
 
     /// Load a graph by name.
@@ -257,6 +305,30 @@ mod tests {
         assert_eq!(deploys[0].operator, "alice");
         assert_eq!(deploys[0].hash, hash);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn historical_save_enables_load_by_hash() {
+        let dir = std::env::temp_dir()
+            .join(format!("mm_strategy_graph_hist_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = GraphStore::new(&dir).unwrap();
+        let g = sample_graph();
+        let hash = store.save(&g, Some("alice")).unwrap();
+        let back = store.load_by_hash("sample", &hash).expect("historical load");
+        assert_eq!(back.content_hash(), hash);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_by_hash_rejects_path_traversal() {
+        let dir = std::env::temp_dir()
+            .join(format!("mm_sg_hash_trav_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = GraphStore::new(&dir).unwrap();
+        assert!(store.load_by_hash("sample", "../../passwd").is_err());
+        assert!(store.load_by_hash("sample", "not!hex").is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 

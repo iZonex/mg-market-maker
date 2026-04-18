@@ -102,6 +102,12 @@ single_scalar_source!(RiskMarginRatio, "Risk.MarginRatio", "value");
 single_scalar_source!(RiskOtr, "Risk.OTR", "value");
 single_scalar_source!(InventoryLevel, "Inventory.Level", "value");
 
+// Phase 2 Wave C — signal + toxicity sources.
+single_scalar_source!(SignalImbalance, "Signal.ImbalanceDepth", "value");
+single_scalar_source!(SignalTradeFlow, "Signal.TradeFlow", "value");
+single_scalar_source!(SignalMicroprice, "Signal.Microprice", "value");
+single_scalar_source!(KyleLambda, "Toxicity.KyleLambda", "value");
+
 // Phase 2 — strategy + pair-class metadata sources. Zero-input
 // typed-enum outputs; the evaluator short-circuits both and the
 // engine fills them from `strategy.name()` / `adaptive_tuner
@@ -126,6 +132,36 @@ impl NodeKind for StrategyActive {
     }
     fn output_ports(&self) -> &[Port] {
         &STRATEGY_ACTIVE_OUTPUTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
+/// `Regime.Detector` — emits the autotuner's current regime tag
+/// as a `String`. Values: `"Quiet" | "Volatile" | "Trending" |
+/// "MeanReverting"`. Pair with `Cast.StringEq` (future node) or
+/// build the comparator inline as needed.
+#[derive(Debug, Default)]
+pub struct RegimeDetector;
+
+static REGIME_OUTPUTS: Lazy<Vec<Port>> =
+    Lazy::new(|| vec![Port::new("regime", PortType::String)]);
+
+impl NodeKind for RegimeDetector {
+    fn kind(&self) -> &'static str {
+        "Regime.Detector"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &REGIME_OUTPUTS
     }
     fn evaluate(
         &self,

@@ -21,6 +21,13 @@ use crate::types::{NodeId, Value};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 
+/// Per-tick capture of every node's produced output values, keyed by
+/// `(node_id, output_port_name)`. Populated only by
+/// [`Evaluator::tick_with_trace`] — the dashboard preview endpoint
+/// streams these back to the UI so the operator sees live values on
+/// every edge of the canvas.
+pub type EvalTrace = HashMap<(NodeId, String), Value>;
+
 /// Engine-side action produced by a sink node firing on a given tick.
 /// The evaluator collects these in order; the engine applies them
 /// after the `tick()` returns.
@@ -29,6 +36,14 @@ pub enum SinkAction {
     SpreadMult(Decimal),
     SizeMult(Decimal),
     KillEscalate { level: u8, reason: String },
+    /// Phase 2 Wave D — graph-authored flatten. `policy` is the
+    /// compact string emitted by an `Exec.*Config` node
+    /// (`twap:120:5`, `vwap:300`, `pov:10`, `iceberg:0.1`). The
+    /// engine fires kill L4 + passes the policy into its exec
+    /// pipeline.
+    Flatten {
+        policy: String,
+    },
 }
 
 /// Pre-compiled graph ready for per-tick evaluation. Holds the
@@ -119,9 +134,39 @@ impl Evaluator {
         ctx: &EvalCtx,
         source_inputs: &HashMap<(NodeId, String), Value>,
     ) -> anyhow::Result<Vec<SinkAction>> {
+        self.tick_inner(ctx, source_inputs, false).map(|(s, _)| s)
+    }
+
+    /// Preview-mode evaluation: same as `tick` but ALSO captures
+    /// every node's produced output keyed by `(node_id, port)`.
+    /// The UI draws these as live labels on the corresponding
+    /// edges so an operator sees exactly what the graph would
+    /// do *before* deploying. Sink actions are returned too so
+    /// the operator sees which branches fire — but the caller
+    /// is expected to discard them (this is preview, not
+    /// production).
+    pub fn tick_with_trace(
+        &mut self,
+        ctx: &EvalCtx,
+        source_inputs: &HashMap<(NodeId, String), Value>,
+    ) -> anyhow::Result<(Vec<SinkAction>, EvalTrace)> {
+        self.tick_inner(ctx, source_inputs, true)
+    }
+
+    fn tick_inner(
+        &mut self,
+        ctx: &EvalCtx,
+        source_inputs: &HashMap<(NodeId, String), Value>,
+        capture: bool,
+    ) -> anyhow::Result<(Vec<SinkAction>, EvalTrace)> {
         let mut outputs: HashMap<NodeId, NodeOutputs> =
             HashMap::with_capacity(self.order.len());
         let mut sinks: Vec<SinkAction> = Vec::new();
+        let mut trace: EvalTrace = if capture {
+            HashMap::with_capacity(self.order.len() * 2)
+        } else {
+            HashMap::new()
+        };
 
         for id in &self.order {
             let node = self
@@ -187,6 +232,9 @@ impl Evaluator {
             // Stash produced values by output port name.
             let mut out_map: NodeOutputs = HashMap::new();
             for (port, value) in node.output_ports().iter().zip(produced.iter().cloned()) {
+                if capture {
+                    trace.insert((*id, port.name.clone()), value.clone());
+                }
                 out_map.insert(port.name.clone(), value);
             }
             outputs.insert(*id, out_map);
@@ -228,10 +276,22 @@ impl Evaluator {
                         sinks.push(SinkAction::KillEscalate { level, reason });
                     }
                 }
+                "Out.Flatten" => {
+                    let trigger =
+                        input_vec.first().and_then(Value::as_bool).unwrap_or(false);
+                    if trigger {
+                        let policy = input_vec
+                            .get(1)
+                            .and_then(Value::as_string)
+                            .unwrap_or("twap:120:5")
+                            .to_string();
+                        sinks.push(SinkAction::Flatten { policy });
+                    }
+                }
                 _ => {}
             }
         }
 
-        Ok(sinks)
+        Ok((sinks, trace))
     }
 }

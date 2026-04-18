@@ -109,3 +109,37 @@ impl NodeKind for KillEscalate {
         Ok(vec![Value::Unit])
     }
 }
+
+static FLATTEN_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
+    vec![
+        Port::new("trigger", PortType::Bool),
+        Port::new("policy", PortType::String),
+    ]
+});
+
+/// `Out.Flatten` — on `trigger = true`, fire a kill-switch L4
+/// (FlattenAll) with the policy string from the connected
+/// `Exec.*Config` node. The engine's existing `paired_unwind` +
+/// `twap_executor` pipeline interprets the policy on escalation.
+#[derive(Debug, Default)]
+pub struct Flatten;
+
+impl NodeKind for Flatten {
+    fn kind(&self) -> &'static str {
+        "Out.Flatten"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &FLATTEN_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &UNIT_OUT
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Unit])
+    }
+}

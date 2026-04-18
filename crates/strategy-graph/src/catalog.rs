@@ -15,7 +15,7 @@
 
 use crate::graph::KindShape;
 use crate::node::NodeKind;
-use crate::nodes::{logic, math, risk, sinks, sources, stats};
+use crate::nodes::{exec, indicators, logic, math, risk, sinks, sources, stats};
 use serde_json::Value as Json;
 
 /// Construct a node by its catalog key + raw config JSON.
@@ -67,6 +67,44 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Risk.CircuitBreaker" => {
             risk::CircuitBreaker::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
         }
+        // Phase 2 Wave C — indicators + signal sources
+        "Indicator.SMA" => {
+            indicators::SmaNode::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
+        }
+        "Indicator.EMA" => {
+            indicators::EmaNode::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
+        }
+        "Indicator.HMA" => {
+            indicators::HmaNode::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
+        }
+        "Indicator.RSI" => {
+            indicators::RsiNode::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
+        }
+        "Indicator.ATR" => {
+            indicators::AtrNode::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
+        }
+        "Indicator.Bollinger" => indicators::BollingerNode::from_config(config)
+            .map(|n| Box::new(n) as Box<dyn NodeKind>),
+        "Signal.ImbalanceDepth" => Some(Box::new(sources::SignalImbalance)),
+        "Signal.TradeFlow" => Some(Box::new(sources::SignalTradeFlow)),
+        "Signal.Microprice" => Some(Box::new(sources::SignalMicroprice)),
+        "Toxicity.KyleLambda" => Some(Box::new(sources::KyleLambda)),
+        "Regime.Detector" => Some(Box::new(sources::RegimeDetector)),
+        // Phase 2 Wave D — exec algo presets + flatten
+        "Logic.StringMux" => Some(Box::new(logic::StringMux)),
+        "Exec.TwapConfig" => {
+            exec::TwapConfig::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
+        }
+        "Exec.VwapConfig" => {
+            exec::VwapConfig::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
+        }
+        "Exec.PovConfig" => {
+            exec::PovConfig::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
+        }
+        "Exec.IcebergConfig" => {
+            exec::IcebergConfig::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
+        }
+        "Out.Flatten" => Some(Box::new(sinks::Flatten)),
         // Sinks
         "Out.SpreadMult" => Some(Box::new(sinks::SpreadMult)),
         "Out.SizeMult" => Some(Box::new(sinks::SizeMult)),
@@ -122,6 +160,23 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Risk.ToxicityWiden",
         "Risk.InventoryUrgency",
         "Risk.CircuitBreaker",
+        "Indicator.SMA",
+        "Indicator.EMA",
+        "Indicator.HMA",
+        "Indicator.RSI",
+        "Indicator.ATR",
+        "Indicator.Bollinger",
+        "Signal.ImbalanceDepth",
+        "Signal.TradeFlow",
+        "Signal.Microprice",
+        "Toxicity.KyleLambda",
+        "Regime.Detector",
+        "Logic.StringMux",
+        "Exec.TwapConfig",
+        "Exec.VwapConfig",
+        "Exec.PovConfig",
+        "Exec.IcebergConfig",
+        "Out.Flatten",
         "Out.SpreadMult",
         "Out.SizeMult",
         "Out.KillEscalate",
@@ -185,9 +240,10 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_26_nodes_after_wave_b() {
-        // MVP 16 + Wave A (4) + Wave B (6: 3 sources + 3 transforms)
-        // = 26.
-        assert_eq!(kinds().len(), 26, "catalog drift");
+    fn catalog_has_43_nodes_after_wave_d() {
+        // MVP 16 + Wave A (4) + Wave B (6) + Wave C (11) +
+        // Wave D (Logic.StringMux + 4 Exec.*Config + Out.Flatten
+        // = 6) = 43.
+        assert_eq!(kinds().len(), 43, "catalog drift");
     }
 }
