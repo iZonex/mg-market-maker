@@ -2931,6 +2931,47 @@ impl MarketMakerEngine {
                         pending_alerts.push((kind.clone(), *id, out));
                     }
                 }
+                "Cost.CumulativeToday" => {
+                    // RS-4 — net trading cost in quote asset:
+                    // fees_paid - rebate_income. The PnL tracker
+                    // resets at each UTC midnight snapshot via
+                    // the daily rotation path, so this is the
+                    // today-to-date view operators want.
+                    let a = &self.pnl_tracker.attribution;
+                    src.insert(
+                        (*id, "value".into()),
+                        Value::Number(a.fees_paid - a.rebate_income),
+                    );
+                }
+                "Decision.RealizedCostBps" => {
+                    // RS-4 — rolling avg of `realized_cost_bps`
+                    // across the last `window_decisions` resolved
+                    // decisions for this engine's symbol.
+                    let cfg = graph.node_configs().get(id);
+                    let n = cfg
+                        .and_then(|c| c.get("window_decisions"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(50)
+                        .max(1) as usize;
+                    let recent = self.decision_ledger.recent(n);
+                    let mut sum = rust_decimal::Decimal::ZERO;
+                    let mut count = 0u32;
+                    for d in &recent {
+                        if d.symbol != self.symbol {
+                            continue;
+                        }
+                        for r in &d.resolved {
+                            sum += r.realized_cost_bps;
+                            count += 1;
+                        }
+                    }
+                    let v = if count == 0 {
+                        Value::Missing
+                    } else {
+                        Value::Number(sum / rust_decimal::Decimal::from(count))
+                    };
+                    src.insert((*id, "value".into()), v);
+                }
                 "Position.CostBasis" => {
                     // RS-3 — direct read off the inventory
                     // tracker. Zero when flat → Missing so the

@@ -167,6 +167,77 @@ impl NodeKind for CostSweep {
     }
 }
 
+// ── Cost.CumulativeToday / Decision.RealizedCostBps (RS-4) ─
+
+/// `Cost.CumulativeToday` — cumulative net trading cost since
+/// UTC midnight in the engine's quote asset:
+/// `fees_paid - rebate_income`. Positive = we paid the venue
+/// today; negative = we're in the rebate green.
+#[derive(Debug, Default)]
+pub struct CumulativeTodayCost;
+
+impl NodeKind for CumulativeTodayCost {
+    fn kind(&self) -> &'static str {
+        "Cost.CumulativeToday"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        static PORTS: Lazy<Vec<Port>> =
+            Lazy::new(|| vec![Port::new("value", PortType::Number)]);
+        &PORTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
+/// `Decision.RealizedCostBps` — rolling average of realized
+/// cost bps across the most recent N resolved decisions for
+/// this engine's symbol. `N` comes from config
+/// (`window_decisions`, default 50). `Missing` when no
+/// decisions have resolved yet.
+#[derive(Debug, Default)]
+pub struct DecisionRealizedCostBps;
+
+impl NodeKind for DecisionRealizedCostBps {
+    fn kind(&self) -> &'static str {
+        "Decision.RealizedCostBps"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        static PORTS: Lazy<Vec<Port>> =
+            Lazy::new(|| vec![Port::new("value", PortType::Number)]);
+        &PORTS
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![ConfigField {
+            name: "window_decisions",
+            label: "Window (decisions)",
+            hint: Some("Number of most-recent resolved decisions to average"),
+            default: serde_json::json!(50),
+            widget: ConfigWidget::Integer { min: Some(1), max: Some(10_000) },
+        }]
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
 // ── Position.CostBasis / Risk.UnrealizedIfFlatten (RS-3) ──
 
 /// `Position.CostBasis` — running average entry price of the

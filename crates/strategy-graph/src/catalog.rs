@@ -167,6 +167,8 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Risk.LiquidationDistance" => Some(Box::new(sources::LiquidationDistanceSource)),
         "Position.CostBasis" => Some(Box::new(sources::PositionCostBasis)),
         "Risk.UnrealizedIfFlatten" => Some(Box::new(sources::UnrealizedIfFlatten)),
+        "Cost.CumulativeToday" => Some(Box::new(sources::CumulativeTodayCost)),
+        "Decision.RealizedCostBps" => Some(Box::new(sources::DecisionRealizedCostBps)),
         // Sinks
         "Out.SpreadMult" => Some(Box::new(sinks::SpreadMult)),
         "Out.SizeMult" => Some(Box::new(sinks::SizeMult)),
@@ -305,6 +307,8 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Risk.LiquidationDistance" => NodeMeta { label: "Liquidation dist",  summary: "Bps distance from mid to the position's liq_price (perp-only)", group: "Risk" },
         "Position.CostBasis"       => NodeMeta { label: "Position cost basis", summary: "Running avg entry price of the open position (0 when flat)", group: "Sources" },
         "Risk.UnrealizedIfFlatten" => NodeMeta { label: "Unrealized if flat", summary: "Quote-asset PnL we'd realise by flattening now against the live book", group: "Risk" },
+        "Cost.CumulativeToday"     => NodeMeta { label: "Cost today",        summary: "fees_paid − rebate_income since UTC midnight", group: "Sources" },
+        "Decision.RealizedCostBps" => NodeMeta { label: "Decision cost avg", summary: "Rolling avg realized cost bps across the last N resolved decisions", group: "Sources" },
 
         // Sinks — always fire on a trigger, consumed by the engine.
         "Out.SpreadMult"       => NodeMeta { label: "Spread multiplier",   summary: "Final spread scalar applied to quotes", group: "Sinks" },
@@ -425,6 +429,8 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Risk.LiquidationDistance",
         "Position.CostBasis",
         "Risk.UnrealizedIfFlatten",
+        "Cost.CumulativeToday",
+        "Decision.RealizedCostBps",
         "Surveillance.SpoofingScore",
         "Surveillance.LayeringScore",
         "Surveillance.QuoteStuffingScore",
@@ -519,8 +525,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_96_nodes_after_rs_3_position_sources() {
-        // 94 + 2 (RS-3: Position.CostBasis + Risk.UnrealizedIfFlatten). = 96.
-        assert_eq!(kinds().len(), 96, "catalog drift");
+    fn catalog_has_98_nodes_after_rs_4_cost_sources() {
+        // 96 + 2 (RS-4: Cost.CumulativeToday + Decision.RealizedCostBps). = 98.
+        assert_eq!(kinds().len(), 98, "catalog drift");
     }
 }
