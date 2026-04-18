@@ -403,6 +403,74 @@ mod integration_tests {
         assert!(matches!(err, ValidationError::InvalidConfigEnumValue { .. }), "got {err:?}");
     }
 
+    /// Sprint 5b — unknown venue in Book.L1 config rejects.
+    #[test]
+    fn rejects_unknown_venue_in_book_l1() {
+        let mut g = Graph::empty("bad-venue", GScope::Global);
+        g.nodes.push(graph::Node {
+            id: NodeId::new(),
+            kind: "Book.L1".into(),
+            config: serde_json::json!({ "venue": "notareal" }),
+            pos: (0.0, 0.0),
+        });
+        let err = g
+            .validate_venues(["binance", "bybit"])
+            .expect_err("rejects");
+        assert!(matches!(err, ValidationError::UnknownVenue { .. }), "got {err:?}");
+    }
+
+    /// Sprint 5b — BasisArb's spot_venue + perp_venue both checked.
+    #[test]
+    fn rejects_unknown_venue_in_basis_arb() {
+        let mut g = Graph::empty("bad-basis", GScope::Global);
+        g.nodes.push(graph::Node {
+            id: NodeId::new(),
+            kind: "Strategy.BasisArb".into(),
+            config: serde_json::json!({
+                "spot_venue": "binance",
+                "perp_venue": "madeupexchange",
+                "symbol": "BTCUSDT",
+            }),
+            pos: (0.0, 0.0),
+        });
+        let err = g
+            .validate_venues(["binance", "bybit"])
+            .expect_err("rejects perp_venue");
+        match err {
+            ValidationError::UnknownVenue { field, venue, .. } => {
+                assert_eq!(field, "perp_venue");
+                assert_eq!(venue, "madeupexchange");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// Sprint 5b — configured venues pass case-insensitively.
+    #[test]
+    fn accepts_configured_venue_case_insensitive() {
+        let mut g = Graph::empty("ok-venue", GScope::Global);
+        g.nodes.push(graph::Node {
+            id: NodeId::new(),
+            kind: "Book.L1".into(),
+            config: serde_json::json!({ "venue": "Binance" }),
+            pos: (0.0, 0.0),
+        });
+        g.validate_venues(["binance"]).expect("case-insensitive match");
+    }
+
+    /// Sprint 5b — empty / missing venue string skipped.
+    #[test]
+    fn skips_empty_venue_string() {
+        let mut g = Graph::empty("empty-venue", GScope::Global);
+        g.nodes.push(graph::Node {
+            id: NodeId::new(),
+            kind: "Book.L1".into(),
+            config: serde_json::json!({ "venue": "" }),
+            pos: (0.0, 0.0),
+        });
+        g.validate_venues::<[&str; 0], &str>([]).expect("empty venue ignored");
+    }
+
     /// Sprint 5 — clean config that matches schema passes.
     #[test]
     fn accepts_valid_config() {

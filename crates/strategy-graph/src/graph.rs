@@ -153,6 +153,17 @@ pub enum ValidationError {
         value: String,
         options: Vec<String>,
     },
+    #[error(
+        "node \"{kind}\" references unknown venue \"{venue}\" \
+         (via field \"{field}\") — configured venues: {known:?}"
+    )]
+    UnknownVenue {
+        node: NodeId,
+        kind: String,
+        field: String,
+        venue: String,
+        known: Vec<String>,
+    },
 }
 
 /// Result of a full topological sort — nodes in evaluation order
@@ -347,6 +358,62 @@ impl Graph {
         }
 
         Ok(TopoOrder { order, depth })
+    }
+
+    /// Sprint 5b — cross-check every venue string the graph
+    /// references against the caller-supplied known-venue set.
+    /// The caller builds the set from `AppConfig.exchange` +
+    /// `sor_extra_venues`. Venue strings are compared case-
+    /// insensitively (match the engine's
+    /// `Debug::fmt(ExchangeType).to_lowercase()` convention).
+    ///
+    /// Venue-typed config fields recognised:
+    /// - `venue` (Book.L1/L2, Trade.Tape, Balance, Funding — all
+    ///   cross-venue source nodes).
+    /// - `spot_venue` / `perp_venue` (Strategy.BasisArb).
+    ///
+    /// Empty / missing venue strings are ignored — those nodes
+    /// default to the engine's own venue, which is always valid.
+    pub fn validate_venues<I, S>(
+        &self,
+        known: I,
+    ) -> std::result::Result<(), ValidationError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let known_set: HashSet<String> = known
+            .into_iter()
+            .map(|v| v.as_ref().to_lowercase())
+            .collect();
+        const VENUE_FIELDS: &[&str] = &["venue", "spot_venue", "perp_venue"];
+        for n in &self.nodes {
+            let serde_json::Value::Object(obj) = &n.config else {
+                continue;
+            };
+            for field in VENUE_FIELDS {
+                let Some(v) = obj.get(*field).and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if v.is_empty() {
+                    continue;
+                }
+                let lower = v.to_lowercase();
+                if !known_set.contains(&lower) {
+                    let mut known_sorted: Vec<String> =
+                        known_set.iter().cloned().collect();
+                    known_sorted.sort();
+                    return Err(ValidationError::UnknownVenue {
+                        node: n.id,
+                        kind: n.kind.clone(),
+                        field: (*field).to_string(),
+                        venue: v.to_string(),
+                        known: known_sorted,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 }
 

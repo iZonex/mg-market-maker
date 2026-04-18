@@ -46,6 +46,12 @@ pub async fn start(
     // throttled by source IP to slow credential-stuffing.
     let admin_rl = RateLimiter::new(300); // 300 req/min per user
     let login_rl = RateLimiter::new(20); // 20/min per source IP
+    // Sprint 5c — strategy-graph deploy is far more expensive than
+    // most admin reads (parse + validate + persist + broadcast to
+    // every engine) and a deploy burst is a plausible misuse / DoS
+    // path, so it gets its own much tighter budget. Reads (graphs
+    // list, templates, history) stay on the generic admin limiter.
+    let graph_deploy_rl = RateLimiter::new(10);
 
     // Public routes — no auth. Login is IP-rate-limited.
     let public = Router::new()
@@ -141,8 +147,24 @@ pub async fn start(
         .route("/api/admin/optimize/apply", post(admin_optimize_apply))
         .route("/api/admin/optimize/discard", post(admin_optimize_discard))
         .route("/api/admin/sentiment/headline", post(admin_sentiment_headline))
-        .route("/api/admin/strategy/graph", post(admin_deploy_strategy_graph))
         .merge(crate::admin_clients::admin_client_routes())
+        .with_state(state.clone());
+
+    // Strategy-graph deploy endpoint — same auth + admin middleware
+    // as the rest of the admin surface but a tighter rate limit.
+    // Split into its own router so the stricter limiter layers
+    // cleanly without double-counting against `admin_rl`.
+    let admin_graph_deploy = Router::new()
+        .route("/api/admin/strategy/graph", post(admin_deploy_strategy_graph))
+        .route_layer(middleware::from_fn_with_state(
+            graph_deploy_rl,
+            rate_limit_middleware,
+        ))
+        .route_layer(middleware::from_fn(admin_middleware))
+        .route_layer(middleware::from_fn_with_state(
+            auth_state.clone(),
+            auth_middleware,
+        ))
         .with_state(state.clone());
 
     // Admin user-management — also admin-only.
@@ -178,6 +200,7 @@ pub async fn start(
         .merge(protected_api)
         .merge(metrics_route)
         .merge(admin)
+        .merge(admin_graph_deploy)
         .merge(ws_routes)
         .layer(cors);
 
@@ -876,6 +899,22 @@ struct DeployQuery {
     rollback_from: Option<String>,
 }
 
+/// Sprint 5b — derive the set of venue names a graph may
+/// reference. One entry per configured `ExchangeType`, produced
+/// exactly the way the engine stringifies its own venue
+/// (`Debug::fmt(&exchange_type).to_lowercase()`), so validator
+/// strings match what the engine compares against at tick time.
+fn known_venue_names(cfg: &mm_common::config::AppConfig) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    out.push(format!("{:?}", cfg.exchange.exchange_type).to_lowercase());
+    for v in &cfg.sor_extra_venues {
+        out.push(format!("{:?}", v.exchange.exchange_type).to_lowercase());
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 async fn admin_deploy_strategy_graph(
     State(state): State<DashboardState>,
     Query(q): Query<DeployQuery>,
@@ -920,6 +959,31 @@ async fn admin_deploy_strategy_graph(
             })),
         )
             .into_response();
+    }
+
+    // Sprint 5b — venue existence check. Walks every venue-typed
+    // config field and refuses the deploy if the string doesn't
+    // match a configured venue on the server. Skipped when the
+    // app config isn't attached (test / minimal-mode servers).
+    if let Some(cfg) = state.app_config() {
+        let known = known_venue_names(&cfg);
+        if let Err(e) = graph.validate_venues(known.iter().map(String::as_str)) {
+            if let Some(audit) = state.audit_log() {
+                audit.strategy_graph_deploy_rejected(
+                    &graph.name,
+                    &format!("unknown venue: {e}"),
+                    &operator,
+                );
+            }
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": "unknown_venue",
+                    "detail": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
     }
 
     // Restricted-kind gate. `MM_RESTRICTED_ALLOW=1` opts in
