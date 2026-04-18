@@ -2931,6 +2931,34 @@ impl MarketMakerEngine {
                         pending_alerts.push((kind.clone(), *id, out));
                     }
                 }
+                "Risk.LiquidationDistance" => {
+                    // RS-2 — distance in bps from mid to the
+                    // venue-reported liq_price for this engine's
+                    // symbol. No position / no liq_price / spot /
+                    // missing mid → all return Missing.
+                    let mut out = Value::Missing;
+                    if let (Some(guard), Some(mid)) = (
+                        self.margin_guard.as_ref(),
+                        self.book_keeper.book.mid_price(),
+                    ) {
+                        if mid > rust_decimal::Decimal::ZERO {
+                            if let Some(info) = guard.last() {
+                                if let Some(pos) = info
+                                    .positions
+                                    .iter()
+                                    .find(|p| p.symbol == self.symbol)
+                                {
+                                    if let Some(liq) = pos.liq_price {
+                                        let ten_k = rust_decimal::Decimal::from(10_000);
+                                        let dist = (liq - mid).abs() / mid * ten_k;
+                                        out = Value::Number(dist);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    src.insert((*id, "value_bps".into()), out);
+                }
                 "Cost.Sweep" => {
                     // INT-4 — run sweep_vwap against the current
                     // book for the node's (side, size) config.

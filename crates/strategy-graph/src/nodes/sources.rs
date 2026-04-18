@@ -167,6 +167,43 @@ impl NodeKind for CostSweep {
     }
 }
 
+// ── Risk.LiquidationDistance (RS-2) ───────────────────────
+//
+// `Risk.MarginRatio` was already declared via the shared
+// `single_scalar_source!` macro below; RS-2 adds the engine-
+// side overlay so the placeholder finally carries live data.
+// Only `Risk.LiquidationDistance` is a genuinely new node here
+// because its output port is `value_bps`, not the generic
+// `value` the macro emits.
+
+/// `Risk.LiquidationDistance` — `|liq_price - mid| / mid * 10_000`
+/// in bps for the engine's current position. `None` when no
+/// position, spot engine, missing liq_price, or mid is zero.
+#[derive(Debug, Default)]
+pub struct LiquidationDistanceSource;
+
+impl NodeKind for LiquidationDistanceSource {
+    fn kind(&self) -> &'static str {
+        "Risk.LiquidationDistance"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        static PORTS: Lazy<Vec<Port>> =
+            Lazy::new(|| vec![Port::new("value_bps", PortType::Number)]);
+        &PORTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
 // Single-output source nodes share this helper since the only
 // difference is the `kind()` string.
 macro_rules! single_scalar_source {

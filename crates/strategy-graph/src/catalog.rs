@@ -164,6 +164,7 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Surveillance.StrategicNonFillingScore" => Some(Box::new(sources::StrategicNonFillingScore)),
         "Surveillance.ForeignTwap" => Some(Box::new(sources::ForeignTwap)),
         "Cost.Sweep" => Some(Box::new(sources::CostSweep)),
+        "Risk.LiquidationDistance" => Some(Box::new(sources::LiquidationDistanceSource)),
         // Sinks
         "Out.SpreadMult" => Some(Box::new(sinks::SpreadMult)),
         "Out.SizeMult" => Some(Box::new(sinks::SizeMult)),
@@ -299,6 +300,7 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Surveillance.StrategicNonFillingScore" => NodeMeta { label: "Non-filling score", summary: "Orders placed near-touch but fill rate near zero", group: "Surveillance" },
         "Surveillance.ForeignTwap" => NodeMeta { label: "Foreign TWAP", summary: "Autocorrelation peak on public-trade cadence — a competing algo is slicing a parent order", group: "Surveillance" },
         "Cost.Sweep"               => NodeMeta { label: "Sweep cost",        summary: "Simulated sweep-VWAP + impact bps against the current book — cost of taking size now", group: "Sources" },
+        "Risk.LiquidationDistance" => NodeMeta { label: "Liquidation dist",  summary: "Bps distance from mid to the position's liq_price (perp-only)", group: "Risk" },
 
         // Sinks — always fire on a trigger, consumed by the engine.
         "Out.SpreadMult"       => NodeMeta { label: "Spread multiplier",   summary: "Final spread scalar applied to quotes", group: "Sinks" },
@@ -416,6 +418,7 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Plan.Accumulate",
         "Surveillance.ForeignTwap",
         "Cost.Sweep",
+        "Risk.LiquidationDistance",
         "Surveillance.SpoofingScore",
         "Surveillance.LayeringScore",
         "Surveillance.QuoteStuffingScore",
@@ -510,8 +513,9 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_93_nodes_after_int_4_cost_sweep() {
-        // 92 (INT-3) + 1 (INT-4: Cost.Sweep) = 93.
-        assert_eq!(kinds().len(), 93, "catalog drift");
+    fn catalog_has_94_nodes_after_rs_2_liq_distance() {
+        // 93 + 1 (RS-2: Risk.LiquidationDistance; Risk.MarginRatio
+        // was already declared as a placeholder before RS-2). = 94.
+        assert_eq!(kinds().len(), 94, "catalog drift");
     }
 }
