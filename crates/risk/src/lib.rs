@@ -4,6 +4,7 @@ pub mod borrow;
 pub mod circuit_breaker;
 pub mod dca;
 pub mod exposure;
+pub mod foreign_twap;
 pub mod hedge_optimizer;
 pub mod inventory;
 pub mod inventory_drift;
