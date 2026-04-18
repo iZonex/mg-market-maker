@@ -3,6 +3,7 @@ pub mod audit_reader;
 pub mod borrow;
 pub mod circuit_breaker;
 pub mod dca;
+pub mod decision_ledger;
 pub mod exposure;
 pub mod foreign_twap;
 pub mod hedge_optimizer;
