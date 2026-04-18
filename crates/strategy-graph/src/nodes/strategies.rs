@@ -350,6 +350,59 @@ impl NodeKind for Mark {
     }
 }
 
+// Remaining pentest exploits — shell nodes that declare their
+// shape + restricted flag. Real behaviour wiring follows the
+// Spoof / Wash / Ignite / Mark pattern and can ride this scaffold
+// without a catalog edit.
+macro_rules! pentest_placeholder {
+    ($struct_name:ident, $kind:literal, $label:literal) => {
+        #[derive(Debug, Default)]
+        pub struct $struct_name;
+        impl NodeKind for $struct_name {
+            fn kind(&self) -> &'static str {
+                $kind
+            }
+            fn input_ports(&self) -> &[Port] {
+                &[]
+            }
+            fn output_ports(&self) -> &[Port] {
+                &QUOTES_OUT
+            }
+            fn restricted(&self) -> bool {
+                true
+            }
+            fn evaluate(
+                &self,
+                _ctx: &EvalCtx,
+                _inputs: &[Value],
+                _state: &mut NodeState,
+            ) -> Result<Vec<Value>> {
+                Ok(vec![Value::Missing])
+            }
+            fn config_schema(&self) -> Vec<ConfigField> {
+                vec![ConfigField {
+                    name: "burst_size",
+                    label: $label,
+                    hint: Some("Per-tick exploit order qty"),
+                    default: serde_json::json!("0.001"),
+                    widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                }]
+            }
+        }
+    };
+}
+
+pentest_placeholder!(Layer, "Strategy.Layer", "Layer burst size");
+pentest_placeholder!(Stuff, "Strategy.Stuff", "Stuff burst size");
+pentest_placeholder!(CrossMarket, "Strategy.CrossMarket", "Cross-market qty");
+pentest_placeholder!(LatencyHunt, "Strategy.LatencyHunt", "Latency-hunt qty");
+pentest_placeholder!(RebateFarm, "Strategy.RebateFarm", "Rebate-farm qty");
+pentest_placeholder!(Imbalance, "Strategy.Imbalance", "Imbalance push qty");
+pentest_placeholder!(ReactCancel, "Strategy.ReactCancel", "React-cancel qty");
+pentest_placeholder!(OneSided, "Strategy.OneSided", "One-sided qty");
+pentest_placeholder!(InvPush, "Strategy.InvPush", "Inv-push qty");
+pentest_placeholder!(NonFill, "Strategy.NonFill", "Non-fill qty");
+
 #[derive(Debug, Default)]
 pub struct Spoof;
 

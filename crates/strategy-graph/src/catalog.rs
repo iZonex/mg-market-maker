@@ -131,6 +131,16 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Strategy.Wash" => Some(Box::new(strategies::Wash)),
         "Strategy.Ignite" => Some(Box::new(strategies::Ignite)),
         "Strategy.Mark" => Some(Box::new(strategies::Mark)),
+        "Strategy.Layer" => Some(Box::new(strategies::Layer)),
+        "Strategy.Stuff" => Some(Box::new(strategies::Stuff)),
+        "Strategy.CrossMarket" => Some(Box::new(strategies::CrossMarket)),
+        "Strategy.LatencyHunt" => Some(Box::new(strategies::LatencyHunt)),
+        "Strategy.RebateFarm" => Some(Box::new(strategies::RebateFarm)),
+        "Strategy.Imbalance" => Some(Box::new(strategies::Imbalance)),
+        "Strategy.ReactCancel" => Some(Box::new(strategies::ReactCancel)),
+        "Strategy.OneSided" => Some(Box::new(strategies::OneSided)),
+        "Strategy.InvPush" => Some(Box::new(strategies::InvPush)),
+        "Strategy.NonFill" => Some(Box::new(strategies::NonFill)),
         // Epic R — surveillance detectors (engine overlays per tick)
         "Surveillance.SpoofingScore" => Some(Box::new(sources::SpoofingScore)),
         "Surveillance.LayeringScore" => Some(Box::new(sources::LayeringScore)),
@@ -250,6 +260,16 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Strategy.Wash"        => NodeMeta { label: "Wash (pentest)",      summary: "⚠ RESTRICTED — buy + sell at the same price every tick (self-trade)", group: "Exploit" },
         "Strategy.Ignite"      => NodeMeta { label: "Ignite (pentest)",    summary: "⚠ RESTRICTED — burst cross-through orders for N ticks, rest M, repeat", group: "Exploit" },
         "Strategy.Mark"        => NodeMeta { label: "Mark (pentest)",      summary: "⚠ RESTRICTED — aggressive cross-through inside the close-window before a session boundary", group: "Exploit" },
+        "Strategy.Layer"       => NodeMeta { label: "Layer (pentest)",     summary: "⚠ RESTRICTED — multi-level stacked orders one side, synchronous cancel", group: "Exploit" },
+        "Strategy.Stuff"       => NodeMeta { label: "Stuff (pentest)",     summary: "⚠ RESTRICTED — quote stuffing: high orders/sec + near-zero fill", group: "Exploit" },
+        "Strategy.CrossMarket" => NodeMeta { label: "Cross-market (pentest)", summary: "⚠ RESTRICTED — bursty illiquid-venue flow to move the correlated liquid mid", group: "Exploit" },
+        "Strategy.LatencyHunt" => NodeMeta { label: "Latency hunt (pentest)", summary: "⚠ RESTRICTED — snipe stale quotes on the other side of a fast move", group: "Exploit" },
+        "Strategy.RebateFarm"  => NodeMeta { label: "Rebate farm (pentest)", summary: "⚠ RESTRICTED — maker turnover only for rebates, no economic edge", group: "Exploit" },
+        "Strategy.Imbalance"   => NodeMeta { label: "Imbalance push (pentest)", summary: "⚠ RESTRICTED — one-side burst to skew imbalance then reverse", group: "Exploit" },
+        "Strategy.ReactCancel" => NodeMeta { label: "React-cancel (pentest)", summary: "⚠ RESTRICTED — cancel immediately when a nearby trade reacts", group: "Exploit" },
+        "Strategy.OneSided"    => NodeMeta { label: "One-sided (pentest)", summary: "⚠ RESTRICTED — post on one side only without inventory reason", group: "Exploit" },
+        "Strategy.InvPush"     => NodeMeta { label: "Inv push (pentest)",  summary: "⚠ RESTRICTED — drive price in unwinding direction to dump inventory", group: "Exploit" },
+        "Strategy.NonFill"     => NodeMeta { label: "Non-filling (pentest)", summary: "⚠ RESTRICTED — orders placed near-touch but pulled before fill", group: "Exploit" },
 
         // Epic R — surveillance detectors (safe, defaults-on)
         "Surveillance.SpoofingScore" => NodeMeta { label: "Spoofing score", summary: "Likelihood our own flow looks like spoofing [0..1] + cancel_ratio + lifetime", group: "Surveillance" },
@@ -371,6 +391,16 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Strategy.Wash",
         "Strategy.Ignite",
         "Strategy.Mark",
+        "Strategy.Layer",
+        "Strategy.Stuff",
+        "Strategy.CrossMarket",
+        "Strategy.LatencyHunt",
+        "Strategy.RebateFarm",
+        "Strategy.Imbalance",
+        "Strategy.ReactCancel",
+        "Strategy.OneSided",
+        "Strategy.InvPush",
+        "Strategy.NonFill",
         "Surveillance.SpoofingScore",
         "Surveillance.LayeringScore",
         "Surveillance.QuoteStuffingScore",
@@ -465,10 +495,12 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_80_nodes_after_epic_r_week_6_remaining_detectors() {
-        // 72 + 8 new Surveillance.* detectors = 80.
-        // Exploit halves for these 8 patterns + for the earlier
-        // Layering / QuoteStuffing land in Week 7.
-        assert_eq!(kinds().len(), 80, "catalog drift");
+    fn catalog_has_90_nodes_after_epic_r_week_7_exploits() {
+        // 80 + 10 pentest exploit placeholders = 90. All 15
+        // manipulation patterns now have both halves in the
+        // catalog; Mark / Spoof / Wash / Ignite ship real
+        // behaviour, the rest are shells with the restricted
+        // gate firing so prod deploy refuses them.
+        assert_eq!(kinds().len(), 90, "catalog drift");
     }
 }
