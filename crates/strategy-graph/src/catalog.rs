@@ -115,6 +115,7 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Quote.Grid" => Some(Box::new(quotes::Grid)),
         "Quote.Mux" => Some(Box::new(quotes::Mux)),
         "Out.Quotes" => Some(Box::new(sinks::Quotes)),
+        "Out.VenueQuotes" => Some(Box::new(sinks::VenueQuotes)),
         // Phase 4 composite strategies (engine overlays via source_inputs)
         "Strategy.Avellaneda" => Some(Box::new(strategies::Avellaneda)),
         "Strategy.GLFT" => Some(Box::new(strategies::Glft)),
@@ -235,6 +236,7 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Out.KillEscalate"     => NodeMeta { label: "Kill-switch escalate",summary: "Raise kill level with a reason", group: "Sinks" },
         "Out.Flatten"          => NodeMeta { label: "Flatten position",    summary: "Fire L4 flatten with the given exec policy", group: "Sinks" },
         "Out.Quotes"           => NodeMeta { label: "Quotes",              summary: "Replace strategy output with a graph-authored quote bundle", group: "Sinks" },
+        "Out.VenueQuotes"      => NodeMeta { label: "Venue quotes",        summary: "Multi-venue quote bundle — each entry names its own venue/symbol/product", group: "Sinks" },
 
         // Defensive fallback — every catalog kind should have its own
         // arm above. If a new kind sneaks in without a meta entry,
@@ -315,6 +317,7 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Quote.Grid",
         "Quote.Mux",
         "Out.Quotes",
+        "Out.VenueQuotes",
         "Strategy.Avellaneda",
         "Strategy.GLFT",
         "Strategy.Grid",
@@ -402,10 +405,9 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_59_nodes_after_multi_venue_2b2() {
-        // 55 after Week 3 + Book.L2 + Trade.Tape + Balance + Funding
-        // = 59. Parameterised cross-venue sources ship as new kinds;
-        // legacy Book.L1 unchanged.
-        assert_eq!(kinds().len(), 59, "catalog drift");
+    fn catalog_has_60_nodes_after_multi_venue_3a() {
+        // 59 after 2.B.2 + Out.VenueQuotes = 60. VenueQuote
+        // format + sink ship; router wiring lands in 3.B.
+        assert_eq!(kinds().len(), 60, "catalog drift");
     }
 }

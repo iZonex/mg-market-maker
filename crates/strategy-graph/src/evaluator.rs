@@ -17,7 +17,7 @@
 use crate::catalog;
 use crate::graph::{Graph, ValidationError};
 use crate::node::{EvalCtx, NodeKind, NodeOutputs, NodeState};
-use crate::types::{GraphQuote, NodeId, Value};
+use crate::types::{GraphQuote, NodeId, Value, VenueQuote};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 
@@ -51,6 +51,12 @@ pub enum SinkAction {
     /// `QuotePair` list from a strategy). Missing / absent `Out.Quotes`
     /// falls back to the hard-wired strategy.
     Quotes(Vec<GraphQuote>),
+    /// Multi-Venue 3.A — like [`Self::Quotes`] but every entry
+    /// carries its own `(venue, symbol, product)` destination.
+    /// The engine dispatcher fans each entry to the matching
+    /// engine's order manager; entries whose target is the engine
+    /// itself collapse to the `Quotes` path for the degenerate case.
+    VenueQuotes(Vec<VenueQuote>),
 }
 
 /// Pre-compiled graph ready for per-tick evaluation. Holds the
@@ -322,6 +328,11 @@ impl Evaluator {
                     // a stale feed never poisons the order placement.
                     if let Some(qs) = input_vec.first().and_then(Value::as_quotes) {
                         sinks.push(SinkAction::Quotes(qs.clone()));
+                    }
+                }
+                "Out.VenueQuotes" => {
+                    if let Some(qs) = input_vec.first().and_then(Value::as_venue_quotes) {
+                        sinks.push(SinkAction::VenueQuotes(qs.clone()));
                     }
                 }
                 _ => {}

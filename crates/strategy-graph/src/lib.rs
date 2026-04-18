@@ -29,7 +29,9 @@ pub use node::{
     ConfigEnumOption, ConfigField, ConfigWidget, EvalCtx, NodeKind, NodeState,
 };
 pub use storage::{DeployRecord, GraphStore};
-pub use types::{Edge, GraphQuote, NodeId, Port, PortRef, PortType, QuoteSide, Value};
+pub use types::{
+    Edge, GraphQuote, NodeId, Port, PortRef, PortType, QuoteSide, Value, VenueQuote,
+};
 
 #[cfg(test)]
 mod integration_tests {

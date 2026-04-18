@@ -2164,6 +2164,67 @@ impl MarketMakerEngine {
                     }
                     self.graph_quotes_override = Some(pairs);
                 }
+                SinkAction::VenueQuotes(vqs) => {
+                    // Multi-Venue 3.A — degenerate dispatcher. Fan
+                    // entries to:
+                    //   · self engine (same venue + symbol)  →
+                    //     reuse the classic `graph_quotes_override`
+                    //     path (legacy diffing, inventory limits,
+                    //     balance check all get their shot).
+                    //   · any other venue/symbol → ignored with a
+                    //     warn; 3.B replaces this arm with a real
+                    //     MultiVenueOrderRouter.
+                    use mm_common::types::{Quote, QuotePair, Side};
+                    use mm_strategy_graph::QuoteSide;
+                    let self_venue = format!("{:?}", self.config.exchange.exchange_type)
+                        .to_lowercase();
+                    let self_product_label =
+                        format!("{:?}", self.config.exchange.product).to_lowercase();
+                    let (mut local_bids, mut local_asks): (Vec<Quote>, Vec<Quote>) =
+                        (Vec::new(), Vec::new());
+                    let mut routed_elsewhere = 0usize;
+                    for vq in &vqs {
+                        let targets_self = vq.venue == self_venue
+                            && vq.symbol == self.symbol
+                            && (vq.product.is_empty() || vq.product == self_product_label);
+                        if !targets_self {
+                            routed_elsewhere += 1;
+                            continue;
+                        }
+                        let q = Quote {
+                            side: match vq.side {
+                                QuoteSide::Buy => Side::Buy,
+                                QuoteSide::Sell => Side::Sell,
+                            },
+                            price: self.product.round_price(vq.price),
+                            qty: self.product.round_qty(vq.qty),
+                        };
+                        match q.side {
+                            Side::Buy => local_bids.push(q),
+                            Side::Sell => local_asks.push(q),
+                        }
+                    }
+                    if routed_elsewhere > 0 {
+                        warn!(
+                            symbol = %self.symbol,
+                            count = routed_elsewhere,
+                            "Out.VenueQuotes entries for other venues dropped (3.B dispatcher not wired yet)"
+                        );
+                    }
+                    // Pair bids + asks inner-first, same shape as the
+                    // Quotes sink path.
+                    local_bids.sort_by(|a, b| b.price.cmp(&a.price));
+                    local_asks.sort_by(|a, b| a.price.cmp(&b.price));
+                    let n = local_bids.len().max(local_asks.len());
+                    let mut pairs = Vec::with_capacity(n);
+                    for i in 0..n {
+                        pairs.push(QuotePair {
+                            bid: local_bids.get(i).cloned(),
+                            ask: local_asks.get(i).cloned(),
+                        });
+                    }
+                    self.graph_quotes_override = Some(pairs);
+                }
                 SinkAction::Flatten { policy } => {
                     // Graph-authored flatten. Escalates kill L4 with
                     // the policy string; existing paired_unwind /

@@ -88,6 +88,30 @@ pub struct GraphQuote {
     pub qty: Decimal,
 }
 
+/// Multi-Venue Level 3.A — a quote bundle entry that explicitly
+/// names which (venue, symbol, product) it targets. Consumed by
+/// `Out.VenueQuotes`; the engine / router dispatches each entry to
+/// the right engine's `order_manager`. The degenerate case —
+/// VenueQuote on this engine's own venue/symbol/product — routes
+/// through `self.order_manager` like a legacy `GraphQuote`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VenueQuote {
+    /// Exchange venue identifier, e.g. `"bybit"`, `"binance"`,
+    /// `"hyperliquid"`. Matches the string used in DataBus stream
+    /// keys (lower-case enum label).
+    pub venue: String,
+    /// Trading pair, e.g. `"BTCUSDT"`.
+    pub symbol: String,
+    /// Product (spot / linear_perp / inverse_perp).
+    pub product: String,
+    /// Buy or sell.
+    pub side: QuoteSide,
+    /// Limit price.
+    pub price: Decimal,
+    /// Quantity in base asset.
+    pub qty: Decimal,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuoteSide {
@@ -111,6 +135,10 @@ pub enum Value {
     /// Phase 4 — a quote bundle: the set of buy + sell levels the
     /// graph wants placed this tick. Consumed by `Out.Quotes`.
     Quotes(Vec<GraphQuote>),
+    /// Multi-Venue 3.A — a bundle of venue-tagged quotes. Consumed
+    /// by `Out.VenueQuotes`. Supersets `Quotes` for any graph that
+    /// places orders on venues other than the hosting engine's.
+    VenueQuotes(Vec<VenueQuote>),
     /// A source that had no observation this tick. Propagates through
     /// transforms as "hold last good" or "pass-through" depending on
     /// the node; sinks fall back to their neutral output after the
@@ -128,13 +156,20 @@ impl Value {
             Value::KillLevel(_) => PortType::KillLevel,
             Value::StrategyKind(_) => PortType::StrategyKind,
             Value::PairClass(_) => PortType::PairClass,
-            Value::Quotes(_) => PortType::Quotes,
+            Value::Quotes(_) | Value::VenueQuotes(_) => PortType::Quotes,
         }
     }
 
     pub fn as_quotes(&self) -> Option<&Vec<GraphQuote>> {
         match self {
             Value::Quotes(q) => Some(q),
+            _ => None,
+        }
+    }
+
+    pub fn as_venue_quotes(&self) -> Option<&Vec<VenueQuote>> {
+        match self {
+            Value::VenueQuotes(q) => Some(q),
             _ => None,
         }
     }

@@ -113,6 +113,38 @@ impl NodeKind for KillEscalate {
 static QUOTES_INPUTS: Lazy<Vec<Port>> =
     Lazy::new(|| vec![Port::new("quotes", PortType::Quotes)]);
 
+static VENUE_QUOTES_INPUTS: Lazy<Vec<Port>> =
+    Lazy::new(|| vec![Port::new("quotes", PortType::Quotes)]);
+
+/// Multi-Venue 3.A — `Out.VenueQuotes`. Accepts a
+/// `VenueQuotes(Vec<VenueQuote>)` bundle. Unlike `Out.Quotes`,
+/// every entry carries its own `(venue, symbol, product)` tag
+/// so the dispatcher can route to the right engine's order
+/// manager. Missing → the engine falls back to its legacy
+/// strategy path (same semantics as an absent `Out.Quotes`).
+#[derive(Debug, Default)]
+pub struct VenueQuotes;
+
+impl NodeKind for VenueQuotes {
+    fn kind(&self) -> &'static str {
+        "Out.VenueQuotes"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &VENUE_QUOTES_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &UNIT_OUT
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Unit])
+    }
+}
+
 /// Phase 4 — `Out.Quotes`. The graph took full authorship of the
 /// quoting pipeline: every tick the incoming `Quotes` bundle is
 /// what the engine places, replacing the built-in strategy.tick()
