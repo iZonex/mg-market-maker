@@ -8,6 +8,7 @@ pub mod cartea_spread;
 pub mod cks_ofi;
 pub mod cross_exchange;
 pub mod exec_algo;
+pub mod exploits;
 pub mod features;
 pub mod funding_arb;
 pub mod funding_arb_driver;

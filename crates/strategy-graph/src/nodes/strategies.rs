@@ -350,48 +350,6 @@ impl NodeKind for Mark {
     }
 }
 
-// Remaining pentest exploits — shell nodes that declare their
-// shape + restricted flag. Real behaviour wiring follows the
-// Spoof / Wash / Ignite / Mark pattern and can ride this scaffold
-// without a catalog edit.
-macro_rules! pentest_placeholder {
-    ($struct_name:ident, $kind:literal, $label:literal) => {
-        #[derive(Debug, Default)]
-        pub struct $struct_name;
-        impl NodeKind for $struct_name {
-            fn kind(&self) -> &'static str {
-                $kind
-            }
-            fn input_ports(&self) -> &[Port] {
-                &[]
-            }
-            fn output_ports(&self) -> &[Port] {
-                &QUOTES_OUT
-            }
-            fn restricted(&self) -> bool {
-                true
-            }
-            fn evaluate(
-                &self,
-                _ctx: &EvalCtx,
-                _inputs: &[Value],
-                _state: &mut NodeState,
-            ) -> Result<Vec<Value>> {
-                Ok(vec![Value::Missing])
-            }
-            fn config_schema(&self) -> Vec<ConfigField> {
-                vec![ConfigField {
-                    name: "burst_size",
-                    label: $label,
-                    hint: Some("Per-tick exploit order qty"),
-                    default: serde_json::json!("0.001"),
-                    widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
-                }]
-            }
-        }
-    };
-}
-
 /// `Strategy.Layer` — structured multi-level layering exploit.
 /// Real behaviour wired in engine via `LayerStrategy`.
 #[derive(Debug, Default)]
@@ -529,14 +487,470 @@ impl NodeKind for Stuff {
     }
 }
 
-pentest_placeholder!(CrossMarket, "Strategy.CrossMarket", "Cross-market qty");
-pentest_placeholder!(LatencyHunt, "Strategy.LatencyHunt", "Latency-hunt qty");
-pentest_placeholder!(RebateFarm, "Strategy.RebateFarm", "Rebate-farm qty");
-pentest_placeholder!(Imbalance, "Strategy.Imbalance", "Imbalance push qty");
-pentest_placeholder!(ReactCancel, "Strategy.ReactCancel", "React-cancel qty");
-pentest_placeholder!(OneSided, "Strategy.OneSided", "One-sided qty");
-pentest_placeholder!(InvPush, "Strategy.InvPush", "Inv-push qty");
-pentest_placeholder!(NonFill, "Strategy.NonFill", "Non-fill qty");
+/// `Strategy.CrossMarket` — burst/rest cross-venue push. Real
+/// behaviour in `CrossMarketStrategy`.
+#[derive(Debug, Default)]
+pub struct CrossMarket;
+
+impl NodeKind for CrossMarket {
+    fn kind(&self) -> &'static str {
+        "Strategy.CrossMarket"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &[]
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUOTES_OUT
+    }
+    fn restricted(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<ConfigField> {
+        vec![
+            ConfigField {
+                name: "push_side",
+                label: "Push side",
+                hint: None,
+                default: serde_json::json!("buy"),
+                widget: ConfigWidget::Enum {
+                    options: vec![
+                        ConfigEnumOption { value: "buy", label: "Buy" },
+                        ConfigEnumOption { value: "sell", label: "Sell" },
+                    ],
+                },
+            },
+            ConfigField {
+                name: "burst_size",
+                label: "Burst size",
+                hint: None,
+                default: serde_json::json!("0.01"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+            ConfigField {
+                name: "cross_depth_bps",
+                label: "Cross depth (bps)",
+                hint: None,
+                default: serde_json::json!("25"),
+                widget: ConfigWidget::Number { min: Some(1.0), max: Some(500.0), step: Some(1.0) },
+            },
+            ConfigField {
+                name: "burst_ticks",
+                label: "Burst ticks",
+                hint: None,
+                default: serde_json::json!(8),
+                widget: ConfigWidget::Integer { min: Some(1), max: Some(100) },
+            },
+            ConfigField {
+                name: "rest_ticks",
+                label: "Rest ticks",
+                hint: None,
+                default: serde_json::json!(4),
+                widget: ConfigWidget::Integer { min: Some(0), max: Some(100) },
+            },
+        ]
+    }
+}
+
+/// `Strategy.LatencyHunt` — fires on book skew. Real behaviour in
+/// `LatencyHuntStrategy`.
+#[derive(Debug, Default)]
+pub struct LatencyHunt;
+
+impl NodeKind for LatencyHunt {
+    fn kind(&self) -> &'static str {
+        "Strategy.LatencyHunt"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &[]
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUOTES_OUT
+    }
+    fn restricted(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<ConfigField> {
+        vec![
+            ConfigField {
+                name: "burst_size",
+                label: "Burst size",
+                hint: None,
+                default: serde_json::json!("0.001"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+            ConfigField {
+                name: "cross_depth_bps",
+                label: "Cross depth (bps)",
+                hint: None,
+                default: serde_json::json!("50"),
+                widget: ConfigWidget::Number { min: Some(1.0), max: Some(500.0), step: Some(1.0) },
+            },
+            ConfigField {
+                name: "skew_threshold",
+                label: "Skew threshold",
+                hint: Some("|bid_qty - ask_qty| / total above which to fire"),
+                default: serde_json::json!("0.5"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: Some(1.0), step: Some(0.05) },
+            },
+        ]
+    }
+}
+
+/// `Strategy.RebateFarm` — tight symmetric maker quotes for fee
+/// rebates. Real behaviour in `RebateFarmStrategy`.
+#[derive(Debug, Default)]
+pub struct RebateFarm;
+
+impl NodeKind for RebateFarm {
+    fn kind(&self) -> &'static str {
+        "Strategy.RebateFarm"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &[]
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUOTES_OUT
+    }
+    fn restricted(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<ConfigField> {
+        vec![
+            ConfigField {
+                name: "leg_size",
+                label: "Leg size",
+                hint: None,
+                default: serde_json::json!("0.01"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+            ConfigField {
+                name: "offset_bps",
+                label: "Offset from mid (bps)",
+                hint: Some("Tight offset maximises churn"),
+                default: serde_json::json!("1"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: Some(200.0), step: Some(0.5) },
+            },
+        ]
+    }
+}
+
+/// `Strategy.Imbalance` — alternating heavy-qty side to skew the
+/// book. Real behaviour in `ImbalanceStrategy`.
+#[derive(Debug, Default)]
+pub struct Imbalance;
+
+impl NodeKind for Imbalance {
+    fn kind(&self) -> &'static str {
+        "Strategy.Imbalance"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &[]
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUOTES_OUT
+    }
+    fn restricted(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<ConfigField> {
+        vec![
+            ConfigField {
+                name: "heavy_size",
+                label: "Heavy-side size",
+                hint: None,
+                default: serde_json::json!("0.05"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+            ConfigField {
+                name: "light_size",
+                label: "Light-side size",
+                hint: None,
+                default: serde_json::json!("0.001"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+            ConfigField {
+                name: "offset_bps",
+                label: "Offset from mid (bps)",
+                hint: None,
+                default: serde_json::json!("2"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: Some(200.0), step: Some(0.5) },
+            },
+            ConfigField {
+                name: "flip_ticks",
+                label: "Flip interval (ticks)",
+                hint: Some("Ticks held before swapping heavy side"),
+                default: serde_json::json!(3),
+                widget: ConfigWidget::Integer { min: Some(1), max: Some(100) },
+            },
+        ]
+    }
+}
+
+/// `Strategy.ReactCancel` — post then cancel if no nearby trade.
+/// Real behaviour in `ReactCancelStrategy`.
+#[derive(Debug, Default)]
+pub struct ReactCancel;
+
+impl NodeKind for ReactCancel {
+    fn kind(&self) -> &'static str {
+        "Strategy.ReactCancel"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &[]
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUOTES_OUT
+    }
+    fn restricted(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<ConfigField> {
+        vec![
+            ConfigField {
+                name: "push_side",
+                label: "Push side",
+                hint: None,
+                default: serde_json::json!("buy"),
+                widget: ConfigWidget::Enum {
+                    options: vec![
+                        ConfigEnumOption { value: "buy", label: "Buy" },
+                        ConfigEnumOption { value: "sell", label: "Sell" },
+                    ],
+                },
+            },
+            ConfigField {
+                name: "burst_size",
+                label: "Burst size",
+                hint: None,
+                default: serde_json::json!("0.001"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+            ConfigField {
+                name: "offset_bps",
+                label: "Offset from mid (bps)",
+                hint: None,
+                default: serde_json::json!("3"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: Some(200.0), step: Some(0.5) },
+            },
+            ConfigField {
+                name: "idle_ticks",
+                label: "Idle ticks between posts",
+                hint: Some("Cancels synchronously between posts"),
+                default: serde_json::json!(2),
+                widget: ConfigWidget::Integer { min: Some(1), max: Some(20) },
+            },
+        ]
+    }
+}
+
+/// `Strategy.OneSided` — post only the configured side. Real
+/// behaviour in `OneSidedStrategy`.
+#[derive(Debug, Default)]
+pub struct OneSided;
+
+impl NodeKind for OneSided {
+    fn kind(&self) -> &'static str {
+        "Strategy.OneSided"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &[]
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUOTES_OUT
+    }
+    fn restricted(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<ConfigField> {
+        vec![
+            ConfigField {
+                name: "side",
+                label: "Quote side",
+                hint: None,
+                default: serde_json::json!("buy"),
+                widget: ConfigWidget::Enum {
+                    options: vec![
+                        ConfigEnumOption { value: "buy", label: "Buy-only" },
+                        ConfigEnumOption { value: "sell", label: "Sell-only" },
+                    ],
+                },
+            },
+            ConfigField {
+                name: "offset_bps",
+                label: "Offset from mid (bps)",
+                hint: None,
+                default: serde_json::json!("2"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: Some(200.0), step: Some(0.5) },
+            },
+            ConfigField {
+                name: "leg_size",
+                label: "Leg size",
+                hint: None,
+                default: serde_json::json!("0.001"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+        ]
+    }
+}
+
+/// `Strategy.InvPush` — cross-through toward inventory-unwind
+/// direction. Real behaviour in `InvPushStrategy`.
+#[derive(Debug, Default)]
+pub struct InvPush;
+
+impl NodeKind for InvPush {
+    fn kind(&self) -> &'static str {
+        "Strategy.InvPush"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &[]
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUOTES_OUT
+    }
+    fn restricted(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<ConfigField> {
+        vec![
+            ConfigField {
+                name: "burst_size",
+                label: "Burst size",
+                hint: None,
+                default: serde_json::json!("0.001"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+            ConfigField {
+                name: "cross_depth_bps",
+                label: "Cross depth (bps)",
+                hint: None,
+                default: serde_json::json!("20"),
+                widget: ConfigWidget::Number { min: Some(1.0), max: Some(500.0), step: Some(1.0) },
+            },
+            ConfigField {
+                name: "min_inventory",
+                label: "Minimum |inventory|",
+                hint: Some("Fires only when inventory magnitude ≥ this"),
+                default: serde_json::json!("0.01"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+        ]
+    }
+}
+
+/// `Strategy.NonFill` — near-touch orders yanked every other tick.
+/// Real behaviour in `NonFillStrategy`.
+#[derive(Debug, Default)]
+pub struct NonFill;
+
+impl NodeKind for NonFill {
+    fn kind(&self) -> &'static str {
+        "Strategy.NonFill"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &[]
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUOTES_OUT
+    }
+    fn restricted(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<ConfigField> {
+        vec![
+            ConfigField {
+                name: "push_side",
+                label: "Push side",
+                hint: None,
+                default: serde_json::json!("buy"),
+                widget: ConfigWidget::Enum {
+                    options: vec![
+                        ConfigEnumOption { value: "buy", label: "Buy" },
+                        ConfigEnumOption { value: "sell", label: "Sell" },
+                    ],
+                },
+            },
+            ConfigField {
+                name: "leg_size",
+                label: "Leg size",
+                hint: None,
+                default: serde_json::json!("0.001"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+            ConfigField {
+                name: "offset_bps",
+                label: "Offset from touch (bps)",
+                hint: Some("Near-touch so placements look real before yank"),
+                default: serde_json::json!("1"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: Some(50.0), step: Some(0.5) },
+            },
+        ]
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct Spoof;

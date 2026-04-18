@@ -1731,6 +1731,174 @@ impl MarketMakerEngine {
                         mm_strategy::ignite::IgniteStrategy::with_config(ignite_cfg),
                     ))
                 }
+                "Strategy.CrossMarket" => {
+                    use mm_common::types::Side;
+                    let cfg = &n.config;
+                    let parse_dec = |k: &str, default: rust_decimal::Decimal| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(default)
+                    };
+                    let parse_i64 = |k: &str, default: i64| {
+                        cfg.get(k).and_then(|v| v.as_i64()).unwrap_or(default)
+                    };
+                    let push_side = match cfg.get("push_side").and_then(|v| v.as_str()) {
+                        Some("sell") => Side::Sell,
+                        _ => Side::Buy,
+                    };
+                    let c = mm_strategy::exploits::CrossMarketConfig {
+                        push_side,
+                        burst_size: parse_dec("burst_size", dec!(0.01)),
+                        cross_depth_bps: parse_dec("cross_depth_bps", dec!(25)),
+                        burst_ticks: parse_i64("burst_ticks", 8) as u64,
+                        rest_ticks: parse_i64("rest_ticks", 4) as u64,
+                    };
+                    Some(Box::new(
+                        mm_strategy::exploits::CrossMarketStrategy::with_config(c),
+                    ))
+                }
+                "Strategy.LatencyHunt" => {
+                    let cfg = &n.config;
+                    let parse_dec = |k: &str, default: rust_decimal::Decimal| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(default)
+                    };
+                    let c = mm_strategy::exploits::LatencyHuntConfig {
+                        burst_size: parse_dec("burst_size", dec!(0.001)),
+                        cross_depth_bps: parse_dec("cross_depth_bps", dec!(50)),
+                        skew_threshold: parse_dec("skew_threshold", dec!(0.5)),
+                    };
+                    Some(Box::new(
+                        mm_strategy::exploits::LatencyHuntStrategy::with_config(c),
+                    ))
+                }
+                "Strategy.RebateFarm" => {
+                    let cfg = &n.config;
+                    let parse_dec = |k: &str, default: rust_decimal::Decimal| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(default)
+                    };
+                    let c = mm_strategy::exploits::RebateFarmConfig {
+                        leg_size: parse_dec("leg_size", dec!(0.01)),
+                        offset_bps: parse_dec("offset_bps", dec!(1)),
+                    };
+                    Some(Box::new(
+                        mm_strategy::exploits::RebateFarmStrategy::with_config(c),
+                    ))
+                }
+                "Strategy.Imbalance" => {
+                    let cfg = &n.config;
+                    let parse_dec = |k: &str, default: rust_decimal::Decimal| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(default)
+                    };
+                    let parse_i64 = |k: &str, default: i64| {
+                        cfg.get(k).and_then(|v| v.as_i64()).unwrap_or(default)
+                    };
+                    let c = mm_strategy::exploits::ImbalanceConfig {
+                        heavy_size: parse_dec("heavy_size", dec!(0.05)),
+                        light_size: parse_dec("light_size", dec!(0.001)),
+                        offset_bps: parse_dec("offset_bps", dec!(2)),
+                        flip_ticks: parse_i64("flip_ticks", 3) as u64,
+                    };
+                    Some(Box::new(
+                        mm_strategy::exploits::ImbalanceStrategy::with_config(c),
+                    ))
+                }
+                "Strategy.ReactCancel" => {
+                    use mm_common::types::Side;
+                    let cfg = &n.config;
+                    let parse_dec = |k: &str, default: rust_decimal::Decimal| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(default)
+                    };
+                    let parse_i64 = |k: &str, default: i64| {
+                        cfg.get(k).and_then(|v| v.as_i64()).unwrap_or(default)
+                    };
+                    let push_side = match cfg.get("push_side").and_then(|v| v.as_str()) {
+                        Some("sell") => Side::Sell,
+                        _ => Side::Buy,
+                    };
+                    let c = mm_strategy::exploits::ReactCancelConfig {
+                        push_side,
+                        burst_size: parse_dec("burst_size", dec!(0.001)),
+                        offset_bps: parse_dec("offset_bps", dec!(3)),
+                        idle_ticks: parse_i64("idle_ticks", 2) as u64,
+                    };
+                    Some(Box::new(
+                        mm_strategy::exploits::ReactCancelStrategy::with_config(c),
+                    ))
+                }
+                "Strategy.OneSided" => {
+                    use mm_common::types::Side;
+                    let cfg = &n.config;
+                    let parse_dec = |k: &str, default: rust_decimal::Decimal| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(default)
+                    };
+                    let side = match cfg.get("side").and_then(|v| v.as_str()) {
+                        Some("sell") => Side::Sell,
+                        _ => Side::Buy,
+                    };
+                    let c = mm_strategy::exploits::OneSidedConfig {
+                        side,
+                        offset_bps: parse_dec("offset_bps", dec!(2)),
+                        leg_size: parse_dec("leg_size", dec!(0.001)),
+                    };
+                    Some(Box::new(
+                        mm_strategy::exploits::OneSidedStrategy::with_config(c),
+                    ))
+                }
+                "Strategy.InvPush" => {
+                    let cfg = &n.config;
+                    let parse_dec = |k: &str, default: rust_decimal::Decimal| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(default)
+                    };
+                    let c = mm_strategy::exploits::InvPushConfig {
+                        burst_size: parse_dec("burst_size", dec!(0.001)),
+                        cross_depth_bps: parse_dec("cross_depth_bps", dec!(20)),
+                        min_inventory: parse_dec("min_inventory", dec!(0.01)),
+                    };
+                    Some(Box::new(
+                        mm_strategy::exploits::InvPushStrategy::with_config(c),
+                    ))
+                }
+                "Strategy.NonFill" => {
+                    use mm_common::types::Side;
+                    let cfg = &n.config;
+                    let parse_dec = |k: &str, default: rust_decimal::Decimal| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(default)
+                    };
+                    let push_side = match cfg.get("push_side").and_then(|v| v.as_str()) {
+                        Some("sell") => Side::Sell,
+                        _ => Side::Buy,
+                    };
+                    let c = mm_strategy::exploits::NonFillConfig {
+                        push_side,
+                        leg_size: parse_dec("leg_size", dec!(0.001)),
+                        offset_bps: parse_dec("offset_bps", dec!(1)),
+                    };
+                    Some(Box::new(
+                        mm_strategy::exploits::NonFillStrategy::with_config(c),
+                    ))
+                }
                 _ => None,
             };
             if let Some(s) = built {
