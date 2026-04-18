@@ -40,6 +40,12 @@ impl InventoryManager {
         self.realized_pnl
     }
 
+    /// RS-3 — read-only accessor for the running average entry
+    /// price. `0` when the position is flat (no open exposure).
+    pub fn avg_entry_price(&self) -> Decimal {
+        self.avg_entry_price
+    }
+
     /// Unrealized PnL at a given mark price.
     pub fn unrealized_pnl(&self, mark_price: Price) -> Decimal {
         if self.inventory.is_zero() || self.avg_entry_price.is_zero() {

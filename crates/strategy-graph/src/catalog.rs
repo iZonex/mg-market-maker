@@ -165,6 +165,8 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Surveillance.ForeignTwap" => Some(Box::new(sources::ForeignTwap)),
         "Cost.Sweep" => Some(Box::new(sources::CostSweep)),
         "Risk.LiquidationDistance" => Some(Box::new(sources::LiquidationDistanceSource)),
+        "Position.CostBasis" => Some(Box::new(sources::PositionCostBasis)),
+        "Risk.UnrealizedIfFlatten" => Some(Box::new(sources::UnrealizedIfFlatten)),
         // Sinks
         "Out.SpreadMult" => Some(Box::new(sinks::SpreadMult)),
         "Out.SizeMult" => Some(Box::new(sinks::SizeMult)),
@@ -301,6 +303,8 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Surveillance.ForeignTwap" => NodeMeta { label: "Foreign TWAP", summary: "Autocorrelation peak on public-trade cadence — a competing algo is slicing a parent order", group: "Surveillance" },
         "Cost.Sweep"               => NodeMeta { label: "Sweep cost",        summary: "Simulated sweep-VWAP + impact bps against the current book — cost of taking size now", group: "Sources" },
         "Risk.LiquidationDistance" => NodeMeta { label: "Liquidation dist",  summary: "Bps distance from mid to the position's liq_price (perp-only)", group: "Risk" },
+        "Position.CostBasis"       => NodeMeta { label: "Position cost basis", summary: "Running avg entry price of the open position (0 when flat)", group: "Sources" },
+        "Risk.UnrealizedIfFlatten" => NodeMeta { label: "Unrealized if flat", summary: "Quote-asset PnL we'd realise by flattening now against the live book", group: "Risk" },
 
         // Sinks — always fire on a trigger, consumed by the engine.
         "Out.SpreadMult"       => NodeMeta { label: "Spread multiplier",   summary: "Final spread scalar applied to quotes", group: "Sinks" },
@@ -419,6 +423,8 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Surveillance.ForeignTwap",
         "Cost.Sweep",
         "Risk.LiquidationDistance",
+        "Position.CostBasis",
+        "Risk.UnrealizedIfFlatten",
         "Surveillance.SpoofingScore",
         "Surveillance.LayeringScore",
         "Surveillance.QuoteStuffingScore",
@@ -513,9 +519,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_94_nodes_after_rs_2_liq_distance() {
-        // 93 + 1 (RS-2: Risk.LiquidationDistance; Risk.MarginRatio
-        // was already declared as a placeholder before RS-2). = 94.
-        assert_eq!(kinds().len(), 94, "catalog drift");
+    fn catalog_has_96_nodes_after_rs_3_position_sources() {
+        // 94 + 2 (RS-3: Position.CostBasis + Risk.UnrealizedIfFlatten). = 96.
+        assert_eq!(kinds().len(), 96, "catalog drift");
     }
 }

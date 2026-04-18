@@ -2931,6 +2931,52 @@ impl MarketMakerEngine {
                         pending_alerts.push((kind.clone(), *id, out));
                     }
                 }
+                "Position.CostBasis" => {
+                    // RS-3 — direct read off the inventory
+                    // tracker. Zero when flat → Missing so the
+                    // downstream math doesn't multiply by a
+                    // placeholder.
+                    let cb = self.inventory_manager.avg_entry_price();
+                    let v = if cb > rust_decimal::Decimal::ZERO {
+                        Value::Number(cb)
+                    } else {
+                        Value::Missing
+                    };
+                    src.insert((*id, "value".into()), v);
+                }
+                "Risk.UnrealizedIfFlatten" => {
+                    // RS-3 — composed: flatten the current
+                    // inventory against the live book, compare
+                    // the achievable VWAP against cost basis.
+                    // Long inventory flattens by SELLING (sweeps
+                    // bids); short by BUYING (sweeps asks).
+                    use mm_common::types::Side;
+                    let inv = self.inventory_manager.inventory();
+                    let cb = self.inventory_manager.avg_entry_price();
+                    let mut out = Value::Missing;
+                    if inv != rust_decimal::Decimal::ZERO
+                        && cb > rust_decimal::Decimal::ZERO
+                    {
+                        let flatten_side = if inv > rust_decimal::Decimal::ZERO {
+                            Side::Sell
+                        } else {
+                            Side::Buy
+                        };
+                        if let Some(r) = self
+                            .book_keeper
+                            .book
+                            .sweep_vwap(flatten_side, inv.abs())
+                        {
+                            // `inv` is signed, (vwap - cb) times
+                            // signed inventory gives quote-asset
+                            // PnL directly — positive means we'd
+                            // lock in a gain by flattening now.
+                            let pnl = inv * (r.vwap - cb);
+                            out = Value::Number(pnl);
+                        }
+                    }
+                    src.insert((*id, "value".into()), out);
+                }
                 "Risk.LiquidationDistance" => {
                     // RS-2 — distance in bps from mid to the
                     // venue-reported liq_price for this engine's
