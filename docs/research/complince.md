@@ -29,7 +29,10 @@ to `prev_hash` of the next) is the canonical check.
 `OrderFilled`, `OrderRejected`, `CircuitBreakerTripped`, `KillSwitchEscalated`,
 `KillSwitchReset`, `InventoryLimitHit`, `ExchangeConnected/Disconnected/
 Reconnected`, `BookResync`, `EngineStarted/Shutdown`, `ConfigLoaded`,
-`CheckpointSaved`, `BalanceReconciled`, and Epic F `NewsRetreatActivated`.
+`CheckpointSaved`, `BalanceReconciled`, Epic F `NewsRetreatActivated`, and
+Epic H strategy-graph events: `StrategyGraphDeployed`,
+`StrategyGraphRolledBack`, `StrategyGraphDeployRejected`,
+`StrategyGraphSinkFired` (all critical → fsync before return).
 
 **Date-range export.** `mm_risk::audit_reader::read_audit_range(path, from,
 to) -> Vec<AuditEvent>`. HMAC-signable via `export_signed(events, from, to,
@@ -101,12 +104,16 @@ operator-side downtime never loses a reporting day.
 ```
 summary.json
 summary.csv
-summary.xlsx   (HMAC manifest baked into workbook)
+summary.xlsx                       (HMAC manifest baked into workbook)
 summary.pdf
 fills.jsonl
 audit.jsonl
-manifest.json  (HMAC-SHA256)
-README.txt     (verification instructions)
+strategy_graphs/deploys.jsonl      (Epic H — DeployRecords in range)
+strategy_graphs/snapshots/{hash}.json (canonical JSON of every
+                                       graph that was live — joined by
+                                       hash on the audit rows above)
+manifest.json                      (HMAC-SHA256)
+README.txt                         (verification instructions)
 ```
 
 One click = one hand-off. Intended for regulator / client portals.
@@ -188,6 +195,81 @@ long-lived IAM creds handed out.
 
 ---
 
+## 11. Strategy-graph governance (Epic H)
+
+The visual strategy builder is the operator's hot-path for changing
+quoting behaviour without a redeploy. Every mutation is recorded on
+the same hash-chained audit trail as order + risk events, joined on
+the graph's content hash (SHA-256 of the canonical JSON form).
+
+**Disk layout.**
+
+```
+data/strategy_graphs/
+├── {name}.json                    active graph per name
+├── .deploys.jsonl                 full deploy history (JSONL)
+├── history/{name}/{hash}.json     immutable per-hash snapshot
+└── user_templates/{name}.json     operator-saved reusable templates
+```
+
+**Endpoints.**
+
+- `POST /api/admin/strategy/graph` — deploy. Validates, compiles,
+  writes `{name}.json` + appends a `DeployRecord` + archives a
+  `history/{name}/{hash}.json` snapshot, broadcasts
+  `ConfigOverride::StrategyGraphSwap` to every engine whose scope
+  matches. Supports `?rollback_from={prev_hash}` so the audit row
+  records *intent* (rollback vs. accidental hash match).
+- `POST /api/v1/strategy/validate` — same validator the deploy path
+  runs, no writes. Front-end calls debounced on every canvas
+  mutation so the operator sees "ready / N issues" live. Returns
+  `{valid, issues[], node_count, edge_count, sink_count}`.
+- `GET /api/v1/strategy/active` — folds the deploy log to one row
+  per `(name, scope)` showing the latest hash + operator + timestamp.
+  The Settings → Config snapshot panel renders it so an auditor sees
+  what's live without opening the graph editor.
+- `GET /api/v1/strategy/deploys` — full DeployRecord history.
+- `GET /api/v1/strategy/graphs/{name}/history/{hash}` — fetch an
+  immutable historical snapshot.
+- `POST/GET/DELETE /api/v1/strategy/custom_templates[/{name}]` —
+  operator-authored reusable templates on disk.
+
+**Restricted gate.** Graphs that reference a node kind marked
+`restricted: true` (pentest-only strategies) are refused unless the
+runtime was started with `MM_RESTRICTED_ALLOW=1` (env-only — the
+flag is deliberately absent from TOML so prod must be explicit).
+Refusal emits `StrategyGraphDeployRejected` before returning 403;
+the `detail` field names every offending kind.
+
+**Audit events.**
+
+| Event | Detail format | Critical |
+|---|---|---|
+| `StrategyGraphDeployed` | `graph={name} hash={sha256} scope={scope} operator={id} recipients={n}` | yes (fsync) |
+| `StrategyGraphRolledBack` | `graph={name} from_hash={sha256} to_hash={sha256} operator={id}` | yes (fsync) |
+| `StrategyGraphDeployRejected` | `graph={name} reason={restricted/validation/...} operator={id}` | yes (fsync) |
+| `StrategyGraphSinkFired` | `action=Flatten{policy}` or `KillEscalate{level,reason}` `hash={sha256}` | yes (fsync) |
+
+The sink-provenance row fires only on high-consequence sinks
+(`Out.Flatten`, `Out.KillEscalate`) — multipliers fire every tick
+and would drown the log. Regulators joining `StrategyGraphSinkFired`
+rows against the bundle's `strategy_graphs/snapshots/{hash}.json`
+get a closed-book reconstruction: "graph X said kill-L4 at time T
+because of input Y".
+
+**Regulator reconstruction workflow (extended).**
+
+1. Pull the bundle for the period (as in §10).
+2. In `audit.jsonl`, filter events of type
+   `strategy_graph_*`. Every row carries the hash of the graph that
+   was live at that moment.
+3. Open `strategy_graphs/snapshots/{hash}.json` to see the authored
+   graph; render it in the editor (File → Import) to visualise
+   exactly what ran.
+4. `strategy_graph_sink_fired` rows let you attribute any specific
+   kill or flatten to the exact graph node that triggered it —
+   needed for MiCA Article 17 market-abuse investigations.
+
 ## Epic commit trail
 
 | Epic | Scope |
@@ -204,3 +286,7 @@ long-lived IAM creds handed out.
 | D    | Observability — Prometheus + S3 health probe |
 | UX-5 | Config snapshot viewer |
 | UX-6 | Reports panel + audit stream on CompliancePage |
+| H-P1 | Visual strategy builder — typed DAG + evaluator + overlay sinks |
+| H-P2 | Catalog expansion to 43 kinds (Waves A-D) + deploy history + rollback |
+| H-P3 | Strategy-graph compliance wiring — deploy/rollback/reject/sink audit events, bundle section, restricted gate, active-graphs API |
+| H-P4 | Graph-authored quoting — `Out.Quotes`, `Quote.Grid`, `Quote.Mux` + live validate endpoint + user templates + export/import |
