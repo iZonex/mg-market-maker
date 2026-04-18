@@ -5735,6 +5735,109 @@ mod dual_connector_tests {
             .and_then(|hb| hb.book.mid_price());
         assert_eq!(ref_price, Some(dec!(50_100)));
     }
+
+    /// Epic H Phase 5 — graph swap must rebuild the strategy pool
+    /// and clear the per-node quote cache. A stale cache entry from
+    /// a previous graph would leak into the new graph's overlay
+    /// reads until it happens to be re-written.
+    #[test]
+    fn swap_strategy_graph_rebuilds_pool_and_clears_cache() {
+        use mm_strategy_graph::{Edge, Graph, GraphNode, NodeId, PortRef, Scope};
+
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        let mut engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            sample_config(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+
+        // Graph A: Strategy.Avellaneda → Out.Quotes + Math.Const → Out.SpreadMult.
+        // Builds a pool entry for the Avellaneda node.
+        let mk_graph = |strategy_kind: &str| -> Graph {
+            let strat = NodeId::new();
+            let quotes_sink = NodeId::new();
+            let cst = NodeId::new();
+            let mult_sink = NodeId::new();
+            let mut g = Graph::empty("t", Scope::Symbol("BTCUSDT".into()));
+            g.nodes.push(GraphNode {
+                id: strat,
+                kind: strategy_kind.into(),
+                config: serde_json::Value::Null,
+                pos: (0.0, 0.0),
+            });
+            g.nodes.push(GraphNode {
+                id: quotes_sink,
+                kind: "Out.Quotes".into(),
+                config: serde_json::Value::Null,
+                pos: (0.0, 0.0),
+            });
+            g.nodes.push(GraphNode {
+                id: cst,
+                kind: "Math.Const".into(),
+                config: serde_json::json!({ "value": "1" }),
+                pos: (0.0, 0.0),
+            });
+            g.nodes.push(GraphNode {
+                id: mult_sink,
+                kind: "Out.SpreadMult".into(),
+                config: serde_json::Value::Null,
+                pos: (0.0, 0.0),
+            });
+            g.edges.push(Edge {
+                from: PortRef { node: strat, port: "quotes".into() },
+                to: PortRef { node: quotes_sink, port: "quotes".into() },
+            });
+            g.edges.push(Edge {
+                from: PortRef { node: cst, port: "value".into() },
+                to: PortRef { node: mult_sink, port: "mult".into() },
+            });
+            g
+        };
+
+        // Deploy A — pool has one Strategy.Avellaneda instance.
+        let g_a = mk_graph("Strategy.Avellaneda");
+        let a_strat_id = g_a.nodes[0].id;
+        engine.swap_strategy_graph(&g_a).expect("graph A compiles");
+        assert_eq!(
+            engine.strategy_pool.len(),
+            1,
+            "pool must hold one instance per Strategy.* node"
+        );
+        assert!(
+            engine.strategy_pool.contains_key(&a_strat_id),
+            "pool keyed by the Avellaneda node id"
+        );
+
+        // Prime the per-node cache with a dummy entry — simulates
+        // what `refresh_quotes` would have written last tick.
+        engine
+            .last_strategy_quotes_per_node
+            .insert(a_strat_id, Vec::new());
+        assert_eq!(engine.last_strategy_quotes_per_node.len(), 1);
+
+        // Deploy B — different node ids, different kind.
+        let g_b = mk_graph("Strategy.Grid");
+        engine.swap_strategy_graph(&g_b).expect("graph B compiles");
+
+        assert_eq!(
+            engine.strategy_pool.len(),
+            1,
+            "pool reshaped for new graph (one Grid instance)"
+        );
+        assert!(
+            !engine.strategy_pool.contains_key(&a_strat_id),
+            "old Avellaneda entry gone after swap"
+        );
+        assert!(
+            engine.last_strategy_quotes_per_node.is_empty(),
+            "stale per-node cache from graph A cleared on swap"
+        );
+    }
 }
 
 #[cfg(test)]
