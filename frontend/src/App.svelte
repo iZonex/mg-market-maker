@@ -65,7 +65,7 @@
       {/if}
       <div class="content">
         {#if route === 'overview'}
-          <Overview {ws} />
+          <Overview {ws} {auth} />
         {:else if route === 'orderbook'}
           <OrderbookPage {ws} {auth} />
         {:else if route === 'history'}
@@ -85,7 +85,7 @@
         {:else if route === 'admin' && auth.canControl()}
           <AdminPage {ws} {auth} />
         {:else}
-          <Overview {ws} />
+          <Overview {ws} {auth} />
         {/if}
       </div>
     </div>

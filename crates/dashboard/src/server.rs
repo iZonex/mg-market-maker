@@ -85,6 +85,7 @@ pub async fn start(
         .route("/api/v1/surveillance/scores", get(surveillance_scores))
         .route("/api/v1/decisions/recent", get(decisions_recent))
         .route("/api/v1/plans/active", get(active_plans))
+        .route("/api/v1/otr/tiered", get(otr_tiered))
         .merge(crate::client_api::client_routes())
         .merge(crate::client_portal::client_portal_routes())
         .route_layer(middleware::from_fn_with_state(
@@ -441,6 +442,63 @@ struct DecisionsResponse {
 #[derive(serde::Serialize)]
 struct ActivePlansResponse {
     plans: Vec<crate::state::PlanSnapshot>,
+}
+
+#[derive(serde::Serialize, Default)]
+struct TieredOtrRow {
+    tob_cumulative: f64,
+    tob_rolling_5min: f64,
+    top20_cumulative: f64,
+    top20_rolling_5min: f64,
+}
+
+#[derive(serde::Serialize)]
+struct TieredOtrResponse {
+    /// Per-symbol 4-way OTR breakdown. Values mirror the
+    /// `mm_otr_tiered{symbol,tier,window}` gauge that engines
+    /// publish every minute.
+    symbols: std::collections::BTreeMap<String, TieredOtrRow>,
+}
+
+async fn otr_tiered() -> Json<TieredOtrResponse> {
+    use prometheus::proto::MetricType;
+    let mut out: std::collections::BTreeMap<String, TieredOtrRow> =
+        std::collections::BTreeMap::new();
+    let families = prometheus::gather();
+    for fam in &families {
+        if fam.get_name() != "mm_otr_tiered"
+            || fam.get_field_type() != MetricType::GAUGE
+        {
+            continue;
+        }
+        for m in fam.get_metric() {
+            let mut symbol = None;
+            let mut tier = None;
+            let mut window = None;
+            for lbl in m.get_label() {
+                match lbl.get_name() {
+                    "symbol" => symbol = Some(lbl.get_value().to_string()),
+                    "tier" => tier = Some(lbl.get_value().to_string()),
+                    "window" => window = Some(lbl.get_value().to_string()),
+                    _ => {}
+                }
+            }
+            let (Some(symbol), Some(tier), Some(window)) = (symbol, tier, window)
+            else {
+                continue;
+            };
+            let v = m.get_gauge().get_value();
+            let row = out.entry(symbol).or_default();
+            match (tier.as_str(), window.as_str()) {
+                ("tob", "cumulative") => row.tob_cumulative = v,
+                ("tob", "rolling_5min") => row.tob_rolling_5min = v,
+                ("top20", "cumulative") => row.top20_cumulative = v,
+                ("top20", "rolling_5min") => row.top20_rolling_5min = v,
+                _ => {}
+            }
+        }
+    }
+    Json(TieredOtrResponse { symbols: out })
 }
 
 async fn active_plans(State(state): State<DashboardState>) -> Json<ActivePlansResponse> {

@@ -20,7 +20,7 @@
       {#snippet children()}<PendingCalibrationCard data={ws} {auth} />{/snippet}
     </Card>
     <Card title="Signals" subtitle="microstructure" span={2}>
-      {#snippet children()}<SignalsPanel data={ws} />{/snippet}
+      {#snippet children()}<SignalsPanel data={ws} {auth} />{/snippet}
     </Card>
   </div>
 </div>

@@ -1,5 +1,7 @@
 <script>
-  let { data } = $props()
+  import { createApiClient } from '../api.svelte.js'
+
+  let { data, auth } = $props()
   const s = $derived(data.state)
   const sym = $derived(s.activeSymbol || s.symbols[0] || '')
   const d = $derived(s.data[sym] || {})
@@ -10,6 +12,31 @@
   const otr = $derived(parseFloat(d.order_to_trade_ratio || '0'))
   const hma = $derived(d.hma_value == null ? null : parseFloat(d.hma_value))
   const mid = $derived(parseFloat(d.mid_price || '0'))
+
+  // UI-3 — tiered + dual-timeline OTR fetched from
+  // /api/v1/otr/tiered every 4 s.
+  const api = auth ? createApiClient(auth) : null
+  let tiered = $state({})
+  if (api) {
+    $effect(() => {
+      async function poll() {
+        try {
+          const data = await api.getJson('/api/v1/otr/tiered')
+          tiered = data?.symbols ?? {}
+        } catch { /* silent — the other signals still render */ }
+      }
+      poll()
+      const t = setInterval(poll, 4_000)
+      return () => clearInterval(t)
+    })
+  }
+  const tRow = $derived(tiered[sym] || null)
+  function otrColour(v) {
+    if (v === null || v === undefined || Number.isNaN(v)) return 'var(--fg-muted)'
+    if (v > 15) return 'var(--danger)'
+    if (v > 5) return 'var(--warn)'
+    return 'var(--fg-primary)'
+  }
 
   // Colour thresholds match AutoTuner::effective_spread_mult +
   // KillSwitch::update_market_resilience: < 0.3 trips L1 after 3 s.
@@ -47,7 +74,7 @@
     </div>
   </div>
 
-  <!-- OTR -->
+  <!-- OTR (legacy scalar) -->
   <div class="block">
     <div class="row-head">
       <span class="label">Order-to-trade ratio</span>
@@ -58,6 +85,43 @@
       {:else if otrWarn}elevated — investigate
       {:else}normal market quality{/if}
     </div>
+  </div>
+
+  <!-- UI-3 — Tiered + dual-timeline OTR (2×2 grid) -->
+  <div class="block">
+    <div class="row-head">
+      <span class="label">OTR tiered (TOB · Top20 / cum · 5m)</span>
+    </div>
+    {#if tRow}
+      <div class="otr-grid">
+        <div class="otr-cell">
+          <span class="otr-tag">TOB cum</span>
+          <span class="otr-num" style:color={otrColour(tRow.tob_cumulative)}>
+            {tRow.tob_cumulative.toFixed(2)}
+          </span>
+        </div>
+        <div class="otr-cell">
+          <span class="otr-tag">TOB 5m</span>
+          <span class="otr-num" style:color={otrColour(tRow.tob_rolling_5min)}>
+            {tRow.tob_rolling_5min.toFixed(2)}
+          </span>
+        </div>
+        <div class="otr-cell">
+          <span class="otr-tag">Top20 cum</span>
+          <span class="otr-num" style:color={otrColour(tRow.top20_cumulative)}>
+            {tRow.top20_cumulative.toFixed(2)}
+          </span>
+        </div>
+        <div class="otr-cell">
+          <span class="otr-tag">Top20 5m</span>
+          <span class="otr-num" style:color={otrColour(tRow.top20_rolling_5min)}>
+            {tRow.top20_rolling_5min.toFixed(2)}
+          </span>
+        </div>
+      </div>
+    {:else}
+      <div class="sub">no tiered data yet — waiting for first snapshot</div>
+    {/if}
   </div>
 
   <!-- HMA vs mid -->
@@ -151,5 +215,31 @@
     background: var(--neg);
     border-radius: 1px;
     opacity: 0.6;
+  }
+
+  .otr-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--s-2);
+  }
+  .otr-cell {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding: var(--s-1) var(--s-2);
+    background: var(--bg-chip);
+    border-radius: var(--r-sm);
+  }
+  .otr-tag {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-label);
+    color: var(--fg-muted);
+    font-family: var(--font-mono);
+  }
+  .otr-num {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
   }
 </style>

@@ -9,7 +9,7 @@
   import InventoryPanel from '../components/InventoryPanel.svelte'
   import InventoryChart from '../components/InventoryChart.svelte'
 
-  let { ws } = $props()
+  let { ws, auth } = $props()
 
   const sym = $derived(ws.state.activeSymbol || ws.state.symbols[0] || '')
   const symData = $derived(ws.state.data[sym] || {})
@@ -34,7 +34,7 @@
       {#snippet children()}<SpreadChart data={ws} />{/snippet}
     </Card>
     <Card title="Signals" subtitle="microstructure">
-      {#snippet children()}<SignalsPanel data={ws} />{/snippet}
+      {#snippet children()}<SignalsPanel data={ws} {auth} />{/snippet}
     </Card>
   </div>
 
