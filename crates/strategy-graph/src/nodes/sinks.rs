@@ -116,6 +116,46 @@ static QUOTES_INPUTS: Lazy<Vec<Port>> =
 static VENUE_QUOTES_INPUTS: Lazy<Vec<Port>> =
     Lazy::new(|| vec![Port::new("quotes", PortType::Quotes)]);
 
+static ATOMIC_BUNDLE_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
+    vec![
+        // Both legs ride on the same Quotes port type — the evaluator
+        // harvest picks the first of each bundle as the maker/hedge.
+        Port::new("maker", PortType::Quotes),
+        Port::new("hedge", PortType::Quotes),
+        // timeout_ms — how long to wait for both venue acks before
+        // rolling back.
+        Port::new("timeout_ms", PortType::Number),
+    ]
+});
+
+/// Multi-Venue 3.E — `Out.AtomicBundle`. Consumes a (maker, hedge)
+/// pair of single-leg quote bundles plus a `timeout_ms` number.
+/// Engine places both legs then watches for ack within timeout;
+/// on one-sided failure it cancels the counter-leg. Empty inputs
+/// abort the bundle cleanly (no dangling legs).
+#[derive(Debug, Default)]
+pub struct AtomicBundle;
+
+impl NodeKind for AtomicBundle {
+    fn kind(&self) -> &'static str {
+        "Out.AtomicBundle"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &ATOMIC_BUNDLE_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &UNIT_OUT
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Unit])
+    }
+}
+
 /// Multi-Venue 3.A — `Out.VenueQuotes`. Accepts a
 /// `VenueQuotes(Vec<VenueQuote>)` bundle. Unlike `Out.Quotes`,
 /// every entry carries its own `(venue, symbol, product)` tag

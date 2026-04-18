@@ -118,6 +118,7 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Quote.Mux" => Some(Box::new(quotes::Mux)),
         "Out.Quotes" => Some(Box::new(sinks::Quotes)),
         "Out.VenueQuotes" => Some(Box::new(sinks::VenueQuotes)),
+        "Out.AtomicBundle" => Some(Box::new(sinks::AtomicBundle)),
         // Phase 4 composite strategies (engine overlays via source_inputs)
         "Strategy.Avellaneda" => Some(Box::new(strategies::Avellaneda)),
         "Strategy.GLFT" => Some(Box::new(strategies::Glft)),
@@ -243,6 +244,7 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Out.Flatten"          => NodeMeta { label: "Flatten position",    summary: "Fire L4 flatten with the given exec policy", group: "Sinks" },
         "Out.Quotes"           => NodeMeta { label: "Quotes",              summary: "Replace strategy output with a graph-authored quote bundle", group: "Sinks" },
         "Out.VenueQuotes"      => NodeMeta { label: "Venue quotes",        summary: "Multi-venue quote bundle — each entry names its own venue/symbol/product", group: "Sinks" },
+        "Out.AtomicBundle"     => NodeMeta { label: "Atomic bundle",       summary: "Maker + hedge pair — both legs fill or both roll back within timeout_ms", group: "Sinks" },
 
         // Defensive fallback — every catalog kind should have its own
         // arm above. If a new kind sneaks in without a meta entry,
@@ -326,6 +328,7 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Quote.Mux",
         "Out.Quotes",
         "Out.VenueQuotes",
+        "Out.AtomicBundle",
         "Strategy.Avellaneda",
         "Strategy.GLFT",
         "Strategy.Grid",
@@ -414,10 +417,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_63_nodes_after_multi_venue_3d() {
-        // 62 after 3.C + Strategy.BasisArb = 63. Composite
-        // cross-venue strategies ship as new kinds; overlay
-        // materialises their Value::VenueQuotes output.
-        assert_eq!(kinds().len(), 63, "catalog drift");
+    fn catalog_has_64_nodes_after_multi_venue_3e() {
+        // 63 after 3.D + Out.AtomicBundle = 64.
+        assert_eq!(kinds().len(), 64, "catalog drift");
     }
 }

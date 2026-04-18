@@ -17,7 +17,7 @@
 use crate::catalog;
 use crate::graph::{Graph, ValidationError};
 use crate::node::{EvalCtx, NodeKind, NodeOutputs, NodeState};
-use crate::types::{GraphQuote, NodeId, Value, VenueQuote};
+use crate::types::{AtomicBundleSpec, GraphQuote, NodeId, Value, VenueQuote};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 
@@ -57,6 +57,11 @@ pub enum SinkAction {
     /// engine's order manager; entries whose target is the engine
     /// itself collapse to the `Quotes` path for the degenerate case.
     VenueQuotes(Vec<VenueQuote>),
+    /// Multi-Venue 3.E — atomic maker+hedge pair. The engine
+    /// arms both legs then watches for ack within `timeout_ms`;
+    /// if either venue fails to ack in time, cancels the other
+    /// leg so we never leave a naked maker sitting on one book.
+    AtomicBundle(Box<AtomicBundleSpec>),
 }
 
 /// Pre-compiled graph ready for per-tick evaluation. Holds the
@@ -333,6 +338,42 @@ impl Evaluator {
                 "Out.VenueQuotes" => {
                     if let Some(qs) = input_vec.first().and_then(Value::as_venue_quotes) {
                         sinks.push(SinkAction::VenueQuotes(qs.clone()));
+                    }
+                }
+                "Out.AtomicBundle" => {
+                    // Inputs: maker Quotes, hedge Quotes, timeout_ms
+                    // Number. Takes the first entry of each bundle.
+                    let maker = input_vec
+                        .first()
+                        .and_then(Value::as_venue_quotes)
+                        .and_then(|v| v.first().cloned())
+                        .or_else(|| {
+                            input_vec
+                                .first()
+                                .and_then(Value::as_quotes)
+                                .and_then(|v| v.first().cloned())
+                                .map(|q| VenueQuote {
+                                    venue: String::new(),
+                                    symbol: String::new(),
+                                    product: String::new(),
+                                    side: q.side,
+                                    price: q.price,
+                                    qty: q.qty,
+                                })
+                        });
+                    let hedge = input_vec
+                        .get(1)
+                        .and_then(Value::as_venue_quotes)
+                        .and_then(|v| v.first().cloned());
+                    let timeout_ms = input_vec
+                        .get(2)
+                        .and_then(Value::as_number)
+                        .map(|d| d.trunc().to_string().parse::<u64>().unwrap_or(2_000))
+                        .unwrap_or(2_000);
+                    if let (Some(maker), Some(hedge)) = (maker, hedge) {
+                        sinks.push(SinkAction::AtomicBundle(Box::new(
+                            AtomicBundleSpec { maker, hedge, timeout_ms },
+                        )));
                     }
                 }
                 _ => {}

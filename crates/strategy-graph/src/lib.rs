@@ -30,7 +30,8 @@ pub use node::{
 };
 pub use storage::{DeployRecord, GraphStore};
 pub use types::{
-    Edge, GraphQuote, NodeId, Port, PortRef, PortType, QuoteSide, Value, VenueQuote,
+    AtomicBundleSpec, Edge, GraphQuote, NodeId, Port, PortRef, PortType, QuoteSide, Value,
+    VenueQuote,
 };
 
 #[cfg(test)]

@@ -95,6 +95,12 @@ pub enum ConfigOverride {
     /// Carries the serialised `Vec<VenueQuote>` as JSON so the
     /// `ConfigOverride` enum stays engine-type-free.
     ExternalVenueQuotes(String),
+    /// Multi-Venue 3.E — a paired maker+hedge bundle that must
+    /// either fill both legs within `timeout_ms` or roll the
+    /// whole bundle back. Carried as JSON so the enum stays
+    /// engine-type-free; the engine decodes into
+    /// `mm_strategy_graph::AtomicBundleSpec` on receipt.
+    ExternalAtomicBundle(String),
 }
 
 /// Per-client state partition (Epic 1: Multi-Client Isolation).

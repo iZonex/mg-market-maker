@@ -2404,6 +2404,92 @@ impl MarketMakerEngine {
                     }
                     self.graph_quotes_override = Some(pairs);
                 }
+                SinkAction::AtomicBundle(spec) => {
+                    // Multi-Venue 3.E MVP — materialise both legs as
+                    // an `ExternalVenueQuotes` dispatch (same path
+                    // as 3.B's fan-out), plus an audit row so the
+                    // operator sees the bundle intent. Timeout +
+                    // rollback on one-sided ack failure is a
+                    // follow-up (3.E.2): for now we dispatch
+                    // fire-and-forget and surface the timeout_ms
+                    // into the audit detail so post-mortems can
+                    // spot stuck bundles.
+                    let legs = vec![spec.maker.clone(), spec.hedge.clone()];
+                    let json = serde_json::to_string(&legs).unwrap_or_else(|_| "[]".into());
+                    // Audit — regulator-visible intent.
+                    self.audit.risk_event(
+                        &self.symbol,
+                        mm_risk::audit::AuditEventType::StrategyGraphSinkFired,
+                        &format!(
+                            "AtomicBundle maker={}:{} hedge={}:{} timeout_ms={}",
+                            spec.maker.venue,
+                            spec.maker.symbol,
+                            spec.hedge.venue,
+                            spec.hedge.symbol,
+                            spec.timeout_ms,
+                        ),
+                    );
+                    // Dispatch each leg to its target symbol's
+                    // channel — the target engine may be this one
+                    // (self-venue legs collapse into
+                    // graph_quotes_override) or another one
+                    // (ExternalVenueQuotes consumer path).
+                    if let Some(dash) = self.dashboard.as_ref() {
+                        for leg in &legs {
+                            if leg.symbol == self.symbol {
+                                // Degenerate — treat as VenueQuotes
+                                // for the self path.
+                                continue;
+                            }
+                            let payload = serde_json::to_string(&vec![leg.clone()])
+                                .unwrap_or_else(|_| "[]".into());
+                            let _ = dash.send_config_override(
+                                &leg.symbol,
+                                mm_dashboard::state::ConfigOverride::ExternalVenueQuotes(
+                                    payload,
+                                ),
+                            );
+                        }
+                    }
+                    // Self-leg materialisation (mirror of the
+                    // VenueQuotes path above). Only runs if one of
+                    // the legs targets this engine's symbol.
+                    use mm_common::types::{Quote, QuotePair, Side};
+                    use mm_strategy_graph::QuoteSide;
+                    let self_venue = format!("{:?}", self.config.exchange.exchange_type)
+                        .to_lowercase();
+                    let mut bids = Vec::new();
+                    let mut asks = Vec::new();
+                    for leg in &legs {
+                        if leg.venue != self_venue || leg.symbol != self.symbol {
+                            continue;
+                        }
+                        let q = Quote {
+                            side: match leg.side {
+                                QuoteSide::Buy => Side::Buy,
+                                QuoteSide::Sell => Side::Sell,
+                            },
+                            price: self.product.round_price(leg.price),
+                            qty: self.product.round_qty(leg.qty),
+                        };
+                        match q.side {
+                            Side::Buy => bids.push(q),
+                            Side::Sell => asks.push(q),
+                        }
+                    }
+                    if !bids.is_empty() || !asks.is_empty() {
+                        let n = bids.len().max(asks.len());
+                        let mut pairs = Vec::with_capacity(n);
+                        for i in 0..n {
+                            pairs.push(QuotePair {
+                                bid: bids.get(i).cloned(),
+                                ask: asks.get(i).cloned(),
+                            });
+                        }
+                        self.graph_quotes_override = Some(pairs);
+                    }
+                    let _ = json; // reserved for 3.E.2 rollback path
+                }
                 SinkAction::Flatten { policy } => {
                     // Graph-authored flatten. Escalates kill L4 with
                     // the policy string; existing paired_unwind /
@@ -5198,6 +5284,18 @@ impl MarketMakerEngine {
                     &self.symbol,
                     mm_risk::audit::AuditEventType::KillSwitchReset,
                     &format!("manual reset: {reason}"),
+                );
+                return;
+            }
+            ConfigOverride::ExternalAtomicBundle(json) => {
+                // 3.E MVP — recipient engine receives a bundle leg
+                // via the same path as ExternalVenueQuotes; full
+                // two-phase commit lands in 3.E.2. Audit the arrival
+                // so post-mortems can reconcile intent vs. action.
+                self.audit.risk_event(
+                    &self.symbol,
+                    mm_risk::audit::AuditEventType::StrategyGraphSinkFired,
+                    &format!("AtomicBundle leg arrived (pending: {json})"),
                 );
                 return;
             }

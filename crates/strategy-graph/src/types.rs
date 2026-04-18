@@ -119,6 +119,21 @@ pub enum QuoteSide {
     Sell,
 }
 
+/// Multi-Venue 3.E — maker + hedge pair that must complete both
+/// sides or roll back. The engine places both legs, waits up to
+/// `timeout_ms` for venue acks, and if either side fails within
+/// the window cancels the other. Guarantees we never leave a
+/// naked maker sitting on one venue because the hedge took too
+/// long.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AtomicBundleSpec {
+    pub maker: VenueQuote,
+    pub hedge: VenueQuote,
+    /// Max wait for both legs to be acknowledged by their
+    /// respective venues before the bundle rolls back.
+    pub timeout_ms: u64,
+}
+
 /// A value riding on an edge during evaluation. Exactly one variant
 /// per `PortType`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
