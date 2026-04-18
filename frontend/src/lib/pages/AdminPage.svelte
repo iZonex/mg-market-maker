@@ -1,6 +1,7 @@
 <script>
   import Card from '../components/Card.svelte'
   import Controls from '../components/Controls.svelte'
+  import VenuesHealth from '../components/VenuesHealth.svelte'
   let { ws, auth } = $props()
 </script>
 
@@ -17,6 +18,9 @@
           <a href="/api/v1/system/diagnostics" target="_blank" rel="noopener">Diagnostics</a>
         </div>
       {/snippet}
+    </Card>
+    <Card title="Venues health" subtitle="per-venue aggregates" span={3}>
+      {#snippet children()}<VenuesHealth {auth} />{/snippet}
     </Card>
   </div>
 </div>
