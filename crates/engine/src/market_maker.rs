@@ -604,7 +604,7 @@ impl MarketMakerEngine {
         } else {
             None
         };
-        Self {
+        let mut engine = Self {
             client_id: None,
             book_keeper: BookKeeper::new(&symbol),
             hedge_book,
@@ -875,7 +875,15 @@ impl MarketMakerEngine {
             reconcile_counter: 0,
             last_daily_snapshot_date: String::new(),
             config_override_rx: None,
-        }
+        };
+        // Epic R — wire the surveillance tracker to the order
+        // manager so every place / cancel we make feeds the detector
+        // tape. Has to happen after `Self` is built because both
+        // fields are owned here.
+        engine
+            .order_manager
+            .attach_surveillance(engine.surveillance_tracker.clone());
+        engine
     }
 
     /// Attach a webhook dispatcher for client event delivery.
@@ -3367,9 +3375,16 @@ impl MarketMakerEngine {
                 // (mutex lock + one vec push), acceptable cost on
                 // the fill path.
                 if let Ok(mut t) = self.surveillance_tracker.lock() {
+                    // Map engine's `Side` to risk-crate side so the
+                    // tracker module has no dep on mm-common types.
+                    let surv_side = match fill.side {
+                        mm_common::types::Side::Buy => mm_risk::surveillance::Side::Buy,
+                        mm_common::types::Side::Sell => mm_risk::surveillance::Side::Sell,
+                    };
                     t.feed(&mm_risk::surveillance::SurveillanceEvent::OrderFilled {
                         order_id: format!("{:?}", fill.order_id),
                         symbol: self.symbol.clone(),
+                        side: surv_side,
                         filled_qty: fill.qty,
                         price: fill.price,
                         ts: chrono::Utc::now(),

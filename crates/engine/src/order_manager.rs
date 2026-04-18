@@ -95,6 +95,12 @@ pub struct OrderManager {
     /// it, a paper-tagged run with live API keys would happily send
     /// real orders to the venue.
     paper_mode: bool,
+    /// Epic R — Shared surveillance tracker. When `Some`, every
+    /// successful place / cancel feeds it a lifecycle event so
+    /// the detector suite can reason about our order stream.
+    /// `None` keeps the manager free of surveillance overhead
+    /// (tests + non-surveillance deployments).
+    surveillance: Option<mm_risk::surveillance::SharedTracker>,
 }
 
 impl OrderManager {
@@ -103,6 +109,25 @@ impl OrderManager {
             live_orders: HashMap::new(),
             price_index: HashMap::new(),
             paper_mode: false,
+            surveillance: None,
+        }
+    }
+
+    /// Epic R — register the shared surveillance tracker. Every
+    /// subsequent place / cancel feeds it a lifecycle event.
+    pub fn attach_surveillance(
+        &mut self,
+        tracker: mm_risk::surveillance::SharedTracker,
+    ) {
+        self.surveillance = Some(tracker);
+    }
+
+    /// Internal helper — emits a place/cancel event to the
+    /// attached tracker if any. No-op otherwise.
+    fn feed_surveillance(&self, ev: mm_risk::surveillance::SurveillanceEvent) {
+        let Some(t) = self.surveillance.as_ref() else { return };
+        if let Ok(mut tracker) = t.lock() {
+            tracker.feed(&ev);
         }
     }
 
@@ -114,6 +139,7 @@ impl OrderManager {
             live_orders: HashMap::new(),
             price_index: HashMap::new(),
             paper_mode: true,
+            surveillance: None,
         }
     }
 
@@ -981,6 +1007,22 @@ impl OrderManager {
     }
 
     pub(crate) fn track_order(&mut self, order: LiveOrder) {
+        // Epic R — feed placement into the surveillance tape. Fires
+        // from both real-venue and paper-mode paths since both go
+        // through `track_order`.
+        self.feed_surveillance(
+            mm_risk::surveillance::SurveillanceEvent::OrderPlaced {
+                order_id: format!("{:?}", order.order_id),
+                symbol: order.symbol.clone(),
+                side: match order.side {
+                    Side::Buy => mm_risk::surveillance::Side::Buy,
+                    Side::Sell => mm_risk::surveillance::Side::Sell,
+                },
+                price: order.price,
+                qty: order.qty,
+                ts: chrono::Utc::now(),
+            },
+        );
         self.price_index
             .insert((order.side, order.price), order.order_id);
         self.live_orders.insert(order.order_id, order);
@@ -988,6 +1030,16 @@ impl OrderManager {
 
     pub(crate) fn remove_order(&mut self, order_id: OrderId) {
         if let Some(order) = self.live_orders.remove(&order_id) {
+            // Epic R — cancellation tape. `remove_order` runs on
+            // venue-confirmed cancels; the tracker pairs this with
+            // the earlier placement to compute order lifetime.
+            self.feed_surveillance(
+                mm_risk::surveillance::SurveillanceEvent::OrderCancelled {
+                    order_id: format!("{:?}", order_id),
+                    symbol: order.symbol.clone(),
+                    ts: chrono::Utc::now(),
+                },
+            );
             self.price_index.remove(&(order.side, order.price));
         }
     }

@@ -66,10 +66,13 @@ pub enum SurveillanceEvent {
         ts: DateTime<Utc>,
     },
     /// Partial or full fill — detectors use the `filled_qty` to
-    /// refine the fill-rate portion of ratios.
+    /// refine the fill-rate portion of ratios. `side` is required
+    /// for Wash detection (buy + sell at the same price within a
+    /// short window = self-trade).
     OrderFilled {
         order_id: String,
         symbol: String,
+        side: Side,
         filled_qty: Decimal,
         price: Decimal,
         ts: DateTime<Utc>,
@@ -627,6 +630,7 @@ mod tests {
         SurveillanceEvent::OrderFilled {
             order_id: id.into(),
             symbol: sym.into(),
+            side: Side::Buy,
             filled_qty: qty,
             price: dec!(100),
             ts,
