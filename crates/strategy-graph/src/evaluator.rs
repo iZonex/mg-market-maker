@@ -117,6 +117,25 @@ impl Evaluator {
         &self.configs
     }
 
+    /// UI-1 — snapshot of `Plan.*` node states. Reads
+    /// `NodeState::get::<PlanState>` for every node whose kind
+    /// starts with `Plan.`, clones the `PlanState` so callers
+    /// don't hold a borrow on the evaluator.
+    pub fn plan_snapshots(&self) -> Vec<(NodeId, String, crate::nodes::plan::PlanState)> {
+        let mut out = Vec::new();
+        for (id, kind) in &self.kinds {
+            if !kind.starts_with("Plan.") {
+                continue;
+            }
+            if let Some(state) = self.states.get(id) {
+                if let Some(ps) = state.get::<crate::nodes::plan::PlanState>() {
+                    out.push((*id, kind.clone(), ps.clone()));
+                }
+            }
+        }
+        out
+    }
+
     /// Validate + compile. Resolves every node via the catalog; any
     /// unknown kind, cycle, or port-type mismatch surfaces as a
     /// `ValidationError` here and the caller refuses the deploy.

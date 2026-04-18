@@ -3778,6 +3778,32 @@ impl MarketMakerEngine {
                 .with_label_values(&[pattern_tag, &self.symbol])
                 .inc();
         }
+
+        // UI-1 — publish active `Plan.*` states to the
+        // DashboardState registry so the StrategyPage footer
+        // can render progress bars without per-tick polling of
+        // the engine. Cheap — just walks the evaluator's state
+        // map for the handful of Plan nodes the operator wired.
+        if let (Some(ev), Some(dash)) =
+            (self.strategy_graph.as_ref(), self.dashboard.as_ref())
+        {
+            let plans: Vec<mm_dashboard::state::PlanSnapshot> = ev
+                .plan_snapshots()
+                .into_iter()
+                .map(|(node_id, kind, st)| {
+                    mm_dashboard::state::PlanSnapshot {
+                        node_id: node_id.to_string(),
+                        kind,
+                        symbol: self.symbol.clone(),
+                        started_at_ms: st.started_at_ms,
+                        qty_emitted: st.qty_emitted,
+                        aborted: st.aborted,
+                        last_slice_ms: st.last_slice_ms,
+                    }
+                })
+                .collect();
+            dash.publish_active_plans(&self.symbol, plans);
+        }
     }
 
     /// Epic G — attach a `SocialRiskEngine`. Once attached,

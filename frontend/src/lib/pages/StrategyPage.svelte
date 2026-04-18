@@ -28,6 +28,7 @@
   import StrategyNodeConfig from '../components/StrategyNodeConfig.svelte'
   import StrategyDeployHistory from '../components/StrategyDeployHistory.svelte'
   import StrategyNode from '../components/StrategyNode.svelte'
+  import ActivePlans from '../components/ActivePlans.svelte'
 
   let { auth } = $props()
   const api = createApiClient(auth)
@@ -751,6 +752,10 @@
       }
     }}
   />
+
+  <div class="plans-footer">
+    <ActivePlans {auth} />
+  </div>
 </div>
 
 <style>
@@ -758,6 +763,11 @@
     display: flex;
     flex-direction: column;
     height: calc(100vh - 57px);
+  }
+  .plans-footer {
+    padding: var(--s-3) var(--s-4);
+    border-top: 1px solid var(--border-subtle);
+    background: var(--bg-raised);
   }
 
   /* ─── Top bar: one row, one height, one typography scale.

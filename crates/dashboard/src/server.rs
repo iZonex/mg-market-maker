@@ -84,6 +84,7 @@ pub async fn start(
         .route("/api/v1/clients/loss-state", get(clients_loss_state))
         .route("/api/v1/surveillance/scores", get(surveillance_scores))
         .route("/api/v1/decisions/recent", get(decisions_recent))
+        .route("/api/v1/plans/active", get(active_plans))
         .merge(crate::client_api::client_routes())
         .merge(crate::client_portal::client_portal_routes())
         .route_layer(middleware::from_fn_with_state(
@@ -435,6 +436,17 @@ struct DecisionsResponse {
         String,
         Vec<mm_risk::decision_ledger::DecisionSnapshot>,
     >,
+}
+
+#[derive(serde::Serialize)]
+struct ActivePlansResponse {
+    plans: Vec<crate::state::PlanSnapshot>,
+}
+
+async fn active_plans(State(state): State<DashboardState>) -> Json<ActivePlansResponse> {
+    Json(ActivePlansResponse {
+        plans: state.active_plans_all(),
+    })
 }
 
 async fn decisions_recent(

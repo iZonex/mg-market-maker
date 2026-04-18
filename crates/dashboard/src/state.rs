@@ -196,6 +196,10 @@ struct StateInner {
         String,
         std::sync::Arc<mm_risk::decision_ledger::DecisionLedger>,
     >,
+    /// UI-1 — snapshot of active execution plans per symbol.
+    /// Written every tick by engines that hold a plan-bearing
+    /// graph; read by the `/api/v1/plans/active` endpoint.
+    active_plans: HashMap<String, Vec<PlanSnapshot>>,
     /// Epic H Phase 3 — shared audit sink the dashboard uses to
     /// record deploy / rollback / reject events on the same
     /// hash-chained timeline as order-lifecycle + risk rows.
@@ -642,6 +646,21 @@ pub struct OrderSnapshot {
     pub status: String,
 }
 
+/// UI-1 — one entry in `/api/v1/plans/active` response. Serialised
+/// shape drives the StrategyPage footer.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PlanSnapshot {
+    /// Graph node id (UUID as hex).
+    pub node_id: String,
+    /// Kind string, e.g. `"Plan.Accumulate"`.
+    pub kind: String,
+    pub symbol: String,
+    pub started_at_ms: Option<i64>,
+    pub qty_emitted: Decimal,
+    pub aborted: bool,
+    pub last_slice_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct PnlSnapshot {
     pub total: Decimal,
@@ -869,6 +888,23 @@ impl DashboardState {
             out.insert(sym.clone(), ledger.recent(per_symbol_max));
         }
         out
+    }
+
+    /// UI-1 — publish active plans for a symbol. Empty vec
+    /// clears previous snapshot.
+    pub fn publish_active_plans(&self, symbol: &str, plans: Vec<PlanSnapshot>) {
+        self.inner
+            .write()
+            .unwrap()
+            .active_plans
+            .insert(symbol.to_string(), plans);
+    }
+
+    /// UI-1 — flat list of every active plan across every
+    /// symbol, for the `/api/v1/plans/active` endpoint.
+    pub fn active_plans_all(&self) -> Vec<PlanSnapshot> {
+        let g = self.inner.read().unwrap();
+        g.active_plans.values().flatten().cloned().collect()
     }
 
     /// Publish the latest margin ratio for `symbol` (Epic 40.4).
