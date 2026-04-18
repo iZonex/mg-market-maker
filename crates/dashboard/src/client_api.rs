@@ -67,6 +67,20 @@ pub fn client_routes() -> Router<DashboardState> {
             "/api/v1/strategy/preview",
             axum::routing::post(preview_strategy_graph),
         )
+        .route(
+            "/api/v1/strategy/validate",
+            axum::routing::post(validate_strategy_graph),
+        )
+        .route(
+            "/api/v1/strategy/custom_templates",
+            get(list_custom_templates)
+                .post(save_custom_template),
+        )
+        .route(
+            "/api/v1/strategy/custom_templates/{name}",
+            get(get_custom_template)
+                .delete(delete_custom_template),
+        )
         .route("/api/v1/loans", get(get_loans))
         .route("/api/v1/loans/{symbol}", get(get_loan_by_symbol))
         .route(
@@ -987,6 +1001,238 @@ struct PreviewResponse {
     sinks: Vec<serde_json::Value>,
     /// Validation / evaluation errors, if any. Empty when OK.
     errors: Vec<String>,
+}
+
+// ─── Epic H Phase 4 — validate + user templates ─────────────
+
+#[derive(Serialize)]
+struct ValidateResponse {
+    /// Canvas-wide "this graph will deploy" flag. Every front-end
+    /// check the operator sees (the green Ready pill, the Deploy
+    /// button enable state) is derived from here — server is the
+    /// single source of truth so client-side rules can't drift.
+    valid: bool,
+    /// Human-readable breakdown of whatever prevents the deploy.
+    /// Stays empty when `valid == true`. Never contains duplicates.
+    issues: Vec<String>,
+    /// Quick stats the UI turns into a status pill.
+    node_count: usize,
+    edge_count: usize,
+    sink_count: usize,
+}
+
+#[derive(Deserialize)]
+struct ValidateRequest {
+    graph: mm_strategy_graph::Graph,
+}
+
+async fn validate_strategy_graph(
+    axum::Json(req): axum::Json<ValidateRequest>,
+) -> Json<ValidateResponse> {
+    let mut issues: Vec<String> = Vec::new();
+
+    // Shape-level: compile via Evaluator::build. That covers unknown
+    // kinds, port type mismatches, cycles, and the SpreadMult-sink
+    // requirement in one call.
+    if let Err(e) = mm_strategy_graph::Evaluator::build(&req.graph) {
+        issues.push(format!("{e:?}"));
+    }
+
+    // Dangling-edges audit. Evaluator::build tolerates missing inputs
+    // (they propagate as Missing) — but an edge whose `from`/`to`
+    // references a node that was deleted is a graph-state bug worth
+    // surfacing before deploy, so a partial delete doesn't persist.
+    let node_ids: std::collections::HashSet<_> =
+        req.graph.nodes.iter().map(|n| n.id).collect();
+    for e in &req.graph.edges {
+        if !node_ids.contains(&e.from.node) {
+            issues.push(format!("edge references missing node {}", e.from.node));
+        }
+        if !node_ids.contains(&e.to.node) {
+            issues.push(format!("edge references missing node {}", e.to.node));
+        }
+    }
+
+    let sink_count = req
+        .graph
+        .nodes
+        .iter()
+        .filter(|n| n.kind.starts_with("Out."))
+        .count();
+
+    Json(ValidateResponse {
+        valid: issues.is_empty(),
+        issues,
+        node_count: req.graph.nodes.len(),
+        edge_count: req.graph.edges.len(),
+        sink_count,
+    })
+}
+
+// ─── User-authored templates (Phase 4 follow-up) ────────────
+
+fn user_templates_dir(
+    state: &DashboardState,
+) -> Option<std::path::PathBuf> {
+    let store = state.strategy_graph_store()?;
+    Some(store.root().join("user_templates"))
+}
+
+#[derive(Serialize, Deserialize)]
+struct CustomTemplateRecord {
+    name: String,
+    description: String,
+    /// Canonical graph JSON. Stored alongside the record so a
+    /// template is a single self-contained file on disk.
+    graph: mm_strategy_graph::Graph,
+    #[serde(default)]
+    saved_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    saved_by: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CustomTemplateSummary {
+    name: String,
+    description: String,
+    saved_at: Option<chrono::DateTime<chrono::Utc>>,
+    saved_by: Option<String>,
+}
+
+async fn list_custom_templates(
+    State(state): State<DashboardState>,
+) -> Json<Vec<CustomTemplateSummary>> {
+    let Some(dir) = user_templates_dir(&state) else {
+        return Json(vec![]);
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Json(vec![]);
+    };
+    let mut out: Vec<CustomTemplateSummary> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| {
+            let raw = std::fs::read_to_string(e.path()).ok()?;
+            let rec: CustomTemplateRecord = serde_json::from_str(&raw).ok()?;
+            Some(CustomTemplateSummary {
+                name: rec.name,
+                description: rec.description,
+                saved_at: rec.saved_at,
+                saved_by: rec.saved_by,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Json(out)
+}
+
+#[derive(Deserialize)]
+struct SaveCustomTemplate {
+    name: String,
+    #[serde(default)]
+    description: String,
+    graph: mm_strategy_graph::Graph,
+}
+
+async fn save_custom_template(
+    State(state): State<DashboardState>,
+    headers: axum::http::HeaderMap,
+    axum::Json(req): axum::Json<SaveCustomTemplate>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let Some(dir) = user_templates_dir(&state) else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "strategy graphs not configured")
+            .into_response();
+    };
+    // Reject path-traversal by restricting the name to the same
+    // ASCII subset the built-in graph store accepts.
+    if !req.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return (StatusCode::BAD_REQUEST, "name must be [A-Za-z0-9_-]+").into_response();
+    }
+    if req.name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "name is required").into_response();
+    }
+    // Compile-check so a user can't "save" an invalid draft.
+    if let Err(e) = mm_strategy_graph::Evaluator::build(&req.graph) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "validate", "detail": format!("{e:?}") })),
+        )
+            .into_response();
+    }
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir: {e}")).into_response();
+    }
+    let saved_by = headers
+        .get("X-MM-User")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let record = CustomTemplateRecord {
+        name: req.name.clone(),
+        description: req.description,
+        graph: req.graph,
+        saved_at: Some(chrono::Utc::now()),
+        saved_by,
+    };
+    let path = dir.join(format!("{}.json", req.name));
+    let body = match serde_json::to_string_pretty(&record) {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    if let Err(e) = std::fs::write(&path, body) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")).into_response();
+    }
+    (StatusCode::OK, Json(serde_json::json!({ "status": "saved" }))).into_response()
+}
+
+async fn get_custom_template(
+    State(state): State<DashboardState>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return (StatusCode::BAD_REQUEST, "bad name").into_response();
+    }
+    let Some(dir) = user_templates_dir(&state) else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "strategy graphs not configured")
+            .into_response();
+    };
+    let path = dir.join(format!("{name}.json"));
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => match serde_json::from_str::<CustomTemplateRecord>(&raw) {
+            Ok(rec) => (StatusCode::OK, Json(rec)).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (StatusCode::NOT_FOUND, "not found").into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn delete_custom_template(
+    State(state): State<DashboardState>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return (StatusCode::BAD_REQUEST, "bad name").into_response();
+    }
+    let Some(dir) = user_templates_dir(&state) else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "strategy graphs not configured")
+            .into_response();
+    };
+    let path = dir.join(format!("{name}.json"));
+    match std::fs::remove_file(&path) {
+        Ok(_) => (StatusCode::OK, "deleted").into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (StatusCode::NOT_FOUND, "not found").into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 async fn preview_strategy_graph(

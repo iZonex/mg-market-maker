@@ -50,6 +50,23 @@
   let rollbackFrom = $state(null)
   let previewBusy = $state(false)
 
+  // Custom / user-authored templates, loaded from disk via
+  // /api/v1/strategy/custom_templates. Shown in the same dropdown
+  // as bundled templates with a `custom:` prefix in the value.
+  let customTemplates = $state([])
+
+  // Live server-side validation snapshot. Debounced on any graph
+  // mutation. `valid` drives the Deploy button; `issues` render as
+  // red chips in the validation strip.
+  let validation = $state({ valid: false, issues: [], node_count: 0, edge_count: 0, sink_count: 0 })
+
+  let fileInput = $state(null)
+  let saveDialogOpen = $state(false)
+  let saveDialogName = $state('')
+  let saveDialogDesc = $state('')
+  let saveDialogBusy = $state(false)
+  let saveDialogError = $state('')
+
   // ─── Local draft persistence ──────────────────────────────
   // Canvas work is checkpointed into localStorage on every change so
   // F5 / tab crashes never lose the WIP. Deploy is still the single
@@ -116,6 +133,117 @@
     queueMicrotask(() => { saveScheduled = false; saveDraft() })
   })
 
+  // ─── Live validation ──────────────────────────────────────
+  //
+  // Server-side is the single source of truth (same validator
+  // Deploy uses) so client-side rules never silently drift.
+  // Debounced 300 ms — fast enough that operator feedback is
+  // immediate, slow enough that dragging a node doesn't spam
+  // the endpoint.
+  let validateTimer = null
+  function scheduleValidate() {
+    if (validateTimer) clearTimeout(validateTimer)
+    validateTimer = setTimeout(runValidate, 300)
+  }
+  async function runValidate() {
+    if (nodes.length === 0) {
+      validation = { valid: false, issues: [], node_count: 0, edge_count: 0, sink_count: 0 }
+      return
+    }
+    try {
+      const body = { graph: toBackendGraph() }
+      validation = await api.postJson('/api/v1/strategy/validate', body)
+    } catch (e) {
+      // Non-fatal — keep last state, surface as a single issue so
+      // the operator at least sees something.
+      validation = { ...validation, valid: false, issues: [`validator unreachable: ${e}`] }
+    }
+  }
+  $effect(() => {
+    // Re-validate on any canvas mutation.
+    nodes.length; edges.length; graphName; scopeKind; scopeValue
+    scheduleValidate()
+  })
+
+  async function loadCustomTemplates() {
+    try {
+      customTemplates = await api.getJson('/api/v1/strategy/custom_templates')
+    } catch {
+      customTemplates = []
+    }
+  }
+
+  // ─── Export / Import ──────────────────────────────────────
+
+  function exportGraph() {
+    const blob = new Blob(
+      [JSON.stringify(toBackendGraph(), null, 2)],
+      { type: 'application/json' },
+    )
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${graphName || 'strategy-graph'}.json`
+    a.click()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
+
+  async function importGraph(ev) {
+    const file = ev.target.files?.[0]
+    if (!file) return
+    try {
+      const text = await file.text()
+      const g = JSON.parse(text)
+      graphName = g.name ?? 'untitled'
+      scopeKind = g.scope?.kind ?? 'symbol'
+      scopeValue = g.scope?.value ?? ''
+      nodes = (g.nodes ?? []).map((n) => ({
+        id: n.id,
+        type: 'graphNode',
+        position: { x: n.pos?.[0] ?? 0, y: n.pos?.[1] ?? 0 },
+        data: nodeData(n.kind, n.config),
+      }))
+      edges = (g.edges ?? []).map((e, i) => ({
+        id: `e${i}`,
+        source: e.from.node, sourceHandle: e.from.port,
+        target: e.to.node, targetHandle: e.to.port,
+      }))
+      deployStatus = `imported ${nodes.length} nodes from ${file.name}`
+    } catch (e) {
+      deployStatus = `import failed: ${e}`
+    } finally {
+      ev.target.value = ''
+    }
+  }
+
+  // ─── Save as custom template ─────────────────────────────
+
+  function openSaveDialog() {
+    saveDialogName = graphName && graphName !== 'untitled' ? graphName : ''
+    saveDialogDesc = ''
+    saveDialogError = ''
+    saveDialogOpen = true
+  }
+
+  async function confirmSaveTemplate() {
+    saveDialogBusy = true
+    saveDialogError = ''
+    try {
+      await api.postJson('/api/v1/strategy/custom_templates', {
+        name: saveDialogName.trim(),
+        description: saveDialogDesc.trim(),
+        graph: toBackendGraph(),
+      })
+      saveDialogOpen = false
+      await loadCustomTemplates()
+      deployStatus = `saved template '${saveDialogName.trim()}'`
+    } catch (e) {
+      saveDialogError = String(e)
+    } finally {
+      saveDialogBusy = false
+    }
+  }
+
   async function loadCatalog() {
     try {
       catalog = await api.getJson('/api/v1/strategy/catalog')
@@ -145,14 +273,28 @@
       }
     })
     loadTemplates()
+    loadCustomTemplates()
   })
 
   async function loadTemplate(name) {
     if (!name) return
+    // `custom:<name>` → user-saved template on disk; hydrates from
+    // the full record (graph + metadata) rather than the bundled
+    // endpoint.
+    const isCustom = name.startsWith('custom:')
+    const realName = isCustom ? name.slice('custom:'.length) : name
     try {
-      const g = await api.getJson(
-        `/api/v1/strategy/templates/${encodeURIComponent(name)}`
-      )
+      let g
+      if (isCustom) {
+        const rec = await api.getJson(
+          `/api/v1/strategy/custom_templates/${encodeURIComponent(realName)}`
+        )
+        g = rec.graph
+      } else {
+        g = await api.getJson(
+          `/api/v1/strategy/templates/${encodeURIComponent(realName)}`
+        )
+      }
       graphName = g.name
       scopeKind = g.scope.kind
       scopeValue = g.scope.value ?? ''
@@ -169,7 +311,7 @@
         target: e.to.node,
         targetHandle: e.to.port,
       }))
-      deployStatus = `loaded template '${name}'`
+      deployStatus = `loaded template '${realName}'`
     } catch (e) {
       deployStatus = `template load failed: ${e}`
     }
@@ -396,36 +538,114 @@
           <option value="global">Global</option>
         </select>
       </label>
-      {#if scopeKind !== 'global'}
-        <label class="field">
-          <span class="field-label">Value</span>
-          <input type="text" bind:value={scopeValue} />
-        </label>
-      {/if}
+      <label class="field" class:field-hidden={scopeKind === 'global'}>
+        <span class="field-label">Value</span>
+        <input
+          type="text"
+          bind:value={scopeValue}
+          disabled={scopeKind === 'global'}
+          placeholder={scopeKind === 'symbol' ? 'BTCUSDT' : ''}
+        />
+      </label>
     </div>
     <div class="right-chunk">
-      {#if templates.length > 0}
-        <label class="field inline">
+      {#if templates.length + customTemplates.length > 0}
+        <label class="field">
           <span class="field-label">Template</span>
           <select onchange={(e) => { loadTemplate(e.currentTarget.value); e.currentTarget.value = '' }}>
             <option value="">—</option>
-            {#each templates as t (t.name)}
-              <option value={t.name} title={t.description}>{t.name}</option>
-            {/each}
+            {#if templates.length > 0}
+              <optgroup label="Built-in">
+                {#each templates as t (t.name)}
+                  <option value={t.name} title={t.description}>{t.name}</option>
+                {/each}
+              </optgroup>
+            {/if}
+            {#if customTemplates.length > 0}
+              <optgroup label="Saved">
+                {#each customTemplates as t (t.name)}
+                  <option value="custom:{t.name}" title={t.description}>{t.name}</option>
+                {/each}
+              </optgroup>
+            {/if}
           </select>
         </label>
       {/if}
-      <span class="status">{deployStatus}</span>
+      <button type="button" class="btn ghost" onclick={exportGraph} disabled={nodes.length === 0} title="Download graph as JSON">
+        <Icon name="download" size={14} />
+      </button>
+      <button type="button" class="btn ghost" onclick={() => fileInput?.click()} title="Import graph from JSON file">
+        <Icon name="upload" size={14} />
+      </button>
+      <input
+        type="file" accept="application/json" bind:this={fileInput}
+        onchange={importGraph} style="display: none"
+      />
+      <button type="button" class="btn ghost" onclick={openSaveDialog} disabled={nodes.length === 0} title="Save as reusable template">
+        <Icon name="save" size={14} />
+      </button>
       <button type="button" class="btn ghost" onclick={simulate} disabled={previewBusy || nodes.length === 0} title="Evaluate graph without deploying">
         <Icon name="pulse" size={14} />
         <span>{previewBusy ? 'Simulating…' : 'Simulate'}</span>
       </button>
-      <button type="button" class="btn" onclick={deploy} disabled={deployBusy || nodes.length === 0}>
+      <button type="button" class="btn" onclick={deploy} disabled={deployBusy || nodes.length === 0 || !validation.valid}>
         <Icon name="bolt" size={14} />
         <span>{deployBusy ? 'Deploying…' : 'Deploy'}</span>
       </button>
     </div>
   </div>
+
+  <!-- Validation strip: live counters + issue list, server-side
+       authoritative. Green pill = Evaluator::build succeeded +
+       no dangling edges; red pill lists every blocker so the
+       operator fixes them before noticing the disabled Deploy. -->
+  <div class="validate-bar" class:valid={validation.valid} class:invalid={!validation.valid && nodes.length > 0}>
+    {#if nodes.length === 0}
+      <span class="v-pill muted"><span class="dot"></span> empty</span>
+      <span class="v-hint">drag a node from the palette to start</span>
+    {:else if validation.valid}
+      <span class="v-pill ok"><span class="dot"></span> ready</span>
+      <span class="v-stats">
+        {validation.node_count} nodes · {validation.edge_count} edges · {validation.sink_count} sinks
+      </span>
+      <span class="v-status">{deployStatus}</span>
+    {:else}
+      <span class="v-pill bad"><span class="dot"></span> {validation.issues.length} issue{validation.issues.length === 1 ? '' : 's'}</span>
+      <span class="v-stats">
+        {validation.node_count} nodes · {validation.edge_count} edges · {validation.sink_count} sinks
+      </span>
+      <span class="v-issues">
+        {#each validation.issues as iss}
+          <code class="v-issue">{iss}</code>
+        {/each}
+      </span>
+    {/if}
+  </div>
+
+  {#if saveDialogOpen}
+    <div class="modal-backdrop" onclick={() => (saveDialogOpen = false)}>
+      <div class="modal" onclick={(e) => e.stopPropagation()} role="dialog" aria-label="Save as template">
+        <h3>Save as template</h3>
+        <label class="field stacked">
+          <span class="field-label">Name</span>
+          <input type="text" bind:value={saveDialogName} placeholder="my-cool-setup" />
+        </label>
+        <label class="field stacked">
+          <span class="field-label">Description</span>
+          <input type="text" bind:value={saveDialogDesc} placeholder="What does this do?" />
+        </label>
+        {#if saveDialogError}
+          <div class="modal-err">{saveDialogError}</div>
+        {/if}
+        <div class="modal-actions">
+          <button type="button" class="btn ghost" onclick={() => (saveDialogOpen = false)}>Cancel</button>
+          <button type="button" class="btn" onclick={confirmSaveTemplate} disabled={saveDialogBusy || !saveDialogName.trim()}>
+            {saveDialogBusy ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </div>
+    </div>
+  {/if}
 
   {#if previewResult}
     <div class="preview-bar" class:has-error={previewResult.errors?.length > 0}>
@@ -605,6 +825,82 @@
   }
   .btn:hover:not(:disabled) { background: var(--accent); color: var(--bg-base); }
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Hide a top-bar field without removing it from the flex layout
+   * so the bar keeps its width on scope toggles. */
+  .field-hidden { visibility: hidden; pointer-events: none; }
+
+  /* Validation strip — sits between the top bar and the canvas,
+   * always present (even when empty) so the bar's height doesn't
+   * jitter when issues come or go. */
+  .validate-bar {
+    display: flex; align-items: center; gap: var(--s-3);
+    padding: 4px var(--s-4);
+    background: var(--bg-raised);
+    border-bottom: 1px solid var(--border-subtle);
+    font-size: 11px;
+    min-height: 26px; flex-shrink: 0;
+  }
+  .validate-bar.valid   { border-bottom-color: color-mix(in srgb, var(--pos) 40%, var(--border-subtle)); }
+  .validate-bar.invalid { border-bottom-color: color-mix(in srgb, var(--neg) 40%, var(--border-subtle)); }
+
+  .v-pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 2px 8px;
+    border: 1px solid var(--border-subtle); border-radius: var(--r-pill);
+    font-family: var(--font-mono); font-size: 10px;
+    text-transform: uppercase; letter-spacing: var(--tracking-label);
+  }
+  .v-pill .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: currentColor;
+  }
+  .v-pill.ok    { color: var(--pos); border-color: color-mix(in srgb, var(--pos) 60%, transparent); }
+  .v-pill.bad   { color: var(--neg); border-color: color-mix(in srgb, var(--neg) 60%, transparent); }
+  .v-pill.muted { color: var(--fg-muted); }
+  .v-stats { font-family: var(--font-mono); font-size: 11px; color: var(--fg-muted); }
+  .v-status { font-family: var(--font-mono); font-size: 11px; color: var(--fg-muted); margin-left: auto; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .v-hint { color: var(--fg-muted); font-size: 11px; }
+  .v-issues { display: flex; gap: 4px; flex-wrap: wrap; flex: 1; min-width: 0; }
+  .v-issue {
+    padding: 2px 6px;
+    background: color-mix(in srgb, var(--neg) 10%, var(--bg-chip));
+    border: 1px solid color-mix(in srgb, var(--neg) 40%, var(--border-subtle));
+    border-radius: var(--r-sm);
+    color: color-mix(in srgb, var(--neg) 80%, var(--fg-primary));
+    font-family: var(--font-mono); font-size: 10px;
+    max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+
+  /* Save-as-template modal. */
+  .modal-backdrop {
+    position: fixed; inset: 0; z-index: 50;
+    background: rgba(0, 0, 0, 0.55);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .modal {
+    min-width: 360px; max-width: 480px;
+    padding: var(--s-4);
+    background: var(--bg-raised);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--r-md);
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+    display: flex; flex-direction: column; gap: var(--s-3);
+  }
+  .modal h3 {
+    margin: 0; font-size: 14px; font-weight: 600;
+    color: var(--fg-primary);
+  }
+  .modal .field.stacked {
+    display: flex; flex-direction: column; gap: 4px; height: auto;
+  }
+  .modal-err {
+    padding: var(--s-2) var(--s-3);
+    background: color-mix(in srgb, var(--neg) 15%, var(--bg-base));
+    border: 1px solid var(--neg); border-radius: var(--r-sm);
+    color: var(--neg); font-family: var(--font-mono); font-size: 11px;
+  }
+  .modal-actions { display: flex; justify-content: flex-end; gap: var(--s-2); }
 
   .preview-bar {
     display: flex; align-items: center; flex-wrap: wrap; gap: var(--s-2);
