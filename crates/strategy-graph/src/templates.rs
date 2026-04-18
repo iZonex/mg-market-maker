@@ -31,6 +31,7 @@ static MEME_SPOT_GUARDED: &str = include_str!("../templates/meme-spot-guarded.js
 static CROSS_ASSET_REGIME: &str = include_str!("../templates/cross-asset-regime.json");
 static GRID_VIA_GRAPH: &str = include_str!("../templates/grid-via-graph.json");
 static AVELLANEDA_VIA_GRAPH: &str = include_str!("../templates/avellaneda-via-graph.json");
+static BASIS_CARRY_SPOT_PERP: &str = include_str!("../templates/basis-carry-spot-perp.json");
 static PENTEST_SPOOF_CLASSIC: &str = include_str!("../templates/pentest/spoof-classic.json");
 
 const BUILTIN: &[BuiltinTemplate] = &[
@@ -58,6 +59,11 @@ const BUILTIN: &[BuiltinTemplate] = &[
         name: "avellaneda-via-graph",
         description: "Phase 4 reference: the engine's Avellaneda-Stoikov wrapped as a composite node (uses live config).",
         body: AVELLANEDA_VIA_GRAPH,
+    },
+    BuiltinTemplate {
+        name: "basis-carry-spot-perp",
+        description: "Multi-Venue ref: reads Binance spot + Bybit perp L1 from the DataBus, feeds a Basis strategy that quotes on this engine's venue. End-to-end demo of cross-venue reads.",
+        body: BASIS_CARRY_SPOT_PERP,
     },
     BuiltinTemplate {
         name: "pentest-spoof-classic",

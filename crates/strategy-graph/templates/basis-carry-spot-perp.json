@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "name": "basis-carry-spot-perp",
+  "scope": { "kind": "symbol", "value": "BTCUSDT" },
+  "stale_hold_ms": 30000,
+  "nodes": [
+    {
+      "id": "00000000-0000-4000-8000-00000000000a",
+      "kind": "Book.L1",
+      "config": { "venue": "binance", "symbol": "BTCUSDT", "product": "spot" },
+      "pos": [40, 40]
+    },
+    {
+      "id": "00000000-0000-4000-8000-00000000000b",
+      "kind": "Book.L1",
+      "config": { "venue": "bybit", "symbol": "BTCUSDT", "product": "linear_perp" },
+      "pos": [40, 200]
+    },
+    {
+      "id": "00000000-0000-4000-8000-00000000000c",
+      "kind": "Strategy.Basis",
+      "config": null,
+      "pos": [320, 120]
+    },
+    {
+      "id": "00000000-0000-4000-8000-00000000000d",
+      "kind": "Out.Quotes",
+      "config": null,
+      "pos": [600, 120]
+    },
+    {
+      "id": "00000000-0000-4000-8000-00000000000e",
+      "kind": "Math.Const",
+      "config": { "value": "1" },
+      "pos": [40, 360]
+    },
+    {
+      "id": "00000000-0000-4000-8000-00000000000f",
+      "kind": "Out.SpreadMult",
+      "config": null,
+      "pos": [320, 360]
+    }
+  ],
+  "edges": [
+    {
+      "from": { "node": "00000000-0000-4000-8000-00000000000c", "port": "quotes" },
+      "to":   { "node": "00000000-0000-4000-8000-00000000000d", "port": "quotes" }
+    },
+    {
+      "from": { "node": "00000000-0000-4000-8000-00000000000e", "port": "value" },
+      "to":   { "node": "00000000-0000-4000-8000-00000000000f", "port": "mult" }
+    }
+  ]
+}
