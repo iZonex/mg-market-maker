@@ -876,6 +876,10 @@ struct CatalogEntry {
     inputs: Vec<CatalogPort>,
     outputs: Vec<CatalogPort>,
     restricted: bool,
+    /// Schema-driven config form — the frontend renders one input per
+    /// entry in this vec automatically. Empty for nodes with no
+    /// parameters.
+    config_schema: Vec<mm_strategy_graph::ConfigField>,
 }
 #[derive(Serialize)]
 struct CatalogPort {
@@ -889,6 +893,13 @@ async fn get_strategy_catalog() -> Json<Vec<CatalogEntry>> {
         .into_iter()
         .map(|(kind, shape)| {
             let m = mm_strategy_graph::catalog::meta(kind);
+            // Build the node with a null config just to read its
+            // schema — every built-in kind accepts `null` here
+            // (configless nodes ignore it, configurable ones fall
+            // back on their Default).
+            let schema = mm_strategy_graph::catalog::build(kind, &serde_json::Value::Null)
+                .map(|n| n.config_schema())
+                .unwrap_or_default();
             CatalogEntry {
                 kind: kind.to_string(),
                 label: m.label.to_string(),
@@ -911,6 +922,7 @@ async fn get_strategy_catalog() -> Json<Vec<CatalogEntry>> {
                     })
                     .collect(),
                 restricted: shape.restricted,
+                config_schema: schema,
             }
         })
         .collect();

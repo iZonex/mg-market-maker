@@ -25,7 +25,9 @@ pub mod types;
 
 pub use evaluator::{Evaluator, SinkAction};
 pub use graph::{Graph, Node as GraphNode, Scope, ValidationError, CURRENT_SCHEMA_VERSION};
-pub use node::{EvalCtx, NodeKind, NodeState};
+pub use node::{
+    ConfigEnumOption, ConfigField, ConfigWidget, EvalCtx, NodeKind, NodeState,
+};
 pub use storage::{DeployRecord, GraphStore};
 pub use types::{Edge, GraphQuote, NodeId, Port, PortRef, PortType, QuoteSide, Value};
 

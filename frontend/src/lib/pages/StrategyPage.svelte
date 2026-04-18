@@ -336,12 +336,20 @@
   // label/group/summary fields and doesn't drift.
   function nodeData(kind, config) {
     const entry = catalog.find((c) => c.kind === kind)
+    // Prefill the config with every schema default so the form is
+    // never empty — operators see what they can tweak even before
+    // they open the right-pane.
+    const defaults = {}
+    for (const f of entry?.config_schema ?? []) {
+      defaults[f.name] = f.default
+    }
     return {
       kind,
       label: entry?.label ?? kind,
       summary: entry?.summary ?? '',
       group: entry?.group ?? kind.split('.')[0],
-      config: config ?? {},
+      config: { ...defaults, ...(config ?? {}) },
+      configSchema: entry?.config_schema ?? [],
       inputs: entry?.inputs ?? [],
       outputs: entry?.outputs ?? [],
       restricted: entry?.restricted ?? false,

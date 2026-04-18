@@ -27,7 +27,9 @@
 //! a subset of those fields so the same Avellaneda can run with
 //! different γ under two branches of a `Quote.Mux`.
 
-use crate::node::{EvalCtx, NodeKind, NodeState};
+use crate::node::{
+    ConfigEnumOption, ConfigField, ConfigWidget, EvalCtx, NodeKind, NodeState,
+};
 use crate::types::{Port, PortType, Value};
 use anyhow::Result;
 use once_cell::sync::Lazy;
@@ -76,43 +78,83 @@ strategy_node!(CrossExchange, "Strategy.CrossExchange");
 //
 // These deliberately reproduce manipulative patterns for internal
 // red-team testing against the user's own exchange. Every one
-// overrides `restricted() -> true` so
-// `Evaluator::build` refuses to compile a graph referencing them
-// unless the server was started with `MM_RESTRICTED_ALLOW=1`. The
-// deploy handler also emits a `StrategyGraphDeployRejected` audit
-// row on refusal so the refusal is regulator-visible.
+// overrides `restricted() -> true` so `Evaluator::build` refuses to
+// compile a graph referencing them unless the server was started
+// with `MM_ALLOW_RESTRICTED=yes-pentest-mode`.
+//
+// Written out by hand (no macro) because every exploit has its own
+// config schema — one per-knob row the frontend renders
+// automatically.
 
-macro_rules! pentest_strategy_node {
-    ($struct_name:ident, $kind_str:literal) => {
-        #[derive(Debug, Default)]
-        pub struct $struct_name;
+#[derive(Debug, Default)]
+pub struct Spoof;
 
-        impl NodeKind for $struct_name {
-            fn kind(&self) -> &'static str {
-                $kind_str
-            }
-            fn input_ports(&self) -> &[Port] {
-                &[]
-            }
-            fn output_ports(&self) -> &[Port] {
-                &QUOTES_OUT
-            }
-            fn restricted(&self) -> bool {
-                true
-            }
-            fn evaluate(
-                &self,
-                _ctx: &EvalCtx,
-                _inputs: &[Value],
-                _state: &mut NodeState,
-            ) -> Result<Vec<Value>> {
-                Ok(vec![Value::Missing])
-            }
-        }
-    };
+impl NodeKind for Spoof {
+    fn kind(&self) -> &'static str {
+        "Strategy.Spoof"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &[]
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUOTES_OUT
+    }
+    fn restricted(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<ConfigField> {
+        vec![
+            ConfigField {
+                name: "pressure_side",
+                label: "Pressure side",
+                hint: Some("Which side the fake order sits on"),
+                default: serde_json::json!("buy"),
+                widget: ConfigWidget::Enum {
+                    options: vec![
+                        ConfigEnumOption { value: "buy", label: "Buy (push price up)" },
+                        ConfigEnumOption { value: "sell", label: "Sell (push price down)" },
+                    ],
+                },
+            },
+            ConfigField {
+                name: "pressure_size_mult",
+                label: "Pressure size × order_size",
+                hint: Some("How many times larger than a real order the fake is. ≥5 trips the detector."),
+                default: serde_json::json!("10"),
+                widget: ConfigWidget::Number { min: Some(1.0), max: Some(50.0), step: Some(0.5) },
+            },
+            ConfigField {
+                name: "pressure_distance_bps",
+                label: "Pressure distance (bps)",
+                hint: Some("How far from mid the fake sits. Close enough to look real, far enough not to fill."),
+                default: serde_json::json!("15"),
+                widget: ConfigWidget::Number { min: Some(1.0), max: Some(200.0), step: Some(1.0) },
+            },
+            ConfigField {
+                name: "real_size_mult",
+                label: "Real size × order_size",
+                hint: Some("How big the genuine capturing order is."),
+                default: serde_json::json!("1"),
+                widget: ConfigWidget::Number { min: Some(0.1), max: Some(10.0), step: Some(0.1) },
+            },
+            ConfigField {
+                name: "real_distance_bps",
+                label: "Real distance (bps)",
+                hint: Some("Tight so the reaction lands on us."),
+                default: serde_json::json!("3"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: Some(100.0), step: Some(0.5) },
+            },
+        ]
+    }
 }
-
-pentest_strategy_node!(Spoof, "Strategy.Spoof");
 
 #[cfg(test)]
 mod tests {

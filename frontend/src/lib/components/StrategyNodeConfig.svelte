@@ -2,11 +2,12 @@
   /*
    * Epic H — right-pane node config panel.
    *
-   * Renders the selected node's kind + port declarations + an
-   * auto-generated form for its `config` JSON. Phase 1 supports
-   * only the two configurable nodes we ship (`Stats.EWMA`,
-   * `Cast.ToBool`); unknown-kind configs fall back to a raw
-   * textarea so power users aren't blocked.
+   * Schema-driven: catalog ships a `config_schema` per kind, the
+   * frontend renders one row per field automatically. Adding a new
+   * configurable node becomes a pure-Rust change — no UI touch.
+   *
+   * The engine still validates the final config server-side on
+   * deploy, so the form is a convenience, not a trust boundary.
    */
 
   let { node, onUpdate, onDelete } = $props()
@@ -15,23 +16,15 @@
   const label = $derived(node?.data?.label ?? kind)
   const summary = $derived(node?.data?.summary ?? '')
   const cfg = $derived(node?.data?.config ?? {})
-  const hasConfig = $derived(configurableKinds.has(kind))
-
-  // Kinds whose `from_config` accepts user-authored fields; anything
-  // else just shows the header + delete so the panel doesn't fake
-  // configurability the node can't honour.
-  const configurableKinds = new Set([
-    'Stats.EWMA', 'Math.Const', 'Cast.ToBool', 'Cast.StrategyEq',
-    'Cast.PairClassEq', 'Risk.ToxicityWiden', 'Risk.InventoryUrgency',
-    'Risk.CircuitBreaker', 'Indicator.SMA', 'Indicator.EMA',
-    'Indicator.HMA', 'Indicator.RSI', 'Indicator.ATR',
-    'Indicator.Bollinger', 'Exec.TwapConfig', 'Exec.VwapConfig',
-    'Exec.PovConfig', 'Exec.IcebergConfig',
-  ])
+  const schema = $derived(node?.data?.configSchema ?? [])
 
   function update(field, v) {
-    const next = { ...cfg, [field]: v }
-    onUpdate?.(next)
+    onUpdate?.({ ...cfg, [field]: v })
+  }
+
+  // Widget kinds use `snake_case` on the wire; match them exactly.
+  function widgetOf(f) {
+    return f.widget?.kind ?? 'text'
   }
 </script>
 
@@ -45,167 +38,63 @@
     <header class="node-head">
       <span class="kind-label">{label}</span>
       {#if summary}<span class="kind-summary">{summary}</span>{/if}
+      {#if node.data.restricted}
+        <span class="restricted-tag">RESTRICTED · pentest only</span>
+      {/if}
     </header>
 
-    {#if kind === 'Stats.EWMA'}
-      <label class="field">
-        <span>α (0,1]</span>
-        <input
-          type="text"
-          value={cfg.alpha ?? '0.1'}
-          oninput={(e) => update('alpha', e.currentTarget.value)}
-        />
-      </label>
-    {:else if kind === 'Math.Const'}
-      <label class="field">
-        <span>value</span>
-        <input
-          type="text"
-          value={cfg.value ?? '0'}
-          oninput={(e) => update('value', e.currentTarget.value)}
-        />
-      </label>
-    {:else if kind === 'Cast.ToBool'}
-      <label class="field">
-        <span>threshold</span>
-        <input
-          type="text"
-          value={cfg.threshold ?? '0'}
-          oninput={(e) => update('threshold', e.currentTarget.value)}
-        />
-      </label>
-      <label class="field">
-        <span>comparator</span>
-        <select
-          value={cfg.cmp ?? 'ge'}
-          onchange={(e) => update('cmp', e.currentTarget.value)}
-        >
-          <option value="ge">≥</option>
-          <option value="gt">&gt;</option>
-          <option value="le">≤</option>
-          <option value="lt">&lt;</option>
-          <option value="eq">=</option>
-        </select>
-      </label>
-    {:else if kind === 'Cast.StrategyEq'}
-      <label class="field">
-        <span>target strategy</span>
-        <select
-          value={cfg.target ?? 'AvellanedaStoikov'}
-          onchange={(e) => update('target', e.currentTarget.value)}
-        >
-          <option value="AvellanedaStoikov">AvellanedaStoikov</option>
-          <option value="GLFT">GLFT</option>
-          <option value="Grid">Grid</option>
-          <option value="Basis">Basis</option>
-          <option value="CrossExchange">CrossExchange</option>
-        </select>
-      </label>
-    {:else if kind === 'Cast.PairClassEq'}
-      <label class="field">
-        <span>target pair class</span>
-        <input
-          type="text"
-          value={cfg.target ?? 'MajorSpot'}
-          oninput={(e) => update('target', e.currentTarget.value)}
-        />
-      </label>
-    {:else if kind === 'Risk.ToxicityWiden'}
-      <label class="field">
-        <span>scale (mult at vpin=1)</span>
-        <input
-          type="text"
-          value={cfg.scale ?? '2'}
-          oninput={(e) => update('scale', e.currentTarget.value)}
-        />
-      </label>
-    {:else if kind === 'Risk.InventoryUrgency'}
-      <label class="field">
-        <span>cap</span>
-        <input
-          type="text"
-          value={cfg.cap ?? '1'}
-          oninput={(e) => update('cap', e.currentTarget.value)}
-        />
-      </label>
-      <label class="field">
-        <span>exponent</span>
-        <input
-          type="text"
-          value={cfg.exponent ?? '2'}
-          oninput={(e) => update('exponent', e.currentTarget.value)}
-        />
-      </label>
-    {:else if kind === 'Risk.CircuitBreaker'}
-      <label class="field">
-        <span>wide spread (bps)</span>
-        <input
-          type="text"
-          value={cfg.wide_bps ?? '100'}
-          oninput={(e) => update('wide_bps', e.currentTarget.value)}
-        />
-      </label>
-    {:else if kind === 'Indicator.SMA' || kind === 'Indicator.EMA' || kind === 'Indicator.HMA' || kind === 'Indicator.RSI' || kind === 'Indicator.ATR'}
-      <label class="field">
-        <span>period</span>
-        <input
-          type="number"
-          min="1"
-          max="10000"
-          value={cfg.period ?? 14}
-          oninput={(e) => update('period', Number(e.currentTarget.value))}
-        />
-      </label>
-    {:else if kind === 'Indicator.Bollinger'}
-      <label class="field">
-        <span>period</span>
-        <input
-          type="number"
-          min="1"
-          max="10000"
-          value={cfg.period ?? 20}
-          oninput={(e) => update('period', Number(e.currentTarget.value))}
-        />
-      </label>
-      <label class="field">
-        <span>k (std dev)</span>
-        <input
-          type="text"
-          value={cfg.k_stddev ?? '2'}
-          oninput={(e) => update('k_stddev', e.currentTarget.value)}
-        />
-      </label>
-    {:else if kind === 'Exec.TwapConfig'}
-      <label class="field">
-        <span>duration (sec)</span>
-        <input type="number" min="1" value={cfg.duration_secs ?? 120}
-          oninput={(e) => update('duration_secs', Number(e.currentTarget.value))} />
-      </label>
-      <label class="field">
-        <span>slice count</span>
-        <input type="number" min="1" max="1000" value={cfg.slice_count ?? 5}
-          oninput={(e) => update('slice_count', Number(e.currentTarget.value))} />
-      </label>
-    {:else if kind === 'Exec.VwapConfig'}
-      <label class="field">
-        <span>duration (sec)</span>
-        <input type="number" min="1" value={cfg.duration_secs ?? 300}
-          oninput={(e) => update('duration_secs', Number(e.currentTarget.value))} />
-      </label>
-    {:else if kind === 'Exec.PovConfig'}
-      <label class="field">
-        <span>target participation (%)</span>
-        <input type="number" min="1" max="100" value={cfg.target_pct ?? 10}
-          oninput={(e) => update('target_pct', Number(e.currentTarget.value))} />
-      </label>
-    {:else if kind === 'Exec.IcebergConfig'}
-      <label class="field">
-        <span>display qty</span>
-        <input type="text" value={cfg.display_qty ?? '0.1'}
-          oninput={(e) => update('display_qty', e.currentTarget.value)} />
-      </label>
-    {:else if !hasConfig}
-      <div class="muted small">No parameters — this node takes its values from the engine.</div>
+    {#if schema.length === 0}
+      <div class="muted small">
+        No parameters — this node takes its values from the engine.
+      </div>
+    {:else}
+      {#each schema as f (f.name)}
+        <label class="field stacked">
+          <span class="field-label">{f.label}</span>
+          {#if widgetOf(f) === 'number'}
+            <input
+              type="text"
+              inputmode="decimal"
+              value={cfg[f.name] ?? f.default}
+              oninput={(e) => update(f.name, e.currentTarget.value)}
+            />
+          {:else if widgetOf(f) === 'integer'}
+            <input
+              type="number"
+              step="1"
+              min={f.widget.min ?? null}
+              max={f.widget.max ?? null}
+              value={cfg[f.name] ?? f.default}
+              oninput={(e) => update(f.name, Number(e.currentTarget.value))}
+            />
+          {:else if widgetOf(f) === 'bool'}
+            <label class="inline-bool">
+              <input
+                type="checkbox"
+                checked={cfg[f.name] ?? f.default}
+                onchange={(e) => update(f.name, e.currentTarget.checked)}
+              />
+              <span>{f.label}</span>
+            </label>
+          {:else if widgetOf(f) === 'enum'}
+            <select
+              value={cfg[f.name] ?? f.default}
+              onchange={(e) => update(f.name, e.currentTarget.value)}
+            >
+              {#each f.widget.options as opt (opt.value)}
+                <option value={opt.value}>{opt.label}</option>
+              {/each}
+            </select>
+          {:else}
+            <input
+              type="text"
+              value={cfg[f.name] ?? f.default}
+              oninput={(e) => update(f.name, e.currentTarget.value)}
+            />
+          {/if}
+          {#if f.hint}<span class="hint">{f.hint}</span>{/if}
+        </label>
+      {/each}
     {/if}
 
     <div class="actions">
@@ -235,23 +124,45 @@
     font-family: var(--font-sans); font-size: 11px; line-height: 1.4;
     color: var(--fg-muted);
   }
+  .restricted-tag {
+    margin-top: 4px;
+    font-family: var(--font-mono); font-size: 10px; font-weight: 600;
+    color: var(--neg); letter-spacing: var(--tracking-label);
+  }
   .empty, .muted { color: var(--fg-muted); font-size: var(--fs-xs); }
   .small { font-size: var(--fs-2xs); }
 
-  .field { display: flex; flex-direction: column; gap: 2px; }
-  .field span { font-size: var(--fs-2xs); color: var(--fg-muted); text-transform: uppercase; letter-spacing: var(--tracking-label); }
+  .field.stacked {
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .field-label {
+    font-family: var(--font-mono); font-size: 10px;
+    color: var(--fg-muted); text-transform: uppercase;
+    letter-spacing: var(--tracking-label);
+  }
   .field input, .field select {
-    padding: var(--s-2) var(--s-3);
+    height: 28px;
+    padding: 0 var(--s-3);
     background: var(--bg-base); border: 1px solid var(--border-subtle);
-    border-radius: var(--r-md); color: var(--fg-primary);
-    font-family: var(--font-mono); font-size: var(--fs-xs);
+    border-radius: var(--r-sm); color: var(--fg-primary);
+    font-family: var(--font-mono); font-size: 12px;
+  }
+  .field input:focus, .field select:focus {
+    outline: none; border-color: var(--accent);
+  }
+  .hint {
+    font-size: 10px; color: var(--fg-muted); line-height: 1.3;
+  }
+  .inline-bool {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 12px; color: var(--fg-primary);
   }
 
-  .actions { display: flex; justify-content: flex-end; }
+  .actions { display: flex; justify-content: flex-end; margin-top: var(--s-2); }
   .btn {
     padding: var(--s-2) var(--s-3);
     background: var(--bg-chip); border: 1px solid var(--border-subtle);
-    border-radius: var(--r-md); color: var(--fg-primary);
+    border-radius: var(--r-sm); color: var(--fg-primary);
     font-size: var(--fs-xs); cursor: pointer;
   }
   .btn.danger { border-color: var(--neg); color: var(--neg); }

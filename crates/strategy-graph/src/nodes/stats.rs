@@ -73,6 +73,16 @@ impl NodeKind for Ewma {
     fn output_ports(&self) -> &[Port] {
         &EWMA_OUTPUTS
     }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![ConfigField {
+            name: "alpha",
+            label: "α (smoothing)",
+            hint: Some("0 < α ≤ 1. Higher = more responsive, less smoothing"),
+            default: serde_json::json!("0.1"),
+            widget: ConfigWidget::Number { min: Some(0.0001), max: Some(1.0), step: Some(0.01) },
+        }]
+    }
     fn evaluate(
         &self,
         _ctx: &EvalCtx,

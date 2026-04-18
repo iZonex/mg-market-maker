@@ -245,6 +245,32 @@ impl NodeKind for SpoofingScore {
     ) -> Result<Vec<Value>> {
         Ok(vec![Value::Missing; 4])
     }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![
+            ConfigField {
+                name: "ratio_hot",
+                label: "Cancel/fill ratio (hot)",
+                hint: Some("≥ this → full score contribution"),
+                default: serde_json::json!("0.9"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: Some(1.0), step: Some(0.01) },
+            },
+            ConfigField {
+                name: "lifetime_hot_ms",
+                label: "Order lifetime (hot, ms)",
+                hint: Some("≤ this → full score contribution"),
+                default: serde_json::json!(100),
+                widget: ConfigWidget::Integer { min: Some(1), max: Some(5000) },
+            },
+            ConfigField {
+                name: "size_ratio_hot",
+                label: "Order size vs avg trade (hot)",
+                hint: Some("≥ this × avg trade → full contribution"),
+                default: serde_json::json!("5"),
+                widget: ConfigWidget::Number { min: Some(1.0), max: Some(50.0), step: Some(0.5) },
+            },
+        ]
+    }
 }
 
 /// `Surveillance.LayeringScore` — many small orders clustered on

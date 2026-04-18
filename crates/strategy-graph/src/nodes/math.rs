@@ -214,6 +214,16 @@ impl NodeKind for Const {
     fn output_ports(&self) -> &[Port] {
         &CONST_OUTPUTS
     }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![ConfigField {
+            name: "value",
+            label: "Value",
+            hint: None,
+            default: serde_json::json!("0"),
+            widget: ConfigWidget::Number { min: None, max: None, step: Some(0.01) },
+        }]
+    }
     fn evaluate(
         &self,
         _ctx: &EvalCtx,
@@ -339,6 +349,33 @@ impl NodeKind for ToBool {
     }
     fn output_ports(&self) -> &[Port] {
         &TOBOOL_OUTPUTS
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigEnumOption, ConfigField, ConfigWidget};
+        vec![
+            ConfigField {
+                name: "threshold",
+                label: "Threshold",
+                hint: Some("Compared with the incoming number"),
+                default: serde_json::json!("0"),
+                widget: ConfigWidget::Number { min: None, max: None, step: Some(0.01) },
+            },
+            ConfigField {
+                name: "cmp",
+                label: "Comparator",
+                hint: None,
+                default: serde_json::json!("ge"),
+                widget: ConfigWidget::Enum {
+                    options: vec![
+                        ConfigEnumOption { value: "ge", label: "≥" },
+                        ConfigEnumOption { value: "gt", label: ">" },
+                        ConfigEnumOption { value: "le", label: "≤" },
+                        ConfigEnumOption { value: "lt", label: "<" },
+                        ConfigEnumOption { value: "eq", label: "=" },
+                    ],
+                },
+            },
+        ]
     }
     fn evaluate(
         &self,

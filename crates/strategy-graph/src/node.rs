@@ -101,6 +101,74 @@ pub trait NodeKind: std::fmt::Debug + Send + Sync {
     fn restricted(&self) -> bool {
         false
     }
+
+    /// Declared config fields. Empty vec by default means "no config
+    /// — the node takes only its inputs". When a node overrides this,
+    /// the catalog API ships the schema to the frontend, which renders
+    /// a form automatically — no per-kind `if kind === ...` branch on
+    /// the UI side. See [`ConfigField`].
+    fn config_schema(&self) -> Vec<ConfigField> {
+        Vec::new()
+    }
+}
+
+/// One field on a node's config blob. Schema-driven: adding a field
+/// is one struct-literal + one default; the UI form gets it for free.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConfigField {
+    /// JSON key the engine reads out of `node.config`.
+    pub name: &'static str,
+    /// Human-facing label on the form.
+    pub label: &'static str,
+    /// One-line hint rendered under the input. Kept short so the
+    /// right-hand config panel doesn't outgrow its width.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<&'static str>,
+    /// Default value the form prefills with. Stored as a JSON value
+    /// so numbers / strings / bools all use one shape.
+    pub default: serde_json::Value,
+    /// Widget hint for the form.
+    pub widget: ConfigWidget,
+}
+
+/// Tag the frontend uses to pick a form widget. New widget types go
+/// here — never grow the set by encoding hints into strings.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ConfigWidget {
+    /// Plain number / decimal input. `step` hints the HTML
+    /// `step=` attribute for a rocker control.
+    Number {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        min: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        step: Option<f64>,
+    },
+    /// Integer counterpart — JS `<input type="number" step="1">`.
+    Integer {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        min: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max: Option<i64>,
+    },
+    /// Free-form text.
+    Text,
+    /// Boolean checkbox / switch.
+    Bool,
+    /// Dropdown with a finite set of string options. Every option
+    /// also carries a human label so we can show "≥" instead of
+    /// `"ge"` while the graph JSON still stores the compact form.
+    Enum {
+        options: Vec<ConfigEnumOption>,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConfigEnumOption {
+    pub value: &'static str,
+    pub label: &'static str,
 }
 
 /// Cached per-node eval output keyed by output port name. Lives on the
