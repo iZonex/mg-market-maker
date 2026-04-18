@@ -492,6 +492,10 @@ pub struct MarketMakerEngine {
     /// Refreshed at the end of every `tick_strategy_graph` so the
     /// "then" snapshot is always one tick old.
     prev_l2_snapshot: Option<mm_risk::surveillance::L2Snapshot>,
+    /// Epic R Week 5b — venue session calendar (funding windows /
+    /// settlement). Default = 8-hour funding cadence; operators can
+    /// override via `set_session_calendar`.
+    session_calendar: mm_risk::session_calendar::SessionCalendar,
     /// Epic H — graph scope cached at `with_strategy_graph` /
     /// `swap_strategy_graph` so the per-tick source marshaller
     /// knows which asset to pull sentiment for without re-reading
@@ -866,6 +870,7 @@ impl MarketMakerEngine {
             surveillance_tracker: mm_risk::surveillance::new_shared_tracker(),
             surveillance_last_alert: std::collections::HashMap::new(),
             prev_l2_snapshot: None,
+            session_calendar: mm_risk::session_calendar::SessionCalendar::funding_8h(),
             strategy_graph_scope: None,
             margin_guard: config.margin.as_ref().map(|m| {
                 MarginGuard::new(MarginGuardThresholds::from_config(m))
@@ -1540,6 +1545,31 @@ impl MarketMakerEngine {
                     };
                     Some(Box::new(mm_strategy::wash::WashStrategy::with_config(wash_cfg)))
                 }
+                "Strategy.Mark" => {
+                    use mm_common::types::Side;
+                    let cfg = &n.config;
+                    let parse_dec = |k: &str, default: rust_decimal::Decimal| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(default)
+                    };
+                    let parse_i64 = |k: &str, default: i64| {
+                        cfg.get(k).and_then(|v| v.as_i64()).unwrap_or(default)
+                    };
+                    let push_side = match cfg.get("push_side").and_then(|v| v.as_str()) {
+                        Some("sell") => Side::Sell,
+                        _ => Side::Buy,
+                    };
+                    let mark_cfg = mm_strategy::mark::MarkConfig {
+                        push_side,
+                        window_secs: parse_i64("window_secs", 60),
+                        burst_size: parse_dec("burst_size", dec!(0.001)),
+                        cross_depth_bps: parse_dec("cross_depth_bps", dec!(30)),
+                    };
+                    let strat = mm_strategy::mark::MarkStrategy::with_config(mark_cfg);
+                    Some(Box::new(strat))
+                }
                 "Strategy.Ignite" => {
                     use mm_common::types::Side;
                     let cfg = &n.config;
@@ -2088,6 +2118,57 @@ impl MarketMakerEngine {
                 // stash an alert tuple if the score crossed 0.8 so
                 // the loop can emit them after it releases its borrow
                 // of `self.strategy_graph`.
+                "Session.TimeToBoundary" => {
+                    let now = chrono::Utc::now();
+                    let ttb = self.session_calendar.seconds_to_next(now);
+                    let tsl = self.session_calendar.seconds_since_last(now);
+                    src.insert(
+                        (*id, "seconds_to_next".into()),
+                        ttb.map(|s| Value::Number(rust_decimal::Decimal::from(s)))
+                            .unwrap_or(Value::Missing),
+                    );
+                    src.insert(
+                        (*id, "seconds_since_last".into()),
+                        tsl.map(|s| Value::Number(rust_decimal::Decimal::from(s)))
+                            .unwrap_or(Value::Missing),
+                    );
+                }
+                "Surveillance.MarkingCloseScore" => {
+                    // Close-window trade-volume ratio. Use the
+                    // DataBus public-trade tape: the last 60 s
+                    // vs. the 60 s before that.
+                    let key = (
+                        format!("{:?}", self.config.exchange.exchange_type).to_lowercase(),
+                        self.symbol.clone(),
+                        self.config.exchange.product,
+                    );
+                    let now = chrono::Utc::now();
+                    let ttb = self.session_calendar.seconds_to_next(now);
+                    let tape = self
+                        .dashboard
+                        .as_ref()
+                        .map(|d| d.data_bus().get_trades(&key))
+                        .unwrap_or_default();
+                    // Two halves: recent 60 s (close window) + the
+                    // minute before it (baseline).
+                    let window = chrono::Duration::seconds(60);
+                    let (recent, base_cutoff) = (now - window, now - window * 2);
+                    let mut window_vol = rust_decimal::Decimal::ZERO;
+                    let mut baseline_vol = rust_decimal::Decimal::ZERO;
+                    for t in &tape {
+                        if t.ts >= recent {
+                            window_vol += t.qty;
+                        } else if t.ts >= base_cutoff {
+                            baseline_vol += t.qty;
+                        }
+                    }
+                    let out = mm_risk::surveillance::MarkingCloseDetector::new()
+                        .score(ttb.unwrap_or(i64::MAX), window_vol, baseline_vol);
+                    src.insert((*id, "value".into()), Value::Number(out.score));
+                    if out.score >= rust_decimal_macros::dec!(0.8) {
+                        pending_alerts.push((kind.clone(), *id, out));
+                    }
+                }
                 "Surveillance.FakeLiquidityScore" => {
                     // Pull current L2 off the bus, compare against
                     // the snapshot we stashed at the end of the
@@ -2658,6 +2739,15 @@ impl MarketMakerEngine {
             }
         }
 
+        // Week 5b — feed per-strategy session timing so Mark-
+        // class exploits know when they're inside the close-window.
+        let now = chrono::Utc::now();
+        if let Some(s) = self.session_calendar.seconds_to_next(now) {
+            for strat in self.strategy_pool.values() {
+                strat.on_session_tick(s);
+            }
+        }
+
         // Week 5 — stash the current L2 for the FakeLiquidity
         // detector's next-tick delta read. Done after the overlay
         // loop so this tick still compared against the previous
@@ -2718,6 +2808,7 @@ impl MarketMakerEngine {
                 "Surveillance.WashScore" => "wash",
                 "Surveillance.MomentumIgnitionScore" => "momentum_ignition",
                 "Surveillance.FakeLiquidityScore" => "fake_liquidity",
+                "Surveillance.MarkingCloseScore" => "marking_close",
                 _ => "unknown",
             };
             self.audit.surveillance_alert(

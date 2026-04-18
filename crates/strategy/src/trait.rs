@@ -80,6 +80,11 @@ pub trait Strategy: Send + Sync {
 
     /// Name of the strategy for logging.
     fn name(&self) -> &str;
+
+    /// Optional pre-tick hook — engine threads per-symbol session
+    /// timing (seconds to next session boundary). Default no-op.
+    /// `MarkStrategy` uses this to gate its close-window activity.
+    fn on_session_tick(&self, _seconds_to_boundary: i64) {}
 }
 
 /// Helper: clamp a price to [mid - max_dist, mid + max_dist].

@@ -726,6 +726,82 @@ pub struct WashFillView {
     pub price: Decimal,
 }
 
+// ─── Marking-the-close detector ─────────────────────────────
+//
+// `docs/research/complince.md` § 7 — aggressive trading in the
+// final seconds before a session boundary (funding window /
+// settlement) to move the VWAP in the actor's favour. Shape:
+// read trade volume in the closing window, compare to the
+// window's typical volume — an unusual spike during the last
+// `close_window_secs` is the signal.
+
+#[derive(Debug, Clone)]
+pub struct MarkingCloseConfig {
+    /// How many seconds before a boundary the detector watches.
+    /// Default 60 — most venues show the marking pattern inside
+    /// a one-minute window.
+    pub close_window_secs: i64,
+    /// Ratio of closing-window volume to baseline volume
+    /// (baseline = same duration window earlier in the session).
+    /// `ratio_hot` → full contribution. 3.0 = triple the baseline.
+    pub ratio_hot: Decimal,
+}
+
+impl Default for MarkingCloseConfig {
+    fn default() -> Self {
+        Self {
+            close_window_secs: 60,
+            ratio_hot: dec!(3),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct MarkingCloseDetector {
+    pub config: MarkingCloseConfig,
+}
+
+impl MarkingCloseDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `seconds_to_boundary` — how far away from the next session
+    /// mark we currently are (0 = at the boundary, < 0 = past).
+    /// `window_volume` + `baseline_volume` come from the engine
+    /// adapter (trade tape slicing).
+    pub fn score(
+        &self,
+        seconds_to_boundary: i64,
+        window_volume: Decimal,
+        baseline_volume: Decimal,
+    ) -> DetectorOutput {
+        // Not inside the closing window → no signal.
+        if seconds_to_boundary < 0 || seconds_to_boundary > self.config.close_window_secs {
+            return DetectorOutput::default();
+        }
+        if baseline_volume <= Decimal::ZERO {
+            return DetectorOutput::default();
+        }
+        let ratio = window_volume / baseline_volume;
+        let sig = if self.config.ratio_hot > Decimal::ZERO {
+            if ratio >= self.config.ratio_hot {
+                Decimal::ONE
+            } else {
+                (ratio / self.config.ratio_hot).min(Decimal::ONE)
+            }
+        } else {
+            Decimal::ZERO
+        };
+        DetectorOutput {
+            score: sig,
+            cancel_to_fill_ratio: Decimal::ZERO,
+            median_order_lifetime_ms: None,
+            size_vs_avg_trade: None,
+        }
+    }
+}
+
 // ─── Fake-liquidity detector ────────────────────────────────
 //
 // `docs/research/complince.md` § 6 — orders pulled right before
@@ -1222,6 +1298,21 @@ mod tests {
         let d = FakeLiquidityDetector::new();
         let out = d.score(&then, &now);
         assert!(out.score >= dec!(0.6), "fake-liquidity score was {}", out.score);
+    }
+
+    #[test]
+    fn marking_close_scores_high_inside_window_with_spike() {
+        let d = MarkingCloseDetector::new();
+        // 20 s to boundary (inside 60-s window), triple baseline vol.
+        let out = d.score(20, dec!(300), dec!(100));
+        assert_eq!(out.score, dec!(1));
+    }
+
+    #[test]
+    fn marking_close_ignores_outside_window() {
+        let d = MarkingCloseDetector::new();
+        // 300 s to boundary → outside window → 0.
+        assert_eq!(d.score(300, dec!(999), dec!(100)).score, dec!(0));
     }
 
     #[test]

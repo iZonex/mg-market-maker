@@ -283,6 +283,73 @@ impl NodeKind for Ignite {
     }
 }
 
+/// `Strategy.Mark` — pentest exploit for marking-the-close.
+/// Places an aggressive cross-through limit order N bps past
+/// the opposite touch inside the close-window before a session
+/// boundary; idle otherwise.
+#[derive(Debug, Default)]
+pub struct Mark;
+
+impl NodeKind for Mark {
+    fn kind(&self) -> &'static str {
+        "Strategy.Mark"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &[]
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUOTES_OUT
+    }
+    fn restricted(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<ConfigField> {
+        vec![
+            ConfigField {
+                name: "push_side",
+                label: "Push side",
+                hint: Some("Which direction to mark"),
+                default: serde_json::json!("buy"),
+                widget: ConfigWidget::Enum {
+                    options: vec![
+                        ConfigEnumOption { value: "buy", label: "Buy (mark up)" },
+                        ConfigEnumOption { value: "sell", label: "Sell (mark down)" },
+                    ],
+                },
+            },
+            ConfigField {
+                name: "window_secs",
+                label: "Close window (s)",
+                hint: Some("How many seconds before boundary to start marking"),
+                default: serde_json::json!(60),
+                widget: ConfigWidget::Integer { min: Some(1), max: Some(3600) },
+            },
+            ConfigField {
+                name: "burst_size",
+                label: "Burst size",
+                hint: Some("Per-tick aggressive order qty"),
+                default: serde_json::json!("0.001"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+            ConfigField {
+                name: "cross_depth_bps",
+                label: "Cross depth (bps)",
+                hint: Some("How far past opposite touch to cross"),
+                default: serde_json::json!("30"),
+                widget: ConfigWidget::Number { min: Some(1.0), max: Some(500.0), step: Some(1.0) },
+            },
+        ]
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Spoof;
 

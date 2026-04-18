@@ -682,6 +682,65 @@ impl NodeKind for WashScore {
     }
 }
 
+/// `Session.TimeToBoundary` — seconds to the next session
+/// boundary (funding window / settlement). Pairs with
+/// `MarkingCloseDetector` + `Cast.ToBool(<=60)` to gate close-
+/// window logic.
+#[derive(Debug, Default)]
+pub struct SessionTimeToBoundary;
+
+static TTB_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
+    vec![
+        Port::new("seconds_to_next", PortType::Number),
+        Port::new("seconds_since_last", PortType::Number),
+    ]
+});
+
+impl NodeKind for SessionTimeToBoundary {
+    fn kind(&self) -> &'static str {
+        "Session.TimeToBoundary"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &TTB_OUTPUTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing; 2])
+    }
+}
+
+/// `Surveillance.MarkingCloseScore` — trade-volume spike inside
+/// the seconds-to-boundary window.
+#[derive(Debug, Default)]
+pub struct MarkingCloseScore;
+
+impl NodeKind for MarkingCloseScore {
+    fn kind(&self) -> &'static str {
+        "Surveillance.MarkingCloseScore"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &SCORE_ONLY_OUTPUT
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
 /// `Surveillance.FakeLiquidityScore` — orders evaporating near
 /// the touch. One-port output.
 #[derive(Debug, Default)]

@@ -130,6 +130,7 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Strategy.Spoof" => Some(Box::new(strategies::Spoof)),
         "Strategy.Wash" => Some(Box::new(strategies::Wash)),
         "Strategy.Ignite" => Some(Box::new(strategies::Ignite)),
+        "Strategy.Mark" => Some(Box::new(strategies::Mark)),
         // Epic R — surveillance detectors (engine overlays per tick)
         "Surveillance.SpoofingScore" => Some(Box::new(sources::SpoofingScore)),
         "Surveillance.LayeringScore" => Some(Box::new(sources::LayeringScore)),
@@ -137,6 +138,8 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Surveillance.WashScore" => Some(Box::new(sources::WashScore)),
         "Surveillance.MomentumIgnitionScore" => Some(Box::new(sources::MomentumIgnitionScore)),
         "Surveillance.FakeLiquidityScore" => Some(Box::new(sources::FakeLiquidityScore)),
+        "Surveillance.MarkingCloseScore" => Some(Box::new(sources::MarkingCloseScore)),
+        "Session.TimeToBoundary" => Some(Box::new(sources::SessionTimeToBoundary)),
         // Sinks
         "Out.SpreadMult" => Some(Box::new(sinks::SpreadMult)),
         "Out.SizeMult" => Some(Box::new(sinks::SizeMult)),
@@ -238,6 +241,7 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Strategy.Spoof"       => NodeMeta { label: "Spoof (pentest)",     summary: "⚠ RESTRICTED — large fake order pulled on tick N+1 while real opposite-side captures reaction", group: "Exploit" },
         "Strategy.Wash"        => NodeMeta { label: "Wash (pentest)",      summary: "⚠ RESTRICTED — buy + sell at the same price every tick (self-trade)", group: "Exploit" },
         "Strategy.Ignite"      => NodeMeta { label: "Ignite (pentest)",    summary: "⚠ RESTRICTED — burst cross-through orders for N ticks, rest M, repeat", group: "Exploit" },
+        "Strategy.Mark"        => NodeMeta { label: "Mark (pentest)",      summary: "⚠ RESTRICTED — aggressive cross-through inside the close-window before a session boundary", group: "Exploit" },
 
         // Epic R — surveillance detectors (safe, defaults-on)
         "Surveillance.SpoofingScore" => NodeMeta { label: "Spoofing score", summary: "Likelihood our own flow looks like spoofing [0..1] + cancel_ratio + lifetime", group: "Surveillance" },
@@ -246,6 +250,8 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Surveillance.WashScore" => NodeMeta { label: "Wash score",        summary: "Self-trade detection (own buy + own sell same price, short window) [0..1]", group: "Surveillance" },
         "Surveillance.MomentumIgnitionScore" => NodeMeta { label: "Momentum ignition score", summary: "Public-tape burst + aggressor dominance + price move [0..1]", group: "Surveillance" },
         "Surveillance.FakeLiquidityScore" => NodeMeta { label: "Fake liquidity score", summary: "L2 levels evaporating within bps-band of mid — the book that disappears on approach", group: "Surveillance" },
+        "Surveillance.MarkingCloseScore" => NodeMeta { label: "Marking-close score", summary: "Volume spike within seconds of a session boundary (funding / settlement)", group: "Surveillance" },
+        "Session.TimeToBoundary" => NodeMeta { label: "Session boundary", summary: "Seconds to next + since last funding / settlement boundary", group: "Sources" },
 
         // Sinks — always fire on a trigger, consumed by the engine.
         "Out.SpreadMult"       => NodeMeta { label: "Spread multiplier",   summary: "Final spread scalar applied to quotes", group: "Sinks" },
@@ -348,12 +354,15 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Strategy.Spoof",
         "Strategy.Wash",
         "Strategy.Ignite",
+        "Strategy.Mark",
         "Surveillance.SpoofingScore",
         "Surveillance.LayeringScore",
         "Surveillance.QuoteStuffingScore",
         "Surveillance.WashScore",
         "Surveillance.MomentumIgnitionScore",
         "Surveillance.FakeLiquidityScore",
+        "Surveillance.MarkingCloseScore",
+        "Session.TimeToBoundary",
         "Out.SpreadMult",
         "Out.SizeMult",
         "Out.KillEscalate",
@@ -432,8 +441,9 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_69_nodes_after_epic_r_week_5_fake_liquidity() {
-        // 68 after Week 4 + Surveillance.FakeLiquidityScore = 69.
-        assert_eq!(kinds().len(), 69, "catalog drift");
+    fn catalog_has_72_nodes_after_epic_r_week_5_marking_close() {
+        // 69 + Session.TimeToBoundary + MarkingCloseScore +
+        // (Strategy.Mark comes in the exploit commit) = 72.
+        assert_eq!(kinds().len(), 72, "catalog drift");
     }
 }
