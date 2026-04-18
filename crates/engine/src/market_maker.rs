@@ -59,6 +59,40 @@ fn decimal_to_f64(d: Decimal) -> f64 {
 /// canonical fiat / stablecoin / BTC / ETH suffixes the v0.4.0
 /// venue matrix trades on. Used only for the Portfolio seed —
 /// never for order routing.
+/// Multi-Venue 3.C — build a snapshot of the
+/// `PortfolioBalanceTracker` from the DataBus's balances map on
+/// every graph tick. Cheap — the bus already serialised writes,
+/// this just clones the values and derives the aggregate. Returns
+/// an empty tracker when the dashboard isn't attached.
+fn build_portfolio(
+    dashboard: Option<&mm_dashboard::state::DashboardState>,
+) -> mm_risk::portfolio_balance::PortfolioBalanceTracker {
+    use mm_risk::portfolio_balance::{BalanceInput, PortfolioBalanceTracker};
+    let mut tracker = PortfolioBalanceTracker::new();
+    let Some(dash) = dashboard else { return tracker };
+    let bus = dash.data_bus();
+    let Ok(map) = bus.balances.read() else { return tracker };
+    let inputs: Vec<BalanceInput> = map
+        .iter()
+        .map(|((venue, asset), bal)| BalanceInput {
+            venue: venue.clone(),
+            asset: asset.clone(),
+            total: bal.total,
+            available: bal.available,
+            reserved: bal.reserved,
+            // Short-leg tagging requires a per-balance flag the
+            // bus doesn't carry yet. For 3.C every entry counts
+            // as long — net-delta is correct for spot portfolios
+            // and over-counts on perp-short; 3.E will add the
+            // short-leg flag when atomic bundles introduce the
+            // leg type properly.
+            short_leg: false,
+        })
+        .collect();
+    tracker.refresh(&inputs);
+    tracker
+}
+
 fn split_symbol_bq(symbol: &str) -> (&str, &str) {
     for suffix in ["USDT", "USDC", "BUSD", "FDUSD", "TUSD", "DAI", "BTC", "ETH"] {
         if let Some(base) = symbol.strip_suffix(suffix) {
@@ -1834,6 +1868,28 @@ impl MarketMakerEngine {
                     src.insert((*id, "total".into()), total);
                     src.insert((*id, "available".into()), available);
                     src.insert((*id, "reserved".into()), reserved);
+                }
+                "Portfolio.NetDelta" => {
+                    let asset = graph
+                        .node_configs()
+                        .get(id)
+                        .and_then(|c| c.get("asset"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("BTC")
+                        .to_string();
+                    let delta = build_portfolio(self.dashboard.as_ref()).net_delta(&asset);
+                    src.insert((*id, "value".into()), Value::Number(delta));
+                }
+                "Portfolio.QuoteAvailable" => {
+                    let venue = graph
+                        .node_configs()
+                        .get(id)
+                        .and_then(|c| c.get("venue"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("binance")
+                        .to_string();
+                    let avail = build_portfolio(self.dashboard.as_ref()).quote_available(&venue);
+                    src.insert((*id, "value".into()), Value::Number(avail));
                 }
                 "Funding" => {
                     let (venue, symbol, product, _) = Self::read_cross_venue_key(

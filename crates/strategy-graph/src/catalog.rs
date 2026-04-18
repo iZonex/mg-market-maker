@@ -46,6 +46,8 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Trade.Tape" => Some(Box::new(sources::TradeTape)),
         "Balance" => Some(Box::new(sources::BalanceSource)),
         "Funding" => Some(Box::new(sources::FundingSource)),
+        "Portfolio.NetDelta" => Some(Box::new(sources::PortfolioNetDelta)),
+        "Portfolio.QuoteAvailable" => Some(Box::new(sources::PortfolioQuoteAvailable)),
         "Sentiment.Rate" => Some(Box::new(sources::SentimentRate)),
         "Sentiment.Score" => Some(Box::new(sources::SentimentScore)),
         "Volatility.Realised" => Some(Box::new(sources::VolatilityRealised)),
@@ -165,6 +167,8 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Trade.Tape"           => NodeMeta { label: "Trade tape",          summary: "Rolling public-trade window (count + buy/sell volume + last px)", group: "Sources" },
         "Balance"              => NodeMeta { label: "Balance",             summary: "Wallet balance (total / available / reserved) per venue + asset", group: "Sources" },
         "Funding"              => NodeMeta { label: "Funding",             summary: "Per-perp funding rate + seconds to next funding", group: "Sources" },
+        "Portfolio.NetDelta"   => NodeMeta { label: "Net delta",           summary: "Cross-venue net exposure for the asset (long spot + short perp = 0)", group: "Sources" },
+        "Portfolio.QuoteAvailable" => NodeMeta { label: "Quote available", summary: "Sum of available USDT/USDC/USD on the named venue", group: "Sources" },
         "Sentiment.Rate"       => NodeMeta { label: "Sentiment rate",      summary: "Social mentions per minute (source asset)", group: "Sources" },
         "Sentiment.Score"      => NodeMeta { label: "Sentiment score",     summary: "Weighted polarity score [-1..1]", group: "Sources" },
         "Volatility.Realised"  => NodeMeta { label: "Realised volatility", summary: "EWMA realised vol (annualised)", group: "Sources" },
@@ -282,6 +286,8 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Trade.Tape",
         "Balance",
         "Funding",
+        "Portfolio.NetDelta",
+        "Portfolio.QuoteAvailable",
         "Sentiment.Rate",
         "Sentiment.Score",
         "Volatility.Realised",
@@ -405,9 +411,9 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_60_nodes_after_multi_venue_3a() {
-        // 59 after 2.B.2 + Out.VenueQuotes = 60. VenueQuote
-        // format + sink ship; router wiring lands in 3.B.
-        assert_eq!(kinds().len(), 60, "catalog drift");
+    fn catalog_has_62_nodes_after_multi_venue_3c() {
+        // 60 after 3.A + Portfolio.NetDelta + Portfolio.QuoteAvailable
+        // = 62.
+        assert_eq!(kinds().len(), 62, "catalog drift");
     }
 }

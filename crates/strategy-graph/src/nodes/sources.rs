@@ -408,6 +408,80 @@ impl NodeKind for FundingSource {
     }
 }
 
+/// `Portfolio.NetDelta(asset)` — signed cross-venue net exposure.
+/// Long spot BTC + short BTC perp → 0 (neutral). Consumers use
+/// this as a delta-aware hedge signal.
+#[derive(Debug, Default)]
+pub struct PortfolioNetDelta;
+
+static NET_DELTA_OUTPUTS: Lazy<Vec<Port>> =
+    Lazy::new(|| vec![Port::new("value", PortType::Number)]);
+
+impl NodeKind for PortfolioNetDelta {
+    fn kind(&self) -> &'static str {
+        "Portfolio.NetDelta"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &NET_DELTA_OUTPUTS
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![ConfigField {
+            name: "asset",
+            label: "Asset",
+            hint: Some("e.g. BTC, ETH"),
+            default: serde_json::json!("BTC"),
+            widget: ConfigWidget::Text,
+        }]
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
+/// `Portfolio.QuoteAvailable(venue)` — aggregate available quote
+/// (USDT/USDC/USD) on a specific venue. Rebalancer-facing.
+#[derive(Debug, Default)]
+pub struct PortfolioQuoteAvailable;
+
+impl NodeKind for PortfolioQuoteAvailable {
+    fn kind(&self) -> &'static str {
+        "Portfolio.QuoteAvailable"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &NET_DELTA_OUTPUTS
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![ConfigField {
+            name: "venue",
+            label: "Venue",
+            hint: Some("e.g. binance, bybit"),
+            default: serde_json::json!("binance"),
+            widget: ConfigWidget::Text,
+        }]
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
 /// Shared `(venue, symbol, product[, extra_int])` config schema
 /// used by every cross-venue source. Factored out so a change to
 /// the tuple (e.g. adding `subaccount`) touches one place.

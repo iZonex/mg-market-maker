@@ -19,6 +19,7 @@ pub mod otr;
 pub mod per_client_circuit;
 pub mod performance;
 pub mod pnl;
+pub mod portfolio_balance;
 pub mod portfolio_risk;
 pub mod portfolio_var;
 pub mod protections;
