@@ -2182,13 +2182,25 @@ impl MarketMakerEngine {
                         format!("{:?}", self.config.exchange.product).to_lowercase();
                     let (mut local_bids, mut local_asks): (Vec<Quote>, Vec<Quote>) =
                         (Vec::new(), Vec::new());
-                    let mut routed_elsewhere = 0usize;
+                    // Multi-Venue 3.B — bucket remote entries by
+                    // target symbol. Each bucket goes through as a
+                    // single `ExternalVenueQuotes` payload via the
+                    // dashboard's per-symbol override channel, so
+                    // the recipient engine reads them on its next
+                    // select-loop tick.
+                    let mut remote_by_symbol: std::collections::HashMap<
+                        String,
+                        Vec<mm_strategy_graph::VenueQuote>,
+                    > = std::collections::HashMap::new();
                     for vq in &vqs {
                         let targets_self = vq.venue == self_venue
                             && vq.symbol == self.symbol
                             && (vq.product.is_empty() || vq.product == self_product_label);
                         if !targets_self {
-                            routed_elsewhere += 1;
+                            remote_by_symbol
+                                .entry(vq.symbol.clone())
+                                .or_default()
+                                .push(vq.clone());
                             continue;
                         }
                         let q = Quote {
@@ -2204,12 +2216,31 @@ impl MarketMakerEngine {
                             Side::Sell => local_asks.push(q),
                         }
                     }
-                    if routed_elsewhere > 0 {
-                        warn!(
-                            symbol = %self.symbol,
-                            count = routed_elsewhere,
-                            "Out.VenueQuotes entries for other venues dropped (3.B dispatcher not wired yet)"
-                        );
+                    // Fire each remote batch. If the target engine
+                    // isn't registered (no matching symbol), the
+                    // dashboard returns false — we surface that as
+                    // a dropped-routing warn.
+                    if !remote_by_symbol.is_empty() {
+                        if let Some(dash) = self.dashboard.as_ref() {
+                            for (sym, batch) in &remote_by_symbol {
+                                let json = serde_json::to_string(batch)
+                                    .unwrap_or_else(|_| "[]".to_string());
+                                let ok = dash.send_config_override(
+                                    sym,
+                                    mm_dashboard::state::ConfigOverride::ExternalVenueQuotes(
+                                        json,
+                                    ),
+                                );
+                                if !ok {
+                                    warn!(
+                                        source_symbol = %self.symbol,
+                                        target_symbol = %sym,
+                                        count = batch.len(),
+                                        "VenueQuotes dispatch — no engine registered for target symbol"
+                                    );
+                                }
+                            }
+                        }
                     }
                     // Pair bids + asks inner-first, same shape as the
                     // Quotes sink path.
@@ -5020,6 +5051,58 @@ impl MarketMakerEngine {
                     mm_risk::audit::AuditEventType::KillSwitchReset,
                     &format!("manual reset: {reason}"),
                 );
+                return;
+            }
+            ConfigOverride::ExternalVenueQuotes(json) => {
+                // Multi-Venue 3.B — another engine's graph authored a
+                // VenueQuote bundle that targets this engine. Parse
+                // the JSON, filter to entries that actually belong
+                // here (symbol must match; venue/product are best-
+                // effort), materialise as `QuotePair`s through the
+                // same inner-first pairing the local dispatcher uses.
+                match serde_json::from_str::<Vec<mm_strategy_graph::VenueQuote>>(&json) {
+                    Ok(entries) => {
+                        use mm_common::types::{Quote, QuotePair, Side};
+                        use mm_strategy_graph::QuoteSide;
+                        let mut bids: Vec<Quote> = Vec::new();
+                        let mut asks: Vec<Quote> = Vec::new();
+                        for e in entries {
+                            if e.symbol != self.symbol {
+                                continue;
+                            }
+                            let q = Quote {
+                                side: match e.side {
+                                    QuoteSide::Buy => Side::Buy,
+                                    QuoteSide::Sell => Side::Sell,
+                                },
+                                price: self.product.round_price(e.price),
+                                qty: self.product.round_qty(e.qty),
+                            };
+                            match q.side {
+                                Side::Buy => bids.push(q),
+                                Side::Sell => asks.push(q),
+                            }
+                        }
+                        bids.sort_by(|a, b| b.price.cmp(&a.price));
+                        asks.sort_by(|a, b| a.price.cmp(&b.price));
+                        let n = bids.len().max(asks.len());
+                        let mut pairs = Vec::with_capacity(n);
+                        for i in 0..n {
+                            pairs.push(QuotePair {
+                                bid: bids.get(i).cloned(),
+                                ask: asks.get(i).cloned(),
+                            });
+                        }
+                        self.graph_quotes_override = Some(pairs);
+                    }
+                    Err(e) => {
+                        warn!(
+                            symbol = %self.symbol,
+                            error = %e,
+                            "ExternalVenueQuotes JSON decode failed"
+                        );
+                    }
+                }
                 return;
             }
         }

@@ -85,6 +85,16 @@ pub enum ConfigOverride {
     /// doesn't match the graph's scope silently ignore the push
     /// (the broadcast goes to every config channel).
     StrategyGraphSwap(String),
+    /// Multi-Venue 3.B — an upstream graph on *another* engine
+    /// routed a `VenueQuote` batch at this one. The engine
+    /// applies it as its `graph_quotes_override` on the next
+    /// `refresh_quotes` tick, which funnels through the same
+    /// diff / balance-check / order-manager path as any other
+    /// strategy-authored bundle.
+    ///
+    /// Carries the serialised `Vec<VenueQuote>` as JSON so the
+    /// `ConfigOverride` enum stays engine-type-free.
+    ExternalVenueQuotes(String),
 }
 
 /// Per-client state partition (Epic 1: Multi-Client Isolation).
