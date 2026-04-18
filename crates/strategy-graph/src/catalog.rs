@@ -170,6 +170,9 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Cost.CumulativeToday" => Some(Box::new(sources::CumulativeTodayCost)),
         "Decision.RealizedCostBps" => Some(Box::new(sources::DecisionRealizedCostBps)),
         "Portfolio.CrossVenueNetDelta" => Some(Box::new(sources::PortfolioCrossVenueNetDelta)),
+        "Borrow.RateApr" => Some(Box::new(sources::BorrowRateApr)),
+        "Borrow.MaxAvailable" => Some(Box::new(sources::BorrowMaxAvailable)),
+        "Borrow.CarryBps" => Some(Box::new(sources::BorrowCarryBps)),
         // Sinks
         "Out.SpreadMult" => Some(Box::new(sinks::SpreadMult)),
         "Out.SizeMult" => Some(Box::new(sinks::SizeMult)),
@@ -311,6 +314,9 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Cost.CumulativeToday"     => NodeMeta { label: "Cost today",        summary: "fees_paid − rebate_income since UTC midnight", group: "Sources" },
         "Decision.RealizedCostBps" => NodeMeta { label: "Decision cost avg", summary: "Rolling avg realized cost bps across the last N resolved decisions", group: "Sources" },
         "Portfolio.CrossVenueNetDelta" => NodeMeta { label: "Cross-venue net delta", summary: "Sum of signed inventory across every connected venue for a base asset", group: "Sources" },
+        "Borrow.RateApr"          => NodeMeta { label: "Borrow APR",         summary: "Spot venue borrow rate (annualised fraction) — Missing on perp", group: "Sources" },
+        "Borrow.MaxAvailable"     => NodeMeta { label: "Max borrowable",     summary: "Base-asset cap the borrow manager will allow — Missing on perp", group: "Sources" },
+        "Borrow.CarryBps"         => NodeMeta { label: "Expected carry bps", summary: "APR converted to bps over operator-tuned holding window", group: "Sources" },
 
         // Sinks — always fire on a trigger, consumed by the engine.
         "Out.SpreadMult"       => NodeMeta { label: "Spread multiplier",   summary: "Final spread scalar applied to quotes", group: "Sinks" },
@@ -434,6 +440,9 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Cost.CumulativeToday",
         "Decision.RealizedCostBps",
         "Portfolio.CrossVenueNetDelta",
+        "Borrow.RateApr",
+        "Borrow.MaxAvailable",
+        "Borrow.CarryBps",
         "Surveillance.SpoofingScore",
         "Surveillance.LayeringScore",
         "Surveillance.QuoteStuffingScore",
@@ -528,8 +537,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_99_nodes_after_inv_3_cross_venue() {
-        // 98 + 1 (INV-3: Portfolio.CrossVenueNetDelta). = 99.
-        assert_eq!(kinds().len(), 99, "catalog drift");
+    fn catalog_has_102_nodes_after_spot_1_borrow_sources() {
+        // 99 + 3 (SPOT-1: Borrow.{RateApr, MaxAvailable, CarryBps}). = 102.
+        assert_eq!(kinds().len(), 102, "catalog drift");
     }
 }

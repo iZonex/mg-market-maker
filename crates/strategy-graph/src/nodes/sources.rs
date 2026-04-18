@@ -408,6 +408,11 @@ macro_rules! single_scalar_source {
     };
 }
 
+// SPOT-1 — borrow sources. Missing on perp (no BorrowManager).
+single_scalar_source!(BorrowRateApr, "Borrow.RateApr", "value");
+single_scalar_source!(BorrowMaxAvailable, "Borrow.MaxAvailable", "value");
+single_scalar_source!(BorrowCarryBps, "Borrow.CarryBps", "value");
+
 single_scalar_source!(SentimentRate, "Sentiment.Rate", "value");
 single_scalar_source!(SentimentScore, "Sentiment.Score", "value");
 single_scalar_source!(VolatilityRealised, "Volatility.Realised", "value");

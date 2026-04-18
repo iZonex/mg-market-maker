@@ -2931,6 +2931,31 @@ impl MarketMakerEngine {
                         pending_alerts.push((kind.clone(), *id, out));
                     }
                 }
+                "Borrow.RateApr" => {
+                    // SPOT-1 — None on perp → Missing.
+                    let v = self
+                        .borrow_manager
+                        .as_ref()
+                        .map(|b| Value::Number(b.state().rate_apr))
+                        .unwrap_or(Value::Missing);
+                    src.insert((*id, "value".into()), v);
+                }
+                "Borrow.MaxAvailable" => {
+                    let v = self
+                        .borrow_manager
+                        .as_ref()
+                        .map(|b| Value::Number(b.max_borrow()))
+                        .unwrap_or(Value::Missing);
+                    src.insert((*id, "value".into()), v);
+                }
+                "Borrow.CarryBps" => {
+                    let v = self
+                        .borrow_manager
+                        .as_ref()
+                        .map(|b| Value::Number(b.effective_carry_bps()))
+                        .unwrap_or(Value::Missing);
+                    src.insert((*id, "value".into()), v);
+                }
                 "Portfolio.CrossVenueNetDelta" => {
                     // INV-3 — sum signed inventory across every
                     // venue for the configured base asset.
