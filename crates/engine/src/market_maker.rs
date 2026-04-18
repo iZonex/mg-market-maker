@@ -2975,6 +2975,21 @@ impl MarketMakerEngine {
                         if b.total.is_zero() && b.available.is_zero() && b.locked.is_zero() {
                             continue;
                         }
+                        // Multi-Venue 2.B.3 — feed the shared
+                        // DataBus so `Balance(venue, asset)` source
+                        // nodes on any engine's graph can read
+                        // this balance. `reserved` mirrors `locked`
+                        // in the venue adapter shape.
+                        ds.data_bus().publish_balance(
+                            venue.clone(),
+                            b.asset.clone(),
+                            mm_dashboard::data_bus::BalanceEntry {
+                                total: b.total,
+                                available: b.available,
+                                reserved: b.locked,
+                                ts: Some(now),
+                            },
+                        );
                         snaps.push(mm_dashboard::state::VenueBalanceSnapshot {
                             venue: venue.clone(),
                             product: product.clone(),
@@ -3476,6 +3491,35 @@ impl MarketMakerEngine {
             }
             MarketEvent::Trade { venue, trade } => {
                 let trade_venue = *venue;
+                // Multi-Venue 2.B.3 — public-trade tape to DataBus.
+                // `Trade.Tape` source nodes on any graph read this
+                // back by (venue, symbol, product). Aggressor side
+                // comes straight from the venue event.
+                if let Some(dash) = self.dashboard.as_ref() {
+                    let bus = dash.data_bus();
+                    let key = (
+                        format!("{trade_venue:?}").to_lowercase(),
+                        self.symbol.clone(),
+                        self.config.exchange.product,
+                    );
+                    let aggressor = match trade.taker_side {
+                        mm_common::types::Side::Buy => {
+                            mm_dashboard::data_bus::TradeSide::Buy
+                        }
+                        mm_common::types::Side::Sell => {
+                            mm_dashboard::data_bus::TradeSide::Sell
+                        }
+                    };
+                    bus.publish_trade(
+                        key,
+                        mm_dashboard::data_bus::TradeTick {
+                            price: trade.price,
+                            qty: trade.qty,
+                            aggressor: Some(aggressor),
+                            ts: chrono::Utc::now(),
+                        },
+                    );
+                }
                 // Epic A stage-2 #2 — feed the per-venue
                 // trade-rate estimator so queue-wait
                 // projections track live tape activity. The
@@ -4274,12 +4318,31 @@ impl MarketMakerEngine {
             );
             let book = &self.book_keeper.book;
             bus.publish_l1(
-                key,
+                key.clone(),
                 mm_dashboard::data_bus::BookL1Snapshot {
                     bid_px: book.best_bid(),
                     ask_px: book.best_ask(),
                     mid: book.mid_price(),
                     spread_bps: book.spread_bps(),
+                    ts: Some(chrono::Utc::now()),
+                },
+            );
+            // 2.B.3 — L2 snapshot (top-20 levels per side). Iterate
+            // BTreeMap; bids descending so index 0 = best bid.
+            let bids: Vec<(rust_decimal::Decimal, rust_decimal::Decimal)> = book
+                .bids
+                .iter()
+                .rev()
+                .take(20)
+                .map(|(p, q)| (*p, *q))
+                .collect();
+            let asks: Vec<(rust_decimal::Decimal, rust_decimal::Decimal)> =
+                book.asks.iter().take(20).map(|(p, q)| (*p, *q)).collect();
+            bus.publish_l2(
+                key,
+                mm_dashboard::data_bus::BookL2Snapshot {
+                    bids,
+                    asks,
                     ts: Some(chrono::Utc::now()),
                 },
             );
