@@ -2,9 +2,10 @@ use mm_common::types::{Quote, QuotePair, Side};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::VecDeque;
+use std::sync::Mutex;
 use tracing::debug;
 
-use crate::r#trait::{bps_to_frac, Strategy, StrategyContext};
+use crate::r#trait::{bps_to_frac, FillObservation, Strategy, StrategyContext};
 use crate::volatility::decimal_sqrt;
 
 /// Guéant-Lehalle-Fernandez-Tapia (GLFT) optimal market making model.
@@ -22,8 +23,25 @@ use crate::volatility::decimal_sqrt;
 ///   bid = fair_price - (half_spread + skew · q)
 ///   ask = fair_price + (half_spread - skew · q)
 pub struct GlftStrategy {
-    /// Calibrated intensity parameters.
-    calibration: IntensityCalibration,
+    /// Calibrated intensity parameters. Behind a `Mutex` so the
+    /// stateful `Strategy::on_fill` hook can recalibrate without
+    /// a `&mut self` borrow — the trait is `Send + Sync` and the
+    /// engine owns the strategy behind `Box<dyn Strategy>`.
+    calibration: Mutex<IntensityCalibration>,
+}
+
+impl std::fmt::Debug for GlftStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let g = self.calibration.lock();
+        match g {
+            Ok(cal) => f.debug_struct("GlftStrategy")
+                .field("a", &cal.a)
+                .field("k", &cal.k)
+                .field("samples", &cal.fill_depths.len())
+                .finish(),
+            Err(_) => f.debug_struct("GlftStrategy<poisoned>").finish(),
+        }
+    }
 }
 
 /// Parameters from fitting λ = A · exp(-k · δ).
@@ -87,13 +105,18 @@ impl IntensityCalibration {
 impl GlftStrategy {
     pub fn new() -> Self {
         Self {
-            calibration: IntensityCalibration::new(),
+            calibration: Mutex::new(IntensityCalibration::new()),
         }
     }
 
-    /// Record a fill for calibration. Call from engine on each fill.
-    pub fn on_fill_depth(&mut self, depth_from_mid: Decimal) {
-        self.calibration.record_fill_depth(depth_from_mid);
+    /// Test / external-caller hook — same semantics as invoking
+    /// `Strategy::on_fill` via the trait, but exposed so the
+    /// engine's legacy (non-graph) single-strategy slot can still
+    /// drive calibration without going through the pool.
+    pub fn record_fill_depth(&self, depth_from_mid: Decimal) {
+        if let Ok(mut cal) = self.calibration.lock() {
+            cal.record_fill_depth(depth_from_mid);
+        }
     }
 }
 
@@ -113,8 +136,12 @@ impl Strategy for GlftStrategy {
         let sigma = ctx.volatility;
         let t = ctx.time_remaining;
         let q = ctx.inventory;
-        let a = self.calibration.a;
-        let k = self.calibration.k;
+        let (a, k) = match self.calibration.lock() {
+            Ok(cal) => (cal.a, cal.k),
+            // Poisoned mutex: fall back to the constructor defaults
+            // so quoting continues rather than silently disappearing.
+            Err(_) => (dec!(1.0), dec!(1.5)),
+        };
 
         // ξ = γ (standard simplification).
         let xi = gamma;
@@ -252,12 +279,19 @@ impl Strategy for GlftStrategy {
             bid_half_spread = %bid_half_spread_t,
             ask_half_spread = %ask_half_spread_t,
             skew = %skew_t,
-            k = %self.calibration.k,
+            k = %k,
             inventory = %q,
             "computed GLFT quotes"
         );
 
         quotes
+    }
+
+    /// MM-2 — recalibrate the intensity curve on every real fill.
+    /// Passive + take-out fills both carry usable depth-from-mid
+    /// information, so we don't filter on `is_maker`.
+    fn on_fill(&self, obs: &FillObservation) {
+        self.record_fill_depth(obs.depth_from_mid);
     }
 }
 
@@ -1028,5 +1062,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// MM-2 — 50+ `on_fill` notifications drive the calibration
+    /// into its recalibration branch; k moves off the constructor
+    /// default. Confirms the `&self` hook actually mutates state
+    /// through the `Mutex`.
+    #[test]
+    fn on_fill_drives_k_recalibration() {
+        use crate::r#trait::{FillObservation, Strategy as _};
+        use mm_common::types::Side;
+
+        let strat = GlftStrategy::new();
+        let k_before = strat.calibration.lock().unwrap().k;
+        // Simulate 60 fills at depth 0.3 from a mid of 100 — a
+        // stable stream should pull k toward 1/0.3 ≈ 3.33.
+        for _ in 0..60u64 {
+            let obs = FillObservation {
+                side: Side::Buy,
+                price: dec!(99.7),
+                qty: dec!(0.001),
+                depth_from_mid: dec!(0.3),
+                mid: dec!(100),
+                is_maker: true,
+                ts_ms: 0,
+            };
+            strat.on_fill(&obs);
+        }
+        let k_after = strat.calibration.lock().unwrap().k;
+        assert_ne!(k_before, k_after, "k should move after 60 fills");
+        // Smoothed update (weight 0.1) pulls k a fraction of the
+        // way toward 1/0.3 ≈ 3.33 — should exceed the 1.5 default.
+        assert!(k_after > dec!(1.5), "k_after = {k_after}; expected to move past default 1.5");
     }
 }

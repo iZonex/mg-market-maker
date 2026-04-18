@@ -1,7 +1,53 @@
 use mm_common::config::MarketMakerConfig;
 use mm_common::orderbook::LocalOrderBook;
-use mm_common::types::{Price, ProductSpec, Qty, QuotePair};
+use mm_common::types::{Fill, Price, ProductSpec, Qty, QuotePair, Side};
 use rust_decimal::Decimal;
+
+/// MM-2 — compact fill summary passed to `Strategy::on_fill`.
+/// The full `Fill` is available on the engine side; strategies
+/// usually only need the handful of fields that drive state
+/// updates (depth from mid, side, size, timing, maker flag).
+///
+/// Computed by the engine once per fill and reused across every
+/// strategy in the pool so each strategy doesn't have to redo
+/// the `mid` lookup + depth arithmetic.
+#[derive(Debug, Clone, Copy)]
+pub struct FillObservation {
+    pub side: Side,
+    pub price: Price,
+    pub qty: Qty,
+    /// `|price - mid|` at the moment of the fill. Strategies
+    /// that calibrate an arrival-rate curve against depth
+    /// (GLFT, Cartea) read this directly.
+    pub depth_from_mid: Decimal,
+    /// Mid price at fill time.
+    pub mid: Price,
+    /// True for passive (maker) fills — always true on the
+    /// PostOnly hot path, occasionally false on emergency
+    /// take-outs (kill-switch, paired_unwind).
+    pub is_maker: bool,
+    /// Unix millis — for fill-timing memory (regret windows,
+    /// inter-arrival distributions).
+    pub ts_ms: i64,
+}
+
+impl FillObservation {
+    /// Build from the raw `Fill` + live mid. `depth_from_mid`
+    /// is absolute so downstream consumers don't have to
+    /// branch on side for the usual |δ| use.
+    pub fn from_fill(fill: &Fill, mid: Price) -> Self {
+        let depth = (fill.price - mid).abs();
+        Self {
+            side: fill.side,
+            price: fill.price,
+            qty: fill.qty,
+            depth_from_mid: depth,
+            mid,
+            is_maker: fill.is_maker,
+            ts_ms: fill.timestamp.timestamp_millis(),
+        }
+    }
+}
 
 /// Context passed to the strategy on each tick.
 pub struct StrategyContext<'a> {
@@ -85,6 +131,30 @@ pub trait Strategy: Send + Sync {
     /// timing (seconds to next session boundary). Default no-op.
     /// `MarkStrategy` uses this to gate its close-window activity.
     fn on_session_tick(&self, _seconds_to_boundary: i64) {}
+
+    /// MM-2 — called **every** tick before [`Self::compute_quotes`],
+    /// with the same context. Lets a strategy advance its own state
+    /// (timers, plan FSMs, regret decay) without being coupled to
+    /// the quote-computation path. Default no-op so legacy
+    /// stateless strategies keep their current behaviour.
+    ///
+    /// Interior mutability required (trait is `Send + Sync`; engine
+    /// owns strategies behind `Box<dyn Strategy>` and
+    /// `strategy_pool: HashMap<NodeId, Box<dyn Strategy>>`). Use
+    /// `Mutex`, `AtomicU64`, etc. — see `GlftStrategy` for the
+    /// canonical pattern.
+    fn on_tick(&self, _ctx: &StrategyContext) {}
+
+    /// MM-2 — called after every successful fill on a symbol this
+    /// strategy participates in. `obs` is the pre-computed compact
+    /// view the engine builds via [`FillObservation::from_fill`].
+    /// Default no-op.
+    ///
+    /// Strategies that calibrate arrival-rate curves (GLFT, Cartea
+    /// adverse-selection) or track fill-timing regret update their
+    /// private state here. Must not block — the engine calls this
+    /// synchronously on the event-loop thread.
+    fn on_fill(&self, _obs: &FillObservation) {}
 }
 
 /// Helper: clamp a price to [mid - max_dist, mid + max_dist].

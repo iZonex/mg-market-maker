@@ -5030,6 +5030,17 @@ impl MarketMakerEngine {
                 if let Some(mid) = self.book_keeper.book.mid_price() {
                     self.pnl_tracker.on_fill(fill, mid);
                     self.adverse_selection.on_fill(fill.price, fill.side, mid);
+                    // MM-2 — notify every strategy (legacy slot +
+                    // graph pool) so stateful strategies can update
+                    // calibration / regret / plan-FSM state. Pre-
+                    // compute the observation once; strategies read
+                    // `depth_from_mid` and `mid` directly without a
+                    // second book lookup.
+                    let obs = mm_strategy::r#trait::FillObservation::from_fill(fill, mid);
+                    self.strategy.on_fill(&obs);
+                    for strat in self.strategy_pool.values() {
+                        strat.on_fill(&obs);
+                    }
                     if let Some(bps) = self.adverse_selection.adverse_selection_bps() {
                         // Feed the adaptive tuner so it can widen
                         // γ when the desk is being picked off.
@@ -5898,6 +5909,15 @@ impl MarketMakerEngine {
         // Epic R 1.2b — mark this refresh as a reprice moment so
         // LatencyExploit can measure fill-vs-reprice delta.
         self.last_reprice_ts = Some(chrono::Utc::now());
+
+        // MM-2 — give every strategy a chance to advance its own
+        // state (timers, plan FSMs, regret decay) before we ask
+        // for quotes. Legacy slot first, then every pool instance
+        // so per-node state carries forward cleanly.
+        self.strategy.on_tick(&ctx);
+        for strat in self.strategy_pool.values() {
+            strat.on_tick(&ctx);
+        }
 
         // Phase 4 — if the graph authored a quote bundle on the last
         // tick via `Out.Quotes`, use it instead of the hand-wired
