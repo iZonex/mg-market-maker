@@ -16,7 +16,7 @@
 use crate::graph::KindShape;
 use crate::node::NodeKind;
 use crate::nodes::{
-    exec, indicators, logic, math, quotes, risk, sinks, sources, stats, strategies,
+    exec, indicators, logic, math, plan, quotes, risk, sinks, sources, stats, strategies,
 };
 use serde_json::Value as Json;
 
@@ -141,6 +141,10 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Strategy.OneSided" => Some(Box::new(strategies::OneSided)),
         "Strategy.InvPush" => Some(Box::new(strategies::InvPush)),
         "Strategy.NonFill" => Some(Box::new(strategies::NonFill)),
+        // MM-3 — execution plan DSL
+        "Plan.Accumulate" => {
+            plan::Accumulate::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
+        }
         // Epic R — surveillance detectors (engine overlays per tick)
         "Surveillance.SpoofingScore" => Some(Box::new(sources::SpoofingScore)),
         "Surveillance.LayeringScore" => Some(Box::new(sources::LayeringScore)),
@@ -270,6 +274,9 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Strategy.OneSided"    => NodeMeta { label: "One-sided (pentest)", summary: "⚠ RESTRICTED — post on one side only without inventory reason", group: "Exploit" },
         "Strategy.InvPush"     => NodeMeta { label: "Inv push (pentest)",  summary: "⚠ RESTRICTED — drive price in unwinding direction to dump inventory", group: "Exploit" },
         "Strategy.NonFill"     => NodeMeta { label: "Non-filling (pentest)", summary: "⚠ RESTRICTED — orders placed near-touch but pulled before fill", group: "Exploit" },
+
+        // MM-3 — execution plan DSL
+        "Plan.Accumulate"      => NodeMeta { label: "Plan: Accumulate", summary: "Time-sliced accumulate / distribute with abort-price guard", group: "Plans" },
 
         // Epic R — surveillance detectors (safe, defaults-on)
         "Surveillance.SpoofingScore" => NodeMeta { label: "Spoofing score", summary: "Likelihood our own flow looks like spoofing [0..1] + cancel_ratio + lifetime", group: "Surveillance" },
@@ -402,6 +409,7 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Strategy.OneSided",
         "Strategy.InvPush",
         "Strategy.NonFill",
+        "Plan.Accumulate",
         "Surveillance.SpoofingScore",
         "Surveillance.LayeringScore",
         "Surveillance.QuoteStuffingScore",
@@ -496,12 +504,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_90_nodes_after_epic_r_week_7_exploits() {
-        // 80 + 10 pentest exploit placeholders = 90. All 15
-        // manipulation patterns now have both halves in the
-        // catalog; Mark / Spoof / Wash / Ignite ship real
-        // behaviour, the rest are shells with the restricted
-        // gate firing so prod deploy refuses them.
-        assert_eq!(kinds().len(), 90, "catalog drift");
+    fn catalog_has_91_nodes_after_mm_3_plan_accumulate() {
+        // 90 (Epic R week 7) + 1 (MM-3: Plan.Accumulate) = 91.
+        assert_eq!(kinds().len(), 91, "catalog drift");
     }
 }

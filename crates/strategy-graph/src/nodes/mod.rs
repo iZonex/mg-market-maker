@@ -13,6 +13,7 @@ pub mod exec;
 pub mod indicators;
 pub mod logic;
 pub mod math;
+pub mod plan;
 pub mod quotes;
 pub mod risk;
 pub mod sinks;
