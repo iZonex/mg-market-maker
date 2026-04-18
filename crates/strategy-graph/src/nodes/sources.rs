@@ -654,6 +654,59 @@ impl NodeKind for QuoteStuffingScore {
     }
 }
 
+/// `Surveillance.WashScore` — self-trade detection (own buy + own
+/// sell same price within short window). Single-port output.
+#[derive(Debug, Default)]
+pub struct WashScore;
+
+static SCORE_ONLY_OUTPUT: Lazy<Vec<Port>> =
+    Lazy::new(|| vec![Port::new("value", PortType::Number)]);
+
+impl NodeKind for WashScore {
+    fn kind(&self) -> &'static str {
+        "Surveillance.WashScore"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &SCORE_ONLY_OUTPUT
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
+/// `Surveillance.MomentumIgnitionScore` — public-tape burst +
+/// aggressor dominance + price-move. Single-port output.
+#[derive(Debug, Default)]
+pub struct MomentumIgnitionScore;
+
+impl NodeKind for MomentumIgnitionScore {
+    fn kind(&self) -> &'static str {
+        "Surveillance.MomentumIgnitionScore"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &SCORE_ONLY_OUTPUT
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

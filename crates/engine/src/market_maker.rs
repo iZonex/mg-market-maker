@@ -2041,6 +2041,56 @@ impl MarketMakerEngine {
                 // stash an alert tuple if the score crossed 0.8 so
                 // the loop can emit them after it releases its borrow
                 // of `self.strategy_graph`.
+                "Surveillance.WashScore" => {
+                    let fills = self
+                        .surveillance_tracker
+                        .lock()
+                        .ok()
+                        .map(|t| t.recent_fills(&self.symbol))
+                        .unwrap_or_default();
+                    let out = mm_risk::surveillance::WashDetector::new()
+                        .score_from_fills(&fills);
+                    src.insert((*id, "value".into()), Value::Number(out.score));
+                    if out.score >= rust_decimal_macros::dec!(0.8) {
+                        pending_alerts.push((kind.clone(), *id, out));
+                    }
+                }
+                "Surveillance.MomentumIgnitionScore" => {
+                    // Read public trades off the DataBus for this
+                    // engine's (venue, symbol, product). Map into
+                    // the detector's sample shape.
+                    let key = (
+                        format!("{:?}", self.config.exchange.exchange_type).to_lowercase(),
+                        self.symbol.clone(),
+                        self.config.exchange.product,
+                    );
+                    let samples: Vec<mm_risk::surveillance::PublicTradeSample> = self
+                        .dashboard
+                        .as_ref()
+                        .map(|d| d.data_bus().get_trades(&key))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|t| mm_risk::surveillance::PublicTradeSample {
+                            ts: t.ts,
+                            price: t.price,
+                            qty: t.qty,
+                            aggressor: t.aggressor.map(|a| match a {
+                                mm_dashboard::data_bus::TradeSide::Buy => {
+                                    mm_risk::surveillance::Side::Buy
+                                }
+                                mm_dashboard::data_bus::TradeSide::Sell => {
+                                    mm_risk::surveillance::Side::Sell
+                                }
+                            }),
+                        })
+                        .collect();
+                    let out = mm_risk::surveillance::MomentumIgnitionDetector::new()
+                        .score(&samples);
+                    src.insert((*id, "value".into()), Value::Number(out.score));
+                    if out.score >= rust_decimal_macros::dec!(0.8) {
+                        pending_alerts.push((kind.clone(), *id, out));
+                    }
+                }
                 "Surveillance.SpoofingScore" |
                 "Surveillance.LayeringScore" |
                 "Surveillance.QuoteStuffingScore" => {
@@ -2553,6 +2603,8 @@ impl MarketMakerEngine {
                 "Surveillance.SpoofingScore" => "spoofing",
                 "Surveillance.LayeringScore" => "layering",
                 "Surveillance.QuoteStuffingScore" => "quote_stuffing",
+                "Surveillance.WashScore" => "wash",
+                "Surveillance.MomentumIgnitionScore" => "momentum_ignition",
                 _ => "unknown",
             };
             self.audit.surveillance_alert(

@@ -131,6 +131,11 @@ pub struct OrderLifecycleTracker {
     /// average trade" ratios — an order five times the avg recent
     /// trade is the classic spoofing-book marker.
     trade_sizes: HashMap<String, VecDeque<(DateTime<Utc>, Decimal)>>,
+    /// Epic R Week 4 — per-symbol fills annotated with side + price
+    /// so the Wash detector can walk the tape and pair own buy +
+    /// own sell at the same price. Separate from `fills` above so
+    /// the existing stats don't change shape.
+    wash_fills: HashMap<String, VecDeque<WashFillView>>,
 }
 
 /// Diagnostic snapshot readers can inspect per symbol.
@@ -176,7 +181,9 @@ impl OrderLifecycleTracker {
                         .push_back((*ts, lifetime_ms, rec.side));
                 }
             }
-            SurveillanceEvent::OrderFilled { symbol, filled_qty, ts, .. } => {
+            SurveillanceEvent::OrderFilled {
+                symbol, side, filled_qty, price, ts, ..
+            } => {
                 // Partial fills still hold the order open — only a
                 // full fill removes it. Detectors don't need that
                 // distinction for ratios (a fill is a fill), so we
@@ -191,6 +198,15 @@ impl OrderLifecycleTracker {
                     .entry(symbol.clone())
                     .or_default()
                     .push_back((*ts, *filled_qty));
+                // Wash-detector tape — keeps side + price per fill.
+                let q = self.wash_fills.entry(symbol.clone()).or_default();
+                q.push_back(WashFillView {
+                    ts: *ts,
+                    side: *side,
+                    price: *price,
+                });
+                // Cap at the rolling window — same WINDOW_SECS cap
+                // as the other queues. Evicted below in `evict`.
             }
             SurveillanceEvent::OrderAmended { order_id, new_price, ts, .. } => {
                 if let Some(rec) = self.open.get_mut(order_id) {
@@ -216,6 +232,11 @@ impl OrderLifecycleTracker {
         }
         for q in self.trade_sizes.values_mut() {
             while q.front().is_some_and(|(t, _)| *t < cutoff) {
+                q.pop_front();
+            }
+        }
+        for q in self.wash_fills.values_mut() {
+            while q.front().is_some_and(|v| v.ts < cutoff) {
                 q.pop_front();
             }
         }
@@ -605,6 +626,248 @@ impl QuoteStuffingDetector {
     }
 }
 
+// ─── Wash-trading detector ─────────────────────────────────
+//
+// `docs/research/complince.md` § 3 — own buy + own sell at the same
+// price within a short window = self-trade. We read the fills tape
+// already in the tracker (it carries `side` after the Level 1 data
+// sprint); the detector walks the recent fill list and scores on
+// how many pairs of opposite-side fills at the same price sit
+// within the configured window.
+
+#[derive(Debug, Clone)]
+pub struct WashConfig {
+    /// Max spread (in ticks) between two fills to still count as
+    /// "same price". Setting it to zero requires exact price equality.
+    pub price_tolerance: Decimal,
+    /// Window in milliseconds within which the buy + sell must pair.
+    pub pair_window_ms: i64,
+    /// `pair_count_hot` pairs → full contribution. Scales linearly
+    /// below that.
+    pub pair_count_hot: usize,
+}
+
+impl Default for WashConfig {
+    fn default() -> Self {
+        Self {
+            price_tolerance: dec!(0),
+            pair_window_ms: 500,
+            pair_count_hot: 3,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct WashDetector {
+    pub config: WashConfig,
+}
+
+impl WashDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn with_config(config: WashConfig) -> Self {
+        Self { config }
+    }
+
+    /// Score derived from recent fills on this symbol. The tracker
+    /// doesn't currently expose fill-side as a public read path, so
+    /// the engine adapter passes the list in directly — keeps the
+    /// tracker's public surface focused on `SymbolStats`.
+    pub fn score_from_fills(&self, fills: &[WashFillView]) -> DetectorOutput {
+        let mut pairs = 0usize;
+        for i in 0..fills.len() {
+            for j in (i + 1)..fills.len() {
+                let a = &fills[i];
+                let b = &fills[j];
+                if a.side == b.side {
+                    continue;
+                }
+                let dt = (b.ts - a.ts).num_milliseconds().abs();
+                if dt > self.config.pair_window_ms {
+                    continue;
+                }
+                let delta = (a.price - b.price).abs();
+                if delta <= self.config.price_tolerance {
+                    pairs += 1;
+                }
+            }
+        }
+        let sig = if self.config.pair_count_hot == 0 {
+            Decimal::ZERO
+        } else {
+            (Decimal::from(pairs) / Decimal::from(self.config.pair_count_hot))
+                .min(Decimal::ONE)
+        };
+        DetectorOutput {
+            score: sig,
+            cancel_to_fill_ratio: Decimal::ZERO,
+            median_order_lifetime_ms: None,
+            size_vs_avg_trade: None,
+        }
+    }
+}
+
+impl OrderLifecycleTracker {
+    /// Epic R Week 4 — pull the side+price-annotated fill tape for
+    /// the symbol. Used by the Wash detector.
+    pub fn recent_fills(&self, symbol: &str) -> Vec<WashFillView> {
+        self.wash_fills
+            .get(symbol)
+            .map(|v| v.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WashFillView {
+    pub ts: DateTime<Utc>,
+    pub side: Side,
+    pub price: Decimal,
+}
+
+// ─── Momentum-ignition detector ────────────────────────────
+//
+// `docs/research/complince.md` § 5 — burst taker flow drives a
+// sharp price move, then the actor closes into the retracement.
+// Different from the other detectors: it reads the PUBLIC trade
+// tape (DataBus.trades), not our own orders, so the engine adapter
+// hands a pre-sliced `Vec<PublicTradeSample>` in rather than the
+// tracker.
+
+#[derive(Debug, Clone)]
+pub struct PublicTradeSample {
+    pub ts: DateTime<Utc>,
+    pub price: Decimal,
+    pub qty: Decimal,
+    /// Aggressor side, if the venue reported it.
+    pub aggressor: Option<Side>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MomentumIgnitionConfig {
+    /// Look-back window for the burst count (ms).
+    pub burst_window_ms: i64,
+    /// `trade_count >=` within window → full contribution.
+    pub trade_count_hot: usize,
+    /// Single-side volume dominance (`dominant_qty / total` ≥ this
+    /// → full contribution). Catches "all aggressor flow one way".
+    pub dominance_hot: Decimal,
+    /// Min price move (bps) across the window to score at all.
+    pub min_move_bps: Decimal,
+}
+
+impl Default for MomentumIgnitionConfig {
+    fn default() -> Self {
+        Self {
+            burst_window_ms: 1_500,
+            trade_count_hot: 30,
+            dominance_hot: dec!(0.8),
+            min_move_bps: dec!(10),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct MomentumIgnitionDetector {
+    pub config: MomentumIgnitionConfig,
+}
+
+impl MomentumIgnitionDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn score(&self, trades: &[PublicTradeSample]) -> DetectorOutput {
+        if trades.is_empty() {
+            return DetectorOutput {
+                score: Decimal::ZERO,
+                cancel_to_fill_ratio: Decimal::ZERO,
+                median_order_lifetime_ms: None,
+                size_vs_avg_trade: None,
+            };
+        }
+        // Window the trades to the config burst_window_ms.
+        let now = trades
+            .last()
+            .map(|t| t.ts)
+            .unwrap_or_else(Utc::now);
+        let cutoff = now - chrono::Duration::milliseconds(self.config.burst_window_ms);
+        let windowed: Vec<&PublicTradeSample> =
+            trades.iter().filter(|t| t.ts >= cutoff).collect();
+        if windowed.is_empty() {
+            return DetectorOutput {
+                score: Decimal::ZERO,
+                cancel_to_fill_ratio: Decimal::ZERO,
+                median_order_lifetime_ms: None,
+                size_vs_avg_trade: None,
+            };
+        }
+
+        // (1) burst rate signal.
+        let rate_sig = if self.config.trade_count_hot == 0 {
+            Decimal::ZERO
+        } else {
+            (Decimal::from(windowed.len())
+                / Decimal::from(self.config.trade_count_hot))
+            .min(Decimal::ONE)
+        };
+
+        // (2) aggressor dominance.
+        let mut buy_qty = Decimal::ZERO;
+        let mut sell_qty = Decimal::ZERO;
+        for t in &windowed {
+            match t.aggressor {
+                Some(Side::Buy) => buy_qty += t.qty,
+                Some(Side::Sell) => sell_qty += t.qty,
+                None => {}
+            }
+        }
+        let total = buy_qty + sell_qty;
+        let dominance = if total > Decimal::ZERO {
+            (buy_qty.max(sell_qty)) / total
+        } else {
+            Decimal::ZERO
+        };
+        let dom_sig = if self.config.dominance_hot > Decimal::ZERO
+            && dominance >= self.config.dominance_hot
+        {
+            Decimal::ONE
+        } else if self.config.dominance_hot > Decimal::ZERO {
+            (dominance / self.config.dominance_hot).min(Decimal::ONE)
+        } else {
+            Decimal::ZERO
+        };
+
+        // (3) price-move signal.
+        let first = windowed.first().unwrap().price;
+        let last = windowed.last().unwrap().price;
+        let move_bps = if first > Decimal::ZERO {
+            (last - first).abs() / first * dec!(10_000)
+        } else {
+            Decimal::ZERO
+        };
+        let move_sig = if self.config.min_move_bps > Decimal::ZERO
+            && move_bps >= self.config.min_move_bps * dec!(3)
+        {
+            Decimal::ONE
+        } else if self.config.min_move_bps > Decimal::ZERO {
+            (move_bps / (self.config.min_move_bps * dec!(3)))
+                .min(Decimal::ONE)
+        } else {
+            Decimal::ZERO
+        };
+
+        let score = (rate_sig + dom_sig + move_sig) / dec!(3);
+        DetectorOutput {
+            score: score.clamp(Decimal::ZERO, Decimal::ONE),
+            cancel_to_fill_ratio: Decimal::ZERO,
+            median_order_lifetime_ms: None,
+            size_vs_avg_trade: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,6 +993,86 @@ mod tests {
         let d = QuoteStuffingDetector::new();
         let out = d.score("BTCUSDT", &t);
         assert!(out.score >= dec!(0.9), "stuffing score was {}", out.score);
+    }
+
+    #[test]
+    fn wash_pairs_own_buy_and_sell_at_same_price() {
+        let t0 = Utc::now();
+        let fills = vec![
+            WashFillView { ts: t0, side: Side::Buy, price: dec!(100) },
+            WashFillView {
+                ts: t0 + chrono::Duration::milliseconds(100),
+                side: Side::Sell,
+                price: dec!(100),
+            },
+            WashFillView {
+                ts: t0 + chrono::Duration::milliseconds(200),
+                side: Side::Buy,
+                price: dec!(100),
+            },
+            WashFillView {
+                ts: t0 + chrono::Duration::milliseconds(300),
+                side: Side::Sell,
+                price: dec!(100),
+            },
+        ];
+        let d = WashDetector::new();
+        let out = d.score_from_fills(&fills);
+        // Four fills → pairs = 4 (every opposite-side within 500ms
+        // same price). With pair_count_hot=3, score clamps to 1.
+        assert!(out.score >= dec!(0.9), "wash score was {}", out.score);
+    }
+
+    #[test]
+    fn wash_ignores_distant_prices() {
+        let t0 = Utc::now();
+        let fills = vec![
+            WashFillView { ts: t0, side: Side::Buy, price: dec!(100) },
+            WashFillView {
+                ts: t0 + chrono::Duration::milliseconds(100),
+                side: Side::Sell,
+                price: dec!(105),
+            },
+        ];
+        let d = WashDetector::new();
+        assert_eq!(d.score_from_fills(&fills).score, dec!(0));
+    }
+
+    #[test]
+    fn momentum_burst_dominant_side_scores_high() {
+        let t0 = Utc::now();
+        let mut trades: Vec<PublicTradeSample> = Vec::new();
+        // 40 trades over 1.5 s all aggressor-buy + price drifts up 50 bps.
+        for i in 0..40 {
+            let ts = t0 + chrono::Duration::milliseconds((i * 30) as i64);
+            let px = dec!(100) + Decimal::from(i) / dec!(20); // 100 → 101.95
+            trades.push(PublicTradeSample {
+                ts,
+                price: px,
+                qty: dec!(1),
+                aggressor: Some(Side::Buy),
+            });
+        }
+        let d = MomentumIgnitionDetector::new();
+        let out = d.score(&trades);
+        assert!(out.score >= dec!(0.9), "mi score was {}", out.score);
+    }
+
+    #[test]
+    fn momentum_balanced_flow_scores_low() {
+        let t0 = Utc::now();
+        let mut trades = Vec::new();
+        for i in 0u32..6 {
+            trades.push(PublicTradeSample {
+                ts: t0 + chrono::Duration::milliseconds((i as i64) * 200),
+                price: dec!(100),
+                qty: dec!(1),
+                aggressor: Some(if i.is_multiple_of(2) { Side::Buy } else { Side::Sell }),
+            });
+        }
+        let d = MomentumIgnitionDetector::new();
+        let out = d.score(&trades);
+        assert!(out.score <= dec!(0.5), "mi score was {}", out.score);
     }
 
     #[test]
