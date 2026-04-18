@@ -16,16 +16,71 @@
 //!   [`venue_state::VenueSeed`])
 //! - `router` — greedy cost-minimising router (Sprint A-3)
 //!
-//! v1 is **advisory**: `MarketMakerEngine::recommend_route`
-//! returns a `router::RouteDecision` but the engine does
-//! not auto-dispatch. Operators run the recommendation
-//! through the dashboard / CLI / audit trail and decide
-//! whether to act. Stage-2 wires inline dispatch through an
-//! `ExecAlgorithm` once the cost model is validated against
-//! real fills.
+//! ## Stage-1 (advisory)
+//! `MarketMakerEngine::recommend_route` returns a
+//! `router::RouteDecision` and emits a `RouteRecommendation`
+//! audit row — the engine does NOT place leg orders. Operators
+//! read the row through the dashboard / CLI to validate the
+//! cost model before arming dispatch.
+//!
+//! ## Stage-2 (inline dispatch — MM-6)
+//! `MarketMakerEngine::dispatch_route` (and the scheduled
+//! `run_sor_dispatch_tick`) place real leg orders through each
+//! venue's connector. Gated by
+//! `market_maker.sor_inline_enabled` (config) with an env
+//! override `MM_SOR_INLINE_DISPATCH=1` (ops hotfix path) —
+//! default is off so upgrading the binary does not silently
+//! start routing real flow. Dispatched ticks emit a
+//! `RouteDispatched` audit row (distinct from the advisory
+//! `RouteRecommendation`) plus per-venue Prometheus counters
+//! (`mm_sor_dispatch_{success,errors}_total`).
 
 pub mod cost;
 pub mod dispatch;
 pub mod router;
 pub mod trade_rate;
 pub mod venue_state;
+
+/// MM-6 — env override for `sor_inline_enabled`. Returns
+/// `Some(true)` when `MM_SOR_INLINE_DISPATCH=1` or `=true`
+/// (case-insensitive), `Some(false)` when `=0` / `=false`,
+/// `None` when unset so the caller falls back to the config
+/// value. Keeps the operator-facing flag live under one name
+/// regardless of config source.
+pub fn inline_dispatch_env_override() -> Option<bool> {
+    let raw = std::env::var("MM_SOR_INLINE_DISPATCH").ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Env override parses the usual truthy / falsy spellings.
+    #[test]
+    fn env_override_accepts_common_spellings() {
+        // Preserve any ambient value.
+        let prev = std::env::var("MM_SOR_INLINE_DISPATCH").ok();
+        let cases_true = ["1", "true", "TRUE", "yes", "on"];
+        let cases_false = ["0", "false", "FALSE", "no", "off"];
+        for v in cases_true {
+            unsafe { std::env::set_var("MM_SOR_INLINE_DISPATCH", v) };
+            assert_eq!(inline_dispatch_env_override(), Some(true), "truthy: {v}");
+        }
+        for v in cases_false {
+            unsafe { std::env::set_var("MM_SOR_INLINE_DISPATCH", v) };
+            assert_eq!(inline_dispatch_env_override(), Some(false), "falsy: {v}");
+        }
+        unsafe { std::env::set_var("MM_SOR_INLINE_DISPATCH", "hmm") };
+        assert_eq!(inline_dispatch_env_override(), None);
+        unsafe { std::env::remove_var("MM_SOR_INLINE_DISPATCH") };
+        assert_eq!(inline_dispatch_env_override(), None);
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("MM_SOR_INLINE_DISPATCH", v) };
+        }
+    }
+}

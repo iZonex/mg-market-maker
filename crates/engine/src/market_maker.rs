@@ -3849,7 +3849,20 @@ impl MarketMakerEngine {
         let mut sor_dispatch_interval =
             tokio::time::interval(tokio::time::Duration::from_secs(sor_secs));
         sor_dispatch_interval.tick().await;
-        let sor_dispatch_enabled = self.config.market_maker.sor_inline_enabled;
+        // MM-6 — ops-hotfix env override. `MM_SOR_INLINE_DISPATCH`
+        // wins over the config flag so an operator can flip dispatch
+        // on/off at process restart without editing the config file.
+        // None = no override → config value wins.
+        let sor_dispatch_enabled = crate::sor::inline_dispatch_env_override()
+            .unwrap_or(self.config.market_maker.sor_inline_enabled);
+        if sor_dispatch_enabled != self.config.market_maker.sor_inline_enabled {
+            tracing::info!(
+                symbol = %self.symbol,
+                env_override = sor_dispatch_enabled,
+                config_value = self.config.market_maker.sor_inline_enabled,
+                "MM_SOR_INLINE_DISPATCH env override active"
+            );
+        }
 
         // Epic A stage-2 #2 — queue-wait refresh tick. Publishes
         // live `trade_rate → queue_wait_secs` into the SOR
