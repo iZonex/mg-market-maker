@@ -75,6 +75,16 @@ impl LocalOrderBook {
         self.asks.keys().next().copied()
     }
 
+    /// Qty at the best bid price.
+    pub fn best_bid_qty(&self) -> Option<Qty> {
+        self.bids.iter().next_back().map(|(_, q)| *q)
+    }
+
+    /// Qty at the best ask price.
+    pub fn best_ask_qty(&self) -> Option<Qty> {
+        self.asks.iter().next().map(|(_, q)| *q)
+    }
+
     /// Mid price = (best_bid + best_ask) / 2.
     pub fn mid_price(&self) -> Option<Price> {
         let two = Decimal::from(2);

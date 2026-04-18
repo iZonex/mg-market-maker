@@ -536,6 +536,29 @@ pub struct MarketMakerEngine {
         String,
         InflightAtomicBundle,
     >,
+    /// Epic R Week 6 feed — inventory sampled on the previous
+    /// surveillance tick; feeds the `InventoryPushingDetector`.
+    last_inventory_for_push: rust_decimal::Decimal,
+    last_mid_for_push: rust_decimal::Decimal,
+    /// `OneSidedQuotingDetector` state — ring-bufferish ticks
+    /// record of whether we posted both sides, one, or none.
+    /// Kept capped at 100 entries (≈ the last ~50 seconds at a
+    /// 500ms refresh cadence).
+    one_sided_tick_ring: std::collections::VecDeque<bool>,
+    /// Reprice-to-fill tracker for `LatencyExploitDetector`. On
+    /// every refresh we note the tick's timestamp; on every
+    /// fill we compute `(fill_ts - last_reprice_ts)` and stash it
+    /// into this capped deque.
+    fill_reprice_deltas_ms: std::collections::VecDeque<i64>,
+    /// Cancel-to-nearby-trade timing for `CancelOnReactionDetector`.
+    cancel_reaction_deltas_ms: std::collections::VecDeque<Option<i64>>,
+    /// Imbalance sample history for `ImbalanceManipulationDetector`.
+    imbalance_history: std::collections::VecDeque<
+        mm_risk::surveillance::ImbalanceSample,
+    >,
+    /// Near-touch placement counter for `StrategicNonFillingDetector`.
+    near_touch_placements: usize,
+    near_touch_fills: usize,
     /// Epic H — graph scope cached at `with_strategy_graph` /
     /// `swap_strategy_graph` so the per-tick source marshaller
     /// knows which asset to pull sentiment for without re-reading
@@ -912,6 +935,14 @@ impl MarketMakerEngine {
             prev_l2_snapshot: None,
             session_calendar: mm_risk::session_calendar::SessionCalendar::funding_8h(),
             inflight_atomic_bundles: std::collections::HashMap::new(),
+            last_inventory_for_push: rust_decimal::Decimal::ZERO,
+            last_mid_for_push: rust_decimal::Decimal::ZERO,
+            one_sided_tick_ring: std::collections::VecDeque::with_capacity(100),
+            fill_reprice_deltas_ms: std::collections::VecDeque::with_capacity(50),
+            cancel_reaction_deltas_ms: std::collections::VecDeque::with_capacity(50),
+            imbalance_history: std::collections::VecDeque::with_capacity(200),
+            near_touch_placements: 0,
+            near_touch_fills: 0,
             strategy_graph_scope: None,
             margin_guard: config.margin.as_ref().map(|m| {
                 MarginGuard::new(MarginGuardThresholds::from_config(m))
@@ -2306,8 +2337,16 @@ impl MarketMakerEngine {
                     src.insert((*id, "value".into()), Value::Number(s));
                 }
                 "Surveillance.LatencyExploitScore" => {
-                    let s = rust_decimal::Decimal::ZERO;
-                    src.insert((*id, "value".into()), Value::Number(s));
+                    // Deltas populated by the engine's fill handler
+                    // — `(fill_ts - last_reprice_ts).millis`. Score
+                    // counts those inside the stale-window.
+                    let deltas: Vec<i64> = self.fill_reprice_deltas_ms.iter().copied().collect();
+                    let out = mm_risk::surveillance::LatencyExploitDetector::new()
+                        .score(&deltas);
+                    src.insert((*id, "value".into()), Value::Number(out.score));
+                    if out.score >= rust_decimal_macros::dec!(0.8) {
+                        pending_alerts.push((kind.clone(), *id, out));
+                    }
                 }
                 "Surveillance.RebateAbuseScore" => {
                     // We have PnlTracker but its split is
@@ -2317,24 +2356,111 @@ impl MarketMakerEngine {
                     src.insert((*id, "value".into()), Value::Number(s));
                 }
                 "Surveillance.ImbalanceManipulationScore" => {
-                    let s = rust_decimal::Decimal::ZERO;
-                    src.insert((*id, "value".into()), Value::Number(s));
+                    // Pull current L1 imbalance off the book,
+                    // append to the history ring (capped at 200
+                    // samples ≈ 2 min at 500ms), score through
+                    // the detector.
+                    let book = &self.book_keeper.book;
+                    let (bid_qty, ask_qty) = (
+                        book.best_bid_qty().unwrap_or(rust_decimal::Decimal::ZERO),
+                        book.best_ask_qty().unwrap_or(rust_decimal::Decimal::ZERO),
+                    );
+                    let total = bid_qty + ask_qty;
+                    let imbalance = if total > rust_decimal::Decimal::ZERO {
+                        (bid_qty - ask_qty) / total
+                    } else {
+                        rust_decimal::Decimal::ZERO
+                    };
+                    self.imbalance_history.push_back(
+                        mm_risk::surveillance::ImbalanceSample {
+                            ts: chrono::Utc::now(),
+                            imbalance,
+                        },
+                    );
+                    if self.imbalance_history.len() > 200 {
+                        self.imbalance_history.pop_front();
+                    }
+                    let samples: Vec<_> = self.imbalance_history.iter().cloned().collect();
+                    let out = mm_risk::surveillance::ImbalanceManipulationDetector::new()
+                        .score(&samples);
+                    src.insert((*id, "value".into()), Value::Number(out.score));
+                    if out.score >= rust_decimal_macros::dec!(0.8) {
+                        pending_alerts.push((kind.clone(), *id, out));
+                    }
                 }
                 "Surveillance.CancelOnReactionScore" => {
-                    let s = rust_decimal::Decimal::ZERO;
-                    src.insert((*id, "value".into()), Value::Number(s));
+                    // Populated when the engine observes a cancel
+                    // happen within the reaction window of a
+                    // nearby public trade (see
+                    // record_cancel_reaction below).
+                    let deltas: Vec<Option<i64>> = self.cancel_reaction_deltas_ms.iter().copied().collect();
+                    let out = mm_risk::surveillance::CancelOnReactionDetector::new()
+                        .score(&deltas);
+                    src.insert((*id, "value".into()), Value::Number(out.score));
+                    if out.score >= rust_decimal_macros::dec!(0.8) {
+                        pending_alerts.push((kind.clone(), *id, out));
+                    }
                 }
                 "Surveillance.OneSidedQuotingScore" => {
-                    let s = rust_decimal::Decimal::ZERO;
-                    src.insert((*id, "value".into()), Value::Number(s));
+                    // Count one-sided ticks in the ring. An entry
+                    // is `true` when we posted exactly one side
+                    // this tick. The ring is updated at the end of
+                    // refresh_quotes; here we just score.
+                    let total = self.one_sided_tick_ring.len();
+                    let one_sided = self
+                        .one_sided_tick_ring
+                        .iter()
+                        .filter(|b| **b)
+                        .count();
+                    let out = mm_risk::surveillance::OneSidedQuotingDetector::new()
+                        .score(one_sided, total);
+                    src.insert((*id, "value".into()), Value::Number(out.score));
+                    if out.score >= rust_decimal_macros::dec!(0.8) {
+                        pending_alerts.push((kind.clone(), *id, out));
+                    }
                 }
                 "Surveillance.InventoryPushingScore" => {
-                    let s = rust_decimal::Decimal::ZERO;
-                    src.insert((*id, "value".into()), Value::Number(s));
+                    // Real feed — compare inventory delta vs mid
+                    // delta over a 1-tick window. Positive
+                    // correlation (inv up AND price up, or both
+                    // down) is the push signature. Normalise each
+                    // delta through a small divisor so absolute
+                    // scale doesn't dominate the product.
+                    let inv = self.inventory_manager.inventory();
+                    let mid = self.book_keeper.book.mid_price().unwrap_or(rust_decimal::Decimal::ZERO);
+                    let inv_delta = inv - self.last_inventory_for_push;
+                    let mid_delta = if self.last_mid_for_push > rust_decimal::Decimal::ZERO && mid > rust_decimal::Decimal::ZERO {
+                        mid - self.last_mid_for_push
+                    } else {
+                        rust_decimal::Decimal::ZERO
+                    };
+                    self.last_inventory_for_push = inv;
+                    self.last_mid_for_push = mid;
+                    // Normalise to unit-ish magnitudes so products
+                    // don't explode for large price levels.
+                    let inv_norm = if inv.abs() > rust_decimal::Decimal::ZERO {
+                        inv_delta / inv.abs().max(rust_decimal_macros::dec!(0.001))
+                    } else { rust_decimal::Decimal::ZERO };
+                    let mid_norm = if mid > rust_decimal::Decimal::ZERO {
+                        mid_delta / mid
+                    } else { rust_decimal::Decimal::ZERO };
+                    let out = mm_risk::surveillance::InventoryPushingDetector::new()
+                        .score(inv_norm, mid_norm);
+                    src.insert((*id, "value".into()), Value::Number(out.score));
+                    if out.score >= rust_decimal_macros::dec!(0.8) {
+                        pending_alerts.push((kind.clone(), *id, out));
+                    }
                 }
                 "Surveillance.StrategicNonFillingScore" => {
-                    let s = rust_decimal::Decimal::ZERO;
-                    src.insert((*id, "value".into()), Value::Number(s));
+                    // Counters are bumped in the order_manager
+                    // track_order + fill paths (see engine-side
+                    // maintenance). Score through the detector.
+                    let out = mm_risk::surveillance::StrategicNonFillingDetector::new()
+                        .score(self.near_touch_placements, self.near_touch_fills);
+                    src.insert((*id, "value".into()), Value::Number(out.score));
+                    if out.score >= rust_decimal_macros::dec!(0.8) {
+                        pending_alerts.push((kind.clone(), *id, out));
+                    }
                 }
                 "Surveillance.FakeLiquidityScore" => {
                     // Pull current L2 off the bus, compare against
