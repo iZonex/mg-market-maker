@@ -2338,11 +2338,48 @@ impl MarketMakerEngine {
                 // `score = 0` (the `score` method handles empty
                 // inputs correctly — no Missing leak into downstream).
                 "Surveillance.CrossMarketScore" => {
-                    // Illiquid-ratio proxy: this engine's trade qty
-                    // vs. our own fill tape. Liquid-move proxy:
-                    // mid change over window.
-                    let s = rust_decimal::Decimal::ZERO;
-                    src.insert((*id, "value".into()), Value::Number(s));
+                    // Real feed — compares the self-venue trade
+                    // volume in the last minute against a nominal
+                    // baseline (default 100 BTC equivalent; in
+                    // practice the operator tunes `illiquid_ratio_hot`
+                    // on the detector), and the self-venue mid
+                    // move in bps as the "correlated liquid move"
+                    // proxy. Without a hedge_book feed this stays
+                    // the best local approximation; a dedicated
+                    // cross-venue hedge tap lands in the
+                    // multi-venue Sprint 3 pass.
+                    let key = (
+                        format!("{:?}", self.config.exchange.exchange_type).to_lowercase(),
+                        self.symbol.clone(),
+                        self.config.exchange.product,
+                    );
+                    let trades = self
+                        .dashboard
+                        .as_ref()
+                        .map(|d| d.data_bus().get_trades(&key))
+                        .unwrap_or_default();
+                    let vol: rust_decimal::Decimal =
+                        trades.iter().map(|t| t.qty).sum();
+                    // Normalise against our own baseline order
+                    // size so the ratio stays in sensible units
+                    // regardless of symbol.
+                    let baseline = self.config.market_maker.order_size.max(rust_decimal_macros::dec!(0.0001));
+                    let ratio = vol / baseline;
+                    // Mid-move proxy across the last minute.
+                    let mut move_bps = rust_decimal::Decimal::ZERO;
+                    if let (Some(first), Some(last)) = (trades.first(), trades.last()) {
+                        if first.price > rust_decimal::Decimal::ZERO {
+                            move_bps = (last.price - first.price).abs()
+                                / first.price
+                                * rust_decimal_macros::dec!(10_000);
+                        }
+                    }
+                    let out = mm_risk::surveillance::CrossMarketDetector::new()
+                        .score(ratio, move_bps);
+                    src.insert((*id, "value".into()), Value::Number(out.score));
+                    if out.score >= rust_decimal_macros::dec!(0.8) {
+                        pending_alerts.push((kind.clone(), *id, out));
+                    }
                 }
                 "Surveillance.LatencyExploitScore" => {
                     // Deltas populated by the engine's fill handler
@@ -2357,11 +2394,20 @@ impl MarketMakerEngine {
                     }
                 }
                 "Surveillance.RebateAbuseScore" => {
-                    // We have PnlTracker but its split is
-                    // trade_pnl + rebate_pnl — pull when surfaced;
-                    // for now, zero.
-                    let s = rust_decimal::Decimal::ZERO;
-                    src.insert((*id, "value".into()), Value::Number(s));
+                    // Real feed — `PnlTracker.attribution` carries
+                    // both `rebate_income` and the trade-driven
+                    // components (spread + inventory PnL).
+                    // Detector expects `trade_pnl` separately from
+                    // `rebate_pnl`; trade_pnl = spread+inventory.
+                    let a = &self.pnl_tracker.attribution;
+                    let trade_pnl = a.spread_pnl + a.inventory_pnl;
+                    let rebate_pnl = a.rebate_income;
+                    let out = mm_risk::surveillance::RebateAbuseDetector::new()
+                        .score(trade_pnl, rebate_pnl);
+                    src.insert((*id, "value".into()), Value::Number(out.score));
+                    if out.score >= rust_decimal_macros::dec!(0.8) {
+                        pending_alerts.push((kind.clone(), *id, out));
+                    }
                 }
                 "Surveillance.ImbalanceManipulationScore" => {
                     // Pull current L1 imbalance off the book,
