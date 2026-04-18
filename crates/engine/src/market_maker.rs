@@ -414,6 +414,14 @@ pub struct MarketMakerEngine {
     /// classic pipeline, so switching between graph-authored and
     /// hand-wired mid-run is seamless.
     graph_quotes_override: Option<Vec<mm_common::types::QuotePair>>,
+    /// Epic H Phase 4 — last tick's `strategy.compute_quotes()`
+    /// result, cached so the next tick's `Strategy.*` composite
+    /// nodes can read it via `source_inputs`. Introduces a 1-tick
+    /// lag on graph-internal consumers of the strategy output (the
+    /// graph sees the previous tick's quotes), which is acceptable
+    /// because the engine still applies **this** tick's strategy
+    /// output when the graph doesn't override via `Out.Quotes`.
+    last_strategy_quotes: Option<Vec<mm_common::types::QuotePair>>,
     /// Epic H — graph scope cached at `with_strategy_graph` /
     /// `swap_strategy_graph` so the per-tick source marshaller
     /// knows which asset to pull sentiment for without re-reading
@@ -782,6 +790,7 @@ impl MarketMakerEngine {
             strategy_graph_name: None,
             strategy_graph_hash: None,
             graph_quotes_override: None,
+            last_strategy_quotes: None,
             strategy_graph_scope: None,
             margin_guard: config.margin.as_ref().map(|m| {
                 MarginGuard::new(MarginGuardThresholds::from_config(m))
@@ -1607,6 +1616,47 @@ impl MarketMakerEngine {
                         _ => Value::Missing,
                     };
                     src.insert((*id, "value".into()), v);
+                }
+                // Phase 4 composite strategies. Every Strategy.*
+                // node reads last tick's `strategy.compute_quotes()`
+                // output as its `quotes: Quotes` port. Engine keeps a
+                // single `self.strategy` instance, so all Strategy.*
+                // nodes in a given graph see the same bundle — the
+                // distinction in kind is cosmetic for now (the node
+                // label tells the operator which strategy is wired),
+                // and the real "mix two strategies with different γ
+                // through a Mux" path will come with the per-node
+                // override follow-up.
+                k if k.starts_with("Strategy.") => {
+                    let v = match &self.last_strategy_quotes {
+                        Some(qs) => {
+                            use mm_common::types::Side;
+                            use mm_strategy_graph::{GraphQuote, QuoteSide};
+                            let mut out = Vec::with_capacity(qs.len() * 2);
+                            for pair in qs {
+                                if let Some(b) = &pair.bid {
+                                    out.push(GraphQuote {
+                                        side: QuoteSide::Buy,
+                                        price: b.price,
+                                        qty: b.qty,
+                                    });
+                                }
+                                if let Some(a) = &pair.ask {
+                                    out.push(GraphQuote {
+                                        side: match a.side {
+                                            Side::Buy => QuoteSide::Buy,
+                                            Side::Sell => QuoteSide::Sell,
+                                        },
+                                        price: a.price,
+                                        qty: a.qty,
+                                    });
+                                }
+                            }
+                            Value::Quotes(out)
+                        }
+                        None => Value::Missing,
+                    };
+                    src.insert((*id, "quotes".into()), v);
                 }
                 _ => {}
             }
@@ -3994,7 +4044,14 @@ impl MarketMakerEngine {
         // either re-authors or falls back cleanly.
         let mut quotes = match self.graph_quotes_override.take() {
             Some(q) => q,
-            None => self.strategy.compute_quotes(&ctx),
+            None => {
+                let strategy_quotes = self.strategy.compute_quotes(&ctx);
+                // Cache for the next tick's `Strategy.*` composite
+                // nodes — they read it out of `last_strategy_quotes`
+                // via the source marshaller.
+                self.last_strategy_quotes = Some(strategy_quotes.clone());
+                strategy_quotes
+            }
         };
 
         // Inventory limits + urgency + dynamic sizing.

@@ -30,6 +30,7 @@ static MAJOR_SPOT_BASIC: &str = include_str!("../templates/major-spot-basic.json
 static MEME_SPOT_GUARDED: &str = include_str!("../templates/meme-spot-guarded.json");
 static CROSS_ASSET_REGIME: &str = include_str!("../templates/cross-asset-regime.json");
 static GRID_VIA_GRAPH: &str = include_str!("../templates/grid-via-graph.json");
+static AVELLANEDA_VIA_GRAPH: &str = include_str!("../templates/avellaneda-via-graph.json");
 
 const BUILTIN: &[BuiltinTemplate] = &[
     BuiltinTemplate {
@@ -51,6 +52,11 @@ const BUILTIN: &[BuiltinTemplate] = &[
         name: "grid-via-graph",
         description: "Phase 4 reference: full graph-authored symmetric grid via Quote.Grid + Out.Quotes.",
         body: GRID_VIA_GRAPH,
+    },
+    BuiltinTemplate {
+        name: "avellaneda-via-graph",
+        description: "Phase 4 reference: the engine's Avellaneda-Stoikov wrapped as a composite node (uses live config).",
+        body: AVELLANEDA_VIA_GRAPH,
     },
 ];
 

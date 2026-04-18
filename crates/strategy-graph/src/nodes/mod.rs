@@ -18,3 +18,4 @@ pub mod risk;
 pub mod sinks;
 pub mod sources;
 pub mod stats;
+pub mod strategies;

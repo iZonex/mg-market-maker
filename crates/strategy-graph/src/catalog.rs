@@ -15,7 +15,9 @@
 
 use crate::graph::KindShape;
 use crate::node::NodeKind;
-use crate::nodes::{exec, indicators, logic, math, quotes, risk, sinks, sources, stats};
+use crate::nodes::{
+    exec, indicators, logic, math, quotes, risk, sinks, sources, stats, strategies,
+};
 use serde_json::Value as Json;
 
 /// Construct a node by its catalog key + raw config JSON.
@@ -109,6 +111,12 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Quote.Grid" => Some(Box::new(quotes::Grid)),
         "Quote.Mux" => Some(Box::new(quotes::Mux)),
         "Out.Quotes" => Some(Box::new(sinks::Quotes)),
+        // Phase 4 composite strategies (engine overlays via source_inputs)
+        "Strategy.Avellaneda" => Some(Box::new(strategies::Avellaneda)),
+        "Strategy.GLFT" => Some(Box::new(strategies::Glft)),
+        "Strategy.Grid" => Some(Box::new(strategies::Grid)),
+        "Strategy.Basis" => Some(Box::new(strategies::Basis)),
+        "Strategy.CrossExchange" => Some(Box::new(strategies::CrossExchange)),
         // Sinks
         "Out.SpreadMult" => Some(Box::new(sinks::SpreadMult)),
         "Out.SizeMult" => Some(Box::new(sinks::SizeMult)),
@@ -193,6 +201,14 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Quote.Grid"           => NodeMeta { label: "Grid quotes",         summary: "Symmetric bid/ask grid around a mid (step + levels + size)", group: "Quotes" },
         "Quote.Mux"            => NodeMeta { label: "Quote mux",           summary: "Pick quote bundle a or b by a boolean selector", group: "Quotes" },
 
+        // Phase 4 composite strategies — engine runs the real
+        // Rust implementation, output feeds into the graph.
+        "Strategy.Avellaneda"  => NodeMeta { label: "Avellaneda-Stoikov",  summary: "Classic optimal MM (γ, κ, σ, T)", group: "Strategies" },
+        "Strategy.GLFT"        => NodeMeta { label: "GLFT",                summary: "Guéant-Lehalle-Fernandez-Tapia quoting", group: "Strategies" },
+        "Strategy.Grid"        => NodeMeta { label: "Grid",                summary: "Symmetric grid around mid (engine-config driven)", group: "Strategies" },
+        "Strategy.Basis"       => NodeMeta { label: "Basis",               summary: "Basis-shifted reservation price (spot + ref)", group: "Strategies" },
+        "Strategy.CrossExchange"=>NodeMeta { label: "Cross-exchange",      summary: "Make on venue A, hedge on venue B", group: "Strategies" },
+
         // Sinks — always fire on a trigger, consumed by the engine.
         "Out.SpreadMult"       => NodeMeta { label: "Spread multiplier",   summary: "Final spread scalar applied to quotes", group: "Sinks" },
         "Out.SizeMult"         => NodeMeta { label: "Size multiplier",     summary: "Final size scalar applied to quotes", group: "Sinks" },
@@ -275,6 +291,11 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Quote.Grid",
         "Quote.Mux",
         "Out.Quotes",
+        "Strategy.Avellaneda",
+        "Strategy.GLFT",
+        "Strategy.Grid",
+        "Strategy.Basis",
+        "Strategy.CrossExchange",
         "Out.SpreadMult",
         "Out.SizeMult",
         "Out.KillEscalate",
@@ -353,9 +374,10 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_46_nodes_after_phase_4_quotes() {
-        // Phase 2 landed 43. Phase 4 adds Quote.Grid + Quote.Mux +
-        // Out.Quotes = 3 → 46.
-        assert_eq!(kinds().len(), 46, "catalog drift");
+    fn catalog_has_51_nodes_after_phase_4_strategies() {
+        // Phase 4 Quote.*/Out.Quotes pushed the count to 46.
+        // Strategy.{Avellaneda, GLFT, Grid, Basis, CrossExchange} = 5
+        // → 51. The classic strategies live on graph rails now.
+        assert_eq!(kinds().len(), 51, "catalog drift");
     }
 }
