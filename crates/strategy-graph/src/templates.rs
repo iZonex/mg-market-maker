@@ -31,6 +31,7 @@ static MEME_SPOT_GUARDED: &str = include_str!("../templates/meme-spot-guarded.js
 static CROSS_ASSET_REGIME: &str = include_str!("../templates/cross-asset-regime.json");
 static GRID_VIA_GRAPH: &str = include_str!("../templates/grid-via-graph.json");
 static AVELLANEDA_VIA_GRAPH: &str = include_str!("../templates/avellaneda-via-graph.json");
+static PENTEST_SPOOF_CLASSIC: &str = include_str!("../templates/pentest/spoof-classic.json");
 
 const BUILTIN: &[BuiltinTemplate] = &[
     BuiltinTemplate {
@@ -57,6 +58,11 @@ const BUILTIN: &[BuiltinTemplate] = &[
         name: "avellaneda-via-graph",
         description: "Phase 4 reference: the engine's Avellaneda-Stoikov wrapped as a composite node (uses live config).",
         body: AVELLANEDA_VIA_GRAPH,
+    },
+    BuiltinTemplate {
+        name: "pentest-spoof-classic",
+        description: "⚠ PENTEST ONLY — Strategy.Spoof + co-located SpoofingScore guard that trips kill L4 when the detector catches us. Requires MM_RESTRICTED_ALLOW=1.",
+        body: PENTEST_SPOOF_CLASSIC,
     },
 ];
 
@@ -88,14 +94,40 @@ mod tests {
     }
 
     #[test]
-    fn every_bundled_template_compiles() {
+    fn every_safe_template_compiles() {
         // Round-trip through the full compile path (validation +
         // topological sort + catalog resolution). Any broken
-        // template fails CI here.
+        // template fails CI here. Pentest templates are skipped —
+        // they're tested separately against the restricted gate.
         for t in BUILTIN {
+            if t.name.starts_with("pentest-") {
+                continue;
+            }
             let g = Graph::from_json(t.body).unwrap();
             Evaluator::build(&g)
                 .unwrap_or_else(|e| panic!("template {} failed to compile: {e:?}", t.name));
+        }
+    }
+
+    #[test]
+    fn pentest_templates_refused_without_env() {
+        // Epic R — exploit templates must be refused unless the
+        // runtime opts in. This test proves the gate actually
+        // fires; ship + change of the gate without fixing this
+        // test is a red flag.
+        use crate::graph::ValidationError;
+        for t in BUILTIN {
+            if !t.name.starts_with("pentest-") {
+                continue;
+            }
+            let g = Graph::from_json(t.body).unwrap();
+            let err = Evaluator::build(&g).expect_err(
+                "pentest template should refuse to compile without the restricted env",
+            );
+            assert!(
+                matches!(err, ValidationError::RestrictedNotAllowed(_)),
+                "expected RestrictedNotAllowed, got {err:?}"
+            );
         }
     }
 

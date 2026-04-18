@@ -17,6 +17,7 @@ pub mod learned_microprice;
 pub mod market_resilience;
 pub mod momentum;
 pub mod paired_unwind;
+pub mod spoof;
 pub mod stat_arb;
 pub mod r#trait;
 pub mod twap;

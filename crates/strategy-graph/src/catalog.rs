@@ -117,6 +117,8 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Strategy.Grid" => Some(Box::new(strategies::Grid)),
         "Strategy.Basis" => Some(Box::new(strategies::Basis)),
         "Strategy.CrossExchange" => Some(Box::new(strategies::CrossExchange)),
+        // Epic R — exploit strategies (pentest-only, restricted)
+        "Strategy.Spoof" => Some(Box::new(strategies::Spoof)),
         // Epic R — surveillance detectors (engine overlays per tick)
         "Surveillance.SpoofingScore" => Some(Box::new(sources::SpoofingScore)),
         "Surveillance.LayeringScore" => Some(Box::new(sources::LayeringScore)),
@@ -212,6 +214,7 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Strategy.Grid"        => NodeMeta { label: "Grid",                summary: "Symmetric grid around mid (engine-config driven)", group: "Strategies" },
         "Strategy.Basis"       => NodeMeta { label: "Basis",               summary: "Basis-shifted reservation price (spot + ref)", group: "Strategies" },
         "Strategy.CrossExchange"=>NodeMeta { label: "Cross-exchange",      summary: "Make on venue A, hedge on venue B", group: "Strategies" },
+        "Strategy.Spoof"       => NodeMeta { label: "Spoof (pentest)",     summary: "⚠ RESTRICTED — large fake order pulled on tick N+1 while real opposite-side captures reaction", group: "Exploit" },
 
         // Epic R — surveillance detectors (safe, defaults-on)
         "Surveillance.SpoofingScore" => NodeMeta { label: "Spoofing score", summary: "Likelihood our own flow looks like spoofing [0..1] + cancel_ratio + lifetime", group: "Surveillance" },
@@ -305,6 +308,7 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Strategy.Grid",
         "Strategy.Basis",
         "Strategy.CrossExchange",
+        "Strategy.Spoof",
         "Surveillance.SpoofingScore",
         "Surveillance.LayeringScore",
         "Surveillance.QuoteStuffingScore",
@@ -386,8 +390,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_54_nodes_after_epic_r_week_2() {
-        // 52 after Week 1 + Layering + QuoteStuffing = 54.
-        assert_eq!(kinds().len(), 54, "catalog drift");
+    fn catalog_has_55_nodes_after_epic_r_week_3_reference_exploit() {
+        // 54 after Week 2 + Strategy.Spoof = 55.
+        assert_eq!(kinds().len(), 55, "catalog drift");
     }
 }
