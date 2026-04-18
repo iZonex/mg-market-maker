@@ -4,6 +4,8 @@ use crate::node::{EvalCtx, NodeKind, NodeState};
 use crate::types::{Port, PortType, Value};
 use anyhow::Result;
 use once_cell::sync::Lazy;
+use serde::Deserialize;
+use serde_json::Value as Json;
 
 // ── Logic.And ──────────────────────────────────────────────
 
@@ -85,6 +87,116 @@ impl NodeKind for Mux {
     }
 }
 
+// ── Enum equality helpers ──────────────────────────────────
+
+/// `Cast.StrategyEq` — compares the `Strategy.Active` output to a
+/// configured target name (e.g. `"GLFT"`) and emits Bool. Use with
+/// `Logic.Mux` to branch on which base strategy is running.
+#[derive(Debug, Default)]
+pub struct StrategyEq {
+    target: String,
+}
+
+#[derive(Deserialize)]
+struct StrategyEqCfg {
+    #[serde(default)]
+    target: Option<String>,
+}
+
+impl StrategyEq {
+    pub fn from_config(cfg: &Json) -> Option<Self> {
+        if cfg.is_null() {
+            return Some(Self::default());
+        }
+        let parsed: StrategyEqCfg = serde_json::from_value(cfg.clone()).ok()?;
+        Some(Self {
+            target: parsed.target.unwrap_or_default(),
+        })
+    }
+}
+
+static STRATEGY_EQ_INPUTS: Lazy<Vec<Port>> =
+    Lazy::new(|| vec![Port::new("kind", PortType::StrategyKind)]);
+static BOOL_OUT: Lazy<Vec<Port>> =
+    Lazy::new(|| vec![Port::new("out", PortType::Bool)]);
+
+impl NodeKind for StrategyEq {
+    fn kind(&self) -> &'static str {
+        "Cast.StrategyEq"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &STRATEGY_EQ_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &BOOL_OUT
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        let hit = inputs
+            .first()
+            .and_then(Value::as_strategy_kind)
+            .map(|k| k == self.target)
+            .unwrap_or(false);
+        Ok(vec![Value::Bool(hit)])
+    }
+}
+
+/// `Cast.PairClassEq` — same pattern for pair-class labels.
+#[derive(Debug, Default)]
+pub struct PairClassEq {
+    target: String,
+}
+
+#[derive(Deserialize)]
+struct PairClassEqCfg {
+    #[serde(default)]
+    target: Option<String>,
+}
+
+impl PairClassEq {
+    pub fn from_config(cfg: &Json) -> Option<Self> {
+        if cfg.is_null() {
+            return Some(Self::default());
+        }
+        let parsed: PairClassEqCfg = serde_json::from_value(cfg.clone()).ok()?;
+        Some(Self {
+            target: parsed.target.unwrap_or_default(),
+        })
+    }
+}
+
+static PAIR_CLASS_EQ_INPUTS: Lazy<Vec<Port>> =
+    Lazy::new(|| vec![Port::new("class", PortType::PairClass)]);
+
+impl NodeKind for PairClassEq {
+    fn kind(&self) -> &'static str {
+        "Cast.PairClassEq"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &PAIR_CLASS_EQ_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &BOOL_OUT
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        let hit = inputs
+            .first()
+            .and_then(Value::as_pair_class)
+            .map(|c| c == self.target)
+            .unwrap_or(false);
+        Ok(vec![Value::Bool(hit)])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +250,53 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out, vec![Value::Number(dec!(1.5))]);
+    }
+
+    #[test]
+    fn strategy_eq_matches_configured_target() {
+        let node = StrategyEq::from_config(&serde_json::json!({ "target": "GLFT" })).unwrap();
+        let mut st = NodeState::default();
+        let hit = node
+            .evaluate(
+                &EvalCtx::default(),
+                &[Value::StrategyKind("GLFT".into())],
+                &mut st,
+            )
+            .unwrap();
+        assert_eq!(hit, vec![Value::Bool(true)]);
+        let miss = node
+            .evaluate(
+                &EvalCtx::default(),
+                &[Value::StrategyKind("Grid".into())],
+                &mut st,
+            )
+            .unwrap();
+        assert_eq!(miss, vec![Value::Bool(false)]);
+    }
+
+    #[test]
+    fn pair_class_eq_matches_configured_target() {
+        let node =
+            PairClassEq::from_config(&serde_json::json!({ "target": "major-spot" })).unwrap();
+        let mut st = NodeState::default();
+        let hit = node
+            .evaluate(
+                &EvalCtx::default(),
+                &[Value::PairClass("major-spot".into())],
+                &mut st,
+            )
+            .unwrap();
+        assert_eq!(hit, vec![Value::Bool(true)]);
+    }
+
+    #[test]
+    fn strategy_eq_missing_input_returns_false() {
+        let node = StrategyEq::from_config(&serde_json::json!({ "target": "GLFT" })).unwrap();
+        let mut st = NodeState::default();
+        let out = node
+            .evaluate(&EvalCtx::default(), &[Value::Missing], &mut st)
+            .unwrap();
+        assert_eq!(out, vec![Value::Bool(false)]);
     }
 
     #[test]

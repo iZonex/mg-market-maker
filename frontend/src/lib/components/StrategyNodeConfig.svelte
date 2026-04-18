@@ -46,6 +46,15 @@
           oninput={(e) => update('alpha', e.currentTarget.value)}
         />
       </label>
+    {:else if kind === 'Math.Const'}
+      <label class="field">
+        <span>value</span>
+        <input
+          type="text"
+          value={cfg.value ?? '0'}
+          oninput={(e) => update('value', e.currentTarget.value)}
+        />
+      </label>
     {:else if kind === 'Cast.ToBool'}
       <label class="field">
         <span>threshold</span>
@@ -67,6 +76,64 @@
           <option value="lt">&lt;</option>
           <option value="eq">=</option>
         </select>
+      </label>
+    {:else if kind === 'Cast.StrategyEq'}
+      <label class="field">
+        <span>target strategy</span>
+        <select
+          value={cfg.target ?? 'AvellanedaStoikov'}
+          onchange={(e) => update('target', e.currentTarget.value)}
+        >
+          <option value="AvellanedaStoikov">AvellanedaStoikov</option>
+          <option value="GLFT">GLFT</option>
+          <option value="Grid">Grid</option>
+          <option value="Basis">Basis</option>
+          <option value="CrossExchange">CrossExchange</option>
+        </select>
+      </label>
+    {:else if kind === 'Cast.PairClassEq'}
+      <label class="field">
+        <span>target pair class</span>
+        <input
+          type="text"
+          value={cfg.target ?? 'MajorSpot'}
+          oninput={(e) => update('target', e.currentTarget.value)}
+        />
+      </label>
+    {:else if kind === 'Risk.ToxicityWiden'}
+      <label class="field">
+        <span>scale (mult at vpin=1)</span>
+        <input
+          type="text"
+          value={cfg.scale ?? '2'}
+          oninput={(e) => update('scale', e.currentTarget.value)}
+        />
+      </label>
+    {:else if kind === 'Risk.InventoryUrgency'}
+      <label class="field">
+        <span>cap</span>
+        <input
+          type="text"
+          value={cfg.cap ?? '1'}
+          oninput={(e) => update('cap', e.currentTarget.value)}
+        />
+      </label>
+      <label class="field">
+        <span>exponent</span>
+        <input
+          type="text"
+          value={cfg.exponent ?? '2'}
+          oninput={(e) => update('exponent', e.currentTarget.value)}
+        />
+      </label>
+    {:else if kind === 'Risk.CircuitBreaker'}
+      <label class="field">
+        <span>wide spread (bps)</span>
+        <input
+          type="text"
+          value={cfg.wide_bps ?? '100'}
+          oninput={(e) => update('wide_bps', e.currentTarget.value)}
+        />
       </label>
     {:else}
       <div class="muted small">This node has no config parameters.</div>

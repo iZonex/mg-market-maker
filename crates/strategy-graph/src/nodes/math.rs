@@ -132,6 +132,26 @@ mod tests {
     }
 
     #[test]
+    fn const_returns_configured_value() {
+        let node = Const::from_config(&serde_json::json!({ "value": "1.75" })).unwrap();
+        let mut st = NodeState::default();
+        let out = node
+            .evaluate(&EvalCtx::default(), &[], &mut st)
+            .unwrap();
+        assert_eq!(out, vec![Value::Number(dec!(1.75))]);
+    }
+
+    #[test]
+    fn const_default_is_zero() {
+        let node = Const::from_config(&serde_json::Value::Null).unwrap();
+        let mut st = NodeState::default();
+        let out = node
+            .evaluate(&EvalCtx::default(), &[], &mut st)
+            .unwrap();
+        assert_eq!(out, vec![Value::Number(dec!(0))]);
+    }
+
+    #[test]
     fn to_bool_missing_returns_false() {
         let node = ToBool::from_config(&serde_json::Value::Null).unwrap();
         let mut st = NodeState::default();
@@ -139,6 +159,68 @@ mod tests {
             .evaluate(&EvalCtx::default(), &[Value::Missing], &mut st)
             .unwrap();
         assert_eq!(out, vec![Value::Bool(false)]);
+    }
+}
+
+/// `Math.Const` — configured constant `{ value: "1.5" }`.
+/// Zero input ports — classified as a source by the evaluator, so
+/// its configured value is available at tick time without any
+/// engine-side plumbing. Use this for literal arms of a
+/// `Logic.Mux`, spread floors, etc.
+#[derive(Debug)]
+pub struct Const {
+    value: Decimal,
+}
+
+impl Default for Const {
+    fn default() -> Self {
+        Self {
+            value: Decimal::ZERO,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ConstCfg {
+    #[serde(default)]
+    value: Option<String>,
+}
+
+impl Const {
+    pub fn from_config(cfg: &Json) -> Option<Self> {
+        if cfg.is_null() {
+            return Some(Self::default());
+        }
+        let parsed: ConstCfg = serde_json::from_value(cfg.clone()).ok()?;
+        let value = match parsed.value {
+            None => Decimal::ZERO,
+            Some(s) => Decimal::from_str(&s).ok()?,
+        };
+        Some(Self { value })
+    }
+}
+
+static CONST_OUTPUTS: Lazy<Vec<Port>> =
+    Lazy::new(|| vec![Port::new("value", PortType::Number)]);
+static EMPTY_INPUTS: Lazy<Vec<Port>> = Lazy::new(Vec::new);
+
+impl NodeKind for Const {
+    fn kind(&self) -> &'static str {
+        "Math.Const"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &CONST_OUTPUTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Number(self.value)])
     }
 }
 

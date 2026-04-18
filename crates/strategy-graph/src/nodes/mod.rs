@@ -11,6 +11,7 @@
 
 pub mod logic;
 pub mod math;
+pub mod risk;
 pub mod sinks;
 pub mod sources;
 pub mod stats;

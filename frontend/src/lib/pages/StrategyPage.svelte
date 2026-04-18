@@ -88,6 +88,12 @@
   function defaultConfigFor(kind) {
     if (kind === 'Stats.EWMA') return { alpha: '0.1' }
     if (kind === 'Cast.ToBool') return { threshold: '0', cmp: 'ge' }
+    if (kind === 'Math.Const') return { value: '1.0' }
+    if (kind === 'Cast.StrategyEq') return { target: 'AvellanedaStoikov' }
+    if (kind === 'Cast.PairClassEq') return { target: 'MajorSpot' }
+    if (kind === 'Risk.ToxicityWiden') return { scale: '2' }
+    if (kind === 'Risk.InventoryUrgency') return { cap: '1', exponent: '2' }
+    if (kind === 'Risk.CircuitBreaker') return { wide_bps: '100' }
     return {}
   }
 

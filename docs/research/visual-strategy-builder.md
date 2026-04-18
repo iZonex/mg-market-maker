@@ -584,6 +584,182 @@ recompile.
 
 ---
 
+## 13. Phase 2 — mixed composer (scope addendum)
+
+Problem statement from the user after Phase 1 shipped:
+
+> *"Many strategy parts, risk layers, exec algos, indicators — need to
+> think about how to compose out of these in the graph."*
+
+Phase 1's overlay-only model is too narrow. Operator's full toolbox is
+~80 composable parts already in the codebase:
+
+| Category | Count | Existing crate code |
+|---|---|---|
+| Base strategies | 5 | `mm_strategy::{avellaneda, glft, grid, basis, cross_exchange}` |
+| Driver strategies | 2 | `funding_arb_driver`, `stat_arb::driver` |
+| Risk guards / layers | 15+ | `mm_risk::{kill_switch, circuit_breaker, margin_guard, protections, var_guard, portfolio_risk, social_risk, news_retreat, lead_lag_guard, toxicity, inventory_skew, dca, otr, order_emulator, volume_limit, exposure}` |
+| Exec algos | 4 | `mm_strategy::exec_algo::{Twap, Vwap, Pov, Iceberg}` + `paired_unwind` |
+| Indicators | 7 | `mm_indicators::{sma, ema, hma, rsi, atr, bollinger, hawkes}` |
+| Signal transforms | 5 | `cks_ofi`, `learned_microprice`, `cartea_spread`, `features`, `momentum` |
+| Autotune / regime | 1 | `autotune::RegimeDetector` |
+
+Three-level integration ladder:
+
+**Level 1 (current / Phase 1):** overlay. Graph produces
+`{ spread_mult, size_mult, skew_bps, kill_trigger }` on top of a
+hardcoded strategy + risk pipeline.
+
+**Level 2 (Phase 2 — this addendum):** mixed composer. Graph still
+layers on top of the existing hot loop, but the *catalog* grows to
+~60 nodes that are **thin shims wrapping the crate modules listed
+above**. The operator can now compose a non-trivial risk pipeline,
+pick among base strategies via a `Logic.Mux` on `PairClass`, or
+drive an unwind algo choice — without any Rust PR. Engine wiring
+change: minimal — each shim node is `impl NodeKind` in
+`mm-strategy-graph` that calls the underlying Rust module on every
+eval. ~80 % of the work is writing the NodeKind impls; the
+wrapped modules stay untouched.
+
+**Level 3 (Phase 4+ — later):** full composer. Graph owns
+`Vec<Quote>` as its terminal output; engine's `compute_quotes`
+delegates to the graph when present; EVERY signal / strategy /
+risk layer is a node, hand-wired hot loop becomes a thin driver.
+Requires reshaping `MarketMakerEngine::tick` into a graph-eval
+loop and adding quote-typed ports (`PortType::Quotes`,
+`PortType::Trade`, …). Out of scope for this addendum.
+
+### 13.1 Phase 2 node-wave breakdown
+
+Four waves, each self-contained and commit-able separately. Target
+~5–6 nodes per wave so each lands as one reviewable PR-sized commit.
+
+**Wave A — `Strategy.*` picker (this pass)**
+- `Strategy.AvellanedaStoikov` — config: `{ gamma, kappa, sigma,
+  time_horizon_secs, num_levels }`. Output port `mult: Number` (the
+  spread multiplier the strategy would apply *above* its own
+  regime/toxicity output — i.e. a per-strategy bias). MVP shim:
+  just reads the current tick's base strategy output and passes it
+  through so a graph can mux between them.
+- `Strategy.GLFT`, `Strategy.Grid`, `Strategy.Basis`,
+  `Strategy.CrossExchange` — same shape.
+- `Strategy.Active` — source node returning the currently-running
+  strategy name as `Enum<StrategyKind>` so a graph can gate on
+  "are we in A-S mode? do X".
+- Use case: `PairClass.Template → Strategy.Active → Logic.Mux on
+  pair class → different spread floor per strategy`.
+
+**Wave B — `Risk.*Gate` pipeline (next pass)**
+- `Risk.ToxicityWiden` — reads VPIN + Kyle from sources, outputs a
+  `spread_mult` in `[1, max]`.
+- `Risk.MarginGate` — reads margin ratio, outputs `Bool` (pass =
+  safe, false = pre-liq).
+- `Risk.CircuitBreaker` — book staleness + wide-spread detector →
+  `Bool`.
+- `Risk.VarGate` — portfolio VaR vs limit → `Enum<Throttle>`
+  (None / Widen / Stop / Flatten).
+- `Risk.DrawdownGuard` — rolling drawdown vs limit → `Bool`.
+- `Risk.OtrGuard` — OTR > threshold → `Bool` (exchange SLA gate).
+- `Risk.InventoryUrgency` — position vs cap → `Number` (urgency
+  score used to scale size).
+
+Each gate's failure mode composes via an explicit `Logic.And` into
+a final `Bool` that drives `Out.KillEscalate` — no more
+implicit-ordering "which check fires first?" guessing.
+
+**Wave C — `Indicator.*` + `Signal.*` (Wave 3)**
+- `Indicator.SMA`, `Indicator.EMA`, `Indicator.HMA`,
+  `Indicator.RSI`, `Indicator.ATR`, `Indicator.Bollinger`,
+  `Indicator.Hawkes` — each takes a `Number` (typically mid or
+  trade price), returns a `Number` (or band struct for Bollinger).
+- `Signal.ImbalanceDepth` (top-N book imbalance),
+  `Signal.TradeFlow`, `Signal.Microprice`,
+  `Signal.LearnedMicroprice.Drift`, `Signal.CarteaSpread`.
+- `Regime.Detector` — source node returning current regime enum.
+
+**Wave D — `Exec.*` (Wave 4)**
+- `Exec.TWAP`, `Exec.VWAP`, `Exec.POV`, `Exec.Iceberg` — when
+  triggered (Bool input + qty input), emit an `ExecAction` struct
+  the engine dispatches.
+- `Exec.PickAlgo` — given context (vol regime, remaining time,
+  size), pick the right algo.
+- `Out.Flatten` — drain inventory via the chosen exec algo; used
+  at kill L4.
+
+### 13.2 Port-type additions
+
+New port types needed for Phase 2:
+
+```text
+Enum<StrategyKind>   // AS / GLFT / Grid / Basis / CrossExchange
+Enum<Regime>         // Quiet / Volatile / Trending / MeanReverting
+Enum<PairClass>      // major-spot / meme-spot / alt-perp / ...
+Enum<Throttle>       // None / Widen / Stop / Flatten
+ExecAlgo             // TWAP / VWAP / POV / Iceberg with config
+Band                 // Bollinger output { upper, mid, lower }
+```
+
+Each expands `PortType` with a new variant. Value enum gets a
+matching variant. No behavioural change to the evaluator — only
+port-shape comparison is affected, and that's already a table
+lookup.
+
+### 13.3 Shim implementation pattern
+
+Every `Strategy.*` / `Risk.*` / `Exec.*` node follows the same
+three-step template:
+
+1. Constructor `from_config(&Value) -> Option<Self>` parses the
+   specific module's config struct (e.g.
+   `AvellanedaStoikovConfig` → `Strategy.AvellanedaStoikov`'s
+   `params` field).
+2. `evaluate(ctx, inputs, state) -> Vec<Value>` calls the
+   underlying module's public method (e.g. `avellaneda.quote()`
+   or `vpin.value()`), translates the return into the declared
+   output ports.
+3. Node-local state (cooldown timers, EWMA accumulators) lives
+   in the node's `NodeState` slot, same pattern as `Stats.EWMA`.
+
+No changes to the wrapped modules. If a module lacks a
+graph-friendly read surface (e.g. `KillSwitch::escalate()` takes
+`&mut self`), the shim holds an `Arc<Mutex<KillSwitch>>` or an
+engine-supplied accessor closure — same surface we already use
+for `per_client_circuit`.
+
+### 13.4 Engine wiring for Wave A
+
+`tick_strategy_graph`'s source marshaller adds two entries:
+
+```text
+"Strategy.Active" -> Enum<StrategyKind> for the current
+                      engine.strategy.name()
+"PairClass.Current" -> Enum<PairClass> for the engine's
+                        adaptive_tuner.pair_class()
+```
+
+Engine-side Rust change: one match arm per new source node kind.
+No change to `Evaluator::tick` mechanics.
+
+### 13.5 Risks + call-outs
+
+- **Performance budget.** 60 nodes × 1 eval/tick at 10 ticks/sec
+  = 600 evals/sec — trivial. The concern is if a shim node
+  itself does heavy work (e.g. Johansen cointegration refit
+  inside an `Indicator.*` shim). Rule: shims READ cached state,
+  never compute. Heavy work stays on the owning module's own
+  cadence.
+- **Config drift.** Duplicating e.g. `AvellanedaStoikovConfig`
+  inside a node's `config` field means TWO places to update when
+  the underlying module changes its param set. Mitigation: node
+  configs serde-derive off the same struct; add a CI test that
+  round-trips every strategy's config through its shim node.
+- **Scope narrowing.** Shim nodes for driver strategies
+  (`funding_arb_driver`, `stat_arb::driver`) are trickier — those
+  own their own tick loop. Phase 2 skips these; they stay driven
+  by `AppConfig` + server boot for now.
+
+---
+
 ## Appendix B — node-state example
 
 `Stats.EWMA` in Rust form:

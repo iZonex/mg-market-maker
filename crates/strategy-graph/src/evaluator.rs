@@ -141,13 +141,24 @@ impl Evaluator {
             let is_source = order.is_empty();
 
             let produced: Vec<Value> = if is_source {
+                // Source nodes: call `evaluate()` first to get any
+                // node-authored defaults (e.g. `Math.Const` returns
+                // its configured value), then overlay engine-
+                // provided `source_inputs` per port so live data
+                // always beats static defaults. That lets us mix
+                // "read from engine" sources (Book.L1 / Sentiment
+                // / Volatility / ...) with "literal" sources
+                // (Math.Const) under one uniform catalog entry.
+                let state = self.states.get_mut(id).expect("state slot per node");
+                let defaults = node.evaluate(ctx, &input_vec, state)?;
                 node.output_ports()
                     .iter()
-                    .map(|p| {
+                    .zip(defaults.into_iter())
+                    .map(|(p, default)| {
                         source_inputs
                             .get(&(*id, p.name.clone()))
                             .cloned()
-                            .unwrap_or(Value::Missing)
+                            .unwrap_or(default)
                     })
                     .collect()
             } else {

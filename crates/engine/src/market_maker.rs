@@ -402,6 +402,11 @@ pub struct MarketMakerEngine {
     /// Epic H — stable name of the deployed graph (for audit + metrics
     /// labels). `None` when no graph is attached.
     strategy_graph_name: Option<String>,
+    /// Epic H — graph scope cached at `with_strategy_graph` /
+    /// `swap_strategy_graph` so the per-tick source marshaller
+    /// knows which asset to pull sentiment for without re-reading
+    /// the whole graph JSON.
+    strategy_graph_scope: Option<mm_strategy_graph::Scope>,
     /// Epic G — reservation-price skew contribution from the
     /// most recent social evaluation. Bumped by
     /// `SocialRiskState.inv_skew_bps` on every tick and
@@ -763,6 +768,7 @@ impl MarketMakerEngine {
             social_skew_bps: Decimal::ZERO,
             strategy_graph: None,
             strategy_graph_name: None,
+            strategy_graph_scope: None,
             margin_guard: config.margin.as_ref().map(|m| {
                 MarginGuard::new(MarginGuardThresholds::from_config(m))
             }),
@@ -1359,6 +1365,7 @@ impl MarketMakerEngine {
         let ev = mm_strategy_graph::Evaluator::build(graph)?;
         self.strategy_graph = Some(ev);
         self.strategy_graph_name = Some(graph.name.clone());
+        self.strategy_graph_scope = Some(graph.scope.clone());
         Ok(self)
     }
 
@@ -1374,6 +1381,7 @@ impl MarketMakerEngine {
         let ev = mm_strategy_graph::Evaluator::build(graph)?;
         self.strategy_graph = Some(ev);
         self.strategy_graph_name = Some(graph.name.clone());
+        self.strategy_graph_scope = Some(graph.scope.clone());
         self.audit.risk_event(
             &self.symbol,
             mm_risk::audit::AuditEventType::StrategyGraphDeployed,
@@ -1444,6 +1452,21 @@ impl MarketMakerEngine {
             .map(Value::Number)
             .unwrap_or(Value::Missing);
 
+        // Resolve asset from scope → latest sentiment tick. Only
+        // Symbol-scoped graphs can resolve an asset today; Global /
+        // AssetClass / Client graphs get Missing (they may aggregate
+        // cross-asset in a future pass — see
+        // `docs/research/visual-strategy-builder.md` §11 Q1).
+        let sentiment_tick = match &self.strategy_graph_scope {
+            Some(mm_strategy_graph::Scope::Symbol(sym)) => {
+                let (base, _quote) = split_symbol_bq(sym);
+                self.dashboard
+                    .as_ref()
+                    .and_then(|d| d.sentiment_tick_for(base))
+            }
+            _ => None,
+        };
+
         // Iterate every node in the evaluator's order, fill source
         // outputs by kind. The evaluator exposes `order` via a
         // read-only helper; the kind lookup is identical to what
@@ -1467,15 +1490,66 @@ impl MarketMakerEngine {
                 "Momentum.OFIZ" => {
                     src.insert((*id, "value".into()), ofi_z.clone());
                 }
-                // Sentiment sources are filled from the latest
-                // `SentimentTick` the engine received via
-                // `ConfigOverride::SentimentTick`. That tick's
-                // data lives on the social risk engine's state;
-                // we plumb it here in a follow-up when the per-
-                // graph scope picker can resolve which asset the
-                // graph is for.
+                // Sentiment sources — resolve the asset from the
+                // graph's scope (Symbol → base asset via
+                // `extract_base_asset`) then look up the latest
+                // tick on the dashboard's in-memory snapshot.
+                // Missing propagates when no tick has arrived
+                // yet or when the scope isn't resolvable (e.g.
+                // Global graph — ambiguous without per-engine
+                // asset tagging).
+                // Phase 2 Wave A — strategy + pair-class tags.
+                "Strategy.Active" => {
+                    src.insert(
+                        (*id, "kind".into()),
+                        Value::StrategyKind(self.strategy.name().to_string()),
+                    );
+                }
+                // Phase 2 Wave B — risk layer sources.
+                "Risk.MarginRatio" => {
+                    // MarginGuard publishes into DashboardState on
+                    // every poll; reading the cached per-symbol
+                    // value avoids doubling the guard's internal
+                    // state. `None` on spot engines or pre-first-
+                    // poll → Missing propagates.
+                    let v = self
+                        .dashboard
+                        .as_ref()
+                        .and_then(|d| d.margin_ratio(&self.symbol))
+                        .map(Value::Number)
+                        .unwrap_or(Value::Missing);
+                    src.insert((*id, "value".into()), v);
+                }
+                "Risk.OTR" => {
+                    src.insert(
+                        (*id, "value".into()),
+                        Value::Number(self.otr.ratio()),
+                    );
+                }
+                "Inventory.Level" => {
+                    src.insert(
+                        (*id, "value".into()),
+                        Value::Number(self.inventory_manager.inventory()),
+                    );
+                }
+                "PairClass.Current" => {
+                    let label = self
+                        .pair_class
+                        .as_ref()
+                        .map(|c| format!("{c:?}"))
+                        .unwrap_or_else(|| "Unknown".into());
+                    src.insert((*id, "class".into()), Value::PairClass(label));
+                }
                 "Sentiment.Rate" | "Sentiment.Score" => {
-                    src.insert((*id, "value".into()), Value::Missing);
+                    let tick = sentiment_tick.as_ref();
+                    let v = match (kind.as_str(), tick) {
+                        ("Sentiment.Rate", Some(t)) => Value::Number(t.mentions_rate),
+                        ("Sentiment.Score", Some(t)) => {
+                            Value::Number(t.sentiment_score_5min)
+                        }
+                        _ => Value::Missing,
+                    };
+                    src.insert((*id, "value".into()), v);
                 }
                 _ => {}
             }

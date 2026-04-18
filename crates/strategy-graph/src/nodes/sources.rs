@@ -97,6 +97,74 @@ single_scalar_source!(VolatilityRealised, "Volatility.Realised", "value");
 single_scalar_source!(ToxicityVpin, "Toxicity.VPIN", "value");
 single_scalar_source!(MomentumOfiZ, "Momentum.OFIZ", "value");
 
+// Phase 2 Wave B — risk layer signal sources.
+single_scalar_source!(RiskMarginRatio, "Risk.MarginRatio", "value");
+single_scalar_source!(RiskOtr, "Risk.OTR", "value");
+single_scalar_source!(InventoryLevel, "Inventory.Level", "value");
+
+// Phase 2 — strategy + pair-class metadata sources. Zero-input
+// typed-enum outputs; the evaluator short-circuits both and the
+// engine fills them from `strategy.name()` / `adaptive_tuner
+// .pair_class()` on each tick.
+
+/// `Strategy.Active` — emits which base strategy is running.
+/// Lets a graph branch on `Logic.Mux` keyed by strategy kind so
+/// per-strategy tuning (e.g. narrower spread on Grid, wider on
+/// A-S) lives in the graph, not in config sprawl.
+#[derive(Debug, Default)]
+pub struct StrategyActive;
+
+static STRATEGY_ACTIVE_OUTPUTS: Lazy<Vec<Port>> =
+    Lazy::new(|| vec![Port::new("kind", PortType::StrategyKind)]);
+
+impl NodeKind for StrategyActive {
+    fn kind(&self) -> &'static str {
+        "Strategy.Active"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &STRATEGY_ACTIVE_OUTPUTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
+/// `PairClass.Current` — emits the classifier's current label
+/// (`"major-spot"`, `"meme-spot"`, `"alt-perp"`, …).
+#[derive(Debug, Default)]
+pub struct PairClassCurrent;
+
+static PAIR_CLASS_OUTPUTS: Lazy<Vec<Port>> =
+    Lazy::new(|| vec![Port::new("class", PortType::PairClass)]);
+
+impl NodeKind for PairClassCurrent {
+    fn kind(&self) -> &'static str {
+        "PairClass.Current"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &PAIR_CLASS_OUTPUTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +183,20 @@ mod tests {
         assert!(n.input_ports().is_empty());
         assert_eq!(n.output_ports().len(), 1);
         assert_eq!(n.output_ports()[0].name, "value");
+    }
+
+    #[test]
+    fn strategy_active_declares_enum_output() {
+        let n = StrategyActive;
+        assert!(n.input_ports().is_empty());
+        assert_eq!(n.output_ports().len(), 1);
+        assert_eq!(n.output_ports()[0].ty, PortType::StrategyKind);
+    }
+
+    #[test]
+    fn pair_class_current_declares_enum_output() {
+        let n = PairClassCurrent;
+        assert_eq!(n.output_ports().len(), 1);
+        assert_eq!(n.output_ports()[0].ty, PortType::PairClass);
     }
 }

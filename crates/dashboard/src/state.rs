@@ -739,6 +739,16 @@ impl DashboardState {
         }
     }
 
+    /// Epic G / H — latest sentiment tick for a canonical asset,
+    /// or `None` if no tick has arrived for it yet. Keyed by the
+    /// asset's normalised ticker (`"BTC"`, `"ETH"`, …).
+    pub fn sentiment_tick_for(
+        &self,
+        asset: &str,
+    ) -> Option<mm_sentiment::SentimentTick> {
+        self.inner.read().unwrap().sentiment_ticks.get(asset).cloned()
+    }
+
     /// Epic G — snapshot of the most-recent tick per asset.
     /// Order-independent; the frontend sorts by asset.
     pub fn get_sentiment_snapshot(&self) -> Vec<mm_sentiment::SentimentTick> {

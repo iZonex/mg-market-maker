@@ -58,6 +58,14 @@ pub enum PortType {
     /// Kill level enum (mirrors `mm_risk::KillLevel` at the Number
     /// level — we don't pull the dep here).
     KillLevel,
+    /// Phase 2 — which base strategy is running. Values are the
+    /// catalog strings `"AvellanedaStoikov" | "GLFT" | "Grid" |
+    /// "Basis" | "CrossExchange"`.
+    StrategyKind,
+    /// Phase 2 — pair-class classification (major-spot, meme-spot,
+    /// alt-perp, etc.). The engine's classifier assigns one at
+    /// startup; a graph can branch on it.
+    PairClass,
 }
 
 /// A value riding on an edge during evaluation. Exactly one variant
@@ -69,6 +77,10 @@ pub enum Value {
     Unit,
     String(String),
     KillLevel(u8),
+    /// Phase 2 — base strategy tag.
+    StrategyKind(String),
+    /// Phase 2 — pair-class tag.
+    PairClass(String),
     /// A source that had no observation this tick. Propagates through
     /// transforms as "hold last good" or "pass-through" depending on
     /// the node; sinks fall back to their neutral output after the
@@ -84,6 +96,22 @@ impl Value {
             Value::Unit => PortType::Unit,
             Value::String(_) => PortType::String,
             Value::KillLevel(_) => PortType::KillLevel,
+            Value::StrategyKind(_) => PortType::StrategyKind,
+            Value::PairClass(_) => PortType::PairClass,
+        }
+    }
+
+    pub fn as_strategy_kind(&self) -> Option<&str> {
+        match self {
+            Value::StrategyKind(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn as_pair_class(&self) -> Option<&str> {
+        match self {
+            Value::PairClass(s) => Some(s.as_str()),
+            _ => None,
         }
     }
 

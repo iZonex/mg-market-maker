@@ -15,7 +15,7 @@
 
 use crate::graph::KindShape;
 use crate::node::NodeKind;
-use crate::nodes::{logic, math, sinks, sources, stats};
+use crate::nodes::{logic, math, risk, sinks, sources, stats};
 use serde_json::Value as Json;
 
 /// Construct a node by its catalog key + raw config JSON.
@@ -28,6 +28,7 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         // Math
         "Math.Add" => Some(Box::new(math::Add)),
         "Math.Mul" => Some(Box::new(math::Mul)),
+        "Math.Const" => math::Const::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>),
         // Stats — configurable α
         "Stats.EWMA" => stats::Ewma::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>),
         // Cast — configurable threshold + comparator
@@ -44,6 +45,28 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Volatility.Realised" => Some(Box::new(sources::VolatilityRealised)),
         "Toxicity.VPIN" => Some(Box::new(sources::ToxicityVpin)),
         "Momentum.OFIZ" => Some(Box::new(sources::MomentumOfiZ)),
+        // Phase 2 Wave A — strategy + pair-class metadata sources
+        "Strategy.Active" => Some(Box::new(sources::StrategyActive)),
+        "PairClass.Current" => Some(Box::new(sources::PairClassCurrent)),
+        "Cast.StrategyEq" => {
+            logic::StrategyEq::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
+        }
+        "Cast.PairClassEq" => {
+            logic::PairClassEq::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
+        }
+        // Phase 2 Wave B — risk layer
+        "Risk.MarginRatio" => Some(Box::new(sources::RiskMarginRatio)),
+        "Risk.OTR" => Some(Box::new(sources::RiskOtr)),
+        "Inventory.Level" => Some(Box::new(sources::InventoryLevel)),
+        "Risk.ToxicityWiden" => {
+            risk::ToxicityWiden::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
+        }
+        "Risk.InventoryUrgency" => {
+            risk::InventoryUrgency::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
+        }
+        "Risk.CircuitBreaker" => {
+            risk::CircuitBreaker::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
+        }
         // Sinks
         "Out.SpreadMult" => Some(Box::new(sinks::SpreadMult)),
         "Out.SizeMult" => Some(Box::new(sinks::SizeMult)),
@@ -78,6 +101,7 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
     let ks: &[&str] = &[
         "Math.Add",
         "Math.Mul",
+        "Math.Const",
         "Stats.EWMA",
         "Cast.ToBool",
         "Logic.And",
@@ -88,6 +112,16 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Volatility.Realised",
         "Toxicity.VPIN",
         "Momentum.OFIZ",
+        "Strategy.Active",
+        "PairClass.Current",
+        "Cast.StrategyEq",
+        "Cast.PairClassEq",
+        "Risk.MarginRatio",
+        "Risk.OTR",
+        "Inventory.Level",
+        "Risk.ToxicityWiden",
+        "Risk.InventoryUrgency",
+        "Risk.CircuitBreaker",
         "Out.SpreadMult",
         "Out.SizeMult",
         "Out.KillEscalate",
@@ -107,6 +141,7 @@ mod tests {
         let null = Json::Null;
         assert!(build("Math.Add", &null).is_some());
         assert!(build("Math.Mul", &null).is_some());
+        assert!(build("Math.Const", &null).is_some());
         assert!(build("Stats.EWMA", &null).is_some());
         assert!(build("Cast.ToBool", &null).is_some());
         assert!(build("Logic.And", &null).is_some());
@@ -150,9 +185,9 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_mvp_15_nodes() {
-        // Sanity: catalog snapshot matches the MVP plan so a
-        // drift shows up in CI.
-        assert_eq!(kinds().len(), 15, "MVP catalog drift");
+    fn catalog_has_26_nodes_after_wave_b() {
+        // MVP 16 + Wave A (4) + Wave B (6: 3 sources + 3 transforms)
+        // = 26.
+        assert_eq!(kinds().len(), 26, "catalog drift");
     }
 }
