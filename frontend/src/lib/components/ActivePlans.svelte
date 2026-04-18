@@ -20,6 +20,7 @@
   let plans = $state([])
   let error = $state(null)
   let lastFetch = $state(null)
+  let loading = $state(true)
 
   async function refresh() {
     try {
@@ -30,8 +31,10 @@
       }))
       error = null
       lastFetch = new Date()
+      loading = false
     } catch (e) {
       error = e?.message || String(e)
+      loading = false
     }
   }
 
@@ -66,7 +69,9 @@
       {/if}
     </div>
   </div>
-  {#if plans.length === 0}
+  {#if loading}
+    <div class="empty"><span class="spinner" aria-hidden="true"></span>loading plans…</div>
+  {:else if plans.length === 0}
     <div class="empty">no active execution plans</div>
   {:else}
     <div class="rows">
@@ -104,7 +109,25 @@
   }
   .title { font-weight: 600; color: var(--fg-primary); }
   .meta .error { color: var(--danger); }
-  .empty { color: var(--fg-muted); font-size: var(--fs-xs); padding: var(--s-4); text-align: center; }
+  .empty {
+    color: var(--fg-muted);
+    font-size: var(--fs-xs);
+    padding: var(--s-4);
+    text-align: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--s-2);
+  }
+  .spinner {
+    display: inline-block;
+    width: 12px; height: 12px;
+    border: 2px solid var(--border-subtle);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
   .rows { display: flex; flex-direction: column; gap: var(--s-2); }
   .row {
     display: grid;

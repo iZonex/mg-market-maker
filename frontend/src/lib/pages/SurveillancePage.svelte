@@ -51,6 +51,7 @@
   let patterns = $state({})
   let error = $state(null)
   let lastFetch = $state(null)
+  let loading = $state(true)
 
   async function refresh() {
     try {
@@ -58,8 +59,10 @@
       patterns = data?.patterns ?? {}
       error = null
       lastFetch = new Date()
+      loading = false
     } catch (e) {
       error = e?.message || String(e)
+      loading = false
     }
   }
 
@@ -92,6 +95,8 @@
     <div class="meta">
       {#if error}
         <span class="error">error: {error}</span>
+      {:else if loading}
+        <span class="stale"><span class="spinner" aria-hidden="true"></span>loading…</span>
       {:else if lastFetch}
         <span class="stale">last refresh {lastFetch.toLocaleTimeString()}</span>
       {/if}
@@ -169,8 +174,19 @@
     font-weight: 600;
     color: var(--fg-primary);
   }
-  .meta { font-size: var(--fs-xs); color: var(--fg-muted); }
+  .meta { font-size: var(--fs-xs); color: var(--fg-muted); display: flex; align-items: center; gap: var(--s-2); }
   .meta .error { color: var(--danger); }
+  .spinner {
+    display: inline-block;
+    width: 10px; height: 10px;
+    border: 2px solid var(--border-subtle);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin-right: var(--s-2);
+    vertical-align: middle;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
   .grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));

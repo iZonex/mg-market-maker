@@ -17,6 +17,7 @@
   let error = $state(null)
   let lastFetch = $state(null)
   let onlyResolved = $state(false)
+  let loading = $state(true)
 
   async function refresh() {
     const base = '/api/v1/decisions/recent?limit=200'
@@ -70,8 +71,10 @@
       decisions = flat
       error = null
       lastFetch = new Date()
+      loading = false
     } catch (e) {
       error = e?.message || String(e)
+      loading = false
     }
   }
 
@@ -114,7 +117,9 @@
       {/if}
     </div>
   </div>
-  {#if filtered.length === 0}
+  {#if loading}
+    <div class="empty"><span class="spinner" aria-hidden="true"></span>loading decisions…</div>
+  {:else if filtered.length === 0}
     <div class="empty">no decisions yet</div>
   {:else}
     <div class="table-wrap">
@@ -159,7 +164,25 @@
   .toolbar { display: flex; align-items: center; justify-content: space-between; padding: 0 var(--s-2); font-size: var(--fs-xs); }
   .toggle { display: inline-flex; align-items: center; gap: var(--s-2); color: var(--fg-secondary); }
   .meta .error { color: var(--danger); }
-  .empty { color: var(--fg-muted); font-size: var(--fs-xs); padding: var(--s-4); text-align: center; }
+  .empty {
+    color: var(--fg-muted);
+    font-size: var(--fs-xs);
+    padding: var(--s-4);
+    text-align: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--s-2);
+  }
+  .spinner {
+    display: inline-block;
+    width: 12px; height: 12px;
+    border: 2px solid var(--border-subtle);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
   .table-wrap { overflow-y: auto; max-height: calc(100% - 32px); }
   table { width: 100%; border-collapse: collapse; font-size: var(--fs-xs); }
   thead { position: sticky; top: 0; background: var(--bg-raised); z-index: 1; }
