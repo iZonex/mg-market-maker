@@ -171,9 +171,25 @@ pub struct InflightAtomicBundle {
     pub timeout_ms: u64,
     pub maker_venue: String,
     pub maker_symbol: String,
+    pub maker_side: mm_common::types::Side,
+    pub maker_price: rust_decimal::Decimal,
+    pub maker_acked: bool,
     pub hedge_venue: String,
     pub hedge_symbol: String,
-    pub both_legs_acked: bool,
+    pub hedge_side: mm_common::types::Side,
+    pub hedge_price: rust_decimal::Decimal,
+    pub hedge_acked: bool,
+}
+
+impl InflightAtomicBundle {
+    /// Bundle is fully acknowledged when both legs have been
+    /// observed on the live-orders map of their respective engine.
+    /// Cross-venue legs whose engine this code isn't running on
+    /// stay `false` forever — they get rolled back on timeout,
+    /// which is the 3.E.2 safety net.
+    pub fn both_legs_acked(&self) -> bool {
+        self.maker_acked && self.hedge_acked
+    }
 }
 
 pub struct MarketMakerEngine {
@@ -1727,6 +1743,48 @@ impl MarketMakerEngine {
         (venue, symbol, product, extra)
     }
 
+    /// Multi-Venue 3.E.3 ack sweep: flips `maker_acked` /
+    /// `hedge_acked` flags on inflight bundles when the matching
+    /// leg is observed in this engine's `live_orders`. Called
+    /// before the watchdog so fresh fills aren't rolled back by
+    /// accident.
+    ///
+    /// Only flips legs whose `venue` matches this engine — cross-
+    /// venue legs stay `false` (their home engine owns the flip
+    /// via the same code path). That's why a cross-venue bundle
+    /// whose remote half has only just been dispatched won't get
+    /// fully acked by this engine alone — timeout-based rollback
+    /// remains the safety net.
+    #[allow(dead_code)]
+    pub(crate) fn sweep_atomic_bundle_acks(&mut self) {
+        let self_venue = format!("{:?}", self.config.exchange.exchange_type)
+            .to_lowercase();
+        let live = self.order_manager.live_orders_snapshot();
+        // Price tolerance: half a tick lets venue-side rounding
+        // still match.
+        let tol = self.product.tick_size / rust_decimal_macros::dec!(2);
+        for b in self.inflight_atomic_bundles.values_mut() {
+            let matches = |venue: &str, symbol: &str, side: mm_common::types::Side, price: rust_decimal::Decimal| -> bool {
+                if venue != self_venue || symbol != self.symbol {
+                    return false;
+                }
+                live.iter().any(|(_oid, live_side, live_price, _qty, _status)| {
+                    *live_side == side && (*live_price - price).abs() <= tol
+                })
+            };
+            if !b.maker_acked && matches(&b.maker_venue, &b.maker_symbol, b.maker_side, b.maker_price) {
+                b.maker_acked = true;
+            }
+            if !b.hedge_acked && matches(&b.hedge_venue, &b.hedge_symbol, b.hedge_side, b.hedge_price) {
+                b.hedge_acked = true;
+            }
+        }
+        // Fully-acked bundles graduate out of the inflight table —
+        // the watchdog doesn't need to watch them any more.
+        self.inflight_atomic_bundles
+            .retain(|_, b| !b.both_legs_acked());
+    }
+
     /// Multi-Venue 3.E.2 watchdog: checks every inflight atomic
     /// bundle's age and cancels the surviving leg when the
     /// timeout window elapsed without both sides acknowledged.
@@ -1743,7 +1801,7 @@ impl MarketMakerEngine {
             .iter()
             .filter(|(_id, b): &(&String, &InflightAtomicBundle)| {
                 let elapsed = (now - b.dispatched_at).num_milliseconds().max(0) as u64;
-                elapsed >= b.timeout_ms && !b.both_legs_acked
+                elapsed >= b.timeout_ms && !b.both_legs_acked()
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -2823,6 +2881,10 @@ impl MarketMakerEngine {
                         spec.maker.venue, spec.maker.symbol,
                         spec.hedge.venue, spec.hedge.symbol,
                     );
+                    let to_side = |s: QuoteSide| match s {
+                        QuoteSide::Buy => Side::Buy,
+                        QuoteSide::Sell => Side::Sell,
+                    };
                     self.inflight_atomic_bundles.insert(
                         bundle_id,
                         InflightAtomicBundle {
@@ -2830,9 +2892,14 @@ impl MarketMakerEngine {
                             timeout_ms: spec.timeout_ms,
                             maker_venue: spec.maker.venue.clone(),
                             maker_symbol: spec.maker.symbol.clone(),
+                            maker_side: to_side(spec.maker.side),
+                            maker_price: spec.maker.price,
+                            maker_acked: false,
                             hedge_venue: spec.hedge.venue.clone(),
                             hedge_symbol: spec.hedge.symbol.clone(),
-                            both_legs_acked: false,
+                            hedge_side: to_side(spec.hedge.side),
+                            hedge_price: spec.hedge.price,
+                            hedge_acked: false,
                         },
                     );
                     let _ = json; // payload available for future diagnostic
@@ -6548,14 +6615,85 @@ mod dual_connector_tests {
                 timeout_ms: 2_000,
                 maker_venue: "binance".into(),
                 maker_symbol: "BTCUSDT".into(),
+                maker_side: mm_common::types::Side::Buy,
+                maker_price: dec!(100),
+                maker_acked: false,
                 hedge_venue: "bybit".into(),
                 hedge_symbol: "BTCUSDT".into(),
-                both_legs_acked: false,
+                hedge_side: mm_common::types::Side::Sell,
+                hedge_price: dec!(100),
+                hedge_acked: false,
             },
         );
         let rolled = engine.tick_atomic_bundle_watchdog();
         assert_eq!(rolled, 1, "one stale bundle must roll back");
         assert!(engine.inflight_atomic_bundles.is_empty());
+    }
+
+    /// 3.E.3 — ack sweep graduates a bundle out of the inflight
+    /// table once this engine sees both matching live orders.
+    #[test]
+    fn atomic_bundle_ack_sweep_graduates_self_venue_bundles() {
+        use mm_common::types::{LiveOrder, OrderStatus, Side};
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        let mut engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            sample_config(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        // Seed two live orders on self-engine matching both legs.
+        let now = chrono::Utc::now();
+        engine.order_manager.track_order(LiveOrder {
+            order_id: uuid::Uuid::new_v4(),
+            symbol: "BTCUSDT".into(),
+            side: Side::Buy,
+            price: dec!(100),
+            qty: dec!(1),
+            filled_qty: dec!(0),
+            status: OrderStatus::Open,
+            created_at: now,
+        });
+        engine.order_manager.track_order(LiveOrder {
+            order_id: uuid::Uuid::new_v4(),
+            symbol: "BTCUSDT".into(),
+            side: Side::Sell,
+            price: dec!(101),
+            qty: dec!(1),
+            filled_qty: dec!(0),
+            status: OrderStatus::Open,
+            created_at: now,
+        });
+        // Bundle whose both legs live on self-engine.
+        engine.inflight_atomic_bundles.insert(
+            "self-bundle".into(),
+            InflightAtomicBundle {
+                dispatched_at: now,
+                timeout_ms: 5_000,
+                // Engine's exchange_type defaults to Custom → venue
+                // string is lowercase "custom". Bundle legs must
+                // match so the ack sweep recognises them.
+                maker_venue: "custom".into(),
+                maker_symbol: "BTCUSDT".into(),
+                maker_side: Side::Buy,
+                maker_price: dec!(100),
+                maker_acked: false,
+                hedge_venue: "custom".into(),
+                hedge_symbol: "BTCUSDT".into(),
+                hedge_side: Side::Sell,
+                hedge_price: dec!(101),
+                hedge_acked: false,
+            },
+        );
+        engine.sweep_atomic_bundle_acks();
+        assert!(
+            engine.inflight_atomic_bundles.is_empty(),
+            "fully-acked bundle should graduate out of the inflight table"
+        );
     }
 
     /// Watchdog leaves fresh bundles alone.
@@ -6579,9 +6717,14 @@ mod dual_connector_tests {
                 timeout_ms: 5_000,
                 maker_venue: "binance".into(),
                 maker_symbol: "BTCUSDT".into(),
+                maker_side: mm_common::types::Side::Buy,
+                maker_price: dec!(100),
+                maker_acked: false,
                 hedge_venue: "bybit".into(),
                 hedge_symbol: "BTCUSDT".into(),
-                both_legs_acked: false,
+                hedge_side: mm_common::types::Side::Sell,
+                hedge_price: dec!(100),
+                hedge_acked: false,
             },
         );
         let rolled = engine.tick_atomic_bundle_watchdog();
