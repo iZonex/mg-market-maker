@@ -7,6 +7,7 @@
   import HistoryPage from './lib/pages/HistoryPage.svelte'
   import CalibrationPage from './lib/pages/CalibrationPage.svelte'
   import CompliancePage from './lib/pages/CompliancePage.svelte'
+  import SurveillancePage from './lib/pages/SurveillancePage.svelte'
   import SettingsPage from './lib/pages/SettingsPage.svelte'
   import UsersPage from './lib/pages/UsersPage.svelte'
   import StrategyPage from './lib/pages/StrategyPage.svelte'
@@ -73,6 +74,8 @@
           <CalibrationPage {ws} {auth} />
         {:else if route === 'compliance'}
           <CompliancePage {ws} {auth} />
+        {:else if route === 'surveillance'}
+          <SurveillancePage {auth} />
         {:else if route === 'strategy' && auth.canControl()}
           <StrategyPage {auth} />
         {:else if route === 'settings' && auth.canControl()}

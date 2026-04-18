@@ -82,6 +82,7 @@ pub async fn start(
             get(inventory_venues_symbol),
         )
         .route("/api/v1/clients/loss-state", get(clients_loss_state))
+        .route("/api/v1/surveillance/scores", get(surveillance_scores))
         .merge(crate::client_api::client_routes())
         .merge(crate::client_portal::client_portal_routes())
         .route_layer(middleware::from_fn_with_state(
@@ -324,6 +325,107 @@ async fn prometheus_metrics() -> String {
     encoder
         .encode_to_string(&metric_families)
         .unwrap_or_default()
+}
+
+// ── Sprint 4 companion — surveillance scores JSON endpoint ─
+//
+// `GET /api/v1/surveillance/scores` — frontend-friendly view
+// into the per-pattern detector state. Reads directly from the
+// Prometheus registry (single source of truth), so values here
+// never drift from `/metrics`. Shape:
+//
+//     {
+//         "patterns": {
+//             "spoofing": {
+//                 "BTCUSDT": { "score": 0.73, "alerts_total": 4 },
+//                 "ETHUSDT": { "score": 0.12, "alerts_total": 0 }
+//             },
+//             ...
+//         }
+//     }
+
+#[derive(serde::Serialize)]
+struct SurveillanceScoreRow {
+    score: f64,
+    alerts_total: u64,
+}
+
+#[derive(serde::Serialize)]
+struct SurveillanceScoresResponse {
+    patterns: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, SurveillanceScoreRow>,
+    >,
+}
+
+async fn surveillance_scores() -> Json<SurveillanceScoresResponse> {
+    use prometheus::proto::MetricType;
+    use std::collections::BTreeMap;
+
+    let families = prometheus::gather();
+    let mut scores: BTreeMap<(String, String), f64> = BTreeMap::new();
+    let mut alerts: BTreeMap<(String, String), u64> = BTreeMap::new();
+
+    for fam in &families {
+        match fam.get_name() {
+            "mm_surveillance_score" if fam.get_field_type() == MetricType::GAUGE => {
+                for m in fam.get_metric() {
+                    let (Some(pattern), Some(symbol)) = label_pair(m) else {
+                        continue;
+                    };
+                    scores.insert((pattern, symbol), m.get_gauge().get_value());
+                }
+            }
+            "mm_surveillance_alerts_total"
+                if fam.get_field_type() == MetricType::COUNTER =>
+            {
+                for m in fam.get_metric() {
+                    let (Some(pattern), Some(symbol)) = label_pair(m) else {
+                        continue;
+                    };
+                    alerts.insert(
+                        (pattern, symbol),
+                        m.get_counter().get_value().round() as u64,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut patterns: BTreeMap<String, BTreeMap<String, SurveillanceScoreRow>> =
+        BTreeMap::new();
+    for ((pattern, symbol), score) in &scores {
+        let alerts_total = alerts.get(&(pattern.clone(), symbol.clone())).copied().unwrap_or(0);
+        patterns
+            .entry(pattern.clone())
+            .or_default()
+            .insert(symbol.clone(), SurveillanceScoreRow { score: *score, alerts_total });
+    }
+    // Union in symbols that have alerts but never reported a score
+    // this tick (e.g. detector ran once, hasn't fired since a
+    // restart).
+    for ((pattern, symbol), alerts_total) in alerts {
+        patterns
+            .entry(pattern)
+            .or_default()
+            .entry(symbol)
+            .or_insert(SurveillanceScoreRow { score: 0.0, alerts_total });
+    }
+    Json(SurveillanceScoresResponse { patterns })
+}
+
+fn label_pair(m: &prometheus::proto::Metric) -> (Option<String>, Option<String>) {
+    let mut pattern = None;
+    let mut symbol = None;
+    for lbl in m.get_label() {
+        match lbl.get_name() {
+            "pattern" => pattern = Some(lbl.get_value().to_string()),
+            "symbol" => symbol = Some(lbl.get_value().to_string()),
+            _ => {}
+        }
+    }
+    (pattern, symbol)
 }
 
 // --- Admin: User Management ---
@@ -1313,6 +1415,32 @@ async fn clients_loss_state(State(state): State<DashboardState>) -> Json<Vec<Cli
 /// switches are NOT reset here; operators call the existing
 /// `POST /api/v1/ops/reset/{symbol}` for each sibling engine so
 /// every post-incident escalation is acknowledged.
+#[cfg(test)]
+mod surveillance_tests {
+    use super::*;
+    use crate::metrics::{SURVEILLANCE_ALERTS_TOTAL, SURVEILLANCE_SCORE};
+
+    /// Sprint 4 companion — endpoint reflects the live gauge +
+    /// counter values for the given (pattern, symbol).
+    #[tokio::test]
+    async fn surveillance_scores_reflects_metric_state() {
+        SURVEILLANCE_SCORE
+            .with_label_values(&["spoofing", "UISURV1"])
+            .set(0.73);
+        SURVEILLANCE_ALERTS_TOTAL
+            .with_label_values(&["spoofing", "UISURV1"])
+            .inc_by(3);
+        let Json(out) = surveillance_scores().await;
+        let spoof = out
+            .patterns
+            .get("spoofing")
+            .expect("spoofing bucket present");
+        let row = spoof.get("UISURV1").expect("symbol bucket present");
+        assert!((row.score - 0.73).abs() < 1e-9, "score round-trips");
+        assert_eq!(row.alerts_total, 3, "alerts counter surfaces");
+    }
+}
+
 async fn ops_client_reset(
     State(state): State<DashboardState>,
     Path(client_id): Path<String>,
