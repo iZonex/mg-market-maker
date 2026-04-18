@@ -1625,6 +1625,30 @@ impl MarketMakerEngine {
                     };
                     Some(Box::new(mm_strategy::wash::WashStrategy::with_config(wash_cfg)))
                 }
+                "Strategy.Stuff" => {
+                    use mm_common::types::Side;
+                    let cfg = &n.config;
+                    let parse_dec = |k: &str, default: rust_decimal::Decimal| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(default)
+                    };
+                    let push_side = match cfg.get("push_side").and_then(|v| v.as_str()) {
+                        Some("sell") => Side::Sell,
+                        _ => Side::Buy,
+                    };
+                    let sc = mm_strategy::stuff::StuffConfig {
+                        push_side,
+                        orders_per_tick: cfg.get("orders_per_tick")
+                            .and_then(|v| v.as_i64())
+                            .map(|i| i as usize)
+                            .unwrap_or(20),
+                        step_bps: parse_dec("step_bps", dec!(0.1)),
+                        leg_size: parse_dec("leg_size", dec!(0.001)),
+                    };
+                    Some(Box::new(mm_strategy::stuff::StuffStrategy::with_config(sc)))
+                }
                 "Strategy.Layer" => {
                     use mm_common::types::Side;
                     let cfg = &n.config;

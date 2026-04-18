@@ -16,6 +16,7 @@ pub mod grid;
 pub mod ignite;
 pub mod layer;
 pub mod mark;
+pub mod stuff;
 pub mod inventory_skew;
 pub mod learned_microprice;
 pub mod market_resilience;

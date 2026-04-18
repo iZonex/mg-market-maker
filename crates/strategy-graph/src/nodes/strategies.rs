@@ -464,7 +464,71 @@ impl NodeKind for Layer {
     }
 }
 
-pentest_placeholder!(Stuff, "Strategy.Stuff", "Stuff burst size");
+/// `Strategy.Stuff` — quote-stuffing exploit. Real behaviour in
+/// `StuffStrategy`.
+#[derive(Debug, Default)]
+pub struct Stuff;
+
+impl NodeKind for Stuff {
+    fn kind(&self) -> &'static str {
+        "Strategy.Stuff"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &[]
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUOTES_OUT
+    }
+    fn restricted(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<ConfigField> {
+        vec![
+            ConfigField {
+                name: "push_side",
+                label: "Push side",
+                hint: None,
+                default: serde_json::json!("buy"),
+                widget: ConfigWidget::Enum {
+                    options: vec![
+                        ConfigEnumOption { value: "buy", label: "Buy" },
+                        ConfigEnumOption { value: "sell", label: "Sell" },
+                    ],
+                },
+            },
+            ConfigField {
+                name: "orders_per_tick",
+                label: "Orders per tick",
+                hint: Some("Higher = more stuffing noise"),
+                default: serde_json::json!(20),
+                widget: ConfigWidget::Integer { min: Some(1), max: Some(200) },
+            },
+            ConfigField {
+                name: "step_bps",
+                label: "Step (bps)",
+                hint: Some("Tiny offsets between tiered orders"),
+                default: serde_json::json!("0.1"),
+                widget: ConfigWidget::Number { min: Some(0.01), max: Some(10.0), step: Some(0.1) },
+            },
+            ConfigField {
+                name: "leg_size",
+                label: "Leg size",
+                hint: None,
+                default: serde_json::json!("0.001"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+        ]
+    }
+}
+
 pentest_placeholder!(CrossMarket, "Strategy.CrossMarket", "Cross-market qty");
 pentest_placeholder!(LatencyHunt, "Strategy.LatencyHunt", "Latency-hunt qty");
 pentest_placeholder!(RebateFarm, "Strategy.RebateFarm", "Rebate-farm qty");
