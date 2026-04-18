@@ -33,6 +33,9 @@ static GRID_VIA_GRAPH: &str = include_str!("../templates/grid-via-graph.json");
 static AVELLANEDA_VIA_GRAPH: &str = include_str!("../templates/avellaneda-via-graph.json");
 static BASIS_CARRY_SPOT_PERP: &str = include_str!("../templates/basis-carry-spot-perp.json");
 static PENTEST_SPOOF_CLASSIC: &str = include_str!("../templates/pentest/spoof-classic.json");
+static FUNDING_AWARE_QUOTER: &str = include_str!("../templates/funding-aware-quoter.json");
+static LIQUIDITY_BURN_GUARD: &str = include_str!("../templates/liquidity-burn-guard.json");
+static COST_GATED_QUOTER: &str = include_str!("../templates/cost-gated-quoter.json");
 
 const BUILTIN: &[BuiltinTemplate] = &[
     BuiltinTemplate {
@@ -69,6 +72,23 @@ const BUILTIN: &[BuiltinTemplate] = &[
         name: "pentest-spoof-classic",
         description: "⚠ PENTEST ONLY — Strategy.Spoof + co-located SpoofingScore guard that trips kill L4 when the detector catches us. Requires MM_RESTRICTED_ALLOW=1.",
         body: PENTEST_SPOOF_CLASSIC,
+    },
+    // RS-5 — risk-aware starter graphs using the new Phase II
+    // sources (Funding / Risk / Cost). Operators clone and edit.
+    BuiltinTemplate {
+        name: "funding-aware-quoter",
+        description: "Widens spread 2× when within 60 s of the next funding settle. Uses Funding.seconds_to_next + Cast.ToBool + Logic.Mux → Out.SpreadMult.",
+        body: FUNDING_AWARE_QUOTER,
+    },
+    BuiltinTemplate {
+        name: "liquidity-burn-guard",
+        description: "Shrinks size to zero when Risk.UnrealizedIfFlatten drops below −1000 quote. Catches a book that thinned under us before the drawdown compounds.",
+        body: LIQUIDITY_BURN_GUARD,
+    },
+    BuiltinTemplate {
+        name: "cost-gated-quoter",
+        description: "Pauses quoting when Cost.CumulativeToday passes 100 quote units. Useful for intraday cost-budget limits on low-edge pairs.",
+        body: COST_GATED_QUOTER,
     },
 ];
 
