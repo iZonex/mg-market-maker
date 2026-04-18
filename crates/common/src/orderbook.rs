@@ -3,7 +3,32 @@ use std::collections::BTreeMap;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
-use crate::types::{Price, PriceLevel, Qty};
+use crate::types::{Price, PriceLevel, Qty, Side};
+
+/// MM-1 — Result of a simulated book sweep. Returned by
+/// [`LocalOrderBook::sweep_vwap`]. `impact_bps` is the cost of
+/// taking `target_qty` right now: the absolute delta between
+/// the achievable VWAP and current mid, always non-negative for
+/// the side we're taking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweepResult {
+    pub side: Side,
+    /// Size the caller asked us to fill.
+    pub target_qty: Qty,
+    /// Qty the book actually covers. Equals `target_qty` when
+    /// `fully_filled`; smaller otherwise.
+    pub filled_qty: Qty,
+    /// Total quote notional `sum(price * qty)` over the filled
+    /// portion.
+    pub notional: Decimal,
+    /// Volume-weighted average price across the filled portion.
+    pub vwap: Price,
+    /// `|vwap - mid| / mid * 10_000`, clamped to 0 on the
+    /// favourable side. Cost in bps.
+    pub impact_bps: Decimal,
+    /// True when the book was deep enough to cover `target_qty`.
+    pub fully_filled: bool,
+}
 
 /// Local mirror of the exchange order book, maintained via WebSocket updates.
 #[derive(Debug, Clone)]
@@ -189,6 +214,90 @@ impl LocalOrderBook {
             .collect()
     }
 
+    /// MM-1 — Book-sweep VWAP estimate.
+    ///
+    /// Simulates walking from the top of `side` (buying sweeps
+    /// asks ascending; selling sweeps bids descending) and
+    /// filling as much of `target_qty` as the book can support.
+    /// Returns the filled qty, the notional consumed / received,
+    /// the VWAP over the filled portion, and the absolute
+    /// adverse-side impact in bps vs current mid.
+    ///
+    /// `impact_bps` is always non-negative — it's the cost, not
+    /// a signed delta. A buy that sweeps a thin ask book gets a
+    /// VWAP above mid → positive impact; a sell through a thin
+    /// bid book gets a VWAP below mid → positive impact. Call
+    /// sites treat it as "how many bps did taking this size
+    /// actually cost us right now".
+    ///
+    /// Returns `None` when the book side is empty or mid price
+    /// is zero / missing. Partial fill (book shallower than
+    /// `target_qty`) returns `Some` with `fully_filled = false`.
+    pub fn sweep_vwap(
+        &self,
+        side: Side,
+        target_qty: Qty,
+    ) -> Option<SweepResult> {
+        if target_qty <= Decimal::ZERO {
+            return None;
+        }
+        let mid = self.mid_price()?;
+        if mid <= Decimal::ZERO {
+            return None;
+        }
+        let mut remaining = target_qty;
+        let mut filled = Decimal::ZERO;
+        let mut notional = Decimal::ZERO;
+        // Walk from best: buying sweeps asks ascending; selling
+        // sweeps bids descending.
+        let levels: Box<dyn Iterator<Item = (&Price, &Qty)>> = match side {
+            Side::Buy => Box::new(self.asks.iter()),
+            Side::Sell => Box::new(self.bids.iter().rev()),
+        };
+        for (price, qty) in levels {
+            if remaining <= Decimal::ZERO {
+                break;
+            }
+            let take = if *qty >= remaining { remaining } else { *qty };
+            filled += take;
+            notional += take * price;
+            remaining -= take;
+        }
+        if filled <= Decimal::ZERO {
+            return None;
+        }
+        let vwap = notional / filled;
+        // Absolute adverse-side impact in bps of mid. Always
+        // non-negative for the side we're taking.
+        let signed = match side {
+            Side::Buy => vwap - mid,
+            Side::Sell => mid - vwap,
+        };
+        let ten_k = Decimal::from(10_000);
+        let impact_bps = (signed / mid * ten_k).max(Decimal::ZERO);
+        Some(SweepResult {
+            side,
+            target_qty,
+            filled_qty: filled,
+            notional,
+            vwap,
+            impact_bps,
+            fully_filled: remaining <= Decimal::ZERO,
+        })
+    }
+
+    /// Convenience — just the `(vwap, impact_bps)` pair. For
+    /// callers that only need the cost estimate, not the full
+    /// fill breakdown.
+    pub fn impact_bps(
+        &self,
+        side: Side,
+        size: Qty,
+    ) -> Option<(Price, Decimal)> {
+        let r = self.sweep_vwap(side, size)?;
+        Some((r.vwap, r.impact_bps))
+    }
+
     /// Book imbalance = (bid_depth - ask_depth) / (bid_depth + ask_depth).
     /// Range: -1.0 (all asks) to +1.0 (all bids).
     pub fn imbalance(&self, levels: usize) -> Option<Decimal> {
@@ -333,5 +442,107 @@ mod tests {
         // Spread = 0.01, mid = 77000.005, bps = 0.01/77000.005*10000
         // ≈ 0.001298940861516.
         assert!(bps > dec!(0.001) && bps < dec!(0.002));
+    }
+
+    // ── MM-1: sweep_vwap + impact_bps ─────────────────────
+
+    /// Buy sweep that fits entirely on the first ask level:
+    /// VWAP is that level's price, impact is the one-tick spread
+    /// half-ish (best_ask - mid).
+    #[test]
+    fn sweep_vwap_buy_within_first_level() {
+        let mut book = LocalOrderBook::new("T".into());
+        book.apply_snapshot(
+            vec![level("99", "5.0")],
+            vec![level("101", "5.0"), level("102", "5.0")],
+            1,
+        );
+        let r = book.sweep_vwap(Side::Buy, dec!(2)).unwrap();
+        assert!(r.fully_filled);
+        assert_eq!(r.filled_qty, dec!(2));
+        assert_eq!(r.vwap, dec!(101));
+        // mid = 100, vwap = 101 → 1/100 * 10_000 = 100 bps.
+        assert_eq!(r.impact_bps, dec!(100));
+    }
+
+    /// Buy sweep that crosses two ask levels: VWAP is the
+    /// notional-weighted mean.
+    #[test]
+    fn sweep_vwap_buy_crosses_levels() {
+        let mut book = LocalOrderBook::new("T".into());
+        book.apply_snapshot(
+            vec![level("99", "5.0")],
+            vec![level("101", "1.0"), level("103", "4.0")],
+            1,
+        );
+        let r = book.sweep_vwap(Side::Buy, dec!(3)).unwrap();
+        assert!(r.fully_filled);
+        // Notional = 101 * 1 + 103 * 2 = 307. VWAP = 307 / 3 ≈ 102.333…
+        assert_eq!(r.filled_qty, dec!(3));
+        assert_eq!(r.notional, dec!(307));
+        assert!(r.vwap > dec!(102.33) && r.vwap < dec!(102.34));
+    }
+
+    /// Sell sweep descends the bid side best-first.
+    #[test]
+    fn sweep_vwap_sell_descends_bids() {
+        let mut book = LocalOrderBook::new("T".into());
+        book.apply_snapshot(
+            vec![level("99", "1.0"), level("98", "4.0")],
+            vec![level("101", "5.0")],
+            1,
+        );
+        let r = book.sweep_vwap(Side::Sell, dec!(3)).unwrap();
+        assert!(r.fully_filled);
+        // Notional = 99 * 1 + 98 * 2 = 295. VWAP = 98.333…
+        assert_eq!(r.filled_qty, dec!(3));
+        assert!(r.vwap > dec!(98.33) && r.vwap < dec!(98.34));
+        // mid = 100, vwap = 98.333 → (100 - 98.333)/100 * 10_000
+        // ≈ 166.67 bps.
+        assert!(r.impact_bps > dec!(166) && r.impact_bps < dec!(167));
+    }
+
+    /// Partial fill — book is shallower than target.
+    #[test]
+    fn sweep_vwap_partial_fill_returns_available() {
+        let mut book = LocalOrderBook::new("T".into());
+        book.apply_snapshot(
+            vec![level("99", "5.0")],
+            vec![level("101", "1.0"), level("102", "1.0")],
+            1,
+        );
+        let r = book.sweep_vwap(Side::Buy, dec!(10)).unwrap();
+        assert!(!r.fully_filled);
+        assert_eq!(r.filled_qty, dec!(2));
+    }
+
+    /// Empty side or zero target → None.
+    #[test]
+    fn sweep_vwap_edge_cases_return_none() {
+        let mut book = LocalOrderBook::new("T".into());
+        book.apply_snapshot(vec![level("99", "5.0")], vec![], 1);
+        // Empty ask side.
+        assert!(book.sweep_vwap(Side::Buy, dec!(1)).is_none());
+        // Zero target.
+        book.apply_snapshot(vec![level("99", "5.0")], vec![level("101", "5.0")], 2);
+        assert!(book.sweep_vwap(Side::Buy, dec!(0)).is_none());
+        // Negative target.
+        assert!(book.sweep_vwap(Side::Buy, dec!(-1)).is_none());
+    }
+
+    /// `impact_bps` is just the `(vwap, impact)` pair from a
+    /// full sweep — sanity-check they agree.
+    #[test]
+    fn impact_bps_agrees_with_sweep_vwap() {
+        let mut book = LocalOrderBook::new("T".into());
+        book.apply_snapshot(
+            vec![level("99", "5.0")],
+            vec![level("101", "1.0"), level("103", "4.0")],
+            1,
+        );
+        let full = book.sweep_vwap(Side::Buy, dec!(3)).unwrap();
+        let (vwap, impact) = book.impact_bps(Side::Buy, dec!(3)).unwrap();
+        assert_eq!(vwap, full.vwap);
+        assert_eq!(impact, full.impact_bps);
     }
 }
