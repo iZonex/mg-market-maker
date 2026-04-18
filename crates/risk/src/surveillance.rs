@@ -29,6 +29,7 @@
 //! and the score so a reviewer can second-guess the threshold.
 
 use chrono::{DateTime, Utc};
+use rust_decimal::prelude::Signed;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::{HashMap, VecDeque};
@@ -726,6 +727,438 @@ pub struct WashFillView {
     pub price: Decimal,
 }
 
+// ─── Cross-market manipulation detector ─────────────────────
+//
+// § 8 — activity on an illiquid venue drives the price there;
+// the actor profits on a correlated, liquid venue. We can't see
+// the actor's P&L on the other venue, but we CAN see the
+// correlation signature: bursty trade qty on the illiquid side +
+// a correlated mid move.
+
+#[derive(Debug, Clone)]
+pub struct CrossMarketConfig {
+    /// `illiquid_ratio_hot` — burst vol on illiquid leg / baseline
+    /// vol to score hot. Default 5×.
+    pub illiquid_ratio_hot: Decimal,
+    /// Min |mid correlation| (lagged move fraction) to count at all.
+    pub min_correlated_move_bps: Decimal,
+}
+
+impl Default for CrossMarketConfig {
+    fn default() -> Self {
+        Self {
+            illiquid_ratio_hot: dec!(5),
+            min_correlated_move_bps: dec!(10),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct CrossMarketDetector {
+    pub config: CrossMarketConfig,
+}
+
+impl CrossMarketDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn score(
+        &self,
+        illiquid_ratio: Decimal,
+        liquid_move_bps: Decimal,
+    ) -> DetectorOutput {
+        let ratio_sig = if self.config.illiquid_ratio_hot > Decimal::ZERO {
+            (illiquid_ratio / self.config.illiquid_ratio_hot).min(Decimal::ONE)
+        } else {
+            Decimal::ZERO
+        };
+        let move_sig = if liquid_move_bps.abs() >= self.config.min_correlated_move_bps {
+            Decimal::ONE
+        } else if self.config.min_correlated_move_bps > Decimal::ZERO {
+            (liquid_move_bps.abs() / self.config.min_correlated_move_bps).min(Decimal::ONE)
+        } else {
+            Decimal::ZERO
+        };
+        DetectorOutput {
+            score: ((ratio_sig + move_sig) / dec!(2))
+                .clamp(Decimal::ZERO, Decimal::ONE),
+            cancel_to_fill_ratio: Decimal::ZERO,
+            median_order_lifetime_ms: None,
+            size_vs_avg_trade: None,
+        }
+    }
+}
+
+// ─── Latency exploit detector ──────────────────────────────
+//
+// § 9 — systematic fills against stale quotes on one venue. We
+// see this as: "we're the resting maker, fills arrive faster than
+// a normal round-trip suggests the other side could have learned
+// about our move". Proxy: a spike in `fill_to_cancel_ms` ≤ some
+// tight threshold on our quotes right after we re-priced them.
+
+#[derive(Debug, Clone)]
+pub struct LatencyExploitConfig {
+    /// Threshold `ms` — fills arriving within this of our last
+    /// re-price count toward the score.
+    pub stale_window_ms: i64,
+    /// `hot_count` fills in the stale window → full contribution.
+    pub hot_count: usize,
+}
+
+impl Default for LatencyExploitConfig {
+    fn default() -> Self {
+        Self {
+            stale_window_ms: 50,
+            hot_count: 3,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct LatencyExploitDetector {
+    pub config: LatencyExploitConfig,
+}
+
+impl LatencyExploitDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `fill_deltas_ms` — time between our last re-price and each
+    /// fill that followed, in ms.
+    pub fn score(&self, fill_deltas_ms: &[i64]) -> DetectorOutput {
+        let hits = fill_deltas_ms
+            .iter()
+            .filter(|d| **d <= self.config.stale_window_ms && **d >= 0)
+            .count();
+        let sig = if self.config.hot_count == 0 {
+            Decimal::ZERO
+        } else {
+            (Decimal::from(hits) / Decimal::from(self.config.hot_count))
+                .min(Decimal::ONE)
+        };
+        DetectorOutput { score: sig, ..Default::default() }
+    }
+}
+
+// ─── Rebate-abuse detector ─────────────────────────────────
+//
+// § 10 — positive net PnL driven by rebates rather than trade
+// edge. `trade_pnl < 0` + `rebate_pnl > 0` + `|trade_pnl| <
+// rebate_pnl`. Strong signal we're churning volume without
+// economic value.
+
+#[derive(Debug, Clone)]
+pub struct RebateAbuseConfig {
+    /// Min rebate / trade-loss ratio to count as hot.
+    pub ratio_hot: Decimal,
+}
+
+impl Default for RebateAbuseConfig {
+    fn default() -> Self {
+        Self { ratio_hot: dec!(2) }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct RebateAbuseDetector {
+    pub config: RebateAbuseConfig,
+}
+
+impl RebateAbuseDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn score(&self, trade_pnl: Decimal, rebate_pnl: Decimal) -> DetectorOutput {
+        if rebate_pnl <= Decimal::ZERO || trade_pnl >= Decimal::ZERO {
+            return DetectorOutput::default();
+        }
+        let abs_loss = -trade_pnl;
+        if abs_loss <= Decimal::ZERO {
+            return DetectorOutput::default();
+        }
+        let ratio = rebate_pnl / abs_loss;
+        let sig = if self.config.ratio_hot > Decimal::ZERO {
+            (ratio / self.config.ratio_hot).min(Decimal::ONE)
+        } else {
+            Decimal::ZERO
+        };
+        DetectorOutput { score: sig, ..Default::default() }
+    }
+}
+
+// ─── Imbalance-manipulation detector ───────────────────────
+//
+// § 11 — deliberate order-book imbalance followed by fast
+// reversal. Shape: `|imbalance|` above threshold AND it flips
+// sign within a short window (the "pump then dump" signature).
+
+#[derive(Debug, Clone)]
+pub struct ImbalanceManipulationConfig {
+    /// Imbalance magnitude to count as "skewed" (`[-1, 1]`).
+    pub skew_hot: Decimal,
+    /// Max window (ms) within which a sign flip counts.
+    pub flip_window_ms: i64,
+}
+
+impl Default for ImbalanceManipulationConfig {
+    fn default() -> Self {
+        Self {
+            skew_hot: dec!(0.6),
+            flip_window_ms: 1_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ImbalanceSample {
+    pub ts: DateTime<Utc>,
+    /// Book imbalance in [-1, 1] where +1 = all bids.
+    pub imbalance: Decimal,
+}
+
+#[derive(Debug, Default)]
+pub struct ImbalanceManipulationDetector {
+    pub config: ImbalanceManipulationConfig,
+}
+
+impl ImbalanceManipulationDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn score(&self, samples: &[ImbalanceSample]) -> DetectorOutput {
+        let mut flips = 0usize;
+        for i in 0..samples.len() {
+            if samples[i].imbalance.abs() < self.config.skew_hot {
+                continue;
+            }
+            for j in (i + 1)..samples.len() {
+                let dt = (samples[j].ts - samples[i].ts).num_milliseconds();
+                if dt > self.config.flip_window_ms {
+                    break;
+                }
+                if samples[j].imbalance.abs() >= self.config.skew_hot
+                    && samples[j].imbalance.signum() != samples[i].imbalance.signum()
+                {
+                    flips += 1;
+                    break;
+                }
+            }
+        }
+        let sig = if flips == 0 { Decimal::ZERO } else { Decimal::ONE };
+        DetectorOutput { score: sig, ..Default::default() }
+    }
+}
+
+// ─── Cancel-on-reaction detector ───────────────────────────
+//
+// § 12 — our order is live, some other market participant reacts
+// (observable as a nearby trade), we cancel immediately after.
+// Measured as: cancels whose `time_since_last_nearby_trade_ms` is
+// below a reflex-threshold and whose price was touched by that
+// trade.
+
+#[derive(Debug, Clone)]
+pub struct CancelOnReactionConfig {
+    /// Max ms between a nearby trade and our cancel to count.
+    pub reaction_window_ms: i64,
+    /// Full contribution at this many reactive cancels.
+    pub hot_count: usize,
+}
+
+impl Default for CancelOnReactionConfig {
+    fn default() -> Self {
+        Self {
+            reaction_window_ms: 100,
+            hot_count: 3,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct CancelOnReactionDetector {
+    pub config: CancelOnReactionConfig,
+}
+
+impl CancelOnReactionDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `cancels_after_nearby_trade_ms` — for every cancel we
+    /// fired, the time gap (ms) between the most recent nearby
+    /// public trade and the cancel. `None` entries mean "no
+    /// nearby trade observed" and are ignored.
+    pub fn score(&self, cancels_after_nearby_trade_ms: &[Option<i64>]) -> DetectorOutput {
+        let hits = cancels_after_nearby_trade_ms
+            .iter()
+            .filter_map(|o| *o)
+            .filter(|d| *d >= 0 && *d <= self.config.reaction_window_ms)
+            .count();
+        let sig = if self.config.hot_count == 0 {
+            Decimal::ZERO
+        } else {
+            (Decimal::from(hits) / Decimal::from(self.config.hot_count))
+                .min(Decimal::ONE)
+        };
+        DetectorOutput { score: sig, ..Default::default() }
+    }
+}
+
+// ─── One-sided quoting detector ────────────────────────────
+//
+// § 13 — engine posts only on one side for an extended window
+// without an inventory reason. Visible on the own-quote log —
+// count of ticks where only bid OR only ask existed in the last
+// N ticks, divided by the total window.
+
+#[derive(Debug, Clone)]
+pub struct OneSidedQuotingConfig {
+    /// Fraction of recent ticks that must be one-sided to score
+    /// hot. 0.9 = 90% of the window.
+    pub one_sided_ratio_hot: Decimal,
+}
+
+impl Default for OneSidedQuotingConfig {
+    fn default() -> Self {
+        Self { one_sided_ratio_hot: dec!(0.9) }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct OneSidedQuotingDetector {
+    pub config: OneSidedQuotingConfig,
+}
+
+impl OneSidedQuotingDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn score(&self, one_sided_ticks: usize, total_ticks: usize) -> DetectorOutput {
+        if total_ticks == 0 {
+            return DetectorOutput::default();
+        }
+        let ratio = Decimal::from(one_sided_ticks) / Decimal::from(total_ticks);
+        let sig = if self.config.one_sided_ratio_hot > Decimal::ZERO {
+            (ratio / self.config.one_sided_ratio_hot).min(Decimal::ONE)
+        } else {
+            Decimal::ZERO
+        };
+        DetectorOutput { score: sig, ..Default::default() }
+    }
+}
+
+// ─── Inventory-pushing detector ────────────────────────────
+//
+// § 14 — inventory rises, then aggressive trading on the same
+// side nudges the price in favour of unwinding. Signal: when
+// `inv_delta > 0 AND price_delta > 0` (or both negative),
+// correlation above threshold.
+
+#[derive(Debug, Clone)]
+pub struct InventoryPushingConfig {
+    /// Threshold on `inv_delta × price_delta` (normalised) to
+    /// trigger — positive means inventory is moving with price,
+    /// which is the push signature.
+    pub correlation_hot: Decimal,
+}
+
+impl Default for InventoryPushingConfig {
+    fn default() -> Self {
+        Self { correlation_hot: dec!(0.6) }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct InventoryPushingDetector {
+    pub config: InventoryPushingConfig,
+}
+
+impl InventoryPushingDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn score(&self, inv_delta_norm: Decimal, price_delta_norm: Decimal) -> DetectorOutput {
+        let correlation = inv_delta_norm * price_delta_norm;
+        let sig = if self.config.correlation_hot > Decimal::ZERO {
+            (correlation / self.config.correlation_hot)
+                .max(Decimal::ZERO)
+                .min(Decimal::ONE)
+        } else {
+            Decimal::ZERO
+        };
+        DetectorOutput { score: sig, ..Default::default() }
+    }
+}
+
+// ─── Strategic-non-filling detector ────────────────────────
+//
+// § 15 — orders near-touch but never fill. Fill rate ≈ 0 while
+// sitting inside the touch for a long window. Proxy: the
+// tracker's cancel_to_fill ratio but restricted to near-touch
+// orders only — needs price-at-placement + best-touch-at-cancel
+// context from the tracker.
+
+#[derive(Debug, Clone)]
+pub struct StrategicNonFillingConfig {
+    /// Max distance from mid (bps) for an order to count as
+    /// "near-touch".
+    pub near_touch_bps: Decimal,
+    /// `fill_rate_cold` — anything below this scores full.
+    pub fill_rate_cold: Decimal,
+    /// Minimum ticks placed to consider this signal stable.
+    pub min_placements: usize,
+}
+
+impl Default for StrategicNonFillingConfig {
+    fn default() -> Self {
+        Self {
+            near_touch_bps: dec!(5),
+            fill_rate_cold: dec!(0.05),
+            min_placements: 20,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct StrategicNonFillingDetector {
+    pub config: StrategicNonFillingConfig,
+}
+
+impl StrategicNonFillingDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn score(
+        &self,
+        near_touch_placements: usize,
+        near_touch_fills: usize,
+    ) -> DetectorOutput {
+        if near_touch_placements < self.config.min_placements {
+            return DetectorOutput::default();
+        }
+        let fill_rate = Decimal::from(near_touch_fills) / Decimal::from(near_touch_placements);
+        let sig = if self.config.fill_rate_cold > Decimal::ZERO {
+            if fill_rate >= self.config.fill_rate_cold {
+                Decimal::ZERO
+            } else {
+                Decimal::ONE
+                    - (fill_rate / self.config.fill_rate_cold).min(Decimal::ONE)
+            }
+        } else {
+            Decimal::ZERO
+        };
+        DetectorOutput { score: sig, ..Default::default() }
+    }
+}
+
 // ─── Marking-the-close detector ─────────────────────────────
 //
 // `docs/research/complince.md` § 7 — aggressive trading in the
@@ -1298,6 +1731,76 @@ mod tests {
         let d = FakeLiquidityDetector::new();
         let out = d.score(&then, &now);
         assert!(out.score >= dec!(0.6), "fake-liquidity score was {}", out.score);
+    }
+
+    #[test]
+    fn cross_market_scores_ratio_and_move() {
+        let d = CrossMarketDetector::new();
+        // 5× baseline vol + 20 bps correlated move → both sigs full.
+        assert_eq!(d.score(dec!(5), dec!(20)).score, dec!(1));
+        // Small ratio + flat move → 0.
+        assert_eq!(d.score(dec!(0), dec!(0)).score, dec!(0));
+    }
+
+    #[test]
+    fn latency_exploit_counts_fills_in_window() {
+        let d = LatencyExploitDetector::new();
+        let out = d.score(&[20, 30, 40, 500]);
+        assert_eq!(out.score, dec!(1)); // 3 hits of 3 = 1.0
+    }
+
+    #[test]
+    fn rebate_abuse_needs_losing_trade_pnl() {
+        let d = RebateAbuseDetector::new();
+        // Losing -100, rebate 250 → ratio 2.5 > 2 → 1.0 (clamped).
+        assert_eq!(d.score(dec!(-100), dec!(250)).score, dec!(1));
+        // Positive trade PnL → 0.
+        assert_eq!(d.score(dec!(10), dec!(50)).score, dec!(0));
+    }
+
+    #[test]
+    fn imbalance_manipulation_detects_flip() {
+        let t0 = Utc::now();
+        let samples = vec![
+            ImbalanceSample { ts: t0, imbalance: dec!(0.7) },
+            ImbalanceSample { ts: t0 + chrono::Duration::milliseconds(200), imbalance: dec!(-0.7) },
+        ];
+        let d = ImbalanceManipulationDetector::new();
+        assert_eq!(d.score(&samples).score, dec!(1));
+    }
+
+    #[test]
+    fn cancel_on_reaction_counts_reflex_cancels() {
+        let d = CancelOnReactionDetector::new();
+        let out = d.score(&[Some(20), Some(30), Some(500), None]);
+        assert_eq!(out.score, dec!(1.0).min(dec!(2) / dec!(3))); // 2 hits / 3 hot
+    }
+
+    #[test]
+    fn one_sided_quoting_ratio_ramp() {
+        let d = OneSidedQuotingDetector::new();
+        // 9 / 10 = 0.9 → right at threshold → 1.0.
+        assert_eq!(d.score(9, 10).score, dec!(1));
+        // 1 / 10 = 0.1 → 0.1/0.9 ≈ 0.111.
+        assert!(d.score(1, 10).score < dec!(0.2));
+    }
+
+    #[test]
+    fn inventory_pushing_correlation() {
+        let d = InventoryPushingDetector::new();
+        // Strong positive correlation → hot.
+        assert_eq!(d.score(dec!(0.8), dec!(0.8)).score, dec!(1));
+        // Zero or negative correlation → 0.
+        assert_eq!(d.score(dec!(0.8), dec!(-0.8)).score, dec!(0));
+    }
+
+    #[test]
+    fn strategic_non_filling_needs_min_placements() {
+        let d = StrategicNonFillingDetector::new();
+        // Only 10 placements → below threshold → 0.
+        assert_eq!(d.score(10, 0).score, dec!(0));
+        // 100 placements, 0 fills → fill_rate 0 → fully cold → 1.0.
+        assert_eq!(d.score(100, 0).score, dec!(1));
     }
 
     #[test]

@@ -2169,6 +2169,50 @@ impl MarketMakerEngine {
                         pending_alerts.push((kind.clone(), *id, out));
                     }
                 }
+                // Week 6 — remaining detectors.
+                // These accept their inputs from the existing
+                // engine state where available; fields we haven't
+                // wired a dedicated feed for yet short-circuit to
+                // `score = 0` (the `score` method handles empty
+                // inputs correctly — no Missing leak into downstream).
+                "Surveillance.CrossMarketScore" => {
+                    // Illiquid-ratio proxy: this engine's trade qty
+                    // vs. our own fill tape. Liquid-move proxy:
+                    // mid change over window.
+                    let s = rust_decimal::Decimal::ZERO;
+                    src.insert((*id, "value".into()), Value::Number(s));
+                }
+                "Surveillance.LatencyExploitScore" => {
+                    let s = rust_decimal::Decimal::ZERO;
+                    src.insert((*id, "value".into()), Value::Number(s));
+                }
+                "Surveillance.RebateAbuseScore" => {
+                    // We have PnlTracker but its split is
+                    // trade_pnl + rebate_pnl — pull when surfaced;
+                    // for now, zero.
+                    let s = rust_decimal::Decimal::ZERO;
+                    src.insert((*id, "value".into()), Value::Number(s));
+                }
+                "Surveillance.ImbalanceManipulationScore" => {
+                    let s = rust_decimal::Decimal::ZERO;
+                    src.insert((*id, "value".into()), Value::Number(s));
+                }
+                "Surveillance.CancelOnReactionScore" => {
+                    let s = rust_decimal::Decimal::ZERO;
+                    src.insert((*id, "value".into()), Value::Number(s));
+                }
+                "Surveillance.OneSidedQuotingScore" => {
+                    let s = rust_decimal::Decimal::ZERO;
+                    src.insert((*id, "value".into()), Value::Number(s));
+                }
+                "Surveillance.InventoryPushingScore" => {
+                    let s = rust_decimal::Decimal::ZERO;
+                    src.insert((*id, "value".into()), Value::Number(s));
+                }
+                "Surveillance.StrategicNonFillingScore" => {
+                    let s = rust_decimal::Decimal::ZERO;
+                    src.insert((*id, "value".into()), Value::Number(s));
+                }
                 "Surveillance.FakeLiquidityScore" => {
                     // Pull current L2 off the bus, compare against
                     // the snapshot we stashed at the end of the

@@ -140,6 +140,14 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Surveillance.FakeLiquidityScore" => Some(Box::new(sources::FakeLiquidityScore)),
         "Surveillance.MarkingCloseScore" => Some(Box::new(sources::MarkingCloseScore)),
         "Session.TimeToBoundary" => Some(Box::new(sources::SessionTimeToBoundary)),
+        "Surveillance.CrossMarketScore" => Some(Box::new(sources::CrossMarketScore)),
+        "Surveillance.LatencyExploitScore" => Some(Box::new(sources::LatencyExploitScore)),
+        "Surveillance.RebateAbuseScore" => Some(Box::new(sources::RebateAbuseScore)),
+        "Surveillance.ImbalanceManipulationScore" => Some(Box::new(sources::ImbalanceManipulationScore)),
+        "Surveillance.CancelOnReactionScore" => Some(Box::new(sources::CancelOnReactionScore)),
+        "Surveillance.OneSidedQuotingScore" => Some(Box::new(sources::OneSidedQuotingScore)),
+        "Surveillance.InventoryPushingScore" => Some(Box::new(sources::InventoryPushingScore)),
+        "Surveillance.StrategicNonFillingScore" => Some(Box::new(sources::StrategicNonFillingScore)),
         // Sinks
         "Out.SpreadMult" => Some(Box::new(sinks::SpreadMult)),
         "Out.SizeMult" => Some(Box::new(sinks::SizeMult)),
@@ -252,6 +260,14 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Surveillance.FakeLiquidityScore" => NodeMeta { label: "Fake liquidity score", summary: "L2 levels evaporating within bps-band of mid — the book that disappears on approach", group: "Surveillance" },
         "Surveillance.MarkingCloseScore" => NodeMeta { label: "Marking-close score", summary: "Volume spike within seconds of a session boundary (funding / settlement)", group: "Surveillance" },
         "Session.TimeToBoundary" => NodeMeta { label: "Session boundary", summary: "Seconds to next + since last funding / settlement boundary", group: "Sources" },
+        "Surveillance.CrossMarketScore" => NodeMeta { label: "Cross-market score", summary: "Burst on illiquid venue correlated with liquid-venue move", group: "Surveillance" },
+        "Surveillance.LatencyExploitScore" => NodeMeta { label: "Latency exploit score", summary: "Stale-quote fills — ours got hit within ms of re-pricing", group: "Surveillance" },
+        "Surveillance.RebateAbuseScore" => NodeMeta { label: "Rebate abuse score", summary: "Positive net PnL driven by rebates with negative trade edge", group: "Surveillance" },
+        "Surveillance.ImbalanceManipulationScore" => NodeMeta { label: "Imbalance manipulation score", summary: "Artificial book imbalance followed by fast reversal", group: "Surveillance" },
+        "Surveillance.CancelOnReactionScore" => NodeMeta { label: "Cancel-on-reaction score", summary: "We cancel within ms of a nearby public trade reacting to our quote", group: "Surveillance" },
+        "Surveillance.OneSidedQuotingScore" => NodeMeta { label: "One-sided quoting score", summary: "Engine posts on one side only without inventory reason", group: "Surveillance" },
+        "Surveillance.InventoryPushingScore" => NodeMeta { label: "Inventory pushing score", summary: "Inventory rises as we push price in unwinding direction", group: "Surveillance" },
+        "Surveillance.StrategicNonFillingScore" => NodeMeta { label: "Non-filling score", summary: "Orders placed near-touch but fill rate near zero", group: "Surveillance" },
 
         // Sinks — always fire on a trigger, consumed by the engine.
         "Out.SpreadMult"       => NodeMeta { label: "Spread multiplier",   summary: "Final spread scalar applied to quotes", group: "Sinks" },
@@ -363,6 +379,14 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Surveillance.FakeLiquidityScore",
         "Surveillance.MarkingCloseScore",
         "Session.TimeToBoundary",
+        "Surveillance.CrossMarketScore",
+        "Surveillance.LatencyExploitScore",
+        "Surveillance.RebateAbuseScore",
+        "Surveillance.ImbalanceManipulationScore",
+        "Surveillance.CancelOnReactionScore",
+        "Surveillance.OneSidedQuotingScore",
+        "Surveillance.InventoryPushingScore",
+        "Surveillance.StrategicNonFillingScore",
         "Out.SpreadMult",
         "Out.SizeMult",
         "Out.KillEscalate",
@@ -441,9 +465,10 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_72_nodes_after_epic_r_week_5_marking_close() {
-        // 69 + Session.TimeToBoundary + MarkingCloseScore +
-        // (Strategy.Mark comes in the exploit commit) = 72.
-        assert_eq!(kinds().len(), 72, "catalog drift");
+    fn catalog_has_80_nodes_after_epic_r_week_6_remaining_detectors() {
+        // 72 + 8 new Surveillance.* detectors = 80.
+        // Exploit halves for these 8 patterns + for the earlier
+        // Layering / QuoteStuffing land in Week 7.
+        assert_eq!(kinds().len(), 80, "catalog drift");
     }
 }

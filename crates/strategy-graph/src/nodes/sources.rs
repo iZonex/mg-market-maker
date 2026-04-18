@@ -682,6 +682,41 @@ impl NodeKind for WashScore {
     }
 }
 
+macro_rules! simple_surveillance_score {
+    ($struct_name:ident, $kind:literal) => {
+        #[derive(Debug, Default)]
+        pub struct $struct_name;
+        impl NodeKind for $struct_name {
+            fn kind(&self) -> &'static str {
+                $kind
+            }
+            fn input_ports(&self) -> &[Port] {
+                &EMPTY_INPUTS
+            }
+            fn output_ports(&self) -> &[Port] {
+                &SCORE_ONLY_OUTPUT
+            }
+            fn evaluate(
+                &self,
+                _ctx: &EvalCtx,
+                _inputs: &[Value],
+                _state: &mut NodeState,
+            ) -> Result<Vec<Value>> {
+                Ok(vec![Value::Missing])
+            }
+        }
+    };
+}
+
+simple_surveillance_score!(CrossMarketScore, "Surveillance.CrossMarketScore");
+simple_surveillance_score!(LatencyExploitScore, "Surveillance.LatencyExploitScore");
+simple_surveillance_score!(RebateAbuseScore, "Surveillance.RebateAbuseScore");
+simple_surveillance_score!(ImbalanceManipulationScore, "Surveillance.ImbalanceManipulationScore");
+simple_surveillance_score!(CancelOnReactionScore, "Surveillance.CancelOnReactionScore");
+simple_surveillance_score!(OneSidedQuotingScore, "Surveillance.OneSidedQuotingScore");
+simple_surveillance_score!(InventoryPushingScore, "Surveillance.InventoryPushingScore");
+simple_surveillance_score!(StrategicNonFillingScore, "Surveillance.StrategicNonFillingScore");
+
 /// `Session.TimeToBoundary` — seconds to the next session
 /// boundary (funding window / settlement). Pairs with
 /// `MarkingCloseDetector` + `Cast.ToBool(<=60)` to gate close-
