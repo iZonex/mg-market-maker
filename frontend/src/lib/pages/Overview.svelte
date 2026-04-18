@@ -8,6 +8,7 @@
   import AdaptivePanel from '../components/AdaptivePanel.svelte'
   import InventoryPanel from '../components/InventoryPanel.svelte'
   import InventoryChart from '../components/InventoryChart.svelte'
+  import CrossVenuePortfolio from '../components/CrossVenuePortfolio.svelte'
 
   let { ws, auth } = $props()
 
@@ -35,6 +36,13 @@
     </Card>
     <Card title="Signals" subtitle="microstructure">
       {#snippet children()}<SignalsPanel data={ws} {auth} />{/snippet}
+    </Card>
+  </div>
+
+  <!-- Row 2.5: Cross-venue portfolio (full width) -->
+  <div class="row row-1">
+    <Card title="Cross-venue portfolio" subtitle="net delta per base asset">
+      {#snippet children()}<CrossVenuePortfolio {auth} />{/snippet}
     </Card>
   </div>
 

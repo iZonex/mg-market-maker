@@ -920,6 +920,18 @@ impl DashboardState {
             .sum()
     }
 
+    /// MV-UI-1 — full picture for the cross-venue panel: every
+    /// published `(symbol, venue) → inventory` tuple. Frontend
+    /// groups by the first 3–4 chars of the symbol to produce
+    /// per-base asset breakdowns.
+    pub fn engine_inventory_all(&self) -> Vec<(String, String, Decimal)> {
+        let g = self.inner.read().unwrap();
+        g.engine_inventory
+            .iter()
+            .map(|((sym, venue), v)| (sym.clone(), venue.clone(), *v))
+            .collect()
+    }
+
     /// UI-1 — publish active plans for a symbol. Empty vec
     /// clears previous snapshot.
     pub fn publish_active_plans(&self, symbol: &str, plans: Vec<PlanSnapshot>) {

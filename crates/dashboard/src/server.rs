@@ -86,6 +86,7 @@ pub async fn start(
         .route("/api/v1/decisions/recent", get(decisions_recent))
         .route("/api/v1/plans/active", get(active_plans))
         .route("/api/v1/otr/tiered", get(otr_tiered))
+        .route("/api/v1/portfolio/cross_venue", get(portfolio_cross_venue))
         .merge(crate::client_api::client_routes())
         .merge(crate::client_portal::client_portal_routes())
         .route_layer(middleware::from_fn_with_state(
@@ -458,6 +459,68 @@ struct TieredOtrResponse {
     /// `mm_otr_tiered{symbol,tier,window}` gauge that engines
     /// publish every minute.
     symbols: std::collections::BTreeMap<String, TieredOtrRow>,
+}
+
+#[derive(serde::Serialize)]
+struct CrossVenueLeg {
+    venue: String,
+    symbol: String,
+    inventory: rust_decimal::Decimal,
+}
+
+#[derive(serde::Serialize)]
+struct CrossVenueAsset {
+    /// Best-effort base asset guess (first 3 chars of symbol,
+    /// truncated to where digits start). Coarse but matches how
+    /// `cross_venue_net_delta(base)` works.
+    base: String,
+    net_delta: rust_decimal::Decimal,
+    legs: Vec<CrossVenueLeg>,
+}
+
+#[derive(serde::Serialize)]
+struct CrossVenuePortfolioResponse {
+    assets: Vec<CrossVenueAsset>,
+}
+
+/// Best-effort base-asset inference from a symbol — matches
+/// the `starts_with` logic the aggregator uses.
+fn infer_base_asset(symbol: &str) -> String {
+    // Walk until we hit a digit or run out of letters. Works
+    // for BTCUSDT, BTC-USDT, BTC_USD, BTCUSDC etc.; fails
+    // gracefully for odd tickers by returning the whole
+    // symbol.
+    let boundary = symbol
+        .chars()
+        .position(|c| c.is_ascii_digit() || c == '-' || c == '_' || c == '/')
+        .unwrap_or(symbol.len());
+    symbol[..boundary].to_string()
+}
+
+async fn portfolio_cross_venue(
+    State(state): State<DashboardState>,
+) -> Json<CrossVenuePortfolioResponse> {
+    use std::collections::BTreeMap;
+    let rows = state.engine_inventory_all();
+    // Group by inferred base.
+    let mut by_base: BTreeMap<String, Vec<CrossVenueLeg>> = BTreeMap::new();
+    for (symbol, venue, inv) in rows {
+        let base = infer_base_asset(&symbol);
+        by_base.entry(base).or_default().push(CrossVenueLeg {
+            venue,
+            symbol,
+            inventory: inv,
+        });
+    }
+    let assets = by_base
+        .into_iter()
+        .map(|(base, mut legs)| {
+            legs.sort_by(|a, b| a.venue.cmp(&b.venue).then(a.symbol.cmp(&b.symbol)));
+            let net = legs.iter().map(|l| l.inventory).sum();
+            CrossVenueAsset { base, net_delta: net, legs }
+        })
+        .collect();
+    Json(CrossVenuePortfolioResponse { assets })
 }
 
 async fn otr_tiered() -> Json<TieredOtrResponse> {
