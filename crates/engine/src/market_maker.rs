@@ -6574,6 +6574,48 @@ impl MarketMakerEngine {
 
         self.kill_switch.on_message_sent();
 
+        // INV-1 — hard pre-send inventory stop. Post-generation
+        // `inventory_scale` already shrinks size as inventory
+        // approaches the cap, but a fill race between this tick
+        // and previous tick's survivors can still overshoot. Any
+        // quote whose worst-case single-fill would strictly
+        // breach `max_inventory` gets nulled pre-send. Audit-
+        // logged so operators can trace the refusal.
+        {
+            let inv = self.inventory_manager.inventory();
+            let max_inv = self.config.risk.max_inventory;
+            if max_inv > rust_decimal::Decimal::ZERO {
+                for pair in quotes.iter_mut() {
+                    if let Some(b) = &pair.bid {
+                        if inv + b.qty > max_inv {
+                            self.audit.risk_event(
+                                &self.symbol,
+                                mm_risk::audit::AuditEventType::InventoryLimitHit,
+                                &format!(
+                                    "INV-1 refused bid qty={} price={} — breach max_inventory={} (inv={})",
+                                    b.qty, b.price, max_inv, inv
+                                ),
+                            );
+                            pair.bid = None;
+                        }
+                    }
+                    if let Some(a) = &pair.ask {
+                        if inv - a.qty < -max_inv {
+                            self.audit.risk_event(
+                                &self.symbol,
+                                mm_risk::audit::AuditEventType::InventoryLimitHit,
+                                &format!(
+                                    "INV-1 refused ask qty={} price={} — breach -max_inventory={} (inv={})",
+                                    a.qty, a.price, max_inv, inv
+                                ),
+                            );
+                            pair.ask = None;
+                        }
+                    }
+                }
+            }
+        }
+
         // INT-1 — record one decision per side that has pending
         // quotes this tick, then snapshot live order IDs so the
         // post-execute_diff diff can bind newly-placed orders to
