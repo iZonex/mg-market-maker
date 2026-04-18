@@ -52,6 +52,10 @@ pub fn client_routes() -> Router<DashboardState> {
         .route("/api/v1/archive/health", get(get_archive_health))
         .route("/api/v1/sentiment/snapshot", get(get_sentiment_snapshot))
         .route("/api/v1/sentiment/history", get(get_sentiment_history))
+        .route("/api/v1/strategy/catalog", get(get_strategy_catalog))
+        .route("/api/v1/strategy/graphs", get(list_strategy_graphs))
+        .route("/api/v1/strategy/graphs/{name}", get(get_strategy_graph))
+        .route("/api/v1/strategy/deploys", get(list_strategy_deploys))
         .route("/api/v1/loans", get(get_loans))
         .route("/api/v1/loans/{symbol}", get(get_loan_by_symbol))
         .route(
@@ -831,6 +835,100 @@ async fn get_monthly_pdf(
                 .into_response()
         }
         Err((code, msg)) => (code, msg).into_response(),
+    }
+}
+
+// ── Epic H — strategy graph read endpoints ─────────────────
+
+/// Node catalog snapshot — the UI palette reads this to render draggable
+/// nodes with their typed port declarations.
+#[derive(Serialize)]
+struct CatalogEntry {
+    kind: String,
+    inputs: Vec<CatalogPort>,
+    outputs: Vec<CatalogPort>,
+    restricted: bool,
+}
+#[derive(Serialize)]
+struct CatalogPort {
+    name: String,
+    #[serde(rename = "type")]
+    ty: String,
+}
+
+async fn get_strategy_catalog() -> Json<Vec<CatalogEntry>> {
+    let entries = mm_strategy_graph::catalog::kinds()
+        .into_iter()
+        .map(|(kind, shape)| CatalogEntry {
+            kind: kind.to_string(),
+            inputs: shape
+                .inputs
+                .into_iter()
+                .map(|(name, ty)| CatalogPort {
+                    name,
+                    ty: format!("{ty:?}"),
+                })
+                .collect(),
+            outputs: shape
+                .outputs
+                .into_iter()
+                .map(|(name, ty)| CatalogPort {
+                    name,
+                    ty: format!("{ty:?}"),
+                })
+                .collect(),
+            restricted: shape.restricted,
+        })
+        .collect();
+    Json(entries)
+}
+
+async fn list_strategy_graphs(
+    State(state): State<DashboardState>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let Some(store) = state.strategy_graph_store() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "strategy graphs not configured" })),
+        )
+            .into_response();
+    };
+    match store.list() {
+        Ok(names) => (StatusCode::OK, Json(names)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn get_strategy_graph(
+    State(state): State<DashboardState>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let Some(store) = state.strategy_graph_store() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "strategy graphs not configured")
+            .into_response();
+    };
+    match store.load(&name) {
+        Ok(g) => (StatusCode::OK, Json(g)).into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+    }
+}
+
+async fn list_strategy_deploys(
+    State(state): State<DashboardState>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let Some(store) = state.strategy_graph_store() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "strategy graphs not configured")
+            .into_response();
+    };
+    match store.deploys() {
+        Ok(records) => (StatusCode::OK, Json(records)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 

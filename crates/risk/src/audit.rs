@@ -281,6 +281,13 @@ pub enum AuditEventType {
     /// `detail` carries the previous class.
     NewsRetreatExpired,
 
+    // Epic H — Visual strategy graph (node-editor composer).
+    /// A strategy graph was deployed (validated + swapped into the
+    /// engine). `detail` carries `graph={name} hash={sha256}` so
+    /// compliance exports can join on the hash to reconstruct the
+    /// graph that was live at any point in time.
+    StrategyGraphDeployed,
+
     // Epic F — Listing sniper (stage-3 engine integration).
     /// Listing sniper discovered a new symbol on a venue.
     /// `detail` carries venue + symbol + tick/lot/min_notional.

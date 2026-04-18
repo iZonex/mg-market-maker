@@ -78,6 +78,13 @@ pub enum ConfigOverride {
     /// the asset just evaluate against stale state (the
     /// risk engine's staleness guard returns neutral).
     SentimentTick(mm_sentiment::SentimentTick),
+    /// Epic H — hot-swap the running strategy graph. Payload is
+    /// the graph JSON body; the engine validates + compiles +
+    /// swaps. Admin-only, routed through
+    /// `POST /api/admin/strategy/graph`. Engines whose scope
+    /// doesn't match the graph's scope silently ignore the push
+    /// (the broadcast goes to every config channel).
+    StrategyGraphSwap(String),
 }
 
 /// Per-client state partition (Epic 1: Multi-Client Isolation).
@@ -160,6 +167,11 @@ struct StateInner {
     /// deque is capped at `MAX_SENTIMENT_HISTORY` entries
     /// (24h at 60-second poll cadence).
     sentiment_history: HashMap<String, std::collections::VecDeque<mm_sentiment::SentimentTick>>,
+    /// Epic H — disk-backed graph store. `None` until the
+    /// server boot call to `set_strategy_graph_store`; the
+    /// HTTP handlers treat `None` as "strategy graphs
+    /// disabled on this deployment" and return 503.
+    strategy_graph_store: Option<std::sync::Arc<mm_strategy_graph::GraphStore>>,
     /// Latest per-symbol margin ratio (Epic 40.4). Published by
     /// the engine's `MarginGuard` poll each
     /// `refresh_interval_secs`. Surfaced on the dashboard so
@@ -737,6 +749,19 @@ impl DashboardState {
             .values()
             .cloned()
             .collect()
+    }
+
+    /// Epic H — register the disk-backed graph store. Called once
+    /// from server boot. HTTP handlers 503 until this is set.
+    pub fn set_strategy_graph_store(&self, store: std::sync::Arc<mm_strategy_graph::GraphStore>) {
+        self.inner.write().unwrap().strategy_graph_store = Some(store);
+    }
+
+    /// Epic H — clone of the graph store handle, if registered.
+    pub fn strategy_graph_store(
+        &self,
+    ) -> Option<std::sync::Arc<mm_strategy_graph::GraphStore>> {
+        self.inner.read().unwrap().strategy_graph_store.clone()
     }
 
     /// Publish the latest margin ratio for `symbol` (Epic 40.4).

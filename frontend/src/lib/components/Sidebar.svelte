@@ -9,6 +9,7 @@
     { id: 'orderbook',   label: 'Orderbook',   icon: 'orderbook',   roles: ['admin','operator','viewer'] },
     { id: 'history',     label: 'History',     icon: 'history',     roles: ['admin','operator','viewer'] },
     { id: 'calibration', label: 'Calibration', icon: 'calibration', roles: ['admin','operator'] },
+    { id: 'strategy',    label: 'Strategy',    icon: 'graph',       roles: ['admin','operator'] },
     { id: 'compliance',  label: 'Compliance',  icon: 'compliance',  roles: ['admin','operator'] },
     { id: 'settings',    label: 'Settings',    icon: 'settings',    roles: ['admin','operator'] },
     { id: 'users',       label: 'Users',       icon: 'users',       roles: ['admin'] },

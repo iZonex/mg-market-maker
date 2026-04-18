@@ -2889,6 +2889,7 @@ dependencies = [
  "mm-portfolio",
  "mm-risk",
  "mm-sentiment",
+ "mm-strategy-graph",
  "once_cell",
  "printpdf",
  "prometheus",
@@ -2928,6 +2929,7 @@ dependencies = [
  "mm-risk",
  "mm-sentiment",
  "mm-strategy",
+ "mm-strategy-graph",
  "proptest",
  "rust_decimal",
  "rust_decimal_macros",
@@ -3219,6 +3221,7 @@ dependencies = [
  "mm-risk",
  "mm-sentiment",
  "mm-strategy",
+ "mm-strategy-graph",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -3258,6 +3261,24 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "mm-strategy-graph"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "hex",
+ "once_cell",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
  "tracing",
  "uuid",
 ]

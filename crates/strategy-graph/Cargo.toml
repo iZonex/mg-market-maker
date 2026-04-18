@@ -1,0 +1,28 @@
+[package]
+name = "mm-strategy-graph"
+edition.workspace = true
+version.workspace = true
+
+# Epic H — visual strategy builder backend.
+#
+# Typed DAG of nodes (closed catalog) the engine evaluates on every tick.
+# See `docs/research/visual-strategy-builder.md` for the architecture.
+#
+# This crate stays dependency-light on purpose: it owns the graph +
+# evaluator + node catalog, nothing else. Engine integration happens
+# in `mm-engine`, not here. That keeps the crate unit-testable without
+# needing to mock orderbooks + connectors.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+once_cell = "1"

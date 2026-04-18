@@ -9,6 +9,7 @@
   import CompliancePage from './lib/pages/CompliancePage.svelte'
   import SettingsPage from './lib/pages/SettingsPage.svelte'
   import UsersPage from './lib/pages/UsersPage.svelte'
+  import StrategyPage from './lib/pages/StrategyPage.svelte'
   import AdminPage from './lib/pages/AdminPage.svelte'
   import { createWsStore } from './lib/ws.svelte.js'
   import { createAuthStore } from './lib/auth.svelte.js'
@@ -72,6 +73,8 @@
           <CalibrationPage {ws} {auth} />
         {:else if route === 'compliance'}
           <CompliancePage {ws} {auth} />
+        {:else if route === 'strategy' && auth.canControl()}
+          <StrategyPage {auth} />
         {:else if route === 'settings' && auth.canControl()}
           <SettingsPage {ws} {auth} />
         {:else if route === 'users' && auth.state.role === 'admin'}

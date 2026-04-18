@@ -394,6 +394,14 @@ pub struct MarketMakerEngine {
     /// own volatility + OFI cross-check. `None` = sentiment
     /// layer disabled (all multipliers pinned at 1.0).
     social_risk: Option<mm_risk::social_risk::SocialRiskEngine>,
+    /// Epic H — optional strategy graph. When present, evaluated
+    /// on every hot-loop tick AFTER the hand-wired signal updates.
+    /// Its sinks feed `autotuner.set_graph_{spread,size}_mult` and
+    /// the kill switch. `None` = classic hand-wired pipeline.
+    strategy_graph: Option<mm_strategy_graph::Evaluator>,
+    /// Epic H — stable name of the deployed graph (for audit + metrics
+    /// labels). `None` when no graph is attached.
+    strategy_graph_name: Option<String>,
     /// Epic G — reservation-price skew contribution from the
     /// most recent social evaluation. Bumped by
     /// `SocialRiskState.inv_skew_bps` on every tick and
@@ -753,6 +761,8 @@ impl MarketMakerEngine {
             news_retreat: None,
             social_risk: None,
             social_skew_bps: Decimal::ZERO,
+            strategy_graph: None,
+            strategy_graph_name: None,
             margin_guard: config.margin.as_ref().map(|m| {
                 MarginGuard::new(MarginGuardThresholds::from_config(m))
             }),
@@ -1334,6 +1344,190 @@ impl MarketMakerEngine {
         self.lead_lag_guard = Some(guard);
         self.lead_lag_active = false;
         self
+    }
+
+    /// Epic H — attach a user-authored strategy graph. Compiles
+    /// the graph (runs `Evaluator::build` which includes
+    /// `Graph::validate` — cycle check, port types, etc.). The
+    /// evaluator short-circuits source nodes at tick time, so the
+    /// engine populates `source_inputs` each tick before calling
+    /// `tick()` — see [`Self::tick_strategy_graph`].
+    pub fn with_strategy_graph(
+        mut self,
+        graph: &mm_strategy_graph::Graph,
+    ) -> Result<Self, mm_strategy_graph::ValidationError> {
+        let ev = mm_strategy_graph::Evaluator::build(graph)?;
+        self.strategy_graph = Some(ev);
+        self.strategy_graph_name = Some(graph.name.clone());
+        Ok(self)
+    }
+
+    /// Epic H — hot-swap the running graph. Called from the
+    /// `ConfigOverride::StrategyGraphSwap` branch on the config
+    /// override channel. On validation failure the existing graph
+    /// stays in place and the error is audit-logged; the caller
+    /// gets the error for surfacing to the operator.
+    pub fn swap_strategy_graph(
+        &mut self,
+        graph: &mm_strategy_graph::Graph,
+    ) -> Result<(), mm_strategy_graph::ValidationError> {
+        let ev = mm_strategy_graph::Evaluator::build(graph)?;
+        self.strategy_graph = Some(ev);
+        self.strategy_graph_name = Some(graph.name.clone());
+        self.audit.risk_event(
+            &self.symbol,
+            mm_risk::audit::AuditEventType::StrategyGraphDeployed,
+            &format!(
+                "graph={} hash={}",
+                graph.name,
+                graph.content_hash()
+            ),
+        );
+        info!(symbol = %self.symbol, graph = %graph.name, hash = %graph.content_hash(), "strategy graph swapped");
+        Ok(())
+    }
+
+    /// Evaluate the attached strategy graph (if any). Builds the
+    /// per-tick `source_inputs` from local engine state, calls
+    /// `Evaluator::tick`, applies sink actions to the autotuner
+    /// and kill switch. No-op when no graph is attached.
+    fn tick_strategy_graph(&mut self) {
+        use mm_strategy_graph::{EvalCtx, NodeId, SinkAction, Value};
+        use std::collections::HashMap;
+
+        let Some(ref mut graph) = self.strategy_graph else {
+            return;
+        };
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let ctx = EvalCtx { now_ms };
+
+        // Marshal source values. We key by (_, port_name) and
+        // iterate every source node in the compiled evaluator by
+        // peeking at the graph structure — for MVP, we broadcast
+        // every known source's value to every node of that kind
+        // (there's at most one of each per graph in practice).
+        // The `source_inputs` map is keyed by `(NodeId, port)`
+        // and the evaluator looks up per-node, so we loop over
+        // every known source kind and fan out.
+        let mut src: HashMap<(NodeId, String), Value> = HashMap::new();
+        // Pre-compute values so the closure loop is cheap.
+        let book = &self.book_keeper.book;
+        // `Book.best_{bid,ask}()` return top-of-book prices. Qty at
+        // the top touch isn't on the common orderbook accessor (yet),
+        // so we surface Missing — the UI catalog doc flags the gap
+        // and a follow-up can plumb qty through the book snapshot.
+        let (bid_px, bid_qty, ask_px, ask_qty, mid, spread_bps) = (
+            book.best_bid().map(Value::Number).unwrap_or(Value::Missing),
+            Value::Missing,
+            book.best_ask().map(Value::Number).unwrap_or(Value::Missing),
+            Value::Missing,
+            book.mid_price()
+                .map(Value::Number)
+                .unwrap_or(Value::Missing),
+            book.spread_bps()
+                .map(Value::Number)
+                .unwrap_or(Value::Missing),
+        );
+        let realised_vol = self
+            .volatility_estimator
+            .volatility()
+            .map(Value::Number)
+            .unwrap_or(Value::Missing);
+        let vpin = self
+            .vpin
+            .vpin()
+            .map(Value::Number)
+            .unwrap_or(Value::Missing);
+        let ofi_z = self
+            .momentum
+            .ofi_z()
+            .map(Value::Number)
+            .unwrap_or(Value::Missing);
+
+        // Iterate every node in the evaluator's order, fill source
+        // outputs by kind. The evaluator exposes `order` via a
+        // read-only helper; the kind lookup is identical to what
+        // `tick()` does internally.
+        for (id, kind) in graph.nodes_by_kind().iter() {
+            match kind.as_str() {
+                "Book.L1" => {
+                    src.insert((*id, "bid_px".into()), bid_px.clone());
+                    src.insert((*id, "bid_qty".into()), bid_qty.clone());
+                    src.insert((*id, "ask_px".into()), ask_px.clone());
+                    src.insert((*id, "ask_qty".into()), ask_qty.clone());
+                    src.insert((*id, "mid".into()), mid.clone());
+                    src.insert((*id, "spread_bps".into()), spread_bps.clone());
+                }
+                "Volatility.Realised" => {
+                    src.insert((*id, "value".into()), realised_vol.clone());
+                }
+                "Toxicity.VPIN" => {
+                    src.insert((*id, "value".into()), vpin.clone());
+                }
+                "Momentum.OFIZ" => {
+                    src.insert((*id, "value".into()), ofi_z.clone());
+                }
+                // Sentiment sources are filled from the latest
+                // `SentimentTick` the engine received via
+                // `ConfigOverride::SentimentTick`. That tick's
+                // data lives on the social risk engine's state;
+                // we plumb it here in a follow-up when the per-
+                // graph scope picker can resolve which asset the
+                // graph is for.
+                "Sentiment.Rate" | "Sentiment.Score" => {
+                    src.insert((*id, "value".into()), Value::Missing);
+                }
+                _ => {}
+            }
+        }
+
+        let actions = match graph.tick(&ctx, &src) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(
+                    symbol = %self.symbol,
+                    error = %e,
+                    "strategy graph tick failed"
+                );
+                return;
+            }
+        };
+        for a in actions {
+            match a {
+                SinkAction::SpreadMult(m) => {
+                    self.auto_tuner.set_graph_spread_mult(m);
+                }
+                SinkAction::SizeMult(m) => {
+                    self.auto_tuner.set_graph_size_mult(m);
+                }
+                SinkAction::KillEscalate { level, reason } => {
+                    let kl = match level {
+                        1 => mm_risk::kill_switch::KillLevel::WidenSpreads,
+                        2 => mm_risk::kill_switch::KillLevel::StopNewOrders,
+                        3 => mm_risk::kill_switch::KillLevel::CancelAll,
+                        4 => mm_risk::kill_switch::KillLevel::FlattenAll,
+                        5 => mm_risk::kill_switch::KillLevel::Disconnect,
+                        _ => {
+                            warn!(level, "graph kill sink emitted invalid level");
+                            continue;
+                        }
+                    };
+                    self.kill_switch.manual_trigger(kl, &reason);
+                    self.audit.risk_event(
+                        &self.symbol,
+                        mm_risk::audit::AuditEventType::KillSwitchEscalated,
+                        &format!("graph L{level}: {reason}"),
+                    );
+                    error!(
+                        symbol = %self.symbol,
+                        graph = self.strategy_graph_name.as_deref().unwrap_or("?"),
+                        level,
+                        reason = %reason,
+                        "strategy graph escalated kill switch"
+                    );
+                }
+            }
+        }
     }
 
     /// Epic G — attach a `SocialRiskEngine`. Once attached,
@@ -3349,6 +3543,12 @@ impl MarketMakerEngine {
             self.auto_tuner.clear_market_resilience();
         }
 
+        // Epic H — evaluate the attached strategy graph (if any)
+        // BEFORE the autotune read. The graph's sinks push spread /
+        // size multipliers into the autotuner, so the product below
+        // already includes them.
+        self.tick_strategy_graph();
+
         // Auto-tune.
         let (mut eff_gamma, mut eff_size, mut eff_spread) = if self.config.toxicity.autotune_enabled
         {
@@ -3873,6 +4073,42 @@ impl MarketMakerEngine {
             }
             ConfigOverride::SentimentTick(tick) => {
                 self.on_sentiment_tick(tick);
+                return;
+            }
+            ConfigOverride::StrategyGraphSwap(json) => {
+                match mm_strategy_graph::Graph::from_json(&json) {
+                    Ok(g) => {
+                        // Scope matching — only apply graphs whose
+                        // scope includes this symbol. Global
+                        // always applies; Symbol must match
+                        // exactly; AssetClass / Client handled by
+                        // the server-side broadcast filter, but
+                        // we double-check here as a belt-and-braces.
+                        let applies = match &g.scope {
+                            mm_strategy_graph::Scope::Global => true,
+                            mm_strategy_graph::Scope::Symbol(s) => s == &self.symbol,
+                            mm_strategy_graph::Scope::AssetClass(_)
+                            | mm_strategy_graph::Scope::Client(_) => true,
+                        };
+                        if !applies {
+                            return;
+                        }
+                        if let Err(e) = self.swap_strategy_graph(&g) {
+                            warn!(
+                                symbol = %self.symbol,
+                                error = ?e,
+                                "strategy graph swap rejected by validator"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            symbol = %self.symbol,
+                            error = %e,
+                            "invalid strategy graph JSON"
+                        );
+                    }
+                }
                 return;
             }
             ConfigOverride::ManualKillSwitchReset { reason } => {

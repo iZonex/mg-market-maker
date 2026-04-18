@@ -507,6 +507,13 @@ pub struct AutoTuner {
     /// below 1.0 (it SHRINKS quotes under crowd spikes).
     /// Floored at `min_size_multiplier` by the risk engine.
     social_size_mult: Decimal,
+    /// Epic H — spread multiplier produced by a user-
+    /// authored strategy graph. Layered on top of all the
+    /// hand-wired multipliers; floored at 1.0 same as the
+    /// others (external signals cannot *narrow* the spread).
+    graph_spread_mult: Decimal,
+    /// Epic H — size multiplier from the graph.
+    graph_size_mult: Decimal,
 }
 
 impl AutoTuner {
@@ -523,6 +530,8 @@ impl AutoTuner {
             product_widen_mult: dec!(1),
             social_spread_mult: dec!(1),
             social_size_mult: dec!(1),
+            graph_spread_mult: dec!(1),
+            graph_size_mult: dec!(1),
         }
     }
 
@@ -588,7 +597,7 @@ impl AutoTuner {
         // Reduce size when toxic.
         let toxicity_size = dec!(2) - self.toxicity_spread_mult; // [1, -1] → invert
         let toxicity_size = toxicity_size.max(dec!(0.2)); // Floor at 0.2x.
-        regime_params.size_mult * toxicity_size * self.social_size_mult
+        regime_params.size_mult * toxicity_size * self.social_size_mult * self.graph_size_mult
     }
 
     /// Set the latest Market Resilience score. Values outside
@@ -662,6 +671,28 @@ impl AutoTuner {
         self.social_size_mult
     }
 
+    /// Epic H — push the spread multiplier emitted by a
+    /// strategy graph's `Out.SpreadMult` sink. Floored at
+    /// 1.0 (no narrowing via graphs).
+    pub fn set_graph_spread_mult(&mut self, mult: Decimal) {
+        self.graph_spread_mult = mult.max(Decimal::ONE);
+    }
+
+    pub fn graph_spread_mult(&self) -> Decimal {
+        self.graph_spread_mult
+    }
+
+    /// Epic H — push the size multiplier from a strategy
+    /// graph's `Out.SizeMult` sink. Clamped to `(0.1, 1]`
+    /// (same invariant as social).
+    pub fn set_graph_size_mult(&mut self, mult: Decimal) {
+        self.graph_size_mult = mult.max(dec!(0.1)).min(dec!(1));
+    }
+
+    pub fn graph_size_mult(&self) -> Decimal {
+        self.graph_size_mult
+    }
+
     /// Get effective spread multiplier. The product is:
     /// `regime · toxicity · (1 / max(mr, 0.2)) · lead_lag · news_retreat · product`.
     /// When `lead_lag`, `news_retreat`, and `product` are at
@@ -682,6 +713,7 @@ impl AutoTuner {
             * self.news_retreat_mult
             * self.product_widen_mult
             * self.social_spread_mult
+            * self.graph_spread_mult
     }
 
     /// Get effective refresh interval multiplier.

@@ -141,6 +141,7 @@ pub async fn start(
         .route("/api/admin/optimize/apply", post(admin_optimize_apply))
         .route("/api/admin/optimize/discard", post(admin_optimize_discard))
         .route("/api/admin/sentiment/headline", post(admin_sentiment_headline))
+        .route("/api/admin/strategy/graph", post(admin_deploy_strategy_graph))
         .merge(crate::admin_clients::admin_client_routes())
         .with_state(state.clone());
 
@@ -849,6 +850,111 @@ async fn admin_sentiment_headline(
         "recipients": recipients,
         "chars": body.text.len(),
     }))
+}
+
+// ── Epic H — strategy graph deploy ─────────────────────────
+//
+// `POST /api/admin/strategy/graph` body: the full graph JSON.
+// Flow:
+//   1. parse + compile (runs full validation via `Evaluator::build`).
+//   2. persist via `GraphStore::save` — atomic tmp+rename + deploy
+//      log append + SHA-256 hash.
+//   3. broadcast `ConfigOverride::StrategyGraphSwap(json)` to every
+//      engine; engines whose scope matches swap in the new graph,
+//      engines that don't match silently skip.
+//   4. respond with `{ hash, recipients }`.
+
+async fn admin_deploy_strategy_graph(
+    State(state): State<DashboardState>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    // Parse + validate.
+    let graph = match mm_strategy_graph::Graph::from_json(&body) {
+        Ok(g) => g,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": "parse",
+                    "detail": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    // Compile runs full DAG + type + cycle + sink checks.
+    if let Err(e) = mm_strategy_graph::Evaluator::build(&graph) {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "validate",
+                "detail": format!("{e:?}"),
+            })),
+        )
+            .into_response();
+    }
+
+    let Some(store) = state.strategy_graph_store() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "error": "strategy graphs not configured",
+            })),
+        )
+            .into_response();
+    };
+
+    // Operator identity from the auth layer's request header
+    // (set by the auth middleware). Falls back to "unknown" if
+    // the header is absent — the admin router enforces admin
+    // role via a layer so the endpoint shouldn't reach this point
+    // anonymously, but we don't want a panic on header drift.
+    let operator = headers
+        .get("X-MM-User")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let hash = match store.save(&graph, Some(&operator)) {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "error": "persist",
+                    "detail": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Broadcast. ConfigOverride clones are cheap (String body).
+    let recipients = state.broadcast_config_override(
+        crate::state::ConfigOverride::StrategyGraphSwap(body.clone()),
+    );
+    tracing::info!(
+        name = %graph.name,
+        hash = %hash,
+        recipients,
+        operator = %operator,
+        "strategy graph deployed"
+    );
+
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "status": "deployed",
+            "hash": hash,
+            "recipients": recipients,
+            "name": graph.name,
+        })),
+    )
+        .into_response()
 }
 
 // ── Ops endpoints — manual kill switch control ───────────────

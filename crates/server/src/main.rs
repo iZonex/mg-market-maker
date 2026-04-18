@@ -320,6 +320,19 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Epic H — strategy graph store. Always initialised so the
+    // admin deploy endpoint works even on fresh deployments; the
+    // directory is created on the first save.
+    match mm_strategy_graph::GraphStore::new("data/strategy_graphs") {
+        Ok(store) => {
+            dashboard_state.set_strategy_graph_store(std::sync::Arc::new(store));
+            info!("strategy graph store ready");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "strategy graph store init failed — graphs disabled");
+        }
+    }
+
     // Block B — spawn the compliance report scheduler when
     // at least one cadence is enabled. The concrete
     // `BuiltinReportJob` writes daily / weekly / monthly
