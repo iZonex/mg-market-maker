@@ -67,6 +67,11 @@ pub struct Evaluator {
     /// Declared input port order per node (so we pass values in the
     /// same order the node's `input_ports()` declares).
     input_order: HashMap<NodeId, Vec<String>>,
+    /// Per-node raw config JSON cloned at build time. Exposed via
+    /// [`Self::node_configs`] so the engine source overlay can read
+    /// each `Strategy.*` node's `γ` / `κ` / `σ` / size overrides
+    /// without reparsing the graph JSON on every tick.
+    configs: HashMap<NodeId, serde_json::Value>,
 }
 
 impl std::fmt::Debug for Evaluator {
@@ -90,6 +95,17 @@ impl Evaluator {
             .collect()
     }
 
+    /// Phase 4.7 — per-node raw JSON config, indexed by `NodeId`.
+    /// Engine reads this when building a per-node `StrategyContext`
+    /// so each composite `Strategy.*` node can run its owning strategy
+    /// under its own `γ` / `κ` / `σ` / size / spread overrides. Empty
+    /// when no graph was registered (the evaluator takes ownership of
+    /// the compiled nodes, not their config — we cache the JSON on
+    /// build for this read-only view).
+    pub fn node_configs(&self) -> &HashMap<NodeId, serde_json::Value> {
+        &self.configs
+    }
+
     /// Validate + compile. Resolves every node via the catalog; any
     /// unknown kind, cycle, or port-type mismatch surfaces as a
     /// `ValidationError` here and the caller refuses the deploy.
@@ -101,6 +117,8 @@ impl Evaluator {
         let mut states: HashMap<NodeId, NodeState> = HashMap::with_capacity(graph.nodes.len());
         let mut input_order: HashMap<NodeId, Vec<String>> =
             HashMap::with_capacity(graph.nodes.len());
+        let mut configs: HashMap<NodeId, serde_json::Value> =
+            HashMap::with_capacity(graph.nodes.len());
         for n in &graph.nodes {
             let built = catalog::build(&n.kind, &n.config)
                 .ok_or_else(|| ValidationError::UnknownKind(n.kind.clone()))?;
@@ -111,6 +129,7 @@ impl Evaluator {
             nodes.insert(n.id, built);
             kinds.insert(n.id, n.kind.clone());
             states.insert(n.id, NodeState::default());
+            configs.insert(n.id, n.config.clone());
         }
         let mut incoming: HashMap<(NodeId, String), (NodeId, String)> =
             HashMap::with_capacity(graph.edges.len());
@@ -127,6 +146,7 @@ impl Evaluator {
             states,
             incoming,
             input_order,
+            configs,
         })
     }
 

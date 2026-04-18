@@ -117,6 +117,8 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Strategy.Grid" => Some(Box::new(strategies::Grid)),
         "Strategy.Basis" => Some(Box::new(strategies::Basis)),
         "Strategy.CrossExchange" => Some(Box::new(strategies::CrossExchange)),
+        // Epic R — surveillance detectors (engine overlays per tick)
+        "Surveillance.SpoofingScore" => Some(Box::new(sources::SpoofingScore)),
         // Sinks
         "Out.SpreadMult" => Some(Box::new(sinks::SpreadMult)),
         "Out.SizeMult" => Some(Box::new(sinks::SizeMult)),
@@ -209,6 +211,9 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Strategy.Basis"       => NodeMeta { label: "Basis",               summary: "Basis-shifted reservation price (spot + ref)", group: "Strategies" },
         "Strategy.CrossExchange"=>NodeMeta { label: "Cross-exchange",      summary: "Make on venue A, hedge on venue B", group: "Strategies" },
 
+        // Epic R — surveillance detectors (safe, defaults-on)
+        "Surveillance.SpoofingScore" => NodeMeta { label: "Spoofing score", summary: "Likelihood our own flow looks like spoofing [0..1] + cancel_ratio + lifetime", group: "Surveillance" },
+
         // Sinks — always fire on a trigger, consumed by the engine.
         "Out.SpreadMult"       => NodeMeta { label: "Spread multiplier",   summary: "Final spread scalar applied to quotes", group: "Sinks" },
         "Out.SizeMult"         => NodeMeta { label: "Size multiplier",     summary: "Final size scalar applied to quotes", group: "Sinks" },
@@ -296,6 +301,7 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Strategy.Grid",
         "Strategy.Basis",
         "Strategy.CrossExchange",
+        "Surveillance.SpoofingScore",
         "Out.SpreadMult",
         "Out.SizeMult",
         "Out.KillEscalate",
@@ -374,10 +380,9 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_51_nodes_after_phase_4_strategies() {
-        // Phase 4 Quote.*/Out.Quotes pushed the count to 46.
-        // Strategy.{Avellaneda, GLFT, Grid, Basis, CrossExchange} = 5
-        // → 51. The classic strategies live on graph rails now.
-        assert_eq!(kinds().len(), 51, "catalog drift");
+    fn catalog_has_52_nodes_after_epic_r_week_1() {
+        // 51 after Phase 4.7 + Surveillance.SpoofingScore (first
+        // detector of 15) = 52.
+        assert_eq!(kinds().len(), 52, "catalog drift");
     }
 }

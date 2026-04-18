@@ -201,6 +201,52 @@ impl NodeKind for PairClassCurrent {
     }
 }
 
+// ── Epic R — Surveillance detectors ────────────────────────
+//
+// Source-only nodes. The engine holds the `OrderLifecycleTracker`
+// + the pattern detectors and pushes their per-tick output into the
+// evaluator's `source_inputs` map. Here we only declare the shape
+// — a single `value: Number` port in `[0, 1]` + auxiliary per-pattern
+// diagnostics the UI surfaces on the edge labels so a reviewer can
+// see exactly what signals are driving the score.
+
+/// `Surveillance.SpoofingScore` — likelihood our own order flow
+/// looks like spoofing. `value ∈ [0, 1]` aggregates cancel-to-fill
+/// ratio, median order lifetime, and biggest-open-vs-avg-trade size.
+/// Pair with `Cast.ToBool(>=0.8)` + `Out.KillEscalate` to stand
+/// down when the detector flags us.
+#[derive(Debug, Default)]
+pub struct SpoofingScore;
+
+static SPOOFING_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
+    vec![
+        Port::new("value", PortType::Number),
+        Port::new("cancel_ratio", PortType::Number),
+        Port::new("lifetime_ms", PortType::Number),
+        Port::new("size_ratio", PortType::Number),
+    ]
+});
+
+impl NodeKind for SpoofingScore {
+    fn kind(&self) -> &'static str {
+        "Surveillance.SpoofingScore"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &SPOOFING_OUTPUTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing; 4])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -422,6 +422,18 @@ pub struct MarketMakerEngine {
     /// because the engine still applies **this** tick's strategy
     /// output when the graph doesn't override via `Out.Quotes`.
     last_strategy_quotes: Option<Vec<mm_common::types::QuotePair>>,
+    /// Epic R — surveillance event lifecycle tracker. Fed by the
+    /// order_manager's placement / cancel / fill callbacks; read
+    /// by every `Surveillance.*Score` detector through the strategy
+    /// graph source overlay. Defaulted (empty) so a build without
+    /// surveillance nodes in its graph pays zero cost — the tracker
+    /// is a handful of hashmaps until it sees its first event.
+    surveillance_tracker: mm_risk::surveillance::OrderLifecycleTracker,
+    /// Epic R reference detector — one per pattern would quickly
+    /// get heavy on the struct, so we instantiate detectors on the
+    /// fly in the source overlay. The tracker is the single
+    /// persistent piece of state.
+    spoofing_detector: mm_risk::surveillance::SpoofingDetector,
     /// Epic H — graph scope cached at `with_strategy_graph` /
     /// `swap_strategy_graph` so the per-tick source marshaller
     /// knows which asset to pull sentiment for without re-reading
@@ -791,6 +803,8 @@ impl MarketMakerEngine {
             strategy_graph_hash: None,
             graph_quotes_override: None,
             last_strategy_quotes: None,
+            surveillance_tracker: mm_risk::surveillance::OrderLifecycleTracker::new(),
+            spoofing_detector: mm_risk::surveillance::SpoofingDetector::new(),
             strategy_graph_scope: None,
             margin_guard: config.margin.as_ref().map(|m| {
                 MarginGuard::new(MarginGuardThresholds::from_config(m))
@@ -1617,16 +1631,42 @@ impl MarketMakerEngine {
                     };
                     src.insert((*id, "value".into()), v);
                 }
-                // Phase 4 composite strategies. Every Strategy.*
+                // Phase 4.7 — composite strategies. Every Strategy.*
                 // node reads last tick's `strategy.compute_quotes()`
-                // output as its `quotes: Quotes` port. Engine keeps a
-                // single `self.strategy` instance, so all Strategy.*
-                // nodes in a given graph see the same bundle — the
-                // distinction in kind is cosmetic for now (the node
-                // label tells the operator which strategy is wired),
-                // and the real "mix two strategies with different γ
-                // through a Mux" path will come with the per-node
-                // override follow-up.
+                // output as its `quotes: Quotes` port. All Strategy.*
+                // nodes in a given graph see the same bundle today;
+                // per-node `γ`/`κ`/`σ` override lands in Phase 5.
+                // Epic R — surveillance detector overlays. Read the
+                // per-symbol tracker state and feed the score + its
+                // diagnostics into the node's output ports. Missing
+                // when the tracker has seen nothing on the symbol
+                // yet — score of zero would be misleading (no
+                // evidence != no spoofing).
+                "Surveillance.SpoofingScore" => {
+                    let out = self.spoofing_detector.score(
+                        &self.symbol,
+                        &self.surveillance_tracker,
+                    );
+                    src.insert((*id, "value".into()), Value::Number(out.score));
+                    src.insert(
+                        (*id, "cancel_ratio".into()),
+                        Value::Number(out.cancel_to_fill_ratio),
+                    );
+                    src.insert(
+                        (*id, "lifetime_ms".into()),
+                        match out.median_order_lifetime_ms {
+                            Some(ms) => Value::Number(rust_decimal::Decimal::from(ms)),
+                            None => Value::Missing,
+                        },
+                    );
+                    src.insert(
+                        (*id, "size_ratio".into()),
+                        match out.size_vs_avg_trade {
+                            Some(r) => Value::Number(r),
+                            None => Value::Missing,
+                        },
+                    );
+                }
                 k if k.starts_with("Strategy.") => {
                     let v = match &self.last_strategy_quotes {
                         Some(qs) => {

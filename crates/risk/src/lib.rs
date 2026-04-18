@@ -24,6 +24,7 @@ pub mod portfolio_var;
 pub mod protections;
 pub mod reconciliation;
 pub mod sla;
+pub mod surveillance;
 pub mod toxicity;
 pub mod var_guard;
 pub mod volume_limit;
