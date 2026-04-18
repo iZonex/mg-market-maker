@@ -26,6 +26,7 @@
     'rebate_abuse', 'imbalance_manipulation',
     'cancel_on_reaction', 'one_sided_quoting',
     'inventory_pushing', 'strategic_non_filling',
+    'foreign_twap',
   ]
 
   const PATTERN_LABELS = {
@@ -44,6 +45,7 @@
     one_sided_quoting: 'One-sided quoting',
     inventory_pushing: 'Inventory pushing',
     strategic_non_filling: 'Strategic non-filling',
+    foreign_twap: 'Foreign TWAP (competing algo)',
   }
 
   let patterns = $state({})

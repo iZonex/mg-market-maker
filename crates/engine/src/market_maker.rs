@@ -212,6 +212,7 @@ pub(crate) fn surveillance_pattern_tag(kind: &str) -> Option<&'static str> {
         "Surveillance.OneSidedQuotingScore" => "one_sided_quoting",
         "Surveillance.InventoryPushingScore" => "inventory_pushing",
         "Surveillance.StrategicNonFillingScore" => "strategic_non_filling",
+        "Surveillance.ForeignTwap" => "foreign_twap",
         _ => return None,
     })
 }
@@ -635,6 +636,11 @@ pub struct MarketMakerEngine {
     /// refresh_quotes that emits orders; resolves fills in the
     /// fill branch.
     decision_ledger: Arc<mm_risk::decision_ledger::DecisionLedger>,
+    /// INT-3 — autocorrelation-based foreign-TWAP detector.
+    /// Ingests every `MarketEvent::Trade` via `record_trade`;
+    /// the `Surveillance.ForeignTwap` graph source overlay
+    /// reads `score()` once per tick.
+    foreign_twap: Mutex<mm_risk::foreign_twap::ForeignTwapDetector>,
     dashboard: Option<DashboardState>,
     alerts: Option<AlertManager>,
     /// Multi-currency portfolio aggregator. Shared across all
@@ -1018,6 +1024,9 @@ impl MarketMakerEngine {
             ),
             decision_ledger: Arc::new(
                 mm_risk::decision_ledger::DecisionLedger::default(),
+            ),
+            foreign_twap: Mutex::new(
+                mm_risk::foreign_twap::ForeignTwapDetector::default(),
             ),
             dashboard,
             alerts,
@@ -2897,6 +2906,19 @@ impl MarketMakerEngine {
                     // maintenance). Score through the detector.
                     let out = mm_risk::surveillance::StrategicNonFillingDetector::new()
                         .score(self.near_touch_placements, self.near_touch_fills);
+                    src.insert((*id, "value".into()), Value::Number(out.score));
+                    if out.score >= rust_decimal_macros::dec!(0.8) {
+                        pending_alerts.push((kind.clone(), *id, out));
+                    }
+                }
+                "Surveillance.ForeignTwap" => {
+                    // INT-3 — read the detector's live score from
+                    // the engine-owned autocorrelation ring.
+                    // Trades are ingested on `MarketEvent::Trade`.
+                    let out = match self.foreign_twap.lock() {
+                        Ok(ft) => ft.score(),
+                        Err(_) => mm_risk::surveillance::DetectorOutput::default(),
+                    };
                     src.insert((*id, "value".into()), Value::Number(out.score));
                     if out.score >= rust_decimal_macros::dec!(0.8) {
                         pending_alerts.push((kind.clone(), *id, out));
@@ -4895,6 +4917,13 @@ impl MarketMakerEngine {
                     if dist <= rust_decimal_macros::dec!(0.0010) {
                         self.last_nearby_trade_ts = Some(chrono::Utc::now());
                     }
+                }
+                // INT-3 — feed the ForeignTwap detector's
+                // bucketed autocorrelation ring. Trade timestamp
+                // in ms so the detector doesn't have to ask for
+                // it again.
+                if let Ok(mut ft) = self.foreign_twap.lock() {
+                    ft.record_trade(trade.timestamp.timestamp_millis());
                 }
                 // Multi-Venue 2.B.3 — public-trade tape to DataBus.
                 // `Trade.Tape` source nodes on any graph read this

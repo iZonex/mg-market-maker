@@ -801,6 +801,34 @@ impl NodeKind for FakeLiquidityScore {
     }
 }
 
+/// `Surveillance.ForeignTwap` — INT-3. Autocorrelation-based
+/// detector of a competing participant's TWAP / iceberg
+/// algorithm. Emits a score in [0, 1] where ≥ 0.8 is
+/// conventional alert-grade. Engine overlays the live score
+/// from the per-engine `ForeignTwapDetector` ring.
+#[derive(Debug, Default)]
+pub struct ForeignTwap;
+
+impl NodeKind for ForeignTwap {
+    fn kind(&self) -> &'static str {
+        "Surveillance.ForeignTwap"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &SCORE_ONLY_OUTPUT
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
 /// `Surveillance.MomentumIgnitionScore` — public-tape burst +
 /// aggressor dominance + price-move. Single-port output.
 #[derive(Debug, Default)]

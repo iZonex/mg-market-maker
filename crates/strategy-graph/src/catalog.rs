@@ -162,6 +162,7 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Surveillance.OneSidedQuotingScore" => Some(Box::new(sources::OneSidedQuotingScore)),
         "Surveillance.InventoryPushingScore" => Some(Box::new(sources::InventoryPushingScore)),
         "Surveillance.StrategicNonFillingScore" => Some(Box::new(sources::StrategicNonFillingScore)),
+        "Surveillance.ForeignTwap" => Some(Box::new(sources::ForeignTwap)),
         // Sinks
         "Out.SpreadMult" => Some(Box::new(sinks::SpreadMult)),
         "Out.SizeMult" => Some(Box::new(sinks::SizeMult)),
@@ -295,6 +296,7 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Surveillance.OneSidedQuotingScore" => NodeMeta { label: "One-sided quoting score", summary: "Engine posts on one side only without inventory reason", group: "Surveillance" },
         "Surveillance.InventoryPushingScore" => NodeMeta { label: "Inventory pushing score", summary: "Inventory rises as we push price in unwinding direction", group: "Surveillance" },
         "Surveillance.StrategicNonFillingScore" => NodeMeta { label: "Non-filling score", summary: "Orders placed near-touch but fill rate near zero", group: "Surveillance" },
+        "Surveillance.ForeignTwap" => NodeMeta { label: "Foreign TWAP", summary: "Autocorrelation peak on public-trade cadence — a competing algo is slicing a parent order", group: "Surveillance" },
 
         // Sinks — always fire on a trigger, consumed by the engine.
         "Out.SpreadMult"       => NodeMeta { label: "Spread multiplier",   summary: "Final spread scalar applied to quotes", group: "Sinks" },
@@ -410,6 +412,7 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Strategy.InvPush",
         "Strategy.NonFill",
         "Plan.Accumulate",
+        "Surveillance.ForeignTwap",
         "Surveillance.SpoofingScore",
         "Surveillance.LayeringScore",
         "Surveillance.QuoteStuffingScore",
@@ -504,8 +507,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_91_nodes_after_mm_3_plan_accumulate() {
-        // 90 (Epic R week 7) + 1 (MM-3: Plan.Accumulate) = 91.
-        assert_eq!(kinds().len(), 91, "catalog drift");
+    fn catalog_has_92_nodes_after_int_3_foreign_twap() {
+        // 91 (MM-3) + 1 (INT-3: Surveillance.ForeignTwap) = 92.
+        assert_eq!(kinds().len(), 92, "catalog drift");
     }
 }
