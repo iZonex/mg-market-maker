@@ -5657,6 +5657,93 @@ impl MarketMakerEngine {
                 dash.set_margin_ratio(&self.symbol, info.margin_ratio);
             }
         }
+        // PERP-1 — proactive reduce-only slice. On `Reduce`
+        // decision the engine sends ONE IoC slice each guard
+        // tick that reduces position by `reduce_slice_pct` of
+        // current inventory. Sized off live inventory so a
+        // decreasing position phases the slices naturally as
+        // the guard cools.
+        if decision.wants_reduce() {
+            self.execute_margin_reduce_slice().await;
+        }
+    }
+
+    /// PERP-1 — IoC reduce slice on the inventory-unwind side.
+    /// Size = `reduce_slice_pct` of current absolute inventory
+    /// (config, default 10%). No-op when flat, spot, or market
+    /// book too thin for a slice to cross. Uses the same
+    /// `execute_unwind_slice` path kill-switch L4 already
+    /// exercises, so the order accounting + fill routing are
+    /// unchanged.
+    async fn execute_margin_reduce_slice(&mut self) {
+        let inv = self.inventory_manager.inventory();
+        if inv == rust_decimal::Decimal::ZERO {
+            return;
+        }
+        use mm_common::types::Side;
+        let unwind_side = if inv > rust_decimal::Decimal::ZERO {
+            Side::Sell
+        } else {
+            Side::Buy
+        };
+        let slice_pct = self
+            .config
+            .market_maker
+            .margin_reduce_slice_pct
+            .max(dec!(0.01))
+            .min(dec!(1));
+        let slice_qty = self.product.round_qty(inv.abs() * slice_pct);
+        if slice_qty <= rust_decimal::Decimal::ZERO {
+            return;
+        }
+        // Price: cross-through the near touch so the IoC
+        // actually fills. Use the opposite side of the book
+        // plus a small reach (2 bps).
+        let Some(mid) = self.book_keeper.book.mid_price() else {
+            return;
+        };
+        if mid <= rust_decimal::Decimal::ZERO {
+            return;
+        }
+        let reach = mid * dec!(0.0002);
+        let price = match unwind_side {
+            Side::Sell => self
+                .book_keeper
+                .book
+                .best_bid()
+                .map(|b| b - reach)
+                .unwrap_or(mid - reach),
+            Side::Buy => self
+                .book_keeper
+                .book
+                .best_ask()
+                .map(|a| a + reach)
+                .unwrap_or(mid + reach),
+        };
+        let quote = mm_common::types::Quote { side: unwind_side, price, qty: slice_qty };
+        self.audit.risk_event(
+            &self.symbol,
+            mm_risk::audit::AuditEventType::KillSwitchEscalated,
+            &format!(
+                "PERP-1 proactive reduce slice: side={unwind_side:?} qty={slice_qty} price={price}"
+            ),
+        );
+        if let Err(e) = self
+            .order_manager
+            .execute_unwind_slice(
+                &self.symbol,
+                &quote,
+                &self.product,
+                &self.connectors.primary,
+            )
+            .await
+        {
+            warn!(
+                symbol = %self.symbol,
+                error = %e,
+                "PERP-1 reduce slice failed — guard still escalates on next tick"
+            );
+        }
     }
 
     #[instrument(skip(self), fields(symbol = %self.symbol, tick = self.tick_count))]

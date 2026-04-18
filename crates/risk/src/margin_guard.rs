@@ -40,8 +40,15 @@ use rust_decimal::Decimal;
 pub enum MarginGuardDecision {
     /// Under `widen_ratio` — no action.
     Normal,
-    /// `widen_ratio ≤ ratio < stop_ratio` — spread multiplier up.
+    /// `widen_ratio ≤ ratio < reduce_ratio` — spread multiplier up.
     WidenSpreads,
+    /// PERP-1: `reduce_ratio ≤ ratio < stop_ratio` — engine
+    /// issues a reduce-only IoC slice to proactively lower
+    /// position BEFORE the stop / cancel thresholds fire. New
+    /// orders still flow (this is gentler than
+    /// `StopNewOrders`), but the engine's unwind loop runs in
+    /// parallel.
+    Reduce,
     /// `stop_ratio ≤ ratio < cancel_ratio` — no new orders.
     StopNewOrders,
     /// `ratio ≥ cancel_ratio` — cancel everything and stop.
@@ -63,9 +70,19 @@ impl MarginGuardDecision {
             MarginGuardDecision::WidenSpreads | MarginGuardDecision::Stale => {
                 Some(KillLevel::WidenSpreads)
             }
+            // Reduce doesn't escalate the kill switch — quoting
+            // stays live, the engine just additionally unwinds.
+            // Sidecar action, not escalation.
+            MarginGuardDecision::Reduce => Some(KillLevel::WidenSpreads),
             MarginGuardDecision::StopNewOrders => Some(KillLevel::StopNewOrders),
             MarginGuardDecision::CancelAll => Some(KillLevel::CancelAll),
         }
+    }
+
+    /// PERP-1 — true when the guard wants a proactive reduce
+    /// slice this tick.
+    pub fn wants_reduce(self) -> bool {
+        matches!(self, MarginGuardDecision::Reduce)
     }
 
     pub fn is_stale(self) -> bool {
@@ -79,6 +96,10 @@ impl MarginGuardDecision {
 #[derive(Debug, Clone)]
 pub struct MarginGuardThresholds {
     pub widen_ratio: Decimal,
+    /// PERP-1 — `reduce_ratio ≤ ratio < stop_ratio` triggers
+    /// a proactive reduce slice. Defaults to the midpoint of
+    /// `(widen_ratio, stop_ratio)` if not configured.
+    pub reduce_ratio: Decimal,
     pub stop_ratio: Decimal,
     pub cancel_ratio: Decimal,
     pub max_stale_secs: i64,
@@ -86,8 +107,10 @@ pub struct MarginGuardThresholds {
 
 impl MarginGuardThresholds {
     pub fn from_config(cfg: &MarginConfig) -> Self {
+        let midpoint = (cfg.widen_ratio + cfg.stop_ratio) / Decimal::from(2);
         Self {
             widen_ratio: cfg.widen_ratio,
+            reduce_ratio: cfg.reduce_ratio.unwrap_or(midpoint),
             stop_ratio: cfg.stop_ratio,
             cancel_ratio: cfg.cancel_ratio,
             max_stale_secs: cfg.max_stale_secs as i64,
@@ -194,6 +217,8 @@ impl MarginGuard {
             MarginGuardDecision::CancelAll
         } else if ratio >= t.stop_ratio {
             MarginGuardDecision::StopNewOrders
+        } else if ratio >= t.reduce_ratio {
+            MarginGuardDecision::Reduce
         } else if ratio >= t.widen_ratio {
             MarginGuardDecision::WidenSpreads
         } else {
@@ -211,6 +236,7 @@ mod tests {
     fn thresholds() -> MarginGuardThresholds {
         MarginGuardThresholds {
             widen_ratio: dec!(0.5),
+            reduce_ratio: dec!(0.65),
             stop_ratio: dec!(0.8),
             cancel_ratio: dec!(0.9),
             max_stale_secs: 30,
@@ -251,8 +277,17 @@ mod tests {
             MarginGuardDecision::WidenSpreads
         );
         assert_eq!(
-            MarginGuard::bucket(dec!(0.79), &t),
+            MarginGuard::bucket(dec!(0.64), &t),
             MarginGuardDecision::WidenSpreads
+        );
+        // PERP-1 — Reduce band starts at 0.65 in the test fixture.
+        assert_eq!(
+            MarginGuard::bucket(dec!(0.65), &t),
+            MarginGuardDecision::Reduce
+        );
+        assert_eq!(
+            MarginGuard::bucket(dec!(0.79), &t),
+            MarginGuardDecision::Reduce
         );
         assert_eq!(
             MarginGuard::bucket(dec!(0.8), &t),

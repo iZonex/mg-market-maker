@@ -70,6 +70,7 @@ fn make_config() -> MarketMakerConfig {
         inventory_drift_auto_correct: false,
         amend_enabled: true,
         amend_max_ticks: 2,
+            margin_reduce_slice_pct: rust_decimal_macros::dec!(0.1),
         fee_tier_refresh_enabled: true,
         fee_tier_refresh_secs: 600,
         borrow_enabled: false,

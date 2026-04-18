@@ -1133,6 +1133,13 @@ pub struct MarketMakerConfig {
     #[serde(default = "default_amend_max_ticks")]
     pub amend_max_ticks: u32,
 
+    /// PERP-1 — fraction of absolute inventory to unload per
+    /// margin-guard tick when `Reduce` fires. Default 0.1 =
+    /// 10% per tick (~every 5–10 s at typical poll cadence).
+    /// Clamped to [0.01, 1.0] at use-site.
+    #[serde(default = "default_margin_reduce_slice_pct")]
+    pub margin_reduce_slice_pct: Decimal,
+
     /// Enable the periodic fee-tier refresh task. When `true`,
     /// the engine queries `ExchangeConnector::fetch_fee_tiers`
     /// every `fee_tier_refresh_secs` and hot-swaps the
@@ -1665,6 +1672,10 @@ fn default_margin_refresh_secs() -> u64 {
     5
 }
 
+fn default_margin_reduce_slice_pct() -> Decimal {
+    rust_decimal_macros::dec!(0.1)
+}
+
 fn default_widen_ratio() -> Decimal {
     dec!(0.50)
 }
@@ -1699,6 +1710,12 @@ pub struct MarginConfig {
     /// Ratio threshold for `KillLevel::WidenSpreads`.
     #[serde(default = "default_widen_ratio")]
     pub widen_ratio: Decimal,
+    /// PERP-1 — ratio threshold at which the engine starts
+    /// shipping proactive reduce-only IoC slices to lower
+    /// position *before* `stop_ratio`. `None` falls back to
+    /// the midpoint of `(widen, stop)`.
+    #[serde(default)]
+    pub reduce_ratio: Option<Decimal>,
     /// Ratio threshold for `KillLevel::StopNewOrders`.
     #[serde(default = "default_stop_ratio")]
     pub stop_ratio: Decimal,
@@ -1731,6 +1748,7 @@ impl Default for MarginConfig {
         Self {
             refresh_interval_secs: default_margin_refresh_secs(),
             widen_ratio: default_widen_ratio(),
+            reduce_ratio: None,
             stop_ratio: default_stop_ratio(),
             cancel_ratio: default_cancel_ratio(),
             max_stale_secs: default_max_stale_secs(),
@@ -2142,6 +2160,7 @@ impl Default for AppConfig {
                 inventory_drift_auto_correct: false,
                 amend_enabled: true,
                 amend_max_ticks: 2,
+                margin_reduce_slice_pct: "0.1".parse().unwrap(),
                 fee_tier_refresh_enabled: true,
                 fee_tier_refresh_secs: 600,
                 borrow_enabled: false,

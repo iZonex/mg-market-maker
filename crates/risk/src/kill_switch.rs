@@ -226,6 +226,9 @@ impl KillSwitch {
                 crate::MarginGuardDecision::WidenSpreads => {
                     "margin ratio elevated (>= widen_ratio)"
                 }
+                crate::MarginGuardDecision::Reduce => {
+                    "margin ratio high — engine reducing proactively (>= reduce_ratio)"
+                }
                 crate::MarginGuardDecision::StopNewOrders => {
                     "margin ratio high (>= stop_ratio)"
                 }

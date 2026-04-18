@@ -153,6 +153,7 @@ mod tests {
             inventory_drift_tolerance: dec!(0.0001),
             inventory_drift_auto_correct: false,
             amend_enabled: false, amend_max_ticks: 2,
+            margin_reduce_slice_pct: rust_decimal_macros::dec!(0.1),
             fee_tier_refresh_enabled: false, fee_tier_refresh_secs: 600,
             borrow_enabled: false, borrow_rate_refresh_secs: 1800,
             borrow_holding_secs: 3600, borrow_max_base: dec!(0),
