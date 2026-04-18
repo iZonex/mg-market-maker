@@ -422,6 +422,27 @@ pub struct MarketMakerEngine {
     /// because the engine still applies **this** tick's strategy
     /// output when the graph doesn't override via `Out.Quotes`.
     last_strategy_quotes: Option<Vec<mm_common::types::QuotePair>>,
+    /// Epic H Phase 5 — per-node strategy pool. Built on every
+    /// graph deploy by walking the graph's `Strategy.*` nodes and
+    /// instantiating each one with its own parsed config. The
+    /// overlay path reads the matching instance's
+    /// `compute_quotes()` output (via the per-node cache below)
+    /// instead of `self.strategy`, which means two Strategy.Spoof
+    /// nodes in one graph with different `pressure_size_mult` now
+    /// genuinely run with those different parameters.
+    strategy_pool: std::collections::HashMap<
+        mm_strategy_graph::NodeId,
+        Box<dyn mm_strategy::r#trait::Strategy>,
+    >,
+    /// Last tick's `compute_quotes()` output per-pool-instance,
+    /// keyed by the node id. Refreshed at the end of
+    /// `refresh_quotes` once the StrategyContext is built — the
+    /// next graph tick reads this map and injects the bundle as
+    /// the node's `quotes` output.
+    last_strategy_quotes_per_node: std::collections::HashMap<
+        mm_strategy_graph::NodeId,
+        Vec<mm_common::types::QuotePair>,
+    >,
     /// Epic R — surveillance event lifecycle tracker. Fed by the
     /// order_manager's placement / cancel / fill callbacks; read
     /// by every `Surveillance.*Score` detector through the strategy
@@ -801,6 +822,8 @@ impl MarketMakerEngine {
             strategy_graph_hash: None,
             graph_quotes_override: None,
             last_strategy_quotes: None,
+            strategy_pool: std::collections::HashMap::new(),
+            last_strategy_quotes_per_node: std::collections::HashMap::new(),
             surveillance_tracker: mm_risk::surveillance::new_shared_tracker(),
             surveillance_last_alert: std::collections::HashMap::new(),
             strategy_graph_scope: None,
@@ -1387,6 +1410,83 @@ impl MarketMakerEngine {
         self
     }
 
+    /// Epic H Phase 5 — walk a graph's `Strategy.*` nodes and build
+    /// one `Box<dyn Strategy>` per occurrence, reading the node's
+    /// own JSON config for per-knob overrides. Intentionally
+    /// tolerates missing kinds (skipped silently) and bad configs
+    /// (falls back to the strategy's `Default`) — the deploy
+    /// validator already caught catalog-level issues; we just want
+    /// the pool to keep running on configs it can't parse.
+    fn build_strategy_pool(
+        graph: &mm_strategy_graph::Graph,
+    ) -> std::collections::HashMap<
+        mm_strategy_graph::NodeId,
+        Box<dyn mm_strategy::r#trait::Strategy>,
+    > {
+        use mm_strategy::r#trait::Strategy as StrategyTrait;
+        let mut pool: std::collections::HashMap<
+            mm_strategy_graph::NodeId,
+            Box<dyn StrategyTrait>,
+        > = std::collections::HashMap::new();
+        for n in &graph.nodes {
+            let built: Option<Box<dyn StrategyTrait>> = match n.kind.as_str() {
+                "Strategy.Avellaneda" => {
+                    Some(Box::new(mm_strategy::AvellanedaStoikov))
+                }
+                "Strategy.GLFT" => {
+                    Some(Box::new(mm_strategy::glft::GlftStrategy::default()))
+                }
+                "Strategy.Grid" => Some(Box::new(mm_strategy::grid::GridStrategy)),
+                "Strategy.Basis" => {
+                    // Basis params come from engine config today —
+                    // node-level override lands when Basis gets its
+                    // own schema.
+                    let shift = rust_decimal_macros::dec!(0.5);
+                    let max_basis_bps = rust_decimal_macros::dec!(100);
+                    Some(Box::new(mm_strategy::basis::BasisStrategy::new(
+                        shift,
+                        max_basis_bps,
+                    )))
+                }
+                "Strategy.CrossExchange" => {
+                    // min_profit_bps taken from engine config; per-
+                    // node override lands with the schema pass.
+                    let min_profit = rust_decimal_macros::dec!(5);
+                    Some(Box::new(
+                        mm_strategy::cross_exchange::CrossExchangeStrategy::new(min_profit),
+                    ))
+                }
+                "Strategy.Spoof" => {
+                    use mm_common::types::Side;
+                    let cfg = &n.config;
+                    let parse_dec = |k: &str, default: rust_decimal::Decimal| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(default)
+                    };
+                    let pressure_side = match cfg.get("pressure_side").and_then(|v| v.as_str()) {
+                        Some("sell") => Side::Sell,
+                        _ => Side::Buy,
+                    };
+                    let spoof_cfg = mm_strategy::spoof::SpoofConfig {
+                        pressure_side,
+                        pressure_size_mult: parse_dec("pressure_size_mult", dec!(10)),
+                        pressure_distance_bps: parse_dec("pressure_distance_bps", dec!(15)),
+                        real_size_mult: parse_dec("real_size_mult", dec!(1)),
+                        real_distance_bps: parse_dec("real_distance_bps", dec!(3)),
+                    };
+                    Some(Box::new(mm_strategy::spoof::SpoofStrategy::with_config(spoof_cfg)))
+                }
+                _ => None,
+            };
+            if let Some(s) = built {
+                pool.insert(n.id, s);
+            }
+        }
+        pool
+    }
+
     /// Epic H — attach a user-authored strategy graph. Compiles
     /// the graph (runs `Evaluator::build` which includes
     /// `Graph::validate` — cycle check, port types, etc.). The
@@ -1402,6 +1502,8 @@ impl MarketMakerEngine {
         self.strategy_graph_name = Some(graph.name.clone());
         self.strategy_graph_hash = Some(graph.content_hash());
         self.strategy_graph_scope = Some(graph.scope.clone());
+        self.strategy_pool = Self::build_strategy_pool(graph);
+        self.last_strategy_quotes_per_node.clear();
         Ok(self)
     }
 
@@ -1419,6 +1521,8 @@ impl MarketMakerEngine {
         self.strategy_graph_name = Some(graph.name.clone());
         self.strategy_graph_hash = Some(graph.content_hash());
         self.strategy_graph_scope = Some(graph.scope.clone());
+        self.strategy_pool = Self::build_strategy_pool(graph);
+        self.last_strategy_quotes_per_node.clear();
         self.audit.risk_event(
             &self.symbol,
             mm_risk::audit::AuditEventType::StrategyGraphDeployed,
@@ -1685,8 +1789,18 @@ impl MarketMakerEngine {
                         pending_alerts.push((kind.clone(), *id, out));
                     }
                 }
+                // Phase 5 — composite strategies with per-node pool.
+                // Each `Strategy.*` node reads its own pool instance's
+                // last-tick output (computed with the node's own
+                // parsed config — γ / spoof size / ref_symbol / …).
+                // Falls back to the shared `last_strategy_quotes` so
+                // legacy graphs with no pool instance keep working.
                 k if k.starts_with("Strategy.") => {
-                    let v = match &self.last_strategy_quotes {
+                    let qs: Option<&Vec<mm_common::types::QuotePair>> =
+                        self.last_strategy_quotes_per_node
+                            .get(id)
+                            .or(self.last_strategy_quotes.as_ref());
+                    let v = match qs {
                         Some(qs) => {
                             use mm_common::types::Side;
                             use mm_strategy_graph::{GraphQuote, QuoteSide};
@@ -4161,6 +4275,17 @@ impl MarketMakerEngine {
                 // nodes — they read it out of `last_strategy_quotes`
                 // via the source marshaller.
                 self.last_strategy_quotes = Some(strategy_quotes.clone());
+                // Phase 5 — also refresh every pool-instance so the
+                // node-level config (different γ across two
+                // `Strategy.Avellaneda`s for example) actually takes
+                // effect. Same ctx, different knobs.
+                let mut per_node = std::collections::HashMap::with_capacity(
+                    self.strategy_pool.len(),
+                );
+                for (node_id, strat) in &self.strategy_pool {
+                    per_node.insert(*node_id, strat.compute_quotes(&ctx));
+                }
+                self.last_strategy_quotes_per_node = per_node;
                 strategy_quotes
             }
         };
