@@ -69,11 +69,14 @@ pub const MAX_GRAPH_DEPTH: usize = 128;
 /// can render them all without caller-side string fishing.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ValidationError {
-    #[error("unsupported schema version {0} (current: {1})")]
+    #[error("saved with schema v{0}, this build reads v{1} — re-save the graph")]
     UnsupportedVersion(u32, u32),
-    #[error("duplicate node id {0}")]
+    #[error("two nodes share the same id — delete the duplicate")]
     DuplicateNodeId(NodeId),
-    #[error("edge {from}:{from_port} -> {to}:{to_port} references missing node")]
+    #[error(
+        "a connection points at a node that no longer exists \
+         (port \"{to_port}\") — delete the stale connection and re-wire"
+    )]
     DanglingEdge {
         from: NodeId,
         from_port: String,
@@ -81,8 +84,8 @@ pub enum ValidationError {
         to_port: String,
     },
     #[error(
-        "port type mismatch on edge {from}:{from_port} -> {to}:{to_port} \
-         ({from_ty:?} -> {to_ty:?})"
+        "can't connect a {from_ty:?} output to a {to_ty:?} input \
+         (edge \"{from_port}\" → \"{to_port}\") — the port types must match"
     )]
     PortTypeMismatch {
         from: NodeId,
@@ -92,24 +95,29 @@ pub enum ValidationError {
         from_ty: PortType,
         to_ty: PortType,
     },
-    #[error("cycle detected involving node {0}")]
+    #[error("the graph has a loop (node {0} feeds into itself) — break the cycle")]
     Cycle(NodeId),
     #[error(
-        "input port {to}:{to_port} has {count} incoming edges (max 1)"
+        "input port \"{to_port}\" has {count} incoming connections \
+         but only accepts one — remove the extra"
     )]
     MultipleInputs {
         to: NodeId,
         to_port: String,
         count: usize,
     },
-    #[error("graph contains no reachable Out.SpreadMult sink")]
+    #[error(
+        "every graph needs one Out.SpreadMult sink — add a \
+         \"Spread multiplier\" node and connect your output to it"
+    )]
     NoSpreadMultSink,
-    #[error("graph depth {0} exceeds MAX_GRAPH_DEPTH={1}")]
+    #[error("graph is too deep ({0} levels, limit {1}) — flatten some branches")]
     DepthExceeded(usize, usize),
-    #[error("unknown node kind '{0}'")]
+    #[error("unknown node type \"{0}\" — was it renamed or removed from the catalog?")]
     UnknownKind(String),
     #[error(
-        "restricted node '{0}' present but MM_ALLOW_RESTRICTED is not set"
+        "node \"{0}\" is restricted (pentest-only) — deploy blocked \
+         unless MM_RESTRICTED_ALLOW=1 is set on the server"
     )]
     RestrictedNotAllowed(String),
 }

@@ -916,7 +916,7 @@ async fn admin_deploy_strategy_graph(
             StatusCode::BAD_REQUEST,
             axum::Json(serde_json::json!({
                 "error": "validate",
-                "detail": format!("{e:?}"),
+                "detail": e.to_string(),
             })),
         )
             .into_response();

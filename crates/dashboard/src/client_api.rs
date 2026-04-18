@@ -1035,7 +1035,11 @@ async fn validate_strategy_graph(
     // kinds, port type mismatches, cycles, and the SpreadMult-sink
     // requirement in one call.
     if let Err(e) = mm_strategy_graph::Evaluator::build(&req.graph) {
-        issues.push(format!("{e:?}"));
+        // thiserror's Display form is the human-facing message
+        // (`"graph contains no reachable Out.SpreadMult sink"`),
+        // not the enum variant name. Keep it that way here so the
+        // validation strip in the UI shows operator-readable text.
+        issues.push(e.to_string());
     }
 
     // Dangling-edges audit. Evaluator::build tolerates missing inputs
@@ -1157,7 +1161,7 @@ async fn save_custom_template(
     if let Err(e) = mm_strategy_graph::Evaluator::build(&req.graph) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "validate", "detail": format!("{e:?}") })),
+            Json(serde_json::json!({ "error": "validate", "detail": e.to_string() })),
         )
             .into_response();
     }
@@ -1252,7 +1256,7 @@ async fn preview_strategy_graph(
                 Json(PreviewResponse {
                     edges: HashMap::new(),
                     sinks: vec![],
-                    errors: vec![format!("{e:?}")],
+                    errors: vec![e.to_string()],
                 }),
             )
                 .into_response();
