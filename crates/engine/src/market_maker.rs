@@ -391,6 +391,12 @@ pub struct MarketMakerEngine {
     /// Prometheus. Market-quality / spoofing proxy tracked for
     /// MiCA compliance.
     otr: OrderToTradeRatio,
+    /// INT-2 — TOB vs Top20 × cumulative vs 5-min OTR. Runs in
+    /// parallel with the legacy scalar counter above so existing
+    /// `self.otr.ratio()` call-sites keep their byte-identical
+    /// numbers. New Prometheus gauges + frontend grid read from
+    /// this tracker.
+    tiered_otr: mm_risk::otr::TieredOtrTracker,
     /// Inventory-vs-wallet drift reconciler. Snapshots the
     /// wallet total at first reconcile and flags any
     /// divergence between the wallet delta and the
@@ -832,6 +838,7 @@ impl MarketMakerEngine {
             adverse_selection: AdverseSelectionTracker::new(200),
             market_resilience: MarketResilienceCalculator::new(MrConfig::default()),
             otr: OrderToTradeRatio::new(),
+            tiered_otr: mm_risk::otr::TieredOtrTracker::new(),
             inventory_drift: InventoryDriftReconciler::new(
                 product.base_asset.clone(),
                 config.market_maker.inventory_drift_tolerance,
@@ -4900,6 +4907,16 @@ impl MarketMakerEngine {
                 // `otr_enabled` toggle.
                 if self.config.market_maker.otr_enabled {
                     self.otr.on_update();
+                    // INT-2 — L2 book deltas don't expose their
+                    // price level at this callsite, so tag them
+                    // as Top20 (broader-tier bucket). A follow-up
+                    // can split the delta earlier in
+                    // `book_keeper.on_event` to promote TOB hits
+                    // to the tighter tier.
+                    self.tiered_otr.on_update(
+                        mm_risk::otr::OtrTier::Top20,
+                        chrono::Utc::now().timestamp_millis(),
+                    );
                 }
                 if let Some(mid) = self.book_keeper.book.mid_price() {
                     self.volatility_estimator.update(mid);
@@ -5038,6 +5055,26 @@ impl MarketMakerEngine {
                 self.momentum.on_trade(trade);
                 if self.config.market_maker.otr_enabled {
                     self.otr.on_trade();
+                    // INT-2 — classify trade by price-tier: at
+                    // the touch vs within Top20 depth. Trades
+                    // outside Top20 still tag as Top20 here
+                    // (they're rare past the 20 nearest levels,
+                    // and the accumulating behaviour on Top20 is
+                    // what compliance actually asks for).
+                    let tier = if let (Some(bb), Some(ba)) = (
+                        self.book_keeper.book.best_bid(),
+                        self.book_keeper.book.best_ask(),
+                    ) {
+                        if trade.price == bb || trade.price == ba {
+                            mm_risk::otr::OtrTier::Tob
+                        } else {
+                            mm_risk::otr::OtrTier::Top20
+                        }
+                    } else {
+                        mm_risk::otr::OtrTier::Top20
+                    };
+                    self.tiered_otr
+                        .on_trade(tier, chrono::Utc::now().timestamp_millis());
                 }
                 if self.config.market_maker.market_resilience_enabled {
                     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -5579,6 +5616,23 @@ impl MarketMakerEngine {
                 self.otr.trades(),
             );
             self.otr.reset();
+            // INT-2 — publish tiered OTR gauges. Does NOT reset
+            // the rolling window because that tracker evicts
+            // internally on the 5-min boundary.
+            use rust_decimal::prelude::ToPrimitive;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let snap = self.tiered_otr.snapshot(now_ms);
+            for (tier_label, cum, roll) in [
+                ("tob", snap.tob_cumulative, snap.tob_rolling_5min),
+                ("top20", snap.top20_cumulative, snap.top20_rolling_5min),
+            ] {
+                mm_dashboard::metrics::ORDER_TO_TRADE_TIERED
+                    .with_label_values(&[&self.symbol, tier_label, "cumulative"])
+                    .set(cum.to_f64().unwrap_or(0.0));
+                mm_dashboard::metrics::ORDER_TO_TRADE_TIERED
+                    .with_label_values(&[&self.symbol, tier_label, "rolling_5min"])
+                    .set(roll.to_f64().unwrap_or(0.0));
+            }
         }
 
         // Kill switch check.

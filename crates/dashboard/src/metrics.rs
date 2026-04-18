@@ -549,6 +549,22 @@ pub static DECISION_VS_EXPECTED_BPS: Lazy<prometheus::HistogramVec> = Lazy::new(
     .unwrap()
 });
 
+// ── INT-2 — tiered OTR gauges ───────────────────────────────
+
+/// 4-way OTR per symbol: `{tier, window}` label pair picks
+/// one of TOB×{cumulative, 5min} + Top20×{cumulative, 5min}.
+/// Engine pushes on every SLA tick; Grafana alerts key off the
+/// Rolling5Min series because cumulative smooths over
+/// intra-session regime changes.
+pub static ORDER_TO_TRADE_TIERED: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_otr_tiered",
+        "Tiered + dual-timeline OTR (venue-surveillance shape)",
+        &["symbol", "tier", "window"]
+    )
+    .unwrap()
+});
+
 /// Initialize all metrics (call once at startup).
 pub fn init() {
     // Force lazy initialization.
@@ -618,6 +634,7 @@ pub fn init() {
     let _ = &*STRATEGY_GRAPH_NODES;
     let _ = &*DECISION_REALIZED_COST_BPS;
     let _ = &*DECISION_VS_EXPECTED_BPS;
+    let _ = &*ORDER_TO_TRADE_TIERED;
 }
 
 // ── Block B / C — archive + scheduler observability ────────
