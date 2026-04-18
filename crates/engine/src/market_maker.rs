@@ -1512,6 +1512,11 @@ impl MarketMakerEngine {
         self.strategy_graph_scope = Some(graph.scope.clone());
         self.strategy_pool = Self::build_strategy_pool(graph);
         self.last_strategy_quotes_per_node.clear();
+        // Drop any pending `Out.Quotes` override from the previous
+        // graph — without this, the first tick after a swap would
+        // consume a stale bundle and place quotes the new graph
+        // never authored.
+        self.graph_quotes_override = None;
         Ok(self)
     }
 
@@ -1531,6 +1536,11 @@ impl MarketMakerEngine {
         self.strategy_graph_scope = Some(graph.scope.clone());
         self.strategy_pool = Self::build_strategy_pool(graph);
         self.last_strategy_quotes_per_node.clear();
+        // Drop any pending `Out.Quotes` override from the previous
+        // graph — without this, the first tick after a swap would
+        // consume a stale bundle and place quotes the new graph
+        // never authored.
+        self.graph_quotes_override = None;
         self.audit.risk_event(
             &self.symbol,
             mm_risk::audit::AuditEventType::StrategyGraphDeployed,
@@ -5819,6 +5829,12 @@ mod dual_connector_tests {
             .last_strategy_quotes_per_node
             .insert(a_strat_id, Vec::new());
         assert_eq!(engine.last_strategy_quotes_per_node.len(), 1);
+        // Also prime `graph_quotes_override` to represent a pending
+        // `Out.Quotes` bundle from the last tick of graph A. The
+        // next refresh-quotes pass would normally consume this;
+        // a swap must drop it instead so the new graph isn't
+        // surprised by quotes it never authored.
+        engine.graph_quotes_override = Some(vec![]);
 
         // Deploy B — different node ids, different kind.
         let g_b = mk_graph("Strategy.Grid");
@@ -5836,6 +5852,10 @@ mod dual_connector_tests {
         assert!(
             engine.last_strategy_quotes_per_node.is_empty(),
             "stale per-node cache from graph A cleared on swap"
+        );
+        assert!(
+            engine.graph_quotes_override.is_none(),
+            "pending Out.Quotes override from graph A dropped on swap"
         );
     }
 }
