@@ -2114,4 +2114,58 @@ mod tests {
         ds.update_venue_balances("BTCUSDT", vec![]);
         assert!(ds.venue_balances("BTCUSDT").is_empty());
     }
+
+    /// PAPER-1 — multi-engine cross-venue inventory aggregation
+    /// works through DashboardState. Two different (symbol,
+    /// venue) tuples for the same base asset sum into a single
+    /// net delta readable by `Portfolio.CrossVenueNetDelta`.
+    #[test]
+    fn cross_venue_inventory_aggregates_by_base_asset() {
+        let ds = DashboardState::new();
+        // Engine A: long 0.5 BTC on Binance spot.
+        ds.publish_inventory("BTCUSDT", "binance", dec!(0.5));
+        // Engine B: short 0.2 BTC on Bybit perp.
+        ds.publish_inventory("BTCUSDC", "bybit", dec!(-0.2));
+        // Engine C: flat ETH on Binance — shouldn't leak into BTC sum.
+        ds.publish_inventory("ETHUSDT", "binance", dec!(3));
+
+        assert_eq!(ds.cross_venue_net_delta("BTC"), dec!(0.3));
+        assert_eq!(ds.cross_venue_net_delta("ETH"), dec!(3));
+        assert_eq!(ds.cross_venue_net_delta("SOL"), dec!(0));
+
+        // Second publish for engine A replaces, not appends.
+        ds.publish_inventory("BTCUSDT", "binance", dec!(0.9));
+        assert_eq!(ds.cross_venue_net_delta("BTC"), dec!(0.7));
+    }
+
+    /// PAPER-1 — active-plan publish/read round-trip behaves as
+    /// UI-1 expects: per-symbol publish, flat-list read.
+    #[test]
+    fn active_plans_publish_then_flat_list() {
+        let ds = DashboardState::new();
+        let plan_a = PlanSnapshot {
+            node_id: "plan-a".into(),
+            kind: "Plan.Accumulate".into(),
+            symbol: "BTCUSDT".into(),
+            started_at_ms: Some(1_000),
+            qty_emitted: dec!(0.3),
+            aborted: false,
+            last_slice_ms: 0,
+        };
+        let plan_b = PlanSnapshot {
+            node_id: "plan-b".into(),
+            kind: "Plan.Accumulate".into(),
+            symbol: "ETHUSDT".into(),
+            started_at_ms: Some(2_000),
+            qty_emitted: dec!(1),
+            aborted: true,
+            last_slice_ms: 0,
+        };
+        ds.publish_active_plans("BTCUSDT", vec![plan_a]);
+        ds.publish_active_plans("ETHUSDT", vec![plan_b]);
+        let all = ds.active_plans_all();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|p| p.symbol == "BTCUSDT" && !p.aborted));
+        assert!(all.iter().any(|p| p.symbol == "ETHUSDT" && p.aborted));
+    }
 }
