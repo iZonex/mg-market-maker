@@ -425,15 +425,13 @@ pub struct MarketMakerEngine {
     /// Epic R — surveillance event lifecycle tracker. Fed by the
     /// order_manager's placement / cancel / fill callbacks; read
     /// by every `Surveillance.*Score` detector through the strategy
-    /// graph source overlay. Defaulted (empty) so a build without
-    /// surveillance nodes in its graph pays zero cost — the tracker
-    /// is a handful of hashmaps until it sees its first event.
-    surveillance_tracker: mm_risk::surveillance::OrderLifecycleTracker,
-    /// Epic R reference detector — one per pattern would quickly
-    /// get heavy on the struct, so we instantiate detectors on the
-    /// fly in the source overlay. The tracker is the single
-    /// persistent piece of state.
-    spoofing_detector: mm_risk::surveillance::SpoofingDetector,
+    /// graph source overlay. `Arc<Mutex>`-shared with the order
+    /// manager so feeds land on the same state readers look at.
+    pub(crate) surveillance_tracker: mm_risk::surveillance::SharedTracker,
+    /// Last per-pattern alert timestamp — dedupes
+    /// `SurveillanceAlert` audit rows when a detector holds above
+    /// threshold for several consecutive ticks.
+    surveillance_last_alert: std::collections::HashMap<String, i64>,
     /// Epic H — graph scope cached at `with_strategy_graph` /
     /// `swap_strategy_graph` so the per-tick source marshaller
     /// knows which asset to pull sentiment for without re-reading
@@ -803,8 +801,8 @@ impl MarketMakerEngine {
             strategy_graph_hash: None,
             graph_quotes_override: None,
             last_strategy_quotes: None,
-            surveillance_tracker: mm_risk::surveillance::OrderLifecycleTracker::new(),
-            spoofing_detector: mm_risk::surveillance::SpoofingDetector::new(),
+            surveillance_tracker: mm_risk::surveillance::new_shared_tracker(),
+            surveillance_last_alert: std::collections::HashMap::new(),
             strategy_graph_scope: None,
             margin_guard: config.margin.as_ref().map(|m| {
                 MarginGuard::new(MarginGuardThresholds::from_config(m))
@@ -1457,6 +1455,14 @@ impl MarketMakerEngine {
         // and the evaluator looks up per-node, so we loop over
         // every known source kind and fan out.
         let mut src: HashMap<(NodeId, String), Value> = HashMap::new();
+        // Epic R — surveillance alerts detected this tick. Emitted
+        // AFTER the source overlay loop releases its `&graph` borrow
+        // so the dedupe map + audit writer can mutate self freely.
+        let mut pending_alerts: Vec<(
+            String,
+            NodeId,
+            mm_risk::surveillance::DetectorOutput,
+        )> = Vec::new();
         // Pre-compute values so the closure loop is cheap.
         let book = &self.book_keeper.book;
         // `Book.best_{bid,ask}()` return top-of-book prices. Qty at
@@ -1636,17 +1642,26 @@ impl MarketMakerEngine {
                 // output as its `quotes: Quotes` port. All Strategy.*
                 // nodes in a given graph see the same bundle today;
                 // per-node `γ`/`κ`/`σ` override lands in Phase 5.
-                // Epic R — surveillance detector overlays. Read the
-                // per-symbol tracker state and feed the score + its
-                // diagnostics into the node's output ports. Missing
-                // when the tracker has seen nothing on the symbol
-                // yet — score of zero would be misleading (no
-                // evidence != no spoofing).
-                "Surveillance.SpoofingScore" => {
-                    let out = self.spoofing_detector.score(
-                        &self.symbol,
-                        &self.surveillance_tracker,
-                    );
+                // Epic R — surveillance detector overlays. All three
+                // detectors share one tracker; we take the lock once
+                // per-node, project the output onto four ports, then
+                // stash an alert tuple if the score crossed 0.8 so
+                // the loop can emit them after it releases its borrow
+                // of `self.strategy_graph`.
+                "Surveillance.SpoofingScore" |
+                "Surveillance.LayeringScore" |
+                "Surveillance.QuoteStuffingScore" => {
+                    let out = {
+                        let Ok(t) = self.surveillance_tracker.lock() else { continue };
+                        match kind.as_str() {
+                            "Surveillance.SpoofingScore" =>
+                                mm_risk::surveillance::SpoofingDetector::new().score(&self.symbol, &t),
+                            "Surveillance.LayeringScore" =>
+                                mm_risk::surveillance::LayeringDetector::new().score(&self.symbol, &t),
+                            _ =>
+                                mm_risk::surveillance::QuoteStuffingDetector::new().score(&self.symbol, &t),
+                        }
+                    };
                     src.insert((*id, "value".into()), Value::Number(out.score));
                     src.insert(
                         (*id, "cancel_ratio".into()),
@@ -1666,6 +1681,9 @@ impl MarketMakerEngine {
                             None => Value::Missing,
                         },
                     );
+                    if out.score >= rust_decimal_macros::dec!(0.8) {
+                        pending_alerts.push((kind.clone(), *id, out));
+                    }
                 }
                 k if k.starts_with("Strategy.") => {
                     let v = match &self.last_strategy_quotes {
@@ -1830,6 +1848,46 @@ impl MarketMakerEngine {
                     );
                 }
             }
+        }
+
+        // Epic R — emit surveillance alerts for scores that crossed
+        // threshold this tick. Cooldown is per-(pattern, node id)
+        // so two detectors of the same kind in one graph don't
+        // stomp each other's dedupe entries.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        for (pattern, node_id, out) in pending_alerts {
+            let key = format!("{pattern}:{node_id}");
+            let recently = self
+                .surveillance_last_alert
+                .get(&key)
+                .map(|prev| now_ms - *prev < 60_000)
+                .unwrap_or(false);
+            if recently {
+                continue;
+            }
+            self.surveillance_last_alert.insert(key, now_ms);
+            let extra = format!(
+                "cancel_ratio={} lifetime_ms={} size_ratio={}",
+                out.cancel_to_fill_ratio,
+                out.median_order_lifetime_ms
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                out.size_vs_avg_trade
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "-".into()),
+            );
+            let pattern_tag = match pattern.as_str() {
+                "Surveillance.SpoofingScore" => "spoofing",
+                "Surveillance.LayeringScore" => "layering",
+                "Surveillance.QuoteStuffingScore" => "quote_stuffing",
+                _ => "unknown",
+            };
+            self.audit.surveillance_alert(
+                &self.symbol,
+                pattern_tag,
+                out.score,
+                &extra,
+            );
         }
     }
 
@@ -3190,6 +3248,19 @@ impl MarketMakerEngine {
 
                 self.inventory_manager.on_fill(fill);
                 self.order_manager.on_fill(fill.order_id, fill.qty);
+                // Epic R — feed the surveillance tracker so
+                // detectors can reason about our fills. Cheap
+                // (mutex lock + one vec push), acceptable cost on
+                // the fill path.
+                if let Ok(mut t) = self.surveillance_tracker.lock() {
+                    t.feed(&mm_risk::surveillance::SurveillanceEvent::OrderFilled {
+                        order_id: format!("{:?}", fill.order_id),
+                        symbol: self.symbol.clone(),
+                        filled_qty: fill.qty,
+                        price: fill.price,
+                        ts: chrono::Utc::now(),
+                    });
+                }
                 self.sla_tracker.on_fill();
                 self.kill_switch.on_fill();
                 self.volume_limiter.on_trade(fill.price * fill.qty);

@@ -247,6 +247,57 @@ impl NodeKind for SpoofingScore {
     }
 }
 
+/// `Surveillance.LayeringScore` — many small orders clustered on
+/// one side at adjacent price ticks, with synchronous cancels.
+/// Same 4-port shape as `SpoofingScore` for UI uniformity.
+#[derive(Debug, Default)]
+pub struct LayeringScore;
+
+impl NodeKind for LayeringScore {
+    fn kind(&self) -> &'static str {
+        "Surveillance.LayeringScore"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &SPOOFING_OUTPUTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing; 4])
+    }
+}
+
+/// `Surveillance.QuoteStuffingScore` — very high orders-per-second
+/// + near-zero fill rate. Same output shape.
+#[derive(Debug, Default)]
+pub struct QuoteStuffingScore;
+
+impl NodeKind for QuoteStuffingScore {
+    fn kind(&self) -> &'static str {
+        "Surveillance.QuoteStuffingScore"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &SPOOFING_OUTPUTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing; 4])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

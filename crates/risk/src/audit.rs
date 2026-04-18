@@ -315,6 +315,17 @@ pub enum AuditEventType {
     /// multipliers fire every tick and would spam the log.
     StrategyGraphSinkFired,
 
+    // Epic R — surveillance & manipulation detectors.
+    /// A [`surveillance`](crate::surveillance) detector crossed its
+    /// alert threshold (`score ≥ 0.8` by default). `detail` carries
+    /// `pattern={spoofing|layering|quote_stuffing|...} score={0..1}
+    /// cancel_ratio={...} lifetime_ms={...}` so a reviewer can
+    /// recompute the decision from the audit row alone. Dedupes on
+    /// the caller side: the engine emits at most one alert per
+    /// pattern per `cooldown_secs` to keep the log readable during
+    /// sustained hot windows.
+    SurveillanceAlert,
+
     // Epic F — Listing sniper (stage-3 engine integration).
     /// Listing sniper discovered a new symbol on a venue.
     /// `detail` carries venue + symbol + tick/lot/min_notional.
@@ -765,6 +776,33 @@ impl AuditLog {
         });
     }
 
+    /// Convenience: log a surveillance alert. Called by the engine
+    /// when a detector score crosses threshold. `detail` carries the
+    /// pattern label + score + the diagnostic sub-signals so the
+    /// row stands on its own for audit review.
+    pub fn surveillance_alert(
+        &self,
+        symbol: &str,
+        pattern: &str,
+        score: rust_decimal::Decimal,
+        detail_extra: &str,
+    ) {
+        let detail = format!("pattern={pattern} score={score} {detail_extra}");
+        self.log(AuditEvent {
+            seq: 0,
+            timestamp: Utc::now(),
+            event_type: AuditEventType::SurveillanceAlert,
+            symbol: symbol.to_string(),
+            client_id: None,
+            order_id: None,
+            side: None,
+            price: None,
+            qty: None,
+            detail: Some(detail),
+            prev_hash: None,
+        });
+    }
+
     /// Flush buffer to disk.
     pub fn flush(&self) {
         if let Ok(mut state) = self.state.lock() {
@@ -913,6 +951,10 @@ fn is_critical(ty: &AuditEventType) -> bool {
             | AuditEventType::StrategyGraphRolledBack
             | AuditEventType::StrategyGraphDeployRejected
             | AuditEventType::StrategyGraphSinkFired
+            // Surveillance alerts are regulator-visible signals the
+            // MM detected itself as the suspect actor — get them on
+            // disk before the next page of the log rotates.
+            | AuditEventType::SurveillanceAlert
     )
 }
 

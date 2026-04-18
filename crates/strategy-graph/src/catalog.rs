@@ -119,6 +119,8 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Strategy.CrossExchange" => Some(Box::new(strategies::CrossExchange)),
         // Epic R — surveillance detectors (engine overlays per tick)
         "Surveillance.SpoofingScore" => Some(Box::new(sources::SpoofingScore)),
+        "Surveillance.LayeringScore" => Some(Box::new(sources::LayeringScore)),
+        "Surveillance.QuoteStuffingScore" => Some(Box::new(sources::QuoteStuffingScore)),
         // Sinks
         "Out.SpreadMult" => Some(Box::new(sinks::SpreadMult)),
         "Out.SizeMult" => Some(Box::new(sinks::SizeMult)),
@@ -213,6 +215,8 @@ pub fn meta(kind: &str) -> NodeMeta {
 
         // Epic R — surveillance detectors (safe, defaults-on)
         "Surveillance.SpoofingScore" => NodeMeta { label: "Spoofing score", summary: "Likelihood our own flow looks like spoofing [0..1] + cancel_ratio + lifetime", group: "Surveillance" },
+        "Surveillance.LayeringScore" => NodeMeta { label: "Layering score", summary: "Multi-order structured pressure + synchronous cancels [0..1]", group: "Surveillance" },
+        "Surveillance.QuoteStuffingScore" => NodeMeta { label: "Quote stuffing score", summary: "High orders/sec + high cancel ratio + near-zero fill rate [0..1]", group: "Surveillance" },
 
         // Sinks — always fire on a trigger, consumed by the engine.
         "Out.SpreadMult"       => NodeMeta { label: "Spread multiplier",   summary: "Final spread scalar applied to quotes", group: "Sinks" },
@@ -302,6 +306,8 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Strategy.Basis",
         "Strategy.CrossExchange",
         "Surveillance.SpoofingScore",
+        "Surveillance.LayeringScore",
+        "Surveillance.QuoteStuffingScore",
         "Out.SpreadMult",
         "Out.SizeMult",
         "Out.KillEscalate",
@@ -380,9 +386,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_52_nodes_after_epic_r_week_1() {
-        // 51 after Phase 4.7 + Surveillance.SpoofingScore (first
-        // detector of 15) = 52.
-        assert_eq!(kinds().len(), 52, "catalog drift");
+    fn catalog_has_54_nodes_after_epic_r_week_2() {
+        // 52 after Week 1 + Layering + QuoteStuffing = 54.
+        assert_eq!(kinds().len(), 54, "catalog drift");
     }
 }

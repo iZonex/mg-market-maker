@@ -10,10 +10,9 @@
 //!
 //!   2. [`OrderLifecycleTracker`] — per-symbol rolling state that
 //!      answers the three questions every detector asks:
-//!          · how long did my orders live before they cancelled?
-//!          · what's my cancel-to-fill ratio in the recent window?
-//!          · how does an individual order size compare to the
-//!            average trade size on this symbol?
+//!      · how long did my orders live before they cancelled?
+//!      · what's my cancel-to-fill ratio in the recent window?
+//!      · order size vs. recent trade average on this symbol.
 //!      The tracker is the *only* place we compute these — detectors
 //!      read, never duplicate.
 //!
@@ -33,6 +32,18 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+
+/// Shared-ownership handle callers pass around. `Arc<Mutex<_>>` is
+/// the right shape here: the tracker is written from the order
+/// manager's async fill / cancel / place paths AND read from the
+/// engine's strategy-graph overlay tick, on different threads.
+pub type SharedTracker = Arc<Mutex<OrderLifecycleTracker>>;
+
+/// Build a fresh tracker handle ready to share.
+pub fn new_shared_tracker() -> SharedTracker {
+    Arc::new(Mutex::new(OrderLifecycleTracker::new()))
+}
 
 /// Minimal shape every order lifecycle event shares. Detectors want
 /// the timestamp + symbol + side at minimum; size / price only
@@ -372,6 +383,225 @@ impl SpoofingDetector {
     }
 }
 
+// ─── Layering detector ─────────────────────────────────────────
+//
+// `docs/research/complince.md` § 2 — "3+ orders on one side, close
+// in price, synchronous cancel". The distinguishing signal vs.
+// plain spoofing is *structure*: many orders layered at adjacent
+// price ticks, not one big order.
+
+/// Input knobs for [`LayeringDetector`].
+#[derive(Debug, Clone)]
+pub struct LayeringConfig {
+    /// Orders on the same side within [`price_cluster_frac`] fraction
+    /// of each other count as "one layer". Default 5 bps.
+    pub price_cluster_frac: Decimal,
+    /// `n_orders_hot` orders on one side + clustered → full signal.
+    pub n_orders_hot: usize,
+    /// `synchronous_cancel_window_ms`: cancels arriving within this
+    /// of each other count toward the synchronous-cancel signal.
+    pub synchronous_cancel_window_ms: i64,
+}
+
+impl Default for LayeringConfig {
+    fn default() -> Self {
+        Self {
+            price_cluster_frac: dec!(0.0005), // 5 bps
+            n_orders_hot: 5,
+            synchronous_cancel_window_ms: 200,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct LayeringDetector {
+    pub config: LayeringConfig,
+}
+
+impl LayeringDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn score(
+        &self,
+        symbol: &str,
+        tracker: &OrderLifecycleTracker,
+    ) -> DetectorOutput {
+        // Collect open orders per side; find the biggest cluster on
+        // either side (consecutive orders within price_cluster_frac
+        // of the median).
+        let open_here: Vec<&OpenOrder> = tracker
+            .open
+            .values()
+            .filter(|o| o.symbol == symbol)
+            .collect();
+
+        let mut biggest_cluster_per_side = 0usize;
+        for side in [Side::Buy, Side::Sell] {
+            let mut prices: Vec<Decimal> = open_here
+                .iter()
+                .filter(|o| o.side == side)
+                .map(|o| o.price)
+                .collect();
+            if prices.len() < 2 {
+                continue;
+            }
+            prices.sort();
+            // Walking window — count the longest run where each
+            // next price is within cluster_frac of the first.
+            let mut i = 0;
+            while i < prices.len() {
+                let anchor = prices[i];
+                let mut j = i;
+                while j < prices.len() {
+                    let delta = (prices[j] - anchor).abs();
+                    if anchor == Decimal::ZERO
+                        || delta / anchor <= self.config.price_cluster_frac
+                    {
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                biggest_cluster_per_side =
+                    biggest_cluster_per_side.max(j - i);
+                i = j.max(i + 1);
+            }
+        }
+        let cluster_sig = if self.config.n_orders_hot == 0 {
+            Decimal::ZERO
+        } else {
+            (Decimal::from(biggest_cluster_per_side)
+                / Decimal::from(self.config.n_orders_hot))
+            .min(Decimal::ONE)
+        };
+
+        // Synchronous-cancel signal: cancels within the window on the
+        // same side → one big co-ordinated pull.
+        let mut sync_sig = Decimal::ZERO;
+        if let Some(cancels) = tracker.cancels.get(symbol) {
+            let window = chrono::Duration::milliseconds(
+                self.config.synchronous_cancel_window_ms,
+            );
+            let mut buckets: Vec<(DateTime<Utc>, Side, usize)> = Vec::new();
+            for (ts, _lifetime, side) in cancels.iter() {
+                if let Some(last) = buckets.last_mut() {
+                    if *ts - last.0 <= window && last.1 == *side {
+                        last.2 += 1;
+                        continue;
+                    }
+                }
+                buckets.push((*ts, *side, 1));
+            }
+            let biggest = buckets.iter().map(|(_, _, n)| *n).max().unwrap_or(0);
+            if self.config.n_orders_hot > 0 {
+                sync_sig = (Decimal::from(biggest)
+                    / Decimal::from(self.config.n_orders_hot))
+                .min(Decimal::ONE);
+            }
+        }
+
+        // Aggregate: mean of cluster + sync signals. The spoofing
+        // detector's cancel-ratio is deliberately not re-used here
+        // — layering is about structure, not fill rate.
+        let score = (cluster_sig + sync_sig) / dec!(2);
+        let stats = tracker.snapshot(symbol);
+        DetectorOutput {
+            score: score.clamp(Decimal::ZERO, Decimal::ONE),
+            cancel_to_fill_ratio: stats.cancel_to_fill_ratio,
+            median_order_lifetime_ms: stats.median_order_lifetime_ms,
+            size_vs_avg_trade: None,
+        }
+    }
+}
+
+// ─── Quote-stuffing detector ────────────────────────────────────
+//
+// `docs/research/complince.md` § 4 — "very high orders/sec + high
+// cancel ratio + near-zero fill rate". The stuffing pattern buries
+// other participants under order-book churn without ever trading.
+
+#[derive(Debug, Clone)]
+pub struct QuoteStuffingConfig {
+    /// `orders_per_sec ≥` → full orders-rate contribution.
+    pub orders_per_sec_hot: usize,
+    /// `cancel_to_fill ≥` → full cancel-ratio contribution.
+    pub cancel_ratio_hot: Decimal,
+    /// `fill_rate <=` → full low-fill contribution. `fill_rate` =
+    /// `fills / (fills + cancels)`.
+    pub fill_rate_cold: Decimal,
+}
+
+impl Default for QuoteStuffingConfig {
+    fn default() -> Self {
+        Self {
+            orders_per_sec_hot: 50,
+            cancel_ratio_hot: dec!(0.95),
+            fill_rate_cold: dec!(0.02),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct QuoteStuffingDetector {
+    pub config: QuoteStuffingConfig,
+}
+
+impl QuoteStuffingDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn score(
+        &self,
+        symbol: &str,
+        tracker: &OrderLifecycleTracker,
+    ) -> DetectorOutput {
+        let stats = tracker.snapshot(symbol);
+        let total = stats.cancel_count + stats.fill_count;
+        // Orders/sec across the 60s rolling window, coarse but
+        // adequate for "is this an outlier" decisions.
+        let orders_per_sec = total as f64 / WINDOW_SECS as f64;
+        let rate_sig = if self.config.orders_per_sec_hot == 0 {
+            Decimal::ZERO
+        } else {
+            let hot = self.config.orders_per_sec_hot as f64;
+            Decimal::from_f64_retain((orders_per_sec / hot).min(1.0))
+                .unwrap_or(Decimal::ZERO)
+        };
+        let cancel_sig = if self.config.cancel_ratio_hot > Decimal::ZERO {
+            (stats.cancel_to_fill_ratio / self.config.cancel_ratio_hot)
+                .min(Decimal::ONE)
+        } else {
+            Decimal::ZERO
+        };
+        let fill_rate = if total == 0 {
+            Decimal::ZERO
+        } else {
+            Decimal::from(stats.fill_count) / Decimal::from(total)
+        };
+        // "fill_rate_cold" signal: low fill_rate → high score.
+        let low_fill_sig = if self.config.fill_rate_cold > Decimal::ZERO {
+            if fill_rate >= self.config.fill_rate_cold {
+                Decimal::ZERO
+            } else {
+                Decimal::ONE
+                    - (fill_rate / self.config.fill_rate_cold).min(Decimal::ONE)
+            }
+        } else {
+            Decimal::ZERO
+        };
+        let score = (rate_sig + cancel_sig + low_fill_sig) / dec!(3);
+        DetectorOutput {
+            score: score.clamp(Decimal::ZERO, Decimal::ONE),
+            cancel_to_fill_ratio: stats.cancel_to_fill_ratio,
+            median_order_lifetime_ms: stats.median_order_lifetime_ms,
+            size_vs_avg_trade: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +681,51 @@ mod tests {
         let det = SpoofingDetector::new();
         let out = det.score("BTCUSDT", &t);
         assert!(out.score >= dec!(0.9), "score was {}", out.score);
+    }
+
+    #[test]
+    fn layering_cluster_of_five_bids_scores_high() {
+        let mut t = OrderLifecycleTracker::new();
+        let t0 = Utc::now();
+        // 6 buy orders clustered within 3 bps of each other.
+        for (i, px) in [100.00, 100.01, 100.02, 100.01, 100.03, 100.02]
+            .iter()
+            .enumerate()
+        {
+            let id = format!("L{i}");
+            t.feed(&SurveillanceEvent::OrderPlaced {
+                order_id: id.clone(),
+                symbol: "BTCUSDT".into(),
+                side: Side::Buy,
+                price: Decimal::from_f64_retain(*px).unwrap(),
+                qty: dec!(1),
+                ts: t0,
+            });
+        }
+        let d = LayeringDetector::new();
+        let out = d.score("BTCUSDT", &t);
+        assert!(out.score >= dec!(0.5), "layering score was {}", out.score);
+    }
+
+    #[test]
+    fn quote_stuffing_high_rate_low_fill_scores_high() {
+        let mut t = OrderLifecycleTracker::new();
+        let t0 = Utc::now();
+        // Feed enough cancels to clear the 50 orders/sec × 60s bar
+        // (3000 total). All fast-cancelled, zero fills — classic
+        // stuffing silhouette.
+        for i in 0..3100 {
+            let id = format!("S{i}");
+            t.feed(&ev_place(&id, "BTCUSDT", Side::Buy, dec!(1), t0));
+            t.feed(&ev_cancel(
+                &id,
+                "BTCUSDT",
+                t0 + chrono::Duration::milliseconds(20),
+            ));
+        }
+        let d = QuoteStuffingDetector::new();
+        let out = d.score("BTCUSDT", &t);
+        assert!(out.score >= dec!(0.9), "stuffing score was {}", out.score);
     }
 
     #[test]
