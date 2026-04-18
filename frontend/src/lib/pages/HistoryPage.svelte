@@ -3,6 +3,7 @@
   import OpenOrders from '../components/OpenOrders.svelte'
   import FillHistory from '../components/FillHistory.svelte'
   import AuditStream from '../components/AuditStream.svelte'
+  import DecisionsLedger from '../components/DecisionsLedger.svelte'
 
   let { ws, auth } = $props()
 </script>
@@ -14,6 +15,9 @@
     </Card>
     <Card title="Fill history" subtitle="latest 20" span={2}>
       {#snippet children()}<FillHistory data={ws} />{/snippet}
+    </Card>
+    <Card title="Decisions" subtitle="expected vs realized cost (bps)" span={3}>
+      {#snippet children()}<DecisionsLedger {auth} />{/snippet}
     </Card>
     <Card title="Audit stream" subtitle="MiCA trail" span={3}>
       {#snippet children()}<AuditStream {auth} />{/snippet}
