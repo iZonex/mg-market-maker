@@ -682,6 +682,31 @@ impl NodeKind for WashScore {
     }
 }
 
+/// `Surveillance.FakeLiquidityScore` — orders evaporating near
+/// the touch. One-port output.
+#[derive(Debug, Default)]
+pub struct FakeLiquidityScore;
+
+impl NodeKind for FakeLiquidityScore {
+    fn kind(&self) -> &'static str {
+        "Surveillance.FakeLiquidityScore"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &SCORE_ONLY_OUTPUT
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
 /// `Surveillance.MomentumIgnitionScore` — public-tape burst +
 /// aggressor dominance + price-move. Single-port output.
 #[derive(Debug, Default)]

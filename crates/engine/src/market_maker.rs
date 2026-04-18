@@ -487,6 +487,11 @@ pub struct MarketMakerEngine {
     /// `SurveillanceAlert` audit rows when a detector holds above
     /// threshold for several consecutive ticks.
     surveillance_last_alert: std::collections::HashMap<String, i64>,
+    /// Epic R Week 5 — previous tick's L2 snapshot. Used by the
+    /// FakeLiquidity detector which needs a then/now comparison.
+    /// Refreshed at the end of every `tick_strategy_graph` so the
+    /// "then" snapshot is always one tick old.
+    prev_l2_snapshot: Option<mm_risk::surveillance::L2Snapshot>,
     /// Epic H — graph scope cached at `with_strategy_graph` /
     /// `swap_strategy_graph` so the per-tick source marshaller
     /// knows which asset to pull sentiment for without re-reading
@@ -860,6 +865,7 @@ impl MarketMakerEngine {
             last_strategy_quotes_per_node: std::collections::HashMap::new(),
             surveillance_tracker: mm_risk::surveillance::new_shared_tracker(),
             surveillance_last_alert: std::collections::HashMap::new(),
+            prev_l2_snapshot: None,
             strategy_graph_scope: None,
             margin_guard: config.margin.as_ref().map(|m| {
                 MarginGuard::new(MarginGuardThresholds::from_config(m))
@@ -2082,6 +2088,44 @@ impl MarketMakerEngine {
                 // stash an alert tuple if the score crossed 0.8 so
                 // the loop can emit them after it releases its borrow
                 // of `self.strategy_graph`.
+                "Surveillance.FakeLiquidityScore" => {
+                    // Pull current L2 off the bus, compare against
+                    // the snapshot we stashed at the end of the
+                    // previous graph tick.
+                    let key = (
+                        format!("{:?}", self.config.exchange.exchange_type).to_lowercase(),
+                        self.symbol.clone(),
+                        self.config.exchange.product,
+                    );
+                    let current = self.dashboard.as_ref().and_then(|d| d.data_bus().get_l2(&key));
+                    let score = match (self.prev_l2_snapshot.as_ref(), current.as_ref()) {
+                        (Some(prev), Some(now_snap)) => {
+                            let to_levels = |v: &[(rust_decimal::Decimal, rust_decimal::Decimal)]|
+                                -> Vec<mm_risk::surveillance::L2Level> {
+                                v.iter()
+                                    .map(|(p, q)| mm_risk::surveillance::L2Level {
+                                        price: *p,
+                                        qty: *q,
+                                    })
+                                    .collect()
+                            };
+                            let then_ss = prev;
+                            let now_ss = mm_risk::surveillance::L2Snapshot {
+                                bids: to_levels(&now_snap.bids),
+                                asks: to_levels(&now_snap.asks),
+                                ts: now_snap.ts.unwrap_or_else(chrono::Utc::now),
+                            };
+                            let out = mm_risk::surveillance::FakeLiquidityDetector::new()
+                                .score(then_ss, &now_ss);
+                            if out.score >= rust_decimal_macros::dec!(0.8) {
+                                pending_alerts.push((kind.clone(), *id, out.clone()));
+                            }
+                            out.score
+                        }
+                        _ => rust_decimal::Decimal::ZERO,
+                    };
+                    src.insert((*id, "value".into()), Value::Number(score));
+                }
                 "Surveillance.WashScore" => {
                     let fills = self
                         .surveillance_tracker
@@ -2614,6 +2658,33 @@ impl MarketMakerEngine {
             }
         }
 
+        // Week 5 — stash the current L2 for the FakeLiquidity
+        // detector's next-tick delta read. Done after the overlay
+        // loop so this tick still compared against the previous
+        // snapshot.
+        let key = (
+            format!("{:?}", self.config.exchange.exchange_type).to_lowercase(),
+            self.symbol.clone(),
+            self.config.exchange.product,
+        );
+        if let Some(snap) = self.dashboard.as_ref().and_then(|d| d.data_bus().get_l2(&key)) {
+            let to_levels =
+                |v: &[(rust_decimal::Decimal, rust_decimal::Decimal)]|
+                 -> Vec<mm_risk::surveillance::L2Level> {
+                    v.iter()
+                        .map(|(p, q)| mm_risk::surveillance::L2Level {
+                            price: *p,
+                            qty: *q,
+                        })
+                        .collect()
+                };
+            self.prev_l2_snapshot = Some(mm_risk::surveillance::L2Snapshot {
+                bids: to_levels(&snap.bids),
+                asks: to_levels(&snap.asks),
+                ts: snap.ts.unwrap_or_else(chrono::Utc::now),
+            });
+        }
+
         // Epic R — emit surveillance alerts for scores that crossed
         // threshold this tick. Cooldown is per-(pattern, node id)
         // so two detectors of the same kind in one graph don't
@@ -2646,6 +2717,7 @@ impl MarketMakerEngine {
                 "Surveillance.QuoteStuffingScore" => "quote_stuffing",
                 "Surveillance.WashScore" => "wash",
                 "Surveillance.MomentumIgnitionScore" => "momentum_ignition",
+                "Surveillance.FakeLiquidityScore" => "fake_liquidity",
                 _ => "unknown",
             };
             self.audit.surveillance_alert(

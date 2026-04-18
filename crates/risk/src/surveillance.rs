@@ -294,7 +294,7 @@ impl OrderLifecycleTracker {
 // ─── Spoofing detector ─────────────────────────────────────────
 
 /// Output shape shared by every surveillance detector.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DetectorOutput {
     /// Likelihood in `[0, 1]`.
     pub score: Decimal,
@@ -726,6 +726,124 @@ pub struct WashFillView {
     pub price: Decimal,
 }
 
+// ─── Fake-liquidity detector ────────────────────────────────
+//
+// `docs/research/complince.md` § 6 — orders pulled right before
+// the touch reaches them. We need two L2 snapshots: one from N ms
+// ago, one now. Level on `now` that was present in `then` with
+// bigger qty and whose price is now *closer to mid* = suspicious
+// cancel. Kept here as a free function so the engine adapter
+// passes the two snapshots in from the DataBus without having to
+// marry the detector to a specific book representation.
+
+#[derive(Debug, Clone)]
+pub struct L2Level {
+    pub price: Decimal,
+    pub qty: Decimal,
+}
+
+#[derive(Debug, Clone)]
+pub struct L2Snapshot {
+    pub bids: Vec<L2Level>, // outer-first (best bid at index 0)
+    pub asks: Vec<L2Level>,
+    pub ts: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FakeLiquidityConfig {
+    /// What fraction of a level's qty must have evaporated to
+    /// count as a "pulled" order. 0.5 = half or more disappeared.
+    pub vanish_threshold: Decimal,
+    /// `pulled_levels_hot` full disappearances → full contribution.
+    pub pulled_levels_hot: usize,
+    /// Max distance from mid (bps) for levels to count. Irrelevant
+    /// far-away levels that vanish don't register.
+    pub max_distance_bps: Decimal,
+}
+
+impl Default for FakeLiquidityConfig {
+    fn default() -> Self {
+        Self {
+            vanish_threshold: dec!(0.5),
+            pulled_levels_hot: 3,
+            max_distance_bps: dec!(20),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct FakeLiquidityDetector {
+    pub config: FakeLiquidityConfig,
+}
+
+impl FakeLiquidityDetector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Compare two snapshots. `then` is the older one, `now` is
+    /// the current. Score climbs with the count of "pulled"
+    /// levels within `max_distance_bps` of mid.
+    pub fn score(&self, then: &L2Snapshot, now: &L2Snapshot) -> DetectorOutput {
+        let mid_now = match (now.bids.first(), now.asks.first()) {
+            (Some(b), Some(a)) => (b.price + a.price) / dec!(2),
+            _ => return DetectorOutput {
+                score: Decimal::ZERO,
+                cancel_to_fill_ratio: Decimal::ZERO,
+                median_order_lifetime_ms: None,
+                size_vs_avg_trade: None,
+            },
+        };
+        let bp = dec!(10_000);
+        let max_frac = self.config.max_distance_bps / bp;
+        let in_band = |p: Decimal| -> bool {
+            mid_now > Decimal::ZERO
+                && (p - mid_now).abs() / mid_now <= max_frac
+        };
+
+        let mut pulled = 0usize;
+        let count_side = |then_levels: &[L2Level], now_levels: &[L2Level]| -> usize {
+            let mut out = 0;
+            for l_then in then_levels {
+                if !in_band(l_then.price) {
+                    continue;
+                }
+                // Find matching price on the new side.
+                let now_qty = now_levels
+                    .iter()
+                    .find(|l| l.price == l_then.price)
+                    .map(|l| l.qty)
+                    .unwrap_or(Decimal::ZERO);
+                if l_then.qty > Decimal::ZERO {
+                    let shrinkage = (l_then.qty - now_qty) / l_then.qty;
+                    if shrinkage >= Decimal::ZERO
+                        && shrinkage >= self.config.vanish_threshold
+                    {
+                        out += 1;
+                    }
+                }
+            }
+            out
+        };
+        pulled += count_side(&then.bids, &now.bids);
+        pulled += count_side(&then.asks, &now.asks);
+
+        let sig = if self.config.pulled_levels_hot == 0 {
+            Decimal::ZERO
+        } else {
+            (Decimal::from(pulled)
+                / Decimal::from(self.config.pulled_levels_hot))
+            .min(Decimal::ONE)
+        };
+        DetectorOutput {
+            score: sig,
+            cancel_to_fill_ratio: Decimal::ZERO,
+            median_order_lifetime_ms: None,
+            size_vs_avg_trade: None,
+        }
+    }
+}
+
 // ─── Momentum-ignition detector ────────────────────────────
 //
 // `docs/research/complince.md` § 5 — burst taker flow drives a
@@ -1073,6 +1191,51 @@ mod tests {
         let d = MomentumIgnitionDetector::new();
         let out = d.score(&trades);
         assert!(out.score <= dec!(0.5), "mi score was {}", out.score);
+    }
+
+    #[test]
+    fn fake_liquidity_detects_pulled_level() {
+        let t0 = Utc::now();
+        let then = L2Snapshot {
+            bids: vec![
+                L2Level { price: dec!(99.90), qty: dec!(10) },
+                L2Level { price: dec!(99.80), qty: dec!(8) },
+            ],
+            asks: vec![
+                L2Level { price: dec!(100.10), qty: dec!(10) },
+                L2Level { price: dec!(100.20), qty: dec!(8) },
+            ],
+            ts: t0,
+        };
+        // 300 ms later: bid at 99.90 shrinks from 10 → 1 (pulled),
+        // ask at 100.10 vanishes entirely. Two pulled levels.
+        let now = L2Snapshot {
+            bids: vec![
+                L2Level { price: dec!(99.90), qty: dec!(1) },
+                L2Level { price: dec!(99.80), qty: dec!(8) },
+            ],
+            asks: vec![
+                L2Level { price: dec!(100.20), qty: dec!(8) },
+            ],
+            ts: t0 + chrono::Duration::milliseconds(300),
+        };
+        let d = FakeLiquidityDetector::new();
+        let out = d.score(&then, &now);
+        assert!(out.score >= dec!(0.6), "fake-liquidity score was {}", out.score);
+    }
+
+    #[test]
+    fn fake_liquidity_ignores_stable_book() {
+        let t0 = Utc::now();
+        let snap = L2Snapshot {
+            bids: vec![L2Level { price: dec!(99.90), qty: dec!(10) }],
+            asks: vec![L2Level { price: dec!(100.10), qty: dec!(10) }],
+            ts: t0,
+        };
+        let mut later = snap.clone();
+        later.ts = t0 + chrono::Duration::milliseconds(300);
+        let d = FakeLiquidityDetector::new();
+        assert_eq!(d.score(&snap, &later).score, dec!(0));
     }
 
     #[test]

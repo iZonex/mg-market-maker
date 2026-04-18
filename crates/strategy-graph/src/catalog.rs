@@ -136,6 +136,7 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Surveillance.QuoteStuffingScore" => Some(Box::new(sources::QuoteStuffingScore)),
         "Surveillance.WashScore" => Some(Box::new(sources::WashScore)),
         "Surveillance.MomentumIgnitionScore" => Some(Box::new(sources::MomentumIgnitionScore)),
+        "Surveillance.FakeLiquidityScore" => Some(Box::new(sources::FakeLiquidityScore)),
         // Sinks
         "Out.SpreadMult" => Some(Box::new(sinks::SpreadMult)),
         "Out.SizeMult" => Some(Box::new(sinks::SizeMult)),
@@ -244,6 +245,7 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Surveillance.QuoteStuffingScore" => NodeMeta { label: "Quote stuffing score", summary: "High orders/sec + high cancel ratio + near-zero fill rate [0..1]", group: "Surveillance" },
         "Surveillance.WashScore" => NodeMeta { label: "Wash score",        summary: "Self-trade detection (own buy + own sell same price, short window) [0..1]", group: "Surveillance" },
         "Surveillance.MomentumIgnitionScore" => NodeMeta { label: "Momentum ignition score", summary: "Public-tape burst + aggressor dominance + price move [0..1]", group: "Surveillance" },
+        "Surveillance.FakeLiquidityScore" => NodeMeta { label: "Fake liquidity score", summary: "L2 levels evaporating within bps-band of mid — the book that disappears on approach", group: "Surveillance" },
 
         // Sinks — always fire on a trigger, consumed by the engine.
         "Out.SpreadMult"       => NodeMeta { label: "Spread multiplier",   summary: "Final spread scalar applied to quotes", group: "Sinks" },
@@ -351,6 +353,7 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Surveillance.QuoteStuffingScore",
         "Surveillance.WashScore",
         "Surveillance.MomentumIgnitionScore",
+        "Surveillance.FakeLiquidityScore",
         "Out.SpreadMult",
         "Out.SizeMult",
         "Out.KillEscalate",
@@ -429,8 +432,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_68_nodes_after_epic_r_week_4_exploits() {
-        // 66 after Week 4a + Strategy.Wash + Strategy.Ignite = 68.
-        assert_eq!(kinds().len(), 68, "catalog drift");
+    fn catalog_has_69_nodes_after_epic_r_week_5_fake_liquidity() {
+        // 68 after Week 4 + Surveillance.FakeLiquidityScore = 69.
+        assert_eq!(kinds().len(), 69, "catalog drift");
     }
 }
