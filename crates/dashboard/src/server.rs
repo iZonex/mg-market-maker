@@ -83,6 +83,7 @@ pub async fn start(
         )
         .route("/api/v1/clients/loss-state", get(clients_loss_state))
         .route("/api/v1/surveillance/scores", get(surveillance_scores))
+        .route("/api/v1/decisions/recent", get(decisions_recent))
         .merge(crate::client_api::client_routes())
         .merge(crate::client_portal::client_portal_routes())
         .route_layer(middleware::from_fn_with_state(
@@ -413,6 +414,44 @@ async fn surveillance_scores() -> Json<SurveillanceScoresResponse> {
             .or_insert(SurveillanceScoreRow { score: 0.0, alerts_total });
     }
     Json(SurveillanceScoresResponse { patterns })
+}
+
+// ── INT-1: decision ledger readback ─────────────────────
+
+#[derive(serde::Deserialize)]
+struct DecisionsQuery {
+    #[serde(default)]
+    symbol: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(serde::Serialize)]
+struct DecisionsResponse {
+    /// Decisions keyed by symbol, newest-first within each
+    /// symbol. When `?symbol=X` is supplied the map has at most
+    /// one key; otherwise every registered symbol is included.
+    symbols: std::collections::BTreeMap<
+        String,
+        Vec<mm_risk::decision_ledger::DecisionSnapshot>,
+    >,
+}
+
+async fn decisions_recent(
+    State(state): State<DashboardState>,
+    axum::extract::Query(q): axum::extract::Query<DecisionsQuery>,
+) -> Json<DecisionsResponse> {
+    let limit = q.limit.unwrap_or(100).min(1_000);
+    let symbols = if let Some(sym) = q.symbol.as_deref() {
+        let mut m = std::collections::BTreeMap::new();
+        if let Some(rows) = state.decisions_recent(sym, limit) {
+            m.insert(sym.to_string(), rows);
+        }
+        m
+    } else {
+        state.decisions_all_symbols(limit)
+    };
+    Json(DecisionsResponse { symbols })
 }
 
 fn label_pair(m: &prometheus::proto::Metric) -> (Option<String>, Option<String>) {

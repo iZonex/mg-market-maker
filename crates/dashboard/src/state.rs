@@ -188,6 +188,14 @@ struct StateInner {
     /// HTTP handlers treat `None` as "strategy graphs
     /// disabled on this deployment" and return 503.
     strategy_graph_store: Option<std::sync::Arc<mm_strategy_graph::GraphStore>>,
+    /// INT-1 — per-symbol decision ledgers. Each engine
+    /// publishes its own `Arc<DecisionLedger>` at startup so
+    /// the `/api/v1/decisions/recent` handler can read without
+    /// threading an engine handle through the request state.
+    decision_ledgers: HashMap<
+        String,
+        std::sync::Arc<mm_risk::decision_ledger::DecisionLedger>,
+    >,
     /// Epic H Phase 3 — shared audit sink the dashboard uses to
     /// record deploy / rollback / reject events on the same
     /// hash-chained timeline as order-lifecycle + risk rows.
@@ -815,6 +823,52 @@ impl DashboardState {
         &self,
     ) -> Option<std::sync::Arc<mm_strategy_graph::GraphStore>> {
         self.inner.read().unwrap().strategy_graph_store.clone()
+    }
+
+    /// INT-1 — register an engine's decision ledger. Called
+    /// once per engine at boot.
+    pub fn register_decision_ledger(
+        &self,
+        symbol: &str,
+        ledger: std::sync::Arc<mm_risk::decision_ledger::DecisionLedger>,
+    ) {
+        self.inner
+            .write()
+            .unwrap()
+            .decision_ledgers
+            .insert(symbol.to_string(), ledger);
+    }
+
+    /// INT-1 — snapshot recent decisions for one symbol. `None`
+    /// when no ledger has been registered.
+    pub fn decisions_recent(
+        &self,
+        symbol: &str,
+        max: usize,
+    ) -> Option<Vec<mm_risk::decision_ledger::DecisionSnapshot>> {
+        self.inner
+            .read()
+            .unwrap()
+            .decision_ledgers
+            .get(symbol)
+            .map(|l| l.recent(max))
+    }
+
+    /// INT-1 — snapshot recent decisions across every
+    /// registered symbol, newest-first within each symbol.
+    pub fn decisions_all_symbols(
+        &self,
+        per_symbol_max: usize,
+    ) -> std::collections::BTreeMap<
+        String,
+        Vec<mm_risk::decision_ledger::DecisionSnapshot>,
+    > {
+        let g = self.inner.read().unwrap();
+        let mut out = std::collections::BTreeMap::new();
+        for (sym, ledger) in g.decision_ledgers.iter() {
+            out.insert(sym.clone(), ledger.recent(per_symbol_max));
+        }
+        out
     }
 
     /// Publish the latest margin ratio for `symbol` (Epic 40.4).

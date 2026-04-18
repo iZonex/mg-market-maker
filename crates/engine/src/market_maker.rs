@@ -629,6 +629,12 @@ pub struct MarketMakerEngine {
     sla_tracker: SlaTracker,
     pnl_tracker: PnlTracker,
     volume_limiter: mm_risk::VolumeLimitTracker,
+    /// INT-1 — per-decision cost ledger. Shared via `Arc` so the
+    /// dashboard's read endpoint can hit it without going
+    /// through the engine. Records a decision on every
+    /// refresh_quotes that emits orders; resolves fills in the
+    /// fill branch.
+    decision_ledger: Arc<mm_risk::decision_ledger::DecisionLedger>,
     dashboard: Option<DashboardState>,
     alerts: Option<AlertManager>,
     /// Multi-currency portfolio aggregator. Shared across all
@@ -1010,6 +1016,9 @@ impl MarketMakerEngine {
                 config.risk.max_daily_volume_quote,
                 config.risk.max_hourly_volume_quote,
             ),
+            decision_ledger: Arc::new(
+                mm_risk::decision_ledger::DecisionLedger::default(),
+            ),
             dashboard,
             alerts,
             portfolio: None,
@@ -1032,6 +1041,15 @@ impl MarketMakerEngine {
         engine
             .order_manager
             .attach_surveillance(engine.surveillance_tracker.clone());
+        // INT-1 — publish the decision-ledger handle on the
+        // shared dashboard so `/api/v1/decisions/recent` can read
+        // without touching the engine.
+        if let Some(dash) = &engine.dashboard {
+            dash.register_decision_ledger(
+                &engine.symbol,
+                Arc::clone(&engine.decision_ledger),
+            );
+        }
         engine
     }
 
@@ -2068,6 +2086,82 @@ impl MarketMakerEngine {
     /// whose remote half has only just been dispatched won't get
     /// fully acked by this engine alone — timeout-based rollback
     /// remains the safety net.
+    #[allow(dead_code)]
+    /// INT-1 — record one decision per side that has quote
+    /// volume this tick. The returned vec is consumed right
+    /// after `execute_diff` to bind newly-placed order IDs.
+    /// Expected cost: the smallest distance-from-mid in bps on
+    /// that side's quotes — an operator-facing estimate of what
+    /// a worst-case getting-picked-off would cost vs the
+    /// decision-time mid.
+    fn record_tick_decisions(
+        &mut self,
+        quotes: &[mm_common::types::QuotePair],
+    ) -> Vec<(mm_common::types::Side, mm_risk::decision_ledger::DecisionId)> {
+        use mm_common::types::Side;
+        let mid = match self.book_keeper.book.mid_price() {
+            Some(m) if m > Decimal::ZERO => m,
+            _ => return Vec::new(),
+        };
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let ten_k = Decimal::from(10_000);
+
+        let mut bid_qty = Decimal::ZERO;
+        let mut bid_nearest_bps: Option<Decimal> = None;
+        let mut ask_qty = Decimal::ZERO;
+        let mut ask_nearest_bps: Option<Decimal> = None;
+        for q in quotes {
+            if let Some(b) = &q.bid {
+                bid_qty += b.qty;
+                let dist_bps = (mid - b.price) / mid * ten_k;
+                bid_nearest_bps = Some(match bid_nearest_bps {
+                    Some(n) => n.min(dist_bps),
+                    None => dist_bps,
+                });
+            }
+            if let Some(a) = &q.ask {
+                ask_qty += a.qty;
+                let dist_bps = (a.price - mid) / mid * ten_k;
+                ask_nearest_bps = Some(match ask_nearest_bps {
+                    Some(n) => n.min(dist_bps),
+                    None => dist_bps,
+                });
+            }
+        }
+
+        let mut out = Vec::with_capacity(2);
+        if bid_qty > Decimal::ZERO {
+            let did = self.decision_ledger.record_decision(
+                now_ms,
+                &self.symbol,
+                Side::Buy,
+                bid_qty,
+                mid,
+                bid_nearest_bps,
+            );
+            out.push((Side::Buy, did));
+        }
+        if ask_qty > Decimal::ZERO {
+            let did = self.decision_ledger.record_decision(
+                now_ms,
+                &self.symbol,
+                Side::Sell,
+                ask_qty,
+                mid,
+                ask_nearest_bps,
+            );
+            out.push((Side::Sell, did));
+        }
+        out
+    }
+
+    /// Publicly readable handle to the decision ledger — the
+    /// server-side `/api/v1/decisions/recent` endpoint goes
+    /// through this to avoid threading a second `Arc`.
+    pub fn decision_ledger(&self) -> Arc<mm_risk::decision_ledger::DecisionLedger> {
+        Arc::clone(&self.decision_ledger)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn sweep_atomic_bundle_acks(&mut self) {
         let self_venue = format!("{:?}", self.config.exchange.exchange_type)
@@ -5054,6 +5148,48 @@ impl MarketMakerEngine {
                     for strat in self.strategy_pool.values() {
                         strat.on_fill(&obs);
                     }
+                    // INT-1 — resolve this fill against its
+                    // originating tick decision. `None` when the
+                    // order was placed pre-ledger (first fills
+                    // after a restart), via a kill-switch flatten,
+                    // or the decision has aged out of the ring.
+                    if let Some(resolved) = self.decision_ledger.on_fill(
+                        fill.order_id,
+                        fill.timestamp.timestamp_millis(),
+                        fill.side,
+                        fill.price,
+                        fill.qty,
+                    ) {
+                        use rust_decimal::prelude::ToPrimitive;
+                        self.audit.risk_event(
+                            &self.symbol,
+                            mm_risk::audit::AuditEventType::StrategyGraphSinkFired,
+                            &format!(
+                                "decision_resolved: realized_bps={} vs_expected_bps={}",
+                                resolved.realized_cost_bps,
+                                match resolved.vs_expected_bps {
+                                    Some(d) => d.to_string(),
+                                    None => "-".into(),
+                                },
+                            ),
+                        );
+                        let side_tag = match fill.side {
+                            mm_common::types::Side::Buy => "buy",
+                            mm_common::types::Side::Sell => "sell",
+                        };
+                        if let Some(v) = resolved.realized_cost_bps.to_f64() {
+                            mm_dashboard::metrics::DECISION_REALIZED_COST_BPS
+                                .with_label_values(&[&self.symbol, side_tag])
+                                .observe(v);
+                        }
+                        if let Some(d) = resolved.vs_expected_bps
+                            .and_then(|v| v.to_f64())
+                        {
+                            mm_dashboard::metrics::DECISION_VS_EXPECTED_BPS
+                                .with_label_values(&[&self.symbol, side_tag])
+                                .observe(d);
+                        }
+                    }
                     if let Some(bps) = self.adverse_selection.adverse_selection_bps() {
                         // Feed the adaptive tuner so it can widen
                         // γ when the desk is being picked off.
@@ -6071,6 +6207,17 @@ impl MarketMakerEngine {
 
         self.kill_switch.on_message_sent();
 
+        // INT-1 — record one decision per side that has pending
+        // quotes this tick, then snapshot live order IDs so the
+        // post-execute_diff diff can bind newly-placed orders to
+        // their decision. Orders that existed before and survived
+        // (amends) already belong to an earlier decision — we
+        // don't rebind them, preserving the chain back to the
+        // originating tick.
+        let tick_decisions = self.record_tick_decisions(&quotes);
+        let pre_exec_ids: std::collections::HashSet<mm_common::types::OrderId> =
+            self.order_manager.live_order_ids().into_iter().collect();
+
         let amend_epsilon = if self.config.market_maker.amend_enabled {
             self.config.market_maker.amend_max_ticks
         } else {
@@ -6085,6 +6232,32 @@ impl MarketMakerEngine {
                 amend_epsilon,
             )
             .await?;
+
+        // INT-1 — bind newly-placed orders to their
+        // originating tick decision.
+        let post_exec_ids: std::collections::HashSet<mm_common::types::OrderId> =
+            self.order_manager.live_order_ids().into_iter().collect();
+        if !tick_decisions.is_empty() {
+            let fresh: Vec<mm_common::types::OrderId> = post_exec_ids
+                .difference(&pre_exec_ids)
+                .copied()
+                .collect();
+            if !fresh.is_empty() {
+                let live_snap = self.order_manager.live_orders_snapshot();
+                for (oid, side, _price, _qty, _status) in live_snap {
+                    if !fresh.contains(&oid) {
+                        continue;
+                    }
+                    if let Some(did) = tick_decisions
+                        .iter()
+                        .find(|(s, _)| *s == side)
+                        .map(|(_, d)| *d)
+                    {
+                        self.decision_ledger.bind_order(did, oid);
+                    }
+                }
+            }
+        }
 
         // SLA update.
         let has_bid = quotes.iter().any(|q| q.bid.is_some());
@@ -7529,6 +7702,84 @@ mod dual_connector_tests {
                 .get(),
             0.0
         );
+    }
+
+    /// INT-1 — `record_tick_decisions` creates one ledger
+    /// entry per side that has quote volume, tags each with
+    /// the nearest-to-mid distance as the expected cost.
+    #[test]
+    fn int1_record_tick_decisions_creates_one_per_side() {
+        use mm_common::types::{Quote, QuotePair, Side};
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        let mut engine = MarketMakerEngine::new(
+            "INT1REC".to_string(),
+            sample_config(),
+            sample_product("INT1REC"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        // Seed a mid so record_tick_decisions passes the guard.
+        engine.book_keeper.book.apply_snapshot(
+            vec![mm_common::types::PriceLevel {
+                price: dec!(99),
+                qty: dec!(5),
+            }],
+            vec![mm_common::types::PriceLevel {
+                price: dec!(101),
+                qty: dec!(5),
+            }],
+            1,
+        );
+        let quotes = vec![
+            QuotePair {
+                bid: Some(Quote { side: Side::Buy, price: dec!(99.5), qty: dec!(0.1) }),
+                ask: Some(Quote { side: Side::Sell, price: dec!(100.5), qty: dec!(0.1) }),
+            },
+        ];
+        let decisions = engine.record_tick_decisions(&quotes);
+        assert_eq!(decisions.len(), 2, "one per side");
+        assert_eq!(engine.decision_ledger.len(), 2);
+        // Recent sees both, newest-first.
+        let recent = engine.decision_ledger.recent(10);
+        assert_eq!(recent.len(), 2);
+        assert!(recent.iter().all(|r| r.symbol == "INT1REC"));
+    }
+
+    /// INT-1 — on_fill resolves back through the ledger +
+    /// emits an audit-friendly delta.
+    #[test]
+    fn int1_on_fill_resolves_through_ledger() {
+        use mm_common::types::Side;
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        let engine = MarketMakerEngine::new(
+            "INT1RES".to_string(),
+            sample_config(),
+            sample_product("INT1RES"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        let did = engine.decision_ledger.record_decision(
+            1_000,
+            "INT1RES",
+            Side::Buy,
+            dec!(0.1),
+            dec!(100),
+            Some(dec!(3)),
+        );
+        let oid = mm_common::types::OrderId::new_v4();
+        assert!(engine.decision_ledger.bind_order(did, oid));
+        let resolved = engine
+            .decision_ledger
+            .on_fill(oid, 1_500, Side::Buy, dec!(100.05), dec!(0.1))
+            .expect("resolved");
+        assert_eq!(resolved.realized_cost_bps, dec!(5));
+        assert_eq!(resolved.vs_expected_bps, Some(dec!(2)));
     }
 
     /// Sprint 4 — deploy counters tick on accepted + rejected.

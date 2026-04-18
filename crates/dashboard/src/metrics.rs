@@ -518,6 +518,37 @@ pub static STRATEGY_GRAPH_NODES: Lazy<GaugeVec> = Lazy::new(|| {
     .unwrap()
 });
 
+// ── INT-1 — decision cost ledger histogram ────────────────
+
+/// Histogram of realized cost bps per resolved decision,
+/// labelled by symbol + side. Bucket boundaries cover both
+/// passive MM outcomes (bps-scale, typically ±5) and
+/// take-driven outcomes (10s of bps). Used to spot regime
+/// changes in fill quality without reading the audit log.
+pub static DECISION_REALIZED_COST_BPS: Lazy<prometheus::HistogramVec> = Lazy::new(|| {
+    prometheus::register_histogram_vec!(
+        "mm_decision_realized_cost_bps",
+        "Realized cost of a resolved decision (bps of decision-time mid, adverse = positive)",
+        &["symbol", "side"],
+        vec![-50.0, -20.0, -10.0, -5.0, -2.0, -1.0, 0.0, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0]
+    )
+    .unwrap()
+});
+
+/// Histogram of `realized - expected` per resolved decision.
+/// Centred on zero for a well-calibrated expected-cost estimator;
+/// a persistent drift points at a stale fee table, a broken
+/// impact_bps, or a model-vs-reality gap.
+pub static DECISION_VS_EXPECTED_BPS: Lazy<prometheus::HistogramVec> = Lazy::new(|| {
+    prometheus::register_histogram_vec!(
+        "mm_decision_vs_expected_bps",
+        "Delta between realized and expected cost bps per decision (positive = worse than expected)",
+        &["symbol", "side"],
+        vec![-50.0, -20.0, -10.0, -5.0, -2.0, -1.0, 0.0, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0]
+    )
+    .unwrap()
+});
+
 /// Initialize all metrics (call once at startup).
 pub fn init() {
     // Force lazy initialization.
@@ -585,6 +616,8 @@ pub fn init() {
     let _ = &*ATOMIC_BUNDLES_COMPLETED_TOTAL;
     let _ = &*STRATEGY_GRAPH_DEPLOYS_TOTAL;
     let _ = &*STRATEGY_GRAPH_NODES;
+    let _ = &*DECISION_REALIZED_COST_BPS;
+    let _ = &*DECISION_VS_EXPECTED_BPS;
 }
 
 // ── Block B / C — archive + scheduler observability ────────
