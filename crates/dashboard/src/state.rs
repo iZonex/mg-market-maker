@@ -200,6 +200,10 @@ struct StateInner {
     /// Written every tick by engines that hold a plan-bearing
     /// graph; read by the `/api/v1/plans/active` endpoint.
     active_plans: HashMap<String, Vec<PlanSnapshot>>,
+    /// INV-3 — per-(symbol, venue) signed inventory published by
+    /// each engine once per tick. Key = `(symbol, venue)` so the
+    /// aggregator can sum across venues for the same base asset.
+    engine_inventory: HashMap<(String, String), Decimal>,
     /// Epic H Phase 3 — shared audit sink the dashboard uses to
     /// record deploy / rollback / reject events on the same
     /// hash-chained timeline as order-lifecycle + risk rows.
@@ -888,6 +892,32 @@ impl DashboardState {
             out.insert(sym.clone(), ledger.recent(per_symbol_max));
         }
         out
+    }
+
+    /// INV-3 — publish engine-side inventory for the (symbol,
+    /// venue) tuple. Engines call this every tick so the cross-
+    /// venue aggregator reads a fresh picture without a round-
+    /// trip through the engine.
+    pub fn publish_inventory(&self, symbol: &str, venue: &str, inv: Decimal) {
+        self.inner
+            .write()
+            .unwrap()
+            .engine_inventory
+            .insert((symbol.to_string(), venue.to_string()), inv);
+    }
+
+    /// INV-3 — sum of every published inventory whose symbol
+    /// STARTS WITH the given base asset (e.g. `"BTC"` matches
+    /// `"BTCUSDT"` on Binance + `"BTCUSDC"` on Bybit). Result
+    /// is the net delta in base asset across every connected
+    /// venue.
+    pub fn cross_venue_net_delta(&self, base_asset: &str) -> Decimal {
+        let g = self.inner.read().unwrap();
+        g.engine_inventory
+            .iter()
+            .filter(|((sym, _), _)| sym.starts_with(base_asset))
+            .map(|(_, v)| *v)
+            .sum()
     }
 
     /// UI-1 — publish active plans for a symbol. Empty vec

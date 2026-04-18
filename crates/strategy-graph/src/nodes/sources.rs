@@ -167,6 +167,48 @@ impl NodeKind for CostSweep {
     }
 }
 
+// ── Portfolio.CrossVenueNetDelta (INV-3) ──────────────────
+
+/// `Portfolio.CrossVenueNetDelta(base_asset)` — sum of signed
+/// inventory across every connected venue whose symbol starts
+/// with `base_asset`. Config: `{ asset: "BTC" }`. A single rule
+/// like `CrossVenueNetDelta > max_delta → Out.SpreadMult widen`
+/// now composes on a graph instead of wiring N engines by hand.
+#[derive(Debug, Default)]
+pub struct PortfolioCrossVenueNetDelta;
+
+impl NodeKind for PortfolioCrossVenueNetDelta {
+    fn kind(&self) -> &'static str {
+        "Portfolio.CrossVenueNetDelta"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        static PORTS: Lazy<Vec<Port>> =
+            Lazy::new(|| vec![Port::new("value", PortType::Number)]);
+        &PORTS
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![ConfigField {
+            name: "asset",
+            label: "Base asset",
+            hint: Some("Symbol prefix the aggregator matches on (e.g. BTC)"),
+            default: serde_json::json!(""),
+            widget: ConfigWidget::Text,
+        }]
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
 // ── Cost.CumulativeToday / Decision.RealizedCostBps (RS-4) ─
 
 /// `Cost.CumulativeToday` — cumulative net trading cost since

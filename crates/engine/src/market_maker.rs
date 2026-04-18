@@ -2931,6 +2931,24 @@ impl MarketMakerEngine {
                         pending_alerts.push((kind.clone(), *id, out));
                     }
                 }
+                "Portfolio.CrossVenueNetDelta" => {
+                    // INV-3 — sum signed inventory across every
+                    // venue for the configured base asset.
+                    // Missing on engines with no dashboard attached.
+                    let cfg = graph.node_configs().get(id);
+                    let asset = cfg
+                        .and_then(|c| c.get("asset"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let v = if asset.is_empty() {
+                        Value::Missing
+                    } else if let Some(dash) = self.dashboard.as_ref() {
+                        Value::Number(dash.cross_venue_net_delta(asset))
+                    } else {
+                        Value::Missing
+                    };
+                    src.insert((*id, "value".into()), v);
+                }
                 "Cost.CumulativeToday" => {
                     // RS-4 — net trading cost in quote asset:
                     // fees_paid - rebate_income. The PnL tracker
@@ -3803,6 +3821,19 @@ impl MarketMakerEngine {
                 })
                 .collect();
             dash.publish_active_plans(&self.symbol, plans);
+        }
+
+        // INV-3 — publish this engine's inventory to the
+        // cross-venue aggregator so graph nodes on sibling
+        // engines can read `Portfolio.CrossVenueNetDelta`.
+        if let Some(dash) = self.dashboard.as_ref() {
+            let venue = format!("{:?}", self.config.exchange.exchange_type)
+                .to_lowercase();
+            dash.publish_inventory(
+                &self.symbol,
+                &venue,
+                self.inventory_manager.inventory(),
+            );
         }
     }
 

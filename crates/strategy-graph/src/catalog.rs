@@ -169,6 +169,7 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Risk.UnrealizedIfFlatten" => Some(Box::new(sources::UnrealizedIfFlatten)),
         "Cost.CumulativeToday" => Some(Box::new(sources::CumulativeTodayCost)),
         "Decision.RealizedCostBps" => Some(Box::new(sources::DecisionRealizedCostBps)),
+        "Portfolio.CrossVenueNetDelta" => Some(Box::new(sources::PortfolioCrossVenueNetDelta)),
         // Sinks
         "Out.SpreadMult" => Some(Box::new(sinks::SpreadMult)),
         "Out.SizeMult" => Some(Box::new(sinks::SizeMult)),
@@ -309,6 +310,7 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Risk.UnrealizedIfFlatten" => NodeMeta { label: "Unrealized if flat", summary: "Quote-asset PnL we'd realise by flattening now against the live book", group: "Risk" },
         "Cost.CumulativeToday"     => NodeMeta { label: "Cost today",        summary: "fees_paid − rebate_income since UTC midnight", group: "Sources" },
         "Decision.RealizedCostBps" => NodeMeta { label: "Decision cost avg", summary: "Rolling avg realized cost bps across the last N resolved decisions", group: "Sources" },
+        "Portfolio.CrossVenueNetDelta" => NodeMeta { label: "Cross-venue net delta", summary: "Sum of signed inventory across every connected venue for a base asset", group: "Sources" },
 
         // Sinks — always fire on a trigger, consumed by the engine.
         "Out.SpreadMult"       => NodeMeta { label: "Spread multiplier",   summary: "Final spread scalar applied to quotes", group: "Sinks" },
@@ -431,6 +433,7 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Risk.UnrealizedIfFlatten",
         "Cost.CumulativeToday",
         "Decision.RealizedCostBps",
+        "Portfolio.CrossVenueNetDelta",
         "Surveillance.SpoofingScore",
         "Surveillance.LayeringScore",
         "Surveillance.QuoteStuffingScore",
@@ -525,8 +528,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_98_nodes_after_rs_4_cost_sources() {
-        // 96 + 2 (RS-4: Cost.CumulativeToday + Decision.RealizedCostBps). = 98.
-        assert_eq!(kinds().len(), 98, "catalog drift");
+    fn catalog_has_99_nodes_after_inv_3_cross_venue() {
+        // 98 + 1 (INV-3: Portfolio.CrossVenueNetDelta). = 99.
+        assert_eq!(kinds().len(), 99, "catalog drift");
     }
 }
