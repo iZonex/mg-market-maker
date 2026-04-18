@@ -966,3 +966,211 @@ fn seed_last_hash_from_file(path: &Path) -> Option<String> {
     let last = content.lines().rev().find(|l| !l.trim().is_empty())?;
     Some(sha256_hex(last.as_bytes()))
 }
+
+/// Sprint-5 companion — offline hash-chain verification for a
+/// single audit log file. Walks the JSONL rows in order and
+/// checks that every `prev_hash` equals the SHA-256 of the
+/// preceding serialised line (i.e. the exact write-path invariant
+/// in `AuditLog::log_event`). Insertion, deletion, reordering, or
+/// field tampering on any row breaks the chain at that row +
+/// every row after it, so a failure at row N pinpoints the first
+/// tampered boundary.
+///
+/// Used by disaster-recovery startup: if the last session's log
+/// fails this check, the operator is required to roll forward on
+/// an earlier known-good archive instead of silently trusting the
+/// suspect file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainVerifyError {
+    /// A line failed to parse as an `AuditEvent`. Payload is the
+    /// 1-indexed line number.
+    MalformedRow(usize),
+    /// `prev_hash` on row `row` didn't match the computed hash of
+    /// row `row - 1`. The `expected` is what the chain says
+    /// should be there; `got` is what the file carries.
+    ChainBroken {
+        row: usize,
+        expected: Option<String>,
+        got: Option<String>,
+    },
+}
+
+impl std::fmt::Display for ChainVerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChainVerifyError::MalformedRow(n) => {
+                write!(f, "row {n} failed to parse as an AuditEvent")
+            }
+            ChainVerifyError::ChainBroken { row, expected, got } => {
+                write!(
+                    f,
+                    "hash chain broken at row {row}: expected {expected:?}, got {got:?}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChainVerifyError {}
+
+/// Report from a successful chain verification — rows checked
+/// and the hash of the final row so callers can decide if the
+/// chain extends correctly into a newer file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainVerifyReport {
+    pub rows_checked: usize,
+    pub last_hash: Option<String>,
+}
+
+/// Walk `path` (a JSONL audit log) and verify the hash chain.
+/// Empty file → `Ok(ChainVerifyReport { 0, None })`. The first
+/// row's `prev_hash` is expected to be `None` (fresh chain after
+/// daily rotation); subsequent rows carry the previous row's
+/// SHA-256.
+pub fn verify_chain(path: &Path) -> std::result::Result<ChainVerifyReport, ChainVerifyError> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => {
+            return Ok(ChainVerifyReport {
+                rows_checked: 0,
+                last_hash: None,
+            });
+        }
+    };
+    let mut prev_hash: Option<String> = None;
+    let mut rows = 0usize;
+    for (idx, line) in content.lines().enumerate() {
+        let row = idx + 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: AuditEvent = serde_json::from_str(line)
+            .map_err(|_| ChainVerifyError::MalformedRow(row))?;
+        if event.prev_hash != prev_hash {
+            return Err(ChainVerifyError::ChainBroken {
+                row,
+                expected: prev_hash,
+                got: event.prev_hash,
+            });
+        }
+        prev_hash = Some(sha256_hex(line.as_bytes()));
+        rows += 1;
+    }
+    Ok(ChainVerifyReport {
+        rows_checked: rows,
+        last_hash: prev_hash,
+    })
+}
+
+#[cfg(test)]
+mod chain_verify_tests {
+    use super::*;
+
+    fn tmp_audit_path(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "mm_audit_chain_{tag}_{}_{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        p
+    }
+
+    fn write_clean_chain(p: &Path, rows: usize) {
+        let log = AuditLog::new(p).expect("open audit");
+        for i in 0..rows {
+            log.risk_event(
+                "BTCUSDT",
+                AuditEventType::EngineStarted,
+                &format!("row-{i}"),
+            );
+        }
+        drop(log);
+    }
+
+    /// Clean chain verifies and reports the row count.
+    #[test]
+    fn clean_chain_passes() {
+        let p = tmp_audit_path("clean");
+        write_clean_chain(&p, 5);
+        let report = verify_chain(&p).expect("clean chain");
+        assert_eq!(report.rows_checked, 5);
+        assert!(report.last_hash.is_some());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Tampering a middle row breaks the chain at the tampered
+    /// row itself — its `prev_hash` no longer matches the computed
+    /// hash of the preceding row.
+    #[test]
+    fn tampered_middle_row_fails_at_row() {
+        let p = tmp_audit_path("tamper");
+        write_clean_chain(&p, 5);
+        let content = std::fs::read_to_string(&p).unwrap();
+        let mut lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 5);
+        // Swap row 3 for a copy of row 1 — its prev_hash (null)
+        // won't match the hash of row 2, so verify_chain fires at
+        // row 3.
+        lines[2] = lines[0];
+        std::fs::write(&p, lines.join("\n") + "\n").unwrap();
+        let err = verify_chain(&p).expect_err("chain should break");
+        match err {
+            ChainVerifyError::ChainBroken { row, .. } => assert_eq!(row, 3),
+            other => panic!("unexpected: {other:?}"),
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Missing first-row prev_hash (operator injected a synthetic
+    /// row at the top) breaks the chain at row 1.
+    #[test]
+    fn inserted_head_row_fails_at_first_boundary() {
+        let p = tmp_audit_path("insert");
+        write_clean_chain(&p, 3);
+        let content = std::fs::read_to_string(&p).unwrap();
+        let mut lines: Vec<String> = content.lines().map(String::from).collect();
+        // Synthetic row with a non-null prev_hash at the head —
+        // full AuditEvent shape so it parses cleanly.
+        let synthetic = r#"{"seq":0,"timestamp":"2020-01-01T00:00:00Z","event_type":"engine_started","symbol":"BTCUSDT","prev_hash":"deadbeef"}"#;
+        lines.insert(0, synthetic.to_string());
+        std::fs::write(&p, lines.join("\n") + "\n").unwrap();
+        let err = verify_chain(&p).expect_err("chain should break");
+        match err {
+            ChainVerifyError::ChainBroken { row, expected, got } => {
+                assert_eq!(row, 1);
+                assert_eq!(expected, None);
+                assert_eq!(got, Some("deadbeef".into()));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Empty or missing file returns an empty report — not an
+    /// error. That's the expected bootstrap case.
+    #[test]
+    fn missing_file_returns_empty_report() {
+        let p = tmp_audit_path("missing");
+        let report = verify_chain(&p).expect("missing = empty");
+        assert_eq!(report.rows_checked, 0);
+        assert_eq!(report.last_hash, None);
+    }
+
+    /// Malformed JSON on row N points at row N.
+    #[test]
+    fn malformed_row_reports_line_number() {
+        let p = tmp_audit_path("malformed");
+        write_clean_chain(&p, 3);
+        let content = std::fs::read_to_string(&p).unwrap();
+        let mut lines: Vec<String> = content.lines().map(String::from).collect();
+        lines[1] = "{ not valid json".to_string();
+        std::fs::write(&p, lines.join("\n") + "\n").unwrap();
+        let err = verify_chain(&p).expect_err("should fail");
+        match err {
+            ChainVerifyError::MalformedRow(n) => assert_eq!(n, 2),
+            other => panic!("unexpected: {other:?}"),
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+}

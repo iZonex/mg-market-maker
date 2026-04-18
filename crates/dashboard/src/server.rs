@@ -1415,6 +1415,27 @@ async fn clients_loss_state(State(state): State<DashboardState>) -> Json<Vec<Cli
 /// switches are NOT reset here; operators call the existing
 /// `POST /api/v1/ops/reset/{symbol}` for each sibling engine so
 /// every post-incident escalation is acknowledged.
+async fn ops_client_reset(
+    State(state): State<DashboardState>,
+    Path(client_id): Path<String>,
+) -> Json<serde_json::Value> {
+    match state.per_client_circuit() {
+        Some(circuit) => {
+            circuit.reset_client(&client_id);
+            Json(serde_json::json!({
+                "client_id": client_id,
+                "status": "reset",
+                "note": "each engine's kill switch must also be reset via /api/v1/ops/reset/{symbol}"
+            }))
+        }
+        None => Json(serde_json::json!({
+            "client_id": client_id,
+            "status": "no_circuit",
+            "error": "per-client loss circuit not registered on this server"
+        })),
+    }
+}
+
 #[cfg(test)]
 mod surveillance_tests {
     use super::*;
@@ -1438,26 +1459,5 @@ mod surveillance_tests {
         let row = spoof.get("UISURV1").expect("symbol bucket present");
         assert!((row.score - 0.73).abs() < 1e-9, "score round-trips");
         assert_eq!(row.alerts_total, 3, "alerts counter surfaces");
-    }
-}
-
-async fn ops_client_reset(
-    State(state): State<DashboardState>,
-    Path(client_id): Path<String>,
-) -> Json<serde_json::Value> {
-    match state.per_client_circuit() {
-        Some(circuit) => {
-            circuit.reset_client(&client_id);
-            Json(serde_json::json!({
-                "client_id": client_id,
-                "status": "reset",
-                "note": "each engine's kill switch must also be reset via /api/v1/ops/reset/{symbol}"
-            }))
-        }
-        None => Json(serde_json::json!({
-            "client_id": client_id,
-            "status": "no_circuit",
-            "error": "per-client loss circuit not registered on this server"
-        })),
     }
 }
