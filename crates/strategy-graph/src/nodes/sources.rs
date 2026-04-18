@@ -238,6 +238,225 @@ impl NodeKind for PairClassCurrent {
     }
 }
 
+// ── Multi-Venue 2.B.2 — parameterised cross-stream sources ───
+
+/// `Book.L2(venue, symbol, product, depth)` — top-N levels per side
+/// off the shared DataBus. Outputs flatten depth×2 arrays into two
+/// string-serialised CSV strings so a graph can read them without
+/// needing a new port type for vectors.
+#[derive(Debug, Default)]
+pub struct BookL2;
+
+static BOOK_L2_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
+    vec![
+        Port::new("bids", PortType::String),
+        Port::new("asks", PortType::String),
+        Port::new("best_bid_px", PortType::Number),
+        Port::new("best_ask_px", PortType::Number),
+    ]
+});
+
+impl NodeKind for BookL2 {
+    fn kind(&self) -> &'static str {
+        "Book.L2"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &BOOK_L2_OUTPUTS
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        cross_venue_config_fields(Some(("depth", "Depth (levels/side)", 10)))
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing; 4])
+    }
+}
+
+/// `Trade.Tape(venue, symbol, product, window_secs)` — rolling
+/// public-trade window. Outputs the tape's size + signed-qty sum +
+/// last price so simple detectors can consume it without parsing
+/// a CSV.
+#[derive(Debug, Default)]
+pub struct TradeTape;
+
+static TRADE_TAPE_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
+    vec![
+        Port::new("trade_count", PortType::Number),
+        Port::new("buy_qty", PortType::Number),
+        Port::new("sell_qty", PortType::Number),
+        Port::new("last_price", PortType::Number),
+    ]
+});
+
+impl NodeKind for TradeTape {
+    fn kind(&self) -> &'static str {
+        "Trade.Tape"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &TRADE_TAPE_OUTPUTS
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        cross_venue_config_fields(Some(("window_secs", "Tape window (s)", 60)))
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing; 4])
+    }
+}
+
+/// `Balance(venue, asset)` — wallet balance off the bus. `total`
+/// and `available` are what graphs usually consume; `reserved` is
+/// the margin + open-orders-locked portion for parity with
+/// the exchange-reported shape.
+#[derive(Debug, Default)]
+pub struct BalanceSource;
+
+static BALANCE_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
+    vec![
+        Port::new("total", PortType::Number),
+        Port::new("available", PortType::Number),
+        Port::new("reserved", PortType::Number),
+    ]
+});
+
+impl NodeKind for BalanceSource {
+    fn kind(&self) -> &'static str {
+        "Balance"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &BALANCE_OUTPUTS
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![
+            ConfigField {
+                name: "venue",
+                label: "Venue",
+                hint: Some("Empty = this engine's venue"),
+                default: serde_json::json!(""),
+                widget: ConfigWidget::Text,
+            },
+            ConfigField {
+                name: "asset",
+                label: "Asset",
+                hint: Some("e.g. USDT, BTC"),
+                default: serde_json::json!("USDT"),
+                widget: ConfigWidget::Text,
+            },
+        ]
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing; 3])
+    }
+}
+
+/// `Funding(venue, symbol)` — per-perp funding rate. `rate` is
+/// per-hour as a fraction (e.g. 0.0001 = 1 bps/h); `seconds_to_next`
+/// counts down to the next funding exchange.
+#[derive(Debug, Default)]
+pub struct FundingSource;
+
+static FUNDING_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
+    vec![
+        Port::new("rate", PortType::Number),
+        Port::new("seconds_to_next", PortType::Number),
+    ]
+});
+
+impl NodeKind for FundingSource {
+    fn kind(&self) -> &'static str {
+        "Funding"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &FUNDING_OUTPUTS
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        cross_venue_config_fields(None)
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing; 2])
+    }
+}
+
+/// Shared `(venue, symbol, product[, extra_int])` config schema
+/// used by every cross-venue source. Factored out so a change to
+/// the tuple (e.g. adding `subaccount`) touches one place.
+fn cross_venue_config_fields(
+    extra_int: Option<(&'static str, &'static str, i64)>,
+) -> Vec<crate::node::ConfigField> {
+    use crate::node::{ConfigEnumOption, ConfigField, ConfigWidget};
+    let mut fields = vec![
+        ConfigField {
+            name: "venue",
+            label: "Venue (optional)",
+            hint: Some("Empty = this engine's venue"),
+            default: serde_json::json!(""),
+            widget: ConfigWidget::Text,
+        },
+        ConfigField {
+            name: "symbol",
+            label: "Symbol (optional)",
+            hint: Some("Empty = this engine's symbol"),
+            default: serde_json::json!(""),
+            widget: ConfigWidget::Text,
+        },
+        ConfigField {
+            name: "product",
+            label: "Product (optional)",
+            hint: None,
+            default: serde_json::json!(""),
+            widget: ConfigWidget::Enum {
+                options: vec![
+                    ConfigEnumOption { value: "", label: "(engine default)" },
+                    ConfigEnumOption { value: "spot", label: "Spot" },
+                    ConfigEnumOption { value: "linear_perp", label: "Linear perp" },
+                    ConfigEnumOption { value: "inverse_perp", label: "Inverse perp" },
+                ],
+            },
+        },
+    ];
+    if let Some((name, label, default)) = extra_int {
+        fields.push(ConfigField {
+            name,
+            label,
+            hint: None,
+            default: serde_json::json!(default),
+            widget: ConfigWidget::Integer { min: Some(1), max: Some(3600) },
+        });
+    }
+    fields
+}
+
 // ── Epic R — Surveillance detectors ────────────────────────
 //
 // Source-only nodes. The engine holds the `OrderLifecycleTracker`

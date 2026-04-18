@@ -1548,6 +1548,39 @@ impl MarketMakerEngine {
     /// per-tick `source_inputs` from local engine state, calls
     /// `Evaluator::tick`, applies sink actions to the autotuner
     /// and kill switch. No-op when no graph is attached.
+    /// Multi-Venue 2.B — resolve a parameterised source-node's
+    /// stream key from its JSON config. Empty venue / symbol /
+    /// product fall back to the engine's own defaults. `read_extra`
+    /// also extracts a numeric extra (depth / window_secs), default
+    /// 10 when absent.
+    fn read_cross_venue_key(
+        cfg: Option<&serde_json::Value>,
+        engine_venue: String,
+        engine_symbol: String,
+        engine_product: mm_common::config::ProductType,
+        read_extra: bool,
+    ) -> (String, String, mm_common::config::ProductType, usize) {
+        let v = cfg.and_then(|c| c.get("venue")).and_then(|v| v.as_str()).unwrap_or("");
+        let s = cfg.and_then(|c| c.get("symbol")).and_then(|v| v.as_str()).unwrap_or("");
+        let p_str = cfg.and_then(|c| c.get("product")).and_then(|v| v.as_str()).unwrap_or("");
+        let venue = if v.is_empty() { engine_venue } else { v.to_string() };
+        let symbol = if s.is_empty() { engine_symbol } else { s.to_string() };
+        let product = match p_str {
+            "spot" => mm_common::config::ProductType::Spot,
+            "linear_perp" => mm_common::config::ProductType::LinearPerp,
+            "inverse_perp" => mm_common::config::ProductType::InversePerp,
+            _ => engine_product,
+        };
+        let extra = if read_extra {
+            cfg.and_then(|c| c.get("depth").or_else(|| c.get("window_secs")))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(10) as usize
+        } else {
+            0
+        };
+        (venue, symbol, product, extra)
+    }
+
     fn tick_strategy_graph(&mut self) {
         use mm_strategy_graph::{EvalCtx, NodeId, SinkAction, Value};
         use std::collections::HashMap;
@@ -1680,6 +1713,145 @@ impl MarketMakerEngine {
                         src.insert((*id, "mid".into()), mid.clone());
                         src.insert((*id, "spread_bps".into()), spread_bps.clone());
                     }
+                }
+                // Multi-Venue 2.B.2 — cross-venue sources. Each
+                // reads the DataBus by the (venue, symbol, product)
+                // config on the node; empty fields fall back to
+                // this engine's own stream.
+                "Book.L2" => {
+                    let (venue, symbol, product, depth) = Self::read_cross_venue_key(
+                        graph.node_configs().get(id),
+                        format!("{:?}", self.config.exchange.exchange_type).to_lowercase(),
+                        self.symbol.clone(),
+                        self.config.exchange.product,
+                        true,
+                    );
+                    let snap = self
+                        .dashboard
+                        .as_ref()
+                        .and_then(|d| d.data_bus().get_l2(&(venue, symbol, product)));
+                    let (bids_str, asks_str, best_bid, best_ask) = match snap {
+                        Some(s) => {
+                            let d = depth.max(1).min(s.bids.len().max(s.asks.len()).max(1));
+                            let fmt = |v: &[(rust_decimal::Decimal, rust_decimal::Decimal)]| {
+                                v.iter()
+                                    .take(d)
+                                    .map(|(p, q)| format!("{p}@{q}"))
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            };
+                            (
+                                Value::String(fmt(&s.bids)),
+                                Value::String(fmt(&s.asks)),
+                                s.bids.first().map(|(p, _)| Value::Number(*p)).unwrap_or(Value::Missing),
+                                s.asks.first().map(|(p, _)| Value::Number(*p)).unwrap_or(Value::Missing),
+                            )
+                        }
+                        None => (
+                            Value::String(String::new()),
+                            Value::String(String::new()),
+                            Value::Missing,
+                            Value::Missing,
+                        ),
+                    };
+                    src.insert((*id, "bids".into()), bids_str);
+                    src.insert((*id, "asks".into()), asks_str);
+                    src.insert((*id, "best_bid_px".into()), best_bid);
+                    src.insert((*id, "best_ask_px".into()), best_ask);
+                }
+                "Trade.Tape" => {
+                    let (venue, symbol, product, _window) = Self::read_cross_venue_key(
+                        graph.node_configs().get(id),
+                        format!("{:?}", self.config.exchange.exchange_type).to_lowercase(),
+                        self.symbol.clone(),
+                        self.config.exchange.product,
+                        true,
+                    );
+                    let ticks = self
+                        .dashboard
+                        .as_ref()
+                        .map(|d| d.data_bus().get_trades(&(venue, symbol, product)))
+                        .unwrap_or_default();
+                    let mut buy_qty = rust_decimal::Decimal::ZERO;
+                    let mut sell_qty = rust_decimal::Decimal::ZERO;
+                    let mut last_px: Option<rust_decimal::Decimal> = None;
+                    for t in &ticks {
+                        match t.aggressor {
+                            Some(mm_dashboard::data_bus::TradeSide::Buy) => buy_qty += t.qty,
+                            Some(mm_dashboard::data_bus::TradeSide::Sell) => sell_qty += t.qty,
+                            None => {}
+                        }
+                        last_px = Some(t.price);
+                    }
+                    src.insert(
+                        (*id, "trade_count".into()),
+                        Value::Number(rust_decimal::Decimal::from(ticks.len())),
+                    );
+                    src.insert((*id, "buy_qty".into()), Value::Number(buy_qty));
+                    src.insert((*id, "sell_qty".into()), Value::Number(sell_qty));
+                    src.insert(
+                        (*id, "last_price".into()),
+                        last_px.map(Value::Number).unwrap_or(Value::Missing),
+                    );
+                }
+                "Balance" => {
+                    let cfg = graph.node_configs().get(id);
+                    let venue = cfg
+                        .and_then(|c| c.get("venue"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| {
+                            format!("{:?}", self.config.exchange.exchange_type).to_lowercase()
+                        });
+                    let asset = cfg
+                        .and_then(|c| c.get("asset"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("USDT")
+                        .to_string();
+                    let bal = self
+                        .dashboard
+                        .as_ref()
+                        .and_then(|d| d.data_bus().get_balance(&venue, &asset));
+                    let (total, available, reserved) = match bal {
+                        Some(b) => (
+                            Value::Number(b.total),
+                            Value::Number(b.available),
+                            Value::Number(b.reserved),
+                        ),
+                        None => (Value::Missing, Value::Missing, Value::Missing),
+                    };
+                    src.insert((*id, "total".into()), total);
+                    src.insert((*id, "available".into()), available);
+                    src.insert((*id, "reserved".into()), reserved);
+                }
+                "Funding" => {
+                    let (venue, symbol, product, _) = Self::read_cross_venue_key(
+                        graph.node_configs().get(id),
+                        format!("{:?}", self.config.exchange.exchange_type).to_lowercase(),
+                        self.symbol.clone(),
+                        self.config.exchange.product,
+                        false,
+                    );
+                    let fr = self
+                        .dashboard
+                        .as_ref()
+                        .and_then(|d| d.data_bus().get_funding(&(venue, symbol, product)));
+                    let (rate, seconds) = match fr {
+                        Some(f) => (
+                            f.rate.map(Value::Number).unwrap_or(Value::Missing),
+                            f.next_funding_ts
+                                .map(|ts| {
+                                    Value::Number(rust_decimal::Decimal::from(
+                                        (ts - chrono::Utc::now()).num_seconds().max(0),
+                                    ))
+                                })
+                                .unwrap_or(Value::Missing),
+                        ),
+                        None => (Value::Missing, Value::Missing),
+                    };
+                    src.insert((*id, "rate".into()), rate);
+                    src.insert((*id, "seconds_to_next".into()), seconds);
                 }
                 "Volatility.Realised" => {
                     src.insert((*id, "value".into()), realised_vol.clone());

@@ -42,6 +42,10 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Logic.Mux" => Some(Box::new(logic::Mux)),
         // Sources — port-only, values come in via source_inputs at eval
         "Book.L1" => Some(Box::new(sources::BookL1)),
+        "Book.L2" => Some(Box::new(sources::BookL2)),
+        "Trade.Tape" => Some(Box::new(sources::TradeTape)),
+        "Balance" => Some(Box::new(sources::BalanceSource)),
+        "Funding" => Some(Box::new(sources::FundingSource)),
         "Sentiment.Rate" => Some(Box::new(sources::SentimentRate)),
         "Sentiment.Score" => Some(Box::new(sources::SentimentScore)),
         "Volatility.Realised" => Some(Box::new(sources::VolatilityRealised)),
@@ -155,7 +159,11 @@ pub struct NodeMeta {
 pub fn meta(kind: &str) -> NodeMeta {
     match kind {
         // Sources — pull live data from the engine.
-        "Book.L1"              => NodeMeta { label: "L1 book",             summary: "Top-of-book bid/ask price + size", group: "Sources" },
+        "Book.L1"              => NodeMeta { label: "L1 book",             summary: "Top-of-book bid/ask price + size (optional venue/symbol/product)", group: "Sources" },
+        "Book.L2"              => NodeMeta { label: "L2 book",             summary: "Top-N levels per side off the shared data bus", group: "Sources" },
+        "Trade.Tape"           => NodeMeta { label: "Trade tape",          summary: "Rolling public-trade window (count + buy/sell volume + last px)", group: "Sources" },
+        "Balance"              => NodeMeta { label: "Balance",             summary: "Wallet balance (total / available / reserved) per venue + asset", group: "Sources" },
+        "Funding"              => NodeMeta { label: "Funding",             summary: "Per-perp funding rate + seconds to next funding", group: "Sources" },
         "Sentiment.Rate"       => NodeMeta { label: "Sentiment rate",      summary: "Social mentions per minute (source asset)", group: "Sources" },
         "Sentiment.Score"      => NodeMeta { label: "Sentiment score",     summary: "Weighted polarity score [-1..1]", group: "Sources" },
         "Volatility.Realised"  => NodeMeta { label: "Realised volatility", summary: "EWMA realised vol (annualised)", group: "Sources" },
@@ -268,6 +276,10 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Logic.And",
         "Logic.Mux",
         "Book.L1",
+        "Book.L2",
+        "Trade.Tape",
+        "Balance",
+        "Funding",
         "Sentiment.Rate",
         "Sentiment.Score",
         "Volatility.Realised",
@@ -390,8 +402,10 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_55_nodes_after_epic_r_week_3_reference_exploit() {
-        // 54 after Week 2 + Strategy.Spoof = 55.
-        assert_eq!(kinds().len(), 55, "catalog drift");
+    fn catalog_has_59_nodes_after_multi_venue_2b2() {
+        // 55 after Week 3 + Book.L2 + Trade.Tape + Balance + Funding
+        // = 59. Parameterised cross-venue sources ship as new kinds;
+        // legacy Book.L1 unchanged.
+        assert_eq!(kinds().len(), 59, "catalog drift");
     }
 }

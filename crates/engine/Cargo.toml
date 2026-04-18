@@ -23,11 +23,11 @@ rust_decimal_macros = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
 mm-exchange-binance = { workspace = true }
 mm-exchange-bybit = { workspace = true }
 mm-exchange-hyperliquid = { workspace = true }
-serde_json = { workspace = true }
 proptest = "1"
