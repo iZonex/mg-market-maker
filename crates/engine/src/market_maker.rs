@@ -5096,7 +5096,21 @@ impl MarketMakerEngine {
 
         match &event {
             MarketEvent::BookSnapshot { .. } | MarketEvent::BookDelta { .. } => {
+                // BOOK-3 — measure engine-side book-update
+                // processing time. Records a histogram sample per
+                // snapshot / delta so ops can spot a slowing
+                // book-update path before it costs us money.
+                let _bk_start = std::time::Instant::now();
+                let _bk_kind = match &event {
+                    MarketEvent::BookSnapshot { .. } => "snapshot",
+                    MarketEvent::BookDelta { .. } => "delta",
+                    _ => "other",
+                };
                 self.book_keeper.on_event(&event);
+                let elapsed_ms = _bk_start.elapsed().as_secs_f64() * 1000.0;
+                mm_dashboard::metrics::BOOK_UPDATE_LATENCY_MS
+                    .with_label_values(&[&self.symbol, _bk_kind])
+                    .observe(elapsed_ms);
                 // OTR: every book event is a price-level update
                 // from the L2 perspective — we don't have L3
                 // add/cancel granularity, so we account for it

@@ -549,6 +549,20 @@ pub static DECISION_VS_EXPECTED_BPS: Lazy<prometheus::HistogramVec> = Lazy::new(
     .unwrap()
 });
 
+/// BOOK-3 — processing latency from `handle_ws_event` entry to
+/// `book_keeper.on_event` completion, per symbol + event kind.
+/// Catches a slowing book-update path before stale quotes cost
+/// us money.
+pub static BOOK_UPDATE_LATENCY_MS: Lazy<prometheus::HistogramVec> = Lazy::new(|| {
+    prometheus::register_histogram_vec!(
+        "mm_book_update_latency_ms",
+        "Engine-side processing latency: WS event arrival → book state applied",
+        &["symbol", "kind"],
+        vec![0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 1000.0]
+    )
+    .unwrap()
+});
+
 // ── INT-2 — tiered OTR gauges ───────────────────────────────
 
 /// 4-way OTR per symbol: `{tier, window}` label pair picks
@@ -635,6 +649,7 @@ pub fn init() {
     let _ = &*DECISION_REALIZED_COST_BPS;
     let _ = &*DECISION_VS_EXPECTED_BPS;
     let _ = &*ORDER_TO_TRADE_TIERED;
+    let _ = &*BOOK_UPDATE_LATENCY_MS;
 }
 
 // ── Block B / C — archive + scheduler observability ────────
