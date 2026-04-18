@@ -2924,6 +2924,42 @@ impl MarketMakerEngine {
                         pending_alerts.push((kind.clone(), *id, out));
                     }
                 }
+                "Cost.Sweep" => {
+                    // INT-4 — run sweep_vwap against the current
+                    // book for the node's (side, size) config.
+                    // Outputs Missing when the book side is empty,
+                    // size is missing / non-positive, or mid is
+                    // unknown — the validator already locked the
+                    // output port types, so `Missing` is safe on
+                    // every port.
+                    use mm_common::types::Side;
+                    use std::str::FromStr;
+                    let cfg = graph.node_configs().get(id);
+                    let side = match cfg
+                        .and_then(|c| c.get("side"))
+                        .and_then(|v| v.as_str())
+                    {
+                        Some("sell") => Side::Sell,
+                        _ => Side::Buy,
+                    };
+                    let size = cfg
+                        .and_then(|c| c.get("size"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| rust_decimal::Decimal::from_str(s).ok())
+                        .unwrap_or(rust_decimal::Decimal::ZERO);
+                    match self.book_keeper.book.sweep_vwap(side, size) {
+                        Some(r) => {
+                            src.insert((*id, "impact_bps".into()), Value::Number(r.impact_bps));
+                            src.insert((*id, "vwap".into()), Value::Number(r.vwap));
+                            src.insert((*id, "fully_filled".into()), Value::Bool(r.fully_filled));
+                        }
+                        None => {
+                            src.insert((*id, "impact_bps".into()), Value::Missing);
+                            src.insert((*id, "vwap".into()), Value::Missing);
+                            src.insert((*id, "fully_filled".into()), Value::Missing);
+                        }
+                    }
+                }
                 "Surveillance.FakeLiquidityScore" => {
                     // Pull current L2 off the bus, compare against
                     // the snapshot we stashed at the end of the

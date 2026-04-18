@@ -97,6 +97,76 @@ impl NodeKind for BookL1 {
     }
 }
 
+// ── Cost.Sweep (INT-4) ──────────────────────────────────────
+
+/// `Cost.Sweep` — simulated sweep cost against the current book.
+/// Engine overlays `impact_bps` + `vwap` by calling
+/// `LocalOrderBook::sweep_vwap(side, size)`. Lets the graph
+/// author rules like "if sweep-to-flatten > 30 bps, widen 2×"
+/// or "if impact > X, pause quoting" without an off-graph
+/// book-walking helper.
+///
+/// Config:
+///   * `side`: "buy" (sweeps asks) or "sell" (sweeps bids)
+///   * `size`: base-asset qty the caller would hypothetically
+///     take right now
+#[derive(Debug, Default)]
+pub struct CostSweep;
+
+static COST_SWEEP_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
+    vec![
+        Port::new("impact_bps", PortType::Number),
+        Port::new("vwap", PortType::Number),
+        Port::new("fully_filled", PortType::Bool),
+    ]
+});
+
+impl NodeKind for CostSweep {
+    fn kind(&self) -> &'static str {
+        "Cost.Sweep"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &COST_SWEEP_OUTPUTS
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigEnumOption, ConfigField, ConfigWidget};
+        vec![
+            ConfigField {
+                name: "side",
+                label: "Side",
+                hint: Some("buy = sweep asks, sell = sweep bids"),
+                default: serde_json::json!("buy"),
+                widget: ConfigWidget::Enum {
+                    options: vec![
+                        ConfigEnumOption { value: "buy", label: "Buy (sweep asks)" },
+                        ConfigEnumOption { value: "sell", label: "Sell (sweep bids)" },
+                    ],
+                },
+            },
+            ConfigField {
+                name: "size",
+                label: "Target qty (base)",
+                hint: Some("Hypothetical base-asset qty to take right now"),
+                default: serde_json::json!("0.01"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+        ]
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        // Engine overlays actual values per tick; `Missing`
+        // falls through when the book is empty / size is zero.
+        Ok(vec![Value::Missing; COST_SWEEP_OUTPUTS.len()])
+    }
+}
+
 // Single-output source nodes share this helper since the only
 // difference is the `kind()` string.
 macro_rules! single_scalar_source {
