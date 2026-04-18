@@ -4,9 +4,49 @@
 
 | Mode | Env | Behavior |
 |------|-----|----------|
-| `live` | `MM_MODE=live` | Real orders. Preflight must pass. |
-| `paper` | `MM_MODE=paper` | Connects to real feed, preflight warnings don't block. |
-| `smoke` | `MM_MODE=smoke` | Connector test only: subscribe, place/cancel test order, exit. |
+| `live` | `MM_MODE=live` | Real orders. Preflight must pass. Validation gates placeholder config. |
+| `paper` | `MM_MODE=paper` | Real market feed. `OrderManager` + `BalanceCache` short-circuit all order egress to simulated UUIDs; paper fills synthesised from public trades. |
+| `smoke` | `MM_MODE=smoke` | Connector test only: subscribe, place/cancel ONE test order, exit. |
+
+### Paper-mode guard (Epic 26)
+
+`mode == "paper"` is not just a log message — it is enforced at the
+`OrderManager` / `BalanceCache` level. Every `place_order`,
+`cancel_order`, `amend_order`, `place_orders_batch`,
+`cancel_orders_batch`, and unwind-slice path checks the paper flag
+before calling the connector and returns a simulated response
+instead. Covered by 7 unit tests in `crates/engine/src/order_manager.rs`.
+
+Live smoke verified with a Binance spot `canTrade:true` key:
+45 s of paper run, 0 calls to `/api/v3/order`, `/openOrders` stayed `[]`.
+
+## Per-Venue Quickstart
+
+| Venue | Products | Auth | Public keyless | Env vars | Notes |
+|-------|----------|------|----------------|----------|-------|
+| Binance | spot + USDM futures | HMAC-SHA256 | yes | `MM_BINANCE_API_KEY`, `MM_BINANCE_API_SECRET` | Shared key pair covers both. `user_stream_enabled = true` on live merges out-of-band fills via listen-key. `LIMIT_MAKER` used for post-only. |
+| Bybit V5 | spot, linear (USDT-M), inverse (coin-margined) | HMAC-SHA256 | yes (spot) | `MM_BYBIT_API_KEY`, `MM_BYBIT_API_SECRET` | One connector per category (`BybitConnector::spot() / ::linear() / ::inverse()`). Private WS (no listen-key). Batch size 20, native `amend`. |
+| HyperLiquid | spot + perps | EIP-712 / secp256k1 | yes (`/info`) | `MM_HL_PRIVATE_KEY` | Two constructors: `new()` for perps, `spot()` for spot. Asset index offset (`SPOT_INDEX_OFFSET = 10_000`) handled internally. USDC-only collateral. 32-byte hex private key; address is derived. |
+| Custom exchange | spot | HMAC | yes | `MM_API_KEY`, `MM_API_SECRET` | Development/integration target only. |
+
+Each venue × product is a **separate connector instance** — an engine
+can run `binance_spot + binance_futures + bybit_spot + bybit_linear +
+hyperliquid_spot + hyperliquid_perp` side-by-side, each with its own
+book-keeper, risk state, and audit feed. Venue credentials are scoped
+per venue (not per product) — the same Binance key covers spot + futures.
+
+```bash
+# Paper run against Binance — simulated orders, real feed.
+MM_CONFIG=config/binance-paper.toml \
+MM_MODE=paper \
+MM_BINANCE_API_KEY=<read-only key> \
+MM_BINANCE_API_SECRET=<secret> \
+MM_AUTH_SECRET="$(openssl rand -base64 48)" \
+cargo run --release -p mm-server
+```
+
+Swap the config path + env pair for Bybit (`MM_BYBIT_*`) or HL
+(`MM_HL_PRIVATE_KEY`).
 
 ## Pre-Flight Checks
 
@@ -15,6 +55,7 @@ Run automatically on startup. In `live` mode, any failure aborts.
 | Check | What | Fail means |
 |-------|------|-----------|
 | `venue_connectivity` | `health_check()` | Exchange unreachable |
+| `clock_skew` | `server_time_ms()` vs local clock | Drift > 2 s ⇒ hard fail (Binance `-1021` silent fails); 500 ms – 2 s ⇒ warn |
 | `{symbol}_product_spec` | `get_product_spec()` | Symbol not found or invalid |
 | `{symbol}_tick_size` | tick > 0 | Can't place orders |
 | `{symbol}_fees` | Non-default fees | VIP tier not loaded |
@@ -169,6 +210,48 @@ Key gauges to monitor:
 | `mm_sla_presence_pct_24h` | < 95% |
 | `mm_portfolio_var_95` | Breaching limit |
 
+## Dashboard Auth & Network Exposure
+
+The dashboard must never be bound to a public interface without
+a TLS-terminating reverse proxy in front. Tokens are Bearer-only,
+HMAC-signed, and leak once over plaintext — the HTTP layer itself
+has no TLS code path.
+
+**Checklist before exposing the dashboard:**
+
+- `MM_AUTH_SECRET` is set to **32+ random bytes** (e.g.
+  `openssl rand -base64 48`). The default placeholder is refused
+  with a warning at startup; do not ship with it.
+- Front the listener with nginx/Caddy/ALB terminating TLS. Bind
+  `mm-server` to `127.0.0.1:<port>` and proxy through.
+- Users are created under `[[users]]` in config with explicit
+  `role` (`admin` / `operator` / `viewer`) and long random
+  `api_key` values (32+ bytes). Never reuse exchange keys.
+- Rotate the `MM_AUTH_SECRET` on operator offboarding — it
+  invalidates every outstanding token immediately.
+
+**Auth surface summary:**
+
+| Path | Method | Auth | Role gate |
+|------|--------|------|-----------|
+| `/api/auth/login` | POST | none (IP-rate-limited 20/min) | — |
+| `/api/auth/logout` | POST | Bearer | any |
+| `/health`, `/ready`, `/startup` | GET | none | — |
+| `/api/status`, `/api/v1/*` (read-only) | GET | Bearer | any |
+| `/metrics` | GET | Bearer | admin/operator |
+| `/api/v1/ops/*`, `/api/admin/*` | POST/GET | Bearer | admin only |
+| `/ws` | GET upgrade | `?token=…` | role-derived |
+
+Tokens are 24 h HMAC-SHA256, stateless — logout emits an audit
+event but cannot revoke the token (the client must drop it). If
+a key is suspected compromised: remove it from `[[users]]`, then
+rotate `MM_AUTH_SECRET` to cut every pre-issued token.
+
+Every `/api/auth/login` success and failure writes a row to the
+MiCA audit trail (`LoginSucceeded` / `LoginFailed`), and every
+`/api/auth/logout` writes a `LogoutSucceeded` row. Failures log
+the source IP and a short key prefix for correlation.
+
 ## Daily Operations Checklist
 
 1. Check `GET /api/v1/system/preflight` — all green?
@@ -177,3 +260,33 @@ Key gauges to monitor:
 4. Check inventory — not pinned at max?
 5. Review audit log for warnings/errors
 6. Backup `data/checkpoint.json`
+
+## Observability
+
+### Sentry (error aggregation)
+
+Always compiled. Activates at runtime when `MM_SENTRY_DSN` is set.
+Release tag is `mm-server@<cargo_pkg_version>`, environment tag
+mirrors `MM_MODE` (live/paper/smoke). Override trace sample rate
+with `SENTRY_TRACES_SAMPLE_RATE` if the default errors-only mode
+is too narrow.
+
+### OpenTelemetry OTLP tracing (optional)
+
+Gated behind the `otel` cargo feature so default builds stay lean.
+
+```bash
+# Build with the feature
+cargo build --release -p mm-server --features otel
+
+# Point at a collector (tonic/gRPC endpoint)
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+cargo run --release -p mm-server --features otel
+```
+
+The layer sits beneath `EnvFilter` so `RUST_LOG` still controls
+volume. Instrumented spans currently cover `run_with_hedge`,
+`refresh_quotes`, `refresh_balances`, `reconcile`, and
+`dispatch_route` — the hot engine paths operators care about
+when tracing a symbol's pipeline latency. Unset the env var (or
+build without `--features otel`) to get zero-network behaviour.

@@ -5,9 +5,11 @@
 //! optional). The derived Ethereum address is used as the account identity.
 
 pub mod auth;
+pub mod classify;
 pub mod connector;
 pub mod types;
 pub mod ws_post;
 
+pub use classify::classify;
 pub use connector::{parse_hl_event_for_test, HyperLiquidConnector};
 pub use ws_post::{HlPostWire, HlWsTrader};

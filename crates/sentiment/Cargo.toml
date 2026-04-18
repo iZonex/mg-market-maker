@@ -1,0 +1,32 @@
+[package]
+name = "mm-sentiment"
+edition.workspace = true
+version.workspace = true
+
+# Pure foundation for social-risk integration (Epic G).
+#
+# This crate is IO-light by design: types, ticker normalisation,
+# sliding-window aggregates, local-LLM + keyword sentiment
+# scorers. Collectors (RSS, CryptoPanic, Twitter, Telegram),
+# persistent storage, and background orchestration ride on top
+# in later sprints and never bleed into `lib.rs`.
+#
+# Ideology note: unlike a trading bot, market-making consumes
+# sentiment as a RISK signal — "crowd coming, tighten up", not
+# "follow the trade". The public API therefore emits
+# `SentimentTick`s with *state* (rate, acceleration, delta),
+# not buy/sell recommendations. Whatever wires this into the
+# engine is responsible for translating state → spread
+# multiplier / size cut / kill-switch — kept in `mm-risk`.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }

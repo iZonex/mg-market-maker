@@ -20,6 +20,13 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 rand = "0.9"
 rand_chacha = "0.9"
+# Live data recorder — pulls Binance/Bybit public WS streams
+# and dumps them as RecordedEvent JSONL so operators can
+# calibrate strategy parameters on real venue flow.
+tokio-tungstenite = { workspace = true }
+futures-util = "0.3"
+reqwest = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [[bin]]
 name = "mm-probe"
@@ -28,3 +35,15 @@ path = "src/bin/mm_probe.rs"
 [[bin]]
 name = "mm-stress-test"
 path = "src/bin/mm_stress_test.rs"
+
+[[bin]]
+name = "mm-record-live"
+path = "src/bin/mm_record_live.rs"
+
+[[bin]]
+name = "mm-calibrate"
+path = "src/bin/mm_calibrate.rs"
+
+[[bin]]
+name = "mm-backtest-live"
+path = "src/bin/mm_backtest_live.rs"

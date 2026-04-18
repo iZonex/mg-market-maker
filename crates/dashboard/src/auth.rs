@@ -1,12 +1,14 @@
-use axum::extract::Request;
+use axum::extract::{ConnectInfo, Request};
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use chrono::{Duration, Utc};
 use hmac::{Hmac, Mac};
+use mm_risk::audit::{AuditEventType, AuditLog};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use subtle::ConstantTimeEq;
 use tracing::warn;
@@ -84,6 +86,11 @@ pub struct AuthState {
     users: Arc<RwLock<HashMap<String, ApiUser>>>,
     /// HMAC secret for token signing. Hidden from Debug output.
     secret: Arc<String>,
+    /// Optional audit sink — when present, login successes,
+    /// failures, and logouts emit rows into the MiCA audit log
+    /// so credential-stuffing attempts and operator intent leave
+    /// a tamper-evident trail (Epic 38).
+    audit: Option<Arc<AuditLog>>,
 }
 
 impl std::fmt::Debug for AuthState {
@@ -113,6 +120,23 @@ impl AuthState {
         Self {
             users: Arc::new(RwLock::new(HashMap::new())),
             secret: Arc::new(secret.to_string()),
+            audit: None,
+        }
+    }
+
+    /// Attach an audit sink — login / logout events will be
+    /// mirrored into the `AuditLog` so the MiCA trail captures
+    /// who logged in from where and when. Optional: when not
+    /// attached, auth events only go to `tracing`.
+    pub fn with_audit(mut self, audit: Arc<AuditLog>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    /// Emit an auth audit event if the sink is attached.
+    fn audit(&self, ty: AuditEventType, detail: &str) {
+        if let Some(a) = &self.audit {
+            a.auth_event(ty, detail);
         }
     }
 
@@ -373,12 +397,22 @@ pub fn verify_token_param(auth: &AuthState, token: &str) -> Option<TokenClaims> 
 }
 
 /// Login endpoint: POST /api/auth/login { "api_key": "..." } → { "token": "...", "role": "..." }
+///
+/// Both paths (success and failure) emit an audit event so
+/// credential-stuffing attempts leave a trail even when no valid
+/// key is ever guessed (Epic 38).
 pub async fn login_handler(
     axum::extract::State(auth): axum::extract::State<AuthState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     axum::Json(body): axum::Json<LoginRequest>,
 ) -> Response {
+    let ip = addr.ip();
     if let Some(user) = auth.auth_by_key(&body.api_key) {
         let token = auth.generate_token(&user);
+        auth.audit(
+            AuditEventType::LoginSucceeded,
+            &format!("user_id={},role={:?},ip={}", user.id, user.role, ip),
+        );
         axum::Json(LoginResponse {
             token,
             user_id: user.id,
@@ -392,8 +426,40 @@ pub async fn login_handler(
         // a valid one, avoiding a trivial timing oracle on api_key
         // membership. Cheap.
         let _ = auth.verify_token(&body.api_key);
+        // Record a short prefix of the presented key so incident
+        // responders can correlate stuffing runs without leaking
+        // the full (possibly valid-on-another-surface) secret.
+        let key_prefix: String = body.api_key.chars().take(6).collect();
+        auth.audit(
+            AuditEventType::LoginFailed,
+            &format!("ip={},key_prefix={},reason=unknown_key", ip, key_prefix),
+        );
         StatusCode::UNAUTHORIZED.into_response()
     }
+}
+
+/// Logout endpoint: POST /api/auth/logout → 204.
+///
+/// Tokens are stateless HMAC so there is no server-side session
+/// to clear — the client drops the token, the 24 h `exp` bound
+/// remains the only server-side enforcement. The event exists to
+/// mark operator intent in the MiCA audit trail.
+pub async fn logout_handler(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: Request,
+) -> Response {
+    let ip = addr.ip();
+    let user_id = req
+        .extensions()
+        .get::<TokenClaims>()
+        .map(|c| c.user_id.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    auth.audit(
+        AuditEventType::LogoutSucceeded,
+        &format!("user_id={user_id},ip={ip}"),
+    );
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[derive(Deserialize)]
@@ -407,4 +473,90 @@ pub struct LoginResponse {
     pub user_id: String,
     pub name: String,
     pub role: Role,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+
+    fn tmp_audit_path() -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "mm_auth_audit_{}_{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        p
+    }
+
+    fn read_audit_lines(path: &std::path::Path) -> Vec<String> {
+        let f = std::fs::File::open(path).expect("open audit file");
+        BufReader::new(f)
+            .lines()
+            .map_while(Result::ok)
+            .collect()
+    }
+
+    fn user(key: &str, role: Role) -> ApiUser {
+        ApiUser {
+            id: format!("u-{key}"),
+            name: "tester".into(),
+            role,
+            api_key: key.to_string(),
+            allowed_symbols: None,
+            client_id: None,
+        }
+    }
+
+    #[test]
+    fn token_round_trips_and_expires() {
+        let auth = AuthState::new("0123456789abcdef0123456789abcdef");
+        let u = user("k-admin", Role::Admin);
+        auth.add_user(u.clone());
+        let tok = auth.generate_token(&u);
+        let claims = auth.verify_token(&tok).expect("valid token verifies");
+        assert_eq!(claims.user_id, u.id);
+        assert_eq!(claims.role, Role::Admin);
+        // Tamper: flip a byte in the signature — must fail.
+        let mut bad = tok.clone();
+        bad.pop();
+        bad.push('a');
+        assert!(auth.verify_token(&bad).is_none());
+    }
+
+    #[test]
+    fn audit_success_and_failure_rows_written() {
+        let path = tmp_audit_path();
+        let audit = Arc::new(AuditLog::new(&path).expect("audit"));
+        let auth = AuthState::new("0123456789abcdef0123456789abcdef").with_audit(audit.clone());
+        auth.add_user(user("real-key", Role::Operator));
+
+        auth.audit(
+            AuditEventType::LoginSucceeded,
+            "user_id=u-real-key,role=Operator,ip=127.0.0.1",
+        );
+        auth.audit(
+            AuditEventType::LoginFailed,
+            "ip=127.0.0.1,key_prefix=badkey,reason=unknown_key",
+        );
+        auth.audit(
+            AuditEventType::LogoutSucceeded,
+            "user_id=u-real-key,ip=127.0.0.1",
+        );
+        audit.flush();
+
+        let lines = read_audit_lines(&path);
+        assert!(lines.iter().any(|l| l.contains("\"login_succeeded\"")));
+        assert!(lines.iter().any(|l| l.contains("\"login_failed\"")));
+        assert!(lines.iter().any(|l| l.contains("\"logout_succeeded\"")));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn audit_sink_optional() {
+        // No audit attached — calls must not panic.
+        let auth = AuthState::new("0123456789abcdef0123456789abcdef");
+        auth.audit(AuditEventType::LoginSucceeded, "no-sink");
+    }
 }

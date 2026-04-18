@@ -11,7 +11,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::auth;
 
@@ -179,6 +179,14 @@ impl BybitConnector {
                 supports_ws_trading: false,
                 supports_fix: false,
                 max_order_rate: 20,
+                // Margin info + mode are perp-only on Bybit —
+                // linear/inverse UTA accounts expose
+                // `/v5/account/wallet-balance` + position-list,
+                // spot returns a 404 on the position endpoint.
+                // Mirror `supports_funding_rate` so the capability
+                // flags stay honest per category.
+                supports_margin_info: category.has_funding(),
+                supports_margin_mode: category.has_funding(),
             },
             wallet: category.wallet_type(),
             category,
@@ -242,21 +250,32 @@ impl BybitConnector {
 
     async fn signed_get(&self, path: &str, params: &str) -> anyhow::Result<Value> {
         self.rate_limiter.acquire(1).await;
-        let (ts, recv, sig) = auth::auth_headers(&self.api_key, &self.api_secret, params);
         let url = if params.is_empty() {
             format!("{}{path}", self.base_url)
         } else {
             format!("{}{path}?{params}", self.base_url)
         };
-        let resp = self
-            .client
-            .get(&url)
-            .header("X-BAPI-API-KEY", &self.api_key)
-            .header("X-BAPI-TIMESTAMP", &ts)
-            .header("X-BAPI-RECV-WINDOW", &recv)
-            .header("X-BAPI-SIGN", &sig)
-            .send()
-            .await?;
+        // Public-only mode: when no API key is configured, skip the
+        // auth headers entirely. Bybit rejects any request with an
+        // empty `X-BAPI-API-KEY` header ("apiKey is missing") even
+        // on public market-data endpoints, so sending empty auth
+        // headers breaks paper-mode runs that don't need trading
+        // access. Attempting the call unsigned lets `/v5/market/*`
+        // work; private endpoints will error out server-side with a
+        // clearer message.
+        let req = if self.api_key.is_empty() {
+            self.client.get(&url)
+        } else {
+            let (ts, recv, sig) =
+                auth::auth_headers(&self.api_key, &self.api_secret, params);
+            self.client
+                .get(&url)
+                .header("X-BAPI-API-KEY", &self.api_key)
+                .header("X-BAPI-TIMESTAMP", &ts)
+                .header("X-BAPI-RECV-WINDOW", &recv)
+                .header("X-BAPI-SIGN", &sig)
+        };
+        let resp = req.send().await?;
         let body: Value = resp.json().await?;
         let ret_code = body.get("retCode").and_then(|v| v.as_i64()).unwrap_or(-1);
         if ret_code != 0 {
@@ -311,6 +330,10 @@ impl ExchangeConnector for BybitConnector {
         &self.capabilities
     }
 
+    fn classify_error(&self, err: &anyhow::Error) -> mm_exchange_core::VenueError {
+        crate::classify(err)
+    }
+
     fn product(&self) -> VenueProduct {
         self.category.venue_product()
     }
@@ -321,9 +344,21 @@ impl ExchangeConnector for BybitConnector {
     ) -> anyhow::Result<mpsc::UnboundedReceiver<MarketEvent>> {
         let (tx, rx) = mpsc::unbounded_channel();
         let ws_url = self.ws_url.clone();
+        // Bybit V5 linear/inverse supports orderbook depths 1, 50,
+        // 200, 500 — **not 25**. Spot supports 1, 50, 200. Depth
+        // 50 is a universal safe default that works across all
+        // categories (verified Bybit docs 2026-04). Sending an
+        // unsupported depth causes the WS to silently never
+        // deliver book updates — the subscription is accepted
+        // but no data flows, which is how our StaleBook circuit
+        // breaker would trip 10 s in.
+        let depth: u32 = match self.category {
+            BybitCategory::Spot => 50,
+            BybitCategory::Linear | BybitCategory::Inverse => 50,
+        };
         let topics: Vec<String> = symbols
             .iter()
-            .flat_map(|s| vec![format!("orderbook.25.{s}"), format!("publicTrade.{s}")])
+            .flat_map(|s| vec![format!("orderbook.{depth}.{s}"), format!("publicTrade.{s}")])
             .collect();
 
         tokio::spawn(async move {
@@ -523,6 +558,37 @@ impl ExchangeConnector for BybitConnector {
             .ok_or_else(|| FeeTierError::Other(anyhow::anyhow!("no fee row for {symbol}")))
     }
 
+    /// Epic 40.3 — Bybit V5 funding rate via
+    /// `GET /v5/market/tickers?category=linear&symbol=`. The
+    /// ticker row carries `fundingRate` and `nextFundingTime`
+    /// (ms). Spot and inverse/linear-without-funding return
+    /// `NotSupported` before hitting the wire so the engine
+    /// never burns a call on a non-perp category.
+    async fn get_funding_rate(&self, symbol: &str) -> Result<FundingRate, FundingRateError> {
+        if !self.category.has_funding() {
+            return Err(FundingRateError::NotSupported);
+        }
+        let params = format!("category={}&symbol={symbol}", self.category.as_str());
+        let url = format!("{}/v5/market/tickers?{params}", self.base_url);
+        let resp: Value = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| FundingRateError::Other(anyhow::anyhow!("{e}")))?
+            .json()
+            .await
+            .map_err(|e| FundingRateError::Other(anyhow::anyhow!("{e}")))?;
+        let result = resp
+            .get("result")
+            .ok_or_else(|| FundingRateError::Other(anyhow::anyhow!("missing `result`")))?;
+        parse_bybit_funding_rate(result, symbol).ok_or_else(|| {
+            FundingRateError::Other(anyhow::anyhow!(
+                "no funding row for {symbol}"
+            ))
+        })
+    }
+
     /// Native V5 amend — preserves queue priority on Bybit.
     /// Maps the engine-side `AmendOrder` onto `POST /v5/order/amend`
     /// with the venue-mandatory `category` field and only the deltas
@@ -622,6 +688,44 @@ impl ExchangeConnector for BybitConnector {
             })
             .filter(|b| b.total > dec!(0))
             .collect())
+    }
+
+    async fn server_time_ms(&self) -> anyhow::Result<Option<i64>> {
+        // Bybit V5 `/v5/market/time` returns `timeSecond` and
+        // `timeNano`. Public endpoint, no signing needed.
+        let url = format!("{}/v5/market/time", self.base_url);
+        let resp: serde_json::Value = self.client.get(&url).send().await?.json().await?;
+        let ts_ms = resp
+            .get("result")
+            .and_then(|r| r.get("timeSecond"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<i64>().ok())
+            .map(|s| s * 1000);
+        Ok(ts_ms)
+    }
+
+    async fn get_24h_volume_usd(
+        &self,
+        symbol: &str,
+    ) -> anyhow::Result<Option<rust_decimal::Decimal>> {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+        // Bybit V5 tickers — public endpoint, signed_get works with
+        // empty credentials. `turnover24h` = quote-currency
+        // 24h turnover.
+        let params = format!("category={}&symbol={symbol}", self.category.as_str());
+        let result = self
+            .signed_get("/v5/market/tickers", &params)
+            .await?;
+        let row = result
+            .get("list")
+            .and_then(|l| l.as_array())
+            .and_then(|a| a.first());
+        let vol = row
+            .and_then(|r| r.get("turnover24h"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| Decimal::from_str(s).ok());
+        Ok(vol)
     }
 
     async fn get_product_spec(&self, symbol: &str) -> anyhow::Result<ProductSpec> {
@@ -725,6 +829,224 @@ impl ExchangeConnector for BybitConnector {
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow::anyhow!("missing transferId in response"))
     }
+
+    /// Account margin snapshot (Epic 40.4). Fans out two V5
+    /// calls: `GET /v5/account/wallet-balance?accountType=UNIFIED`
+    /// for the aggregate totals (`totalEquity`,
+    /// `totalInitialMargin`, `totalMaintenanceMargin`,
+    /// `accountMMRate`), and `GET /v5/position/list?category=linear`
+    /// for per-symbol detail (`positionIM`, `positionMM`,
+    /// `liqPrice`). Spot category returns `NotSupported` before
+    /// hitting the wire — matches the capability flag.
+    async fn account_margin_info(&self) -> Result<AccountMarginInfo, MarginError> {
+        if !self.category.has_funding() {
+            return Err(MarginError::NotSupported);
+        }
+        let wallet = self
+            .signed_get("/v5/account/wallet-balance", "accountType=UNIFIED")
+            .await
+            .map_err(MarginError::Other)?;
+        let positions = self
+            .signed_get(
+                "/v5/position/list",
+                &format!("category={}&settleCoin=USDT", self.category.as_str()),
+            )
+            .await
+            .map_err(MarginError::Other)?;
+        parse_bybit_account_margin(&wallet, &positions)
+            .ok_or_else(|| MarginError::Other(anyhow::anyhow!(
+                "malformed Bybit wallet-balance / position-list response"
+            )))
+    }
+
+    /// Set account-wide margin mode via
+    /// `POST /v5/account/set-margin-mode` (Epic 40.7). Bybit
+    /// treats mode as an account-level switch in Unified
+    /// Trading Account — the `symbol` arg is ignored here
+    /// (Binance per-symbol, HL per-asset — Bybit is the
+    /// outlier). Error `110026` = "already in this mode",
+    /// mapped to `Ok(())`.
+    async fn set_margin_mode(
+        &self,
+        _symbol: &str,
+        mode: MarginMode,
+    ) -> Result<(), MarginError> {
+        if !self.category.has_funding() {
+            return Err(MarginError::NotSupported);
+        }
+        let wire = match mode {
+            MarginMode::Isolated => "ISOLATED_MARGIN",
+            MarginMode::Cross => "REGULAR_MARGIN",
+        };
+        let body = serde_json::json!({ "setMarginMode": wire });
+        match self.signed_post("/v5/account/set-margin-mode", &body).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("110026") || msg.contains("already") {
+                    info!(mode = wire, "Bybit margin mode already set");
+                    Ok(())
+                } else {
+                    Err(MarginError::Other(e))
+                }
+            }
+        }
+    }
+
+    /// Set per-symbol leverage via
+    /// `POST /v5/position/set-leverage` (Epic 40.7). Bybit
+    /// takes separate `buyLeverage` / `sellLeverage` fields —
+    /// we set both to the requested value since we run in
+    /// one-way-position mode.
+    async fn set_leverage(
+        &self,
+        symbol: &str,
+        leverage: u32,
+    ) -> Result<(), MarginError> {
+        if !self.category.has_funding() {
+            return Err(MarginError::NotSupported);
+        }
+        let body = serde_json::json!({
+            "category": self.category.as_str(),
+            "symbol": symbol,
+            "buyLeverage": leverage.to_string(),
+            "sellLeverage": leverage.to_string(),
+        });
+        match self.signed_post("/v5/position/set-leverage", &body).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                // 110043 = "Set leverage not modified"
+                if msg.contains("110043") || msg.contains("not modified") {
+                    info!(symbol, leverage, "Bybit leverage already set");
+                    Ok(())
+                } else {
+                    Err(MarginError::Other(e))
+                }
+            }
+        }
+    }
+}
+
+/// Parse the merged output of V5 `wallet-balance` + `position-list`
+/// into an [`AccountMarginInfo`] (Epic 40.4). Bybit publishes
+/// `accountMMRate` as a *fraction-times-100* (i.e. `2.5` means 2.5 %,
+/// not 2.5x), but the same row carries `totalMaintenanceMargin` and
+/// `totalEquity` as raw amounts — we recompute the ratio to avoid
+/// the fraction-vs-percentage ambiguity and drop the reported
+/// `accountMMRate` on the floor.
+pub(crate) fn parse_bybit_account_margin(
+    wallet_result: &Value,
+    positions_result: &Value,
+) -> Option<AccountMarginInfo> {
+    let parse_dec = |v: Option<&Value>| -> Decimal {
+        v.and_then(|x| x.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(Decimal::ZERO)
+    };
+    // wallet-balance shape:
+    // { "list": [ { "accountType": "UNIFIED", "totalEquity": "…",
+    //               "totalInitialMargin": "…",
+    //               "totalMaintenanceMargin": "…",
+    //               "totalAvailableBalance": "…" } ] }
+    let row = wallet_result.get("list")?.as_array()?.iter().find(|r| {
+        r.get("accountType").and_then(|v| v.as_str()) == Some("UNIFIED")
+    })?;
+    let total_equity = parse_dec(row.get("totalEquity"));
+    let total_initial_margin = parse_dec(row.get("totalInitialMargin"));
+    let total_maintenance_margin = parse_dec(row.get("totalMaintenanceMargin"));
+    let available_balance = parse_dec(row.get("totalAvailableBalance"));
+    let margin_ratio = if total_equity > Decimal::ZERO {
+        total_maintenance_margin / total_equity
+    } else {
+        Decimal::ONE
+    };
+    let positions = positions_result
+        .get("list")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(parse_bybit_position_margin)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(AccountMarginInfo {
+        total_equity,
+        total_initial_margin,
+        total_maintenance_margin,
+        available_balance,
+        margin_ratio,
+        positions,
+        reported_at_ms: chrono::Utc::now().timestamp_millis(),
+    })
+}
+
+fn parse_bybit_position_margin(pos: &Value) -> Option<PositionMargin> {
+    let symbol = pos.get("symbol")?.as_str()?.to_string();
+    let parse_dec = |v: Option<&Value>| -> Decimal {
+        v.and_then(|x| x.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(Decimal::ZERO)
+    };
+    let size = parse_dec(pos.get("size"));
+    if size == Decimal::ZERO {
+        return None;
+    }
+    let side_str = pos.get("side").and_then(|v| v.as_str()).unwrap_or("");
+    let side = match side_str {
+        "Buy" => Side::Buy,
+        "Sell" => Side::Sell,
+        _ => return None,
+    };
+    let entry_price = parse_dec(pos.get("avgPrice"));
+    let mark_price = parse_dec(pos.get("markPrice"));
+    // `positionIM` surfaces on isolated positions; cross
+    // positions have `positionIM == 0` and the bucket lives
+    // in the account-wide cross-margin pool.
+    let im = parse_dec(pos.get("positionIM"));
+    let isolated_margin = if im > Decimal::ZERO { Some(im) } else { None };
+    let liq_price = pos
+        .get("liqPrice")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && *s != "0")
+        .and_then(|s| s.parse::<Decimal>().ok())
+        .filter(|d| *d > Decimal::ZERO);
+    Some(PositionMargin {
+        symbol,
+        side,
+        size,
+        entry_price,
+        mark_price,
+        isolated_margin,
+        liq_price,
+    })
+}
+
+/// Parse the `result` payload of
+/// `GET /v5/market/tickers?category=linear` into a
+/// [`FundingRate`] for the requested `symbol` (Epic 40.3).
+/// Bybit V5 ships `fundingRate` as a string decimal and
+/// `nextFundingTime` as a string of Unix-millis. Pure helper
+/// so the wire shape is unit-tested without a live HTTP
+/// client. Cadence is assumed 8h (Bybit's default) — the
+/// venue does not expose cadence on the ticker endpoint; a
+/// one-off `/v5/market/instruments-info.funding_interval`
+/// lookup could refine this for the handful of symbols on
+/// 4h settlement but that's deferred to a later sub-task.
+pub(crate) fn parse_bybit_funding_rate(result: &Value, symbol: &str) -> Option<FundingRate> {
+    let list = result.get("list")?.as_array()?;
+    let row = list
+        .iter()
+        .find(|row| row.get("symbol").and_then(|s| s.as_str()) == Some(symbol))
+        .or_else(|| list.first())?;
+    let rate: Decimal = row.get("fundingRate")?.as_str()?.parse().ok()?;
+    let next_ms: i64 = row.get("nextFundingTime")?.as_str()?.parse().ok()?;
+    let next_funding_time = chrono::DateTime::from_timestamp_millis(next_ms)?;
+    Some(FundingRate {
+        rate,
+        next_funding_time,
+        interval: std::time::Duration::from_secs(8 * 3600),
+    })
 }
 
 /// Parse the `result` payload of `GET /v5/account/fee-rate` into a
@@ -1279,5 +1601,105 @@ mod tests {
         merged.extend(parse_bybit_instruments_list(&empty));
         merged.extend(parse_bybit_instruments_list(&empty));
         assert!(merged.is_empty());
+    }
+
+    /// Epic 40.4 — Bybit V5 account margin wire shape. Both
+    /// `wallet-balance` and `position-list` payloads are needed;
+    /// pin the combined shape so a V5 schema drift fails the
+    /// test before it silently drops the guard's ratio to zero.
+    #[test]
+    fn account_margin_parser_reads_unified_wallet_and_positions() {
+        let wallet = serde_json::json!({
+            "list": [
+                {
+                    "accountType": "UNIFIED",
+                    "totalEquity": "10000.50",
+                    "totalInitialMargin": "2000",
+                    "totalMaintenanceMargin": "500",
+                    "totalAvailableBalance": "8000"
+                }
+            ]
+        });
+        let positions = serde_json::json!({
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "side": "Buy",
+                    "size": "0.05",
+                    "avgPrice": "50000",
+                    "markPrice": "50500",
+                    "positionIM": "250",
+                    "liqPrice": "45000"
+                },
+                {
+                    "symbol": "ETHUSDT",
+                    "side": "Sell",
+                    "size": "0",
+                    "avgPrice": "0",
+                    "markPrice": "0",
+                    "positionIM": "0",
+                    "liqPrice": ""
+                }
+            ]
+        });
+        let info = parse_bybit_account_margin(&wallet, &positions).unwrap();
+        assert_eq!(info.total_equity, rd!(10000.50));
+        assert_eq!(info.total_maintenance_margin, rd!(500));
+        assert!(info.margin_ratio > rd!(0.049));
+        assert!(info.margin_ratio < rd!(0.051));
+        // Zero-size ETHUSDT filtered out.
+        assert_eq!(info.positions.len(), 1);
+        let btc = &info.positions[0];
+        assert_eq!(btc.symbol, "BTCUSDT");
+        assert_eq!(btc.side, Side::Buy);
+        assert_eq!(btc.isolated_margin, Some(rd!(250)));
+        assert_eq!(btc.liq_price, Some(rd!(45000)));
+    }
+
+    /// Epic 40.3 — Bybit V5 ticker funding wire shape.
+    #[test]
+    fn funding_rate_parser_reads_ticker_row() {
+        let result = serde_json::json!({
+            "list": [
+                {
+                    "symbol": "BTCUSDT",
+                    "fundingRate": "0.0001",
+                    "nextFundingTime": "1700000000000"
+                },
+                {
+                    "symbol": "ETHUSDT",
+                    "fundingRate": "-0.0002",
+                    "nextFundingTime": "1700000000000"
+                }
+            ]
+        });
+        let eth = parse_bybit_funding_rate(&result, "ETHUSDT").unwrap();
+        assert_eq!(eth.rate, rd!(-0.0002));
+        assert_eq!(eth.interval, std::time::Duration::from_secs(8 * 3600));
+    }
+
+    #[test]
+    fn funding_rate_parser_returns_none_on_missing_symbol() {
+        // Empty list → None.
+        let result = serde_json::json!({ "list": [] });
+        assert!(parse_bybit_funding_rate(&result, "BTCUSDT").is_none());
+    }
+
+    #[test]
+    fn account_margin_parser_zero_equity_saturates_ratio() {
+        let wallet = serde_json::json!({
+            "list": [
+                {
+                    "accountType": "UNIFIED",
+                    "totalEquity": "0",
+                    "totalInitialMargin": "0",
+                    "totalMaintenanceMargin": "0",
+                    "totalAvailableBalance": "0"
+                }
+            ]
+        });
+        let positions = serde_json::json!({"list": []});
+        let info = parse_bybit_account_margin(&wallet, &positions).unwrap();
+        assert_eq!(info.margin_ratio, Decimal::ONE);
     }
 }

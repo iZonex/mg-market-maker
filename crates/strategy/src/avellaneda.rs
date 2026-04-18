@@ -224,10 +224,14 @@ mod tests {
             market_resilience_enabled: true,
             otr_enabled: true,
             hma_enabled: true,
+            adaptive_enabled: false,
+            apply_pair_class_template: false,
             hma_window: 9,
             momentum_ofi_enabled: false,
             momentum_learned_microprice_path: None,
             momentum_learned_microprice_pair_paths: std::collections::HashMap::new(),
+            momentum_learned_microprice_online: false,
+            momentum_learned_microprice_horizon: 10,
             user_stream_enabled: true,
             inventory_drift_tolerance: dec!(0.0001),
             inventory_drift_auto_correct: false,
@@ -250,6 +254,12 @@ mod tests {
             cross_exchange_min_profit_bps: dec!(5),
             max_cross_venue_divergence_pct: None,
             sor_inline_enabled: false,
+            sor_dispatch_interval_secs: 5,
+            sor_urgency: rust_decimal_macros::dec!(0.4),
+            sor_target_qty_source: mm_common::config::SorTargetSource::InventoryExcess,
+            sor_inventory_threshold: rust_decimal::Decimal::ZERO,
+            sor_trade_rate_window_secs: 60,
+            sor_queue_refresh_secs: 2,
         }
     }
 

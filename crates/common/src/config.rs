@@ -99,6 +99,466 @@ pub struct AppConfig {
     /// `config.symbols`.
     #[serde(default)]
     pub clients: Vec<ClientConfig>,
+
+    /// Margin guard plus per-symbol mode configuration (Epic
+    /// 40.4 and 40.7). Required when `exchange.product` has
+    /// funding (linear/inverse perp); ignored for spot. Engine
+    /// startup rejects a perp config with `margin = None` so
+    /// the guard is never silently disabled on a live perp
+    /// account.
+    #[serde(default)]
+    pub margin: Option<MarginConfig>,
+
+    /// Epic A stage-2 #3 — additional venue connectors the
+    /// SOR routes across on top of `exchange` + optional
+    /// `hedge`. Each entry produces one `ExchangeConnector`
+    /// at startup via the same `create_connector` path, gets
+    /// appended to the bundle's `extra` list, and gets
+    /// registered on the engine's `VenueStateAggregator` so
+    /// the greedy router can pick it.
+    ///
+    /// Leave empty to run single-venue (or single + hedge)
+    /// — the default. Typical multi-venue config lists 2–4
+    /// entries, all on the same base asset (BTCUSDT on
+    /// Binance spot + Bybit spot + HyperLiquid perp is a
+    /// canonical setup).
+    #[serde(default)]
+    pub sor_extra_venues: Vec<SorVenueConfig>,
+
+    /// Epic F stage-3 — listing sniper real-entry policy.
+    /// Opt-in: when `entry.enter_on_discovery = true` the
+    /// sniper places a single IOC BUY once a newly-detected
+    /// symbol clears the quarantine window. Default off so
+    /// upgrading the binary does NOT silently start
+    /// trading. Safety envelope (quarantine, max notional,
+    /// max concurrent entries, trading-status gate) lives
+    /// on the entry config.
+    #[serde(default)]
+    pub listing_sniper_entry: Option<ListingSniperEntryConfig>,
+
+    /// Epic B stage-2 — background pair-screener config.
+    /// When `enabled`, the server spawns a task that polls
+    /// mid prices for every symbol in `pairs` and runs
+    /// `PairScreener::screen_all` every
+    /// `scan_interval_secs`. Results are audited +
+    /// surfaced on the dashboard so operators can pick
+    /// candidate pairs for a `stat_arb_driver` without
+    /// manually running cointegration tests.
+    #[serde(default)]
+    pub pair_screener: Option<PairScreenerConfig>,
+
+    /// Block C — S3 archive pipeline. When set, the server
+    /// ships the hash-chained audit log, fill log, and daily
+    /// report snapshots to the configured bucket on a
+    /// background timer. Client / regulator handover pulls from
+    /// S3 instead of the local filesystem. Credentials come
+    /// from the usual AWS chain (env / IAM role / profile) —
+    /// NEVER from this config. Leave unset for single-host
+    /// deployments that do their own backup.
+    #[serde(default)]
+    pub archive: Option<ArchiveConfig>,
+
+    /// Block B — scheduled compliance report generator. When
+    /// any of `daily_enabled` / `weekly_enabled` /
+    /// `monthly_enabled` is `true`, the server spawns a
+    /// `ReportScheduler` at boot and fires a
+    /// `BuiltinReportJob` on the configured cron cadence.
+    /// Reports land under `data/reports/{cadence}/` and (when
+    /// `archive` is configured) get shipped to S3 on the next
+    /// shipper tick. Catch-up window keeps missed runs from
+    /// operator-side downtime intact on restart.
+    #[serde(default)]
+    pub schedule: Option<ScheduleRef>,
+
+    /// Epic F #1 — defensive lead-lag guard. When `Some` AND
+    /// a hedge connector is configured, every hedge-side mid
+    /// update flows into an EWMA z-score tracker; outsized
+    /// leader moves feed a 1..N multiplier into the
+    /// autotuner so the follower-side engine widens quotes
+    /// before the cross-venue arb hits. Leave unset to keep
+    /// the multiplier pinned at 1.0.
+    #[serde(default)]
+    pub lead_lag: Option<LeadLagCfg>,
+
+    /// Epic F #2 — headline-driven retreat state machine.
+    /// When set, each engine wires a
+    /// `NewsRetreatStateMachine` with the configured regex
+    /// tables + cooldowns + multipliers. Headlines arrive via
+    /// `POST /api/admin/config` (broadcast) with
+    /// `field = "News"`, text in `value`. Critical-class
+    /// transitions escalate the kill switch to L2.
+    #[serde(default)]
+    pub news_retreat: Option<NewsRetreatCfg>,
+
+    /// Epic G — native sentiment/social-risk pipeline. When
+    /// set, the server spawns the `mm-sentiment`
+    /// orchestrator (collectors → Ollama analyzer →
+    /// mention counter → periodic `SentimentTick` broadcast)
+    /// and every engine wires a `SocialRiskEngine`. Leave
+    /// unset to skip both sides cleanly.
+    #[serde(default)]
+    pub sentiment: Option<SentimentCfg>,
+}
+
+/// Epic G — sentiment pipeline configuration. All the knobs
+/// operators need to run the native social-risk loop end-to-
+/// end in-process, no FastAPI / sidecar required.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentimentCfg {
+    /// Poll cadence for collectors + ticks. Default 60 s.
+    #[serde(default = "default_sentiment_interval")]
+    pub poll_interval_secs: u64,
+    /// Canonical tickers the orchestrator emits ticks for
+    /// (e.g. `["BTC", "ETH"]`). An engine's symbol is matched
+    /// by calling the ticker normaliser on the symbol's base
+    /// asset; a tick with a mismatched asset lands in the
+    /// counter but doesn't broadcast.
+    #[serde(default)]
+    pub monitored_assets: Vec<String>,
+
+    /// Ollama endpoint + model. Defaults target `gemma3:4b`
+    /// on `localhost:11434` — fast multimodal model that
+    /// handles Twitter screenshots well in JSON mode.
+    #[serde(default)]
+    pub ollama: OllamaCfg,
+
+    /// Source collectors. Empty sections disable that source.
+    #[serde(default)]
+    pub rss: RssCfg,
+    #[serde(default)]
+    pub cryptopanic: CryptoPanicCfg,
+    #[serde(default)]
+    pub twitter: TwitterCfg,
+
+    /// Risk engine knobs. Mirrors
+    /// `mm_risk::social_risk::SocialRiskConfig`; same default
+    /// values so leaving `[sentiment.risk] = {}` in TOML
+    /// produces the tested baseline.
+    #[serde(default)]
+    pub risk: SocialRiskCfg,
+
+    /// Optional JSONL path — when set, each analysed article
+    /// lands as one line. Archive shipper uploads the file on
+    /// the same cadence as `audit.jsonl` when both are
+    /// configured. Default: `data/sentiment/articles.jsonl`.
+    #[serde(default = "default_sentiment_persist_path")]
+    pub persist_path: String,
+    #[serde(default = "default_sentiment_persist")]
+    pub persist_articles: bool,
+}
+fn default_sentiment_persist_path() -> String {
+    "data/sentiment/articles.jsonl".into()
+}
+fn default_sentiment_persist() -> bool {
+    true
+}
+
+fn default_sentiment_interval() -> u64 {
+    60
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OllamaCfg {
+    #[serde(default = "default_ollama_url")]
+    pub base_url: String,
+    #[serde(default = "default_ollama_model")]
+    pub model: String,
+    #[serde(default = "default_ollama_timeout")]
+    pub timeout_secs: u64,
+}
+impl Default for OllamaCfg {
+    fn default() -> Self {
+        Self {
+            base_url: default_ollama_url(),
+            model: default_ollama_model(),
+            timeout_secs: default_ollama_timeout(),
+        }
+    }
+}
+fn default_ollama_url() -> String {
+    "http://localhost:11434".into()
+}
+fn default_ollama_model() -> String {
+    "gemma3:4b".into()
+}
+fn default_ollama_timeout() -> u64 {
+    60
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RssCfg {
+    #[serde(default)]
+    pub feeds: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CryptoPanicCfg {
+    /// Full JSON URL including auth + query params. Leave
+    /// empty to disable.
+    #[serde(default)]
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TwitterCfg {
+    /// Env var name holding the bearer token
+    /// (`TWITTER_BEARER` by default). The server looks it up
+    /// at boot so the secret never touches TOML.
+    #[serde(default = "default_twitter_bearer_env")]
+    pub bearer_env: String,
+    /// Search queries (see X API v2 recent-search syntax).
+    /// Empty list = Twitter disabled.
+    #[serde(default)]
+    pub queries: Vec<String>,
+}
+fn default_twitter_bearer_env() -> String {
+    "TWITTER_BEARER".into()
+}
+
+/// Mirror of `mm_risk::social_risk::SocialRiskConfig` using
+/// strings where the risk-side uses `Decimal`. Exact same
+/// defaults as the struct's `Default` impl.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocialRiskCfg {
+    #[serde(default = "default_social_rate_warn")]
+    pub rate_warn: String,
+    #[serde(default = "default_social_rate_alarm")]
+    pub rate_alarm: String,
+    #[serde(default = "default_social_max_vol_mult")]
+    pub max_vol_multiplier: String,
+    #[serde(default = "default_social_min_size_mult")]
+    pub min_size_multiplier: String,
+    #[serde(default = "default_social_kill_rate")]
+    pub kill_mentions_rate: String,
+    #[serde(default = "default_social_kill_vol")]
+    pub kill_vol_threshold: String,
+    #[serde(default = "default_social_skew_threshold")]
+    pub skew_threshold: String,
+    #[serde(default = "default_social_max_skew_bps")]
+    pub max_skew_bps: String,
+    #[serde(default = "default_social_ofi_confirm")]
+    pub ofi_confirm_z: String,
+    #[serde(default = "default_social_staleness_mins")]
+    pub staleness_mins: i64,
+}
+
+impl Default for SocialRiskCfg {
+    fn default() -> Self {
+        Self {
+            rate_warn: default_social_rate_warn(),
+            rate_alarm: default_social_rate_alarm(),
+            max_vol_multiplier: default_social_max_vol_mult(),
+            min_size_multiplier: default_social_min_size_mult(),
+            kill_mentions_rate: default_social_kill_rate(),
+            kill_vol_threshold: default_social_kill_vol(),
+            skew_threshold: default_social_skew_threshold(),
+            max_skew_bps: default_social_max_skew_bps(),
+            ofi_confirm_z: default_social_ofi_confirm(),
+            staleness_mins: default_social_staleness_mins(),
+        }
+    }
+}
+
+fn default_social_rate_warn() -> String { "2".into() }
+fn default_social_rate_alarm() -> String { "5".into() }
+fn default_social_max_vol_mult() -> String { "3".into() }
+fn default_social_min_size_mult() -> String { "0.5".into() }
+fn default_social_kill_rate() -> String { "10".into() }
+fn default_social_kill_vol() -> String { "0.8".into() }
+fn default_social_skew_threshold() -> String { "0.3".into() }
+fn default_social_max_skew_bps() -> String { "15".into() }
+fn default_social_ofi_confirm() -> String { "1.5".into() }
+fn default_social_staleness_mins() -> i64 { 10 }
+
+/// Serialisable mirror of
+/// `mm_risk::news_retreat::NewsRetreatConfig`. Same field set,
+/// Decimal replaced with string for readable TOML.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NewsRetreatCfg {
+    #[serde(default)]
+    pub critical_keywords: Vec<String>,
+    #[serde(default)]
+    pub high_keywords: Vec<String>,
+    #[serde(default)]
+    pub low_keywords: Vec<String>,
+    #[serde(default = "default_news_critical_cooldown_ms")]
+    pub critical_cooldown_ms: i64,
+    #[serde(default = "default_news_high_cooldown_ms")]
+    pub high_cooldown_ms: i64,
+    #[serde(default)]
+    pub low_cooldown_ms: i64,
+    #[serde(default = "default_news_high_mult")]
+    pub high_multiplier: String,
+    #[serde(default = "default_news_critical_mult")]
+    pub critical_multiplier: String,
+}
+
+fn default_news_critical_cooldown_ms() -> i64 {
+    30 * 60_000
+}
+fn default_news_high_cooldown_ms() -> i64 {
+    5 * 60_000
+}
+fn default_news_high_mult() -> String {
+    "2".into()
+}
+fn default_news_critical_mult() -> String {
+    "3".into()
+}
+
+/// Serialisable mirror of
+/// `mm_risk::lead_lag_guard::LeadLagGuardConfig`. Same field
+/// set, `Decimal` replaced by `String` so TOML stays readable.
+/// The server parses the strings via `Decimal::from_str` before
+/// handing them to the guard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeadLagCfg {
+    /// EWMA half-life in observation count. 20 events ≈ 5 s
+    /// at a 250 ms hedge-side tick.
+    #[serde(default = "default_lead_lag_half_life")]
+    pub half_life_events: usize,
+    /// Lower ramp edge. `|z| < z_min` keeps multiplier at
+    /// 1.0. Default `"2"`.
+    #[serde(default = "default_lead_lag_z_min")]
+    pub z_min: String,
+    /// Upper ramp edge. `|z| > z_max` saturates at
+    /// `max_mult`. Default `"4"`.
+    #[serde(default = "default_lead_lag_z_max")]
+    pub z_max: String,
+    /// Saturation multiplier. Default `"3"`.
+    #[serde(default = "default_lead_lag_max_mult")]
+    pub max_mult: String,
+}
+
+impl Default for LeadLagCfg {
+    fn default() -> Self {
+        Self {
+            half_life_events: 20,
+            z_min: "2".into(),
+            z_max: "4".into(),
+            max_mult: "3".into(),
+        }
+    }
+}
+
+fn default_lead_lag_half_life() -> usize {
+    20
+}
+fn default_lead_lag_z_min() -> String {
+    "2".into()
+}
+fn default_lead_lag_z_max() -> String {
+    "4".into()
+}
+fn default_lead_lag_max_mult() -> String {
+    "3".into()
+}
+
+/// Serialisable shape mirroring
+/// `mm_dashboard::report_scheduler::ScheduleConfig`. Duplicated
+/// here because the `common` crate must stay free of the
+/// dashboard dep to avoid circular imports. Fields stay 1-for-1
+/// so the server can trivially convert between them.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ScheduleRef {
+    #[serde(default)]
+    pub daily_enabled: bool,
+    #[serde(default)]
+    pub weekly_enabled: bool,
+    #[serde(default)]
+    pub monthly_enabled: bool,
+    #[serde(default = "default_catchup_hours")]
+    pub catchup_hours: u32,
+    #[serde(default = "default_last_run_path")]
+    pub last_run_path: String,
+}
+
+fn default_catchup_hours() -> u32 {
+    6
+}
+fn default_last_run_path() -> String {
+    "data/report_last_run.jsonl".into()
+}
+
+/// Block C — compliance archive target.
+///
+/// Endpoint URL is optional so the same code works against AWS
+/// S3 (leave `s3_endpoint_url = None`), MinIO, Cloudflare R2,
+/// Backblaze B2, etc. The only requirements on the backend:
+///   - PUT Object with x-amz-server-side-encryption headers
+///   - GET Object (bundle download fallback path)
+///
+/// Retention defaults to 2555 days (7 years) to clear the
+/// longest mainstream requirement (MiFID II). MiCA Article 17
+/// currently asks for 5 years; sizing the default at the
+/// stricter bar means operators don't have to touch this for
+/// most regulators. Actual retention enforcement lives on the
+/// bucket (Object Lock + lifecycle policy) — the shipper just
+/// uploads; the bucket is the source of truth for deletes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveConfig {
+    /// S3 bucket name. Required.
+    pub s3_bucket: String,
+
+    /// AWS region (or compatible region, e.g. `"auto"` for R2).
+    #[serde(default = "default_s3_region")]
+    pub s3_region: String,
+
+    /// Optional endpoint override for S3-compatible backends
+    /// (MinIO `http://minio:9000`, R2
+    /// `https://<account>.r2.cloudflarestorage.com`, etc.).
+    /// Leave unset for AWS S3 proper.
+    #[serde(default)]
+    pub s3_endpoint_url: Option<String>,
+
+    /// Key prefix prepended to every uploaded object. Lets one
+    /// bucket host multiple deployments / tenants without
+    /// cross-contamination. Example: `"prod/venue-maker-a"`.
+    #[serde(default)]
+    pub s3_prefix: String,
+
+    /// Retention target, in days. Informational at the shipper
+    /// level — enforcement lives on the bucket (Object Lock +
+    /// lifecycle). Recorded in the manifest so auditors can
+    /// verify the policy the operator claimed to run.
+    #[serde(default = "default_archive_retention_days")]
+    pub retention_days: u32,
+
+    /// When `Some`, uploads go up with
+    /// `x-amz-server-side-encryption = aws:kms` and
+    /// `x-amz-server-side-encryption-aws-kms-key-id` set to
+    /// this ID. When `None`, SSE-S3 (`AES256`) is used — still
+    /// encrypted at rest, just managed by S3 instead of KMS.
+    #[serde(default)]
+    pub encrypt_kms_key: Option<String>,
+
+    /// Ship the hash-chained audit log on the shipper timer.
+    #[serde(default = "default_true")]
+    pub ship_audit_log: bool,
+
+    /// Ship the persistent fill log on the shipper timer.
+    #[serde(default = "default_true")]
+    pub ship_fills: bool,
+
+    /// Ship daily report snapshots (one JSON per day).
+    #[serde(default = "default_true")]
+    pub ship_daily_reports: bool,
+
+    /// Shipper tick interval, seconds. Default 3600 (1 h).
+    /// Lower values increase S3 PUT counts + cost; higher
+    /// values widen the RPO window.
+    #[serde(default = "default_shipper_interval_secs")]
+    pub shipper_interval_secs: u64,
+}
+
+fn default_s3_region() -> String {
+    "us-east-1".into()
+}
+fn default_archive_retention_days() -> u32 {
+    2555
+}
+fn default_shipper_interval_secs() -> u64 {
+    3600
 }
 
 /// Serializable shape of `FundingArbDriverConfig` — same fields,
@@ -252,11 +712,64 @@ pub enum ExchangeType {
     HyperLiquidTestnet,
 }
 
+/// Product type on an exchange. Epic 40.1 foundation — before this,
+/// product was implicit in the `ExchangeType` (Binance → spot,
+/// Bybit → linear perp, HL → perp). Explicit typing lets the
+/// connector factory pick the right constructor (`BybitConnector::
+/// spot()` vs `::linear()` vs `::inverse()`; `BinanceConnector` vs
+/// `BinanceFuturesConnector`), propagates product-specific fee
+/// tables + margin semantics to strategy + risk layers, and drives
+/// the per-product toxicity widen multiplier (Epic 40.8).
+///
+/// Serialised as snake_case: `spot`, `linear_perp`, `inverse_perp`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductType {
+    #[default]
+    Spot,
+    /// USDⓈ-M / USDT-M / USDC-M linear perpetual (Binance USDM,
+    /// Bybit linear, HL perp, OKX USDT-swap).
+    LinearPerp,
+    /// Coin-margined inverse perpetual (Bybit inverse, Deribit,
+    /// legacy BitMEX). Funding in base asset, not quote.
+    InversePerp,
+}
+
+impl ProductType {
+    /// Short label for dashboards / audit. Stable — do not change.
+    pub fn label(self) -> &'static str {
+        match self {
+            ProductType::Spot => "spot",
+            ProductType::LinearPerp => "linear_perp",
+            ProductType::InversePerp => "inverse_perp",
+        }
+    }
+
+    /// True when the product accrues funding (all perps).
+    pub fn has_funding(self) -> bool {
+        matches!(self, ProductType::LinearPerp | ProductType::InversePerp)
+    }
+
+    /// True when the product uses leverage / margin (all perps).
+    pub fn has_margin(self) -> bool {
+        matches!(self, ProductType::LinearPerp | ProductType::InversePerp)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ExchangeConfig {
     /// Exchange type: custom, binance, binance_testnet, bybit, bybit_testnet.
     #[serde(default)]
     pub exchange_type: ExchangeType,
+    /// Product type on this exchange (Epic 40.1). Default `spot`
+    /// preserves legacy config compatibility — existing
+    /// `binance-paper.toml` stays on spot. Set to `linear_perp` to
+    /// route Binance/Bybit to futures/linear constructors; set to
+    /// `inverse_perp` for coin-margined. Ignored for HyperLiquid
+    /// since that connector has distinct `new()` (perp) and
+    /// `spot()` constructors already.
+    #[serde(default)]
+    pub product: ProductType,
     pub rest_url: String,
     pub ws_url: String,
     pub api_key: Option<String>,
@@ -393,6 +906,25 @@ pub struct MarketMakerConfig {
     #[serde(default = "default_true")]
     pub hma_enabled: bool,
 
+    /// Epic 30 — enable the online `AdaptiveTuner`. When `true`,
+    /// the engine feeds fills / inventory / adverse-selection
+    /// readings into the tuner and multiplies γ by its output in
+    /// every `refresh_quotes` cycle. Off by default — existing
+    /// deployments see byte-identical behaviour unless they flip
+    /// this on.
+    #[serde(default = "default_false")]
+    pub adaptive_enabled: bool,
+
+    /// Epic 31 — auto-apply the matching pair-class template at
+    /// engine startup. Merges `config/pair-classes/<class>.toml`
+    /// into the running config between `AppConfig` deserialise
+    /// and engine construction. User-set fields still win because
+    /// they were already loaded; the template only fills in
+    /// class-appropriate defaults for fields the user did not
+    /// specify. Off by default for backwards compatibility.
+    #[serde(default = "default_false")]
+    pub apply_pair_class_template: bool,
+
     /// Hull Moving Average window for the mid-price feed.
     /// Default 9 — matches the `mm-toolbox` quickstart and
     /// gives a HMA lag of ≈3 samples on typical mid streams.
@@ -456,12 +988,93 @@ pub struct MarketMakerConfig {
     #[serde(default)]
     pub momentum_learned_microprice_pair_paths: std::collections::HashMap<String, String>,
 
-    /// Enable SOR inline dispatch (Epic 4 item 4.6). When
-    /// `true`, `dispatch_route()` executes route decisions
-    /// automatically. When `false` (default), SOR is
+    /// Epic D stage-2 — enable the **online streaming fit** on
+    /// top of the loaded learned-microprice model. When `true`
+    /// (and a model was successfully loaded from
+    /// `momentum_learned_microprice_path` or its per-pair
+    /// override), the engine attaches the model via
+    /// `MomentumSignals::with_learned_microprice_online` so
+    /// every L1 snapshot feeds the model's online ring and
+    /// the g-matrix rebuilds on the cadence set by the
+    /// model's own `refit_every` config. Intraday regime
+    /// drift adapts without the offline-CLI round-trip.
+    #[serde(default)]
+    pub momentum_learned_microprice_online: bool,
+
+    /// Epic D stage-2 — forward-mid horizon the online fit
+    /// pairs `(imbalance_{t-k}, spread_{t-k}, mid_t − mid_{t-k})`
+    /// against. MUST match the horizon the offline fit was
+    /// trained with (default of the CLI binary is 10 L1
+    /// ticks) — otherwise the online path biases the
+    /// g-matrix against a different lookahead than it was
+    /// trained on. Ignored when
+    /// `momentum_learned_microprice_online = false`.
+    #[serde(default = "default_learned_microprice_horizon")]
+    pub momentum_learned_microprice_horizon: usize,
+
+    /// Enable SOR inline dispatch (Epic A stage-2 #1). When
+    /// `true`, the engine fires `dispatch_route()`
+    /// automatically every [`Self::sor_dispatch_interval_secs`]
+    /// if the qty-source
+    /// [`Self::sor_target_qty_source`] produces a non-zero
+    /// target. When `false` (default), SOR stays
     /// advisory-only via `recommend_route()`.
     #[serde(default)]
     pub sor_inline_enabled: bool,
+
+    /// How often the inline SOR dispatch tick fires. Ignored
+    /// when `sor_inline_enabled = false`. Default 5 s — cheap
+    /// enough to keep routing decisions fresh, loose enough
+    /// that transient route churn doesn't batter the venue
+    /// rate limits.
+    #[serde(default = "default_sor_dispatch_interval_secs")]
+    pub sor_dispatch_interval_secs: u64,
+
+    /// Urgency parameter forwarded to `dispatch_route`. `≥ 0.5`
+    /// → taker-leg (IOC), `< 0.5` → maker-leg (PostOnly). The
+    /// cost model's fee vs queue-wait tradeoff picks per-leg;
+    /// this global knob tilts the bias. Default 0.4 — leans
+    /// maker, preferring queue patience over immediate
+    /// execution. Operators running a more aggressive hedge
+    /// lift it toward 0.7.
+    #[serde(default = "default_sor_urgency")]
+    pub sor_urgency: Decimal,
+
+    /// Where the auto-dispatch tick sources its target qty
+    /// from. See [`SorTargetSource`] variants. Default
+    /// `InventoryExcess` — the safest: only dispatches when
+    /// the engine is holding more than
+    /// [`Self::sor_inventory_threshold`] of net inventory.
+    #[serde(default)]
+    pub sor_target_qty_source: SorTargetSource,
+
+    /// Absolute inventory (base asset) threshold for the
+    /// `InventoryExcess` qty source. Dispatch ticks fire only
+    /// when `|inventory| > threshold`; the target qty is
+    /// `|inventory| − threshold` so the engine unloads the
+    /// excess in a single routing pass. Ignored for other
+    /// qty sources.
+    #[serde(default)]
+    pub sor_inventory_threshold: Decimal,
+
+    /// Epic A stage-2 #2 — rolling-window length (secs) for
+    /// the per-venue trade-rate estimator. The engine feeds
+    /// every `MarketEvent::Trade` into the matching venue's
+    /// ring, divides the windowed `qty` by the window length,
+    /// and publishes the derived `queue_wait_secs` into the
+    /// SOR aggregator. Longer window = smoother but slower
+    /// to react. Default 60 s.
+    #[serde(default = "default_sor_trade_rate_window_secs")]
+    pub sor_trade_rate_window_secs: u64,
+
+    /// Epic A stage-2 #2 — how often the engine refreshes
+    /// `queue_wait_secs` on the SOR aggregator from the
+    /// estimator. Default 2 s — fast enough that routing
+    /// reacts within a few quote refreshes of a regime
+    /// change, slow enough that we don't re-walk the deque
+    /// on every tick.
+    #[serde(default = "default_sor_queue_refresh_secs")]
+    pub sor_queue_refresh_secs: u64,
 
     /// Enable the Binance listen-key user-data stream. When
     /// `true` (the default), the server spawns a background
@@ -756,6 +1369,45 @@ fn default_listing_sniper_scan_secs() -> u64 {
     300
 }
 
+fn default_learned_microprice_horizon() -> usize {
+    10
+}
+
+fn default_sor_dispatch_interval_secs() -> u64 {
+    5
+}
+
+fn default_sor_urgency() -> Decimal {
+    dec!(0.4)
+}
+
+fn default_sor_trade_rate_window_secs() -> u64 {
+    60
+}
+
+fn default_sor_queue_refresh_secs() -> u64 {
+    2
+}
+
+/// Qty-source policy for the auto-dispatch SOR tick (Epic A
+/// stage-2 #1). Picks which engine-level signal drives the
+/// target qty + side of each dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SorTargetSource {
+    /// Dispatch only when `|inventory| > sor_inventory_threshold`,
+    /// targeting `|inventory| − threshold` of reduction. The
+    /// safest default — SOR only fires when the engine is
+    /// over-exposed.
+    #[default]
+    InventoryExcess,
+    /// Dispatch every tick with `|last_hedge_basket.entries|`
+    /// worth of the first leg matching this symbol. Used by
+    /// operators running a live hedge optimizer advisory.
+    /// Skips when the optimizer's basket is empty.
+    HedgeBudget,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskConfig {
     /// Maximum absolute inventory in base asset.
@@ -866,6 +1518,280 @@ impl Default for KillSwitchCfg {
     }
 }
 
+/// Epic F stage-3 — listing sniper real-entry policy with
+/// a layered safety envelope. Every check below is a hard
+/// prerequisite — failure on any one skips the entry and
+/// logs a reason.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListingSniperEntryConfig {
+    /// Master switch. When `false` the sniper stays in
+    /// observer-only mode: audit + alert on discovery but
+    /// do not place orders. Default `false` so opting in
+    /// is explicit. Operators who want automated sniping
+    /// flip this alongside a tight `max_notional_usd`.
+    #[serde(default)]
+    pub enter_on_discovery: bool,
+    /// Entry notional cap in quote asset. Each sniper entry
+    /// buys `max_notional_usd / ask` base-asset units (lot-
+    /// rounded). Keep modest — new listings on thin books
+    /// slip hard. Default 50 USDT.
+    #[serde(default = "default_sniper_notional_usd")]
+    pub max_notional_usd: Decimal,
+    /// Quarantine window in seconds. A newly-discovered
+    /// symbol must be observed for at least this long
+    /// before any entry fires. Defends against venue data
+    /// glitches and "fake listing" wire bursts.
+    #[serde(default = "default_sniper_quarantine_secs")]
+    pub quarantine_secs: u64,
+    /// Max simultaneously-open sniper entries across every
+    /// venue. Once reached, new discoveries accumulate in
+    /// the pending queue but no orders are placed until
+    /// active count drops (via cancel / fill / time-out).
+    /// Default 3 so one bad wire snapshot cannot blow up
+    /// the account.
+    #[serde(default = "default_sniper_max_active")]
+    pub max_active_entries: u32,
+    /// Only snipe symbols whose `trading_status == Trading`.
+    /// Skips `PreTrading`, `Halted`, `Break`, `Delisted`
+    /// states. Default `true`. Operators wanting to snipe
+    /// pre-open (where some venues expose the symbol before
+    /// it trades) can flip this.
+    #[serde(default = "default_true")]
+    pub require_trading_status: bool,
+}
+
+fn default_sniper_notional_usd() -> Decimal {
+    dec!(50)
+}
+fn default_sniper_quarantine_secs() -> u64 {
+    30
+}
+fn default_sniper_max_active() -> u32 {
+    3
+}
+
+impl Default for ListingSniperEntryConfig {
+    fn default() -> Self {
+        Self {
+            enter_on_discovery: false,
+            max_notional_usd: default_sniper_notional_usd(),
+            quarantine_secs: default_sniper_quarantine_secs(),
+            max_active_entries: default_sniper_max_active(),
+            require_trading_status: true,
+        }
+    }
+}
+
+/// Epic B stage-2 — background cointegration pair screener.
+/// Scans a fixed list of candidate pairs on a periodic
+/// schedule and writes results into the audit trail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairScreenerConfig {
+    /// Candidate pairs as `(y_symbol, x_symbol)` tuples. The
+    /// Engle-Granger test treats `y = β·x + ε` so ordering
+    /// matters for the reported β — operators pick `y` as
+    /// the more-liquid asset by convention.
+    pub pairs: Vec<(String, String)>,
+    /// How often the task polls one fresh mid per configured
+    /// symbol from the primary connector's
+    /// `get_orderbook(symbol, 1)`. Shorter cadence = the
+    /// sample window covers a shorter wall-clock span for
+    /// the same number of samples. Default 10 s — the
+    /// cointegration regression does not need sub-second
+    /// resolution, and slower sampling conserves rate-limit
+    /// budget. Must be ≥ 1.
+    #[serde(default = "default_pair_screener_sample_secs")]
+    pub sample_interval_secs: u64,
+    /// How often the task runs `PairScreener::screen_all()`
+    /// and emits audit events for the cointegration result.
+    /// Default 300 s — screening is a diagnostic tool,
+    /// minute-by-minute output would be noise. Must be ≥
+    /// `sample_interval_secs`.
+    #[serde(default = "default_pair_screener_scan_secs")]
+    pub scan_interval_secs: u64,
+}
+
+fn default_pair_screener_sample_secs() -> u64 {
+    10
+}
+fn default_pair_screener_scan_secs() -> u64 {
+    300
+}
+
+/// Epic A stage-2 #3 — one SOR-only venue that the greedy
+/// router considers alongside the primary and hedge venues.
+/// The connector is built with the same `create_connector`
+/// path as `config.exchange`, so every field (auth,
+/// withdraw whitelist, etc.) is supported uniformly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SorVenueConfig {
+    /// Full exchange connector config for this venue.
+    pub exchange: ExchangeConfig,
+    /// Symbol to quote on this venue. Usually the same base
+    /// asset as the primary engine (e.g. `"BTCUSDT"`) but
+    /// can differ on venues that use distinct ticker
+    /// conventions (`"BTC-USDT"`, `"BTCUSD_PERP"`).
+    pub symbol: String,
+    /// Max base-asset qty the router may push through this
+    /// venue. Maps 1:1 to `VenueSeed.available_qty`.
+    pub max_inventory: Decimal,
+}
+
+/// Margin mode keyword for perp accounts (Epic 40.7). Mirrors
+/// the `exchange::core::MarginMode` enum but lives in `common`
+/// so `AppConfig` can deserialize it without a circular dep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MarginModeCfg {
+    #[default]
+    Isolated,
+    Cross,
+}
+
+/// Per-symbol margin overrides (Epic 40.7).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerSymbolMargin {
+    #[serde(default)]
+    pub mode: MarginModeCfg,
+    #[serde(default = "default_leverage")]
+    pub leverage: u32,
+}
+
+fn default_leverage() -> u32 {
+    5
+}
+
+fn default_margin_refresh_secs() -> u64 {
+    5
+}
+
+fn default_widen_ratio() -> Decimal {
+    dec!(0.50)
+}
+
+fn default_stop_ratio() -> Decimal {
+    dec!(0.80)
+}
+
+fn default_cancel_ratio() -> Decimal {
+    dec!(0.90)
+}
+
+fn default_max_stale_secs() -> u64 {
+    30
+}
+
+/// Margin guard configuration (Epic 40.4). Thresholds express
+/// `margin_ratio = totalMaintMargin / totalMarginBalance`; when
+/// the observed or projected ratio crosses a threshold the kill
+/// switch is escalated monotonically. Values must satisfy
+/// `widen < stop < cancel` — `validate.rs` rejects anything
+/// else. Same `KillLevel` cascade applies whether the trip is
+/// observed (poll loop) or projected (pre-order hook).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarginConfig {
+    /// How often the engine polls `account_margin_info()` from
+    /// the venue. Venues publish every 1–2 s (Binance push) or
+    /// allow a 5 s poll under weight budget; too-frequent polls
+    /// burn rate-limit tokens without changing guard decisions.
+    #[serde(default = "default_margin_refresh_secs")]
+    pub refresh_interval_secs: u64,
+    /// Ratio threshold for `KillLevel::WidenSpreads`.
+    #[serde(default = "default_widen_ratio")]
+    pub widen_ratio: Decimal,
+    /// Ratio threshold for `KillLevel::StopNewOrders`.
+    #[serde(default = "default_stop_ratio")]
+    pub stop_ratio: Decimal,
+    /// Ratio threshold for `KillLevel::CancelAll`.
+    #[serde(default = "default_cancel_ratio")]
+    pub cancel_ratio: Decimal,
+    /// Maximum acceptable age of the last-received margin
+    /// snapshot before the guard escalates to `WidenSpreads`
+    /// on stale data. Defends against a silent venue data
+    /// outage after a successful handshake.
+    #[serde(default = "default_max_stale_secs")]
+    pub max_stale_secs: u64,
+    /// Default mode applied to every perp symbol that has no
+    /// explicit entry in `per_symbol`. Startup hard-fails if
+    /// `set_margin_mode` returns anything other than `Ok` or
+    /// `NotSupported`.
+    #[serde(default)]
+    pub default_mode: MarginModeCfg,
+    /// Default leverage applied where `per_symbol` is silent.
+    #[serde(default = "default_leverage")]
+    pub default_leverage: u32,
+    /// Symbol-scoped overrides. Missing symbols fall back to
+    /// `default_mode` + `default_leverage`.
+    #[serde(default)]
+    pub per_symbol: std::collections::HashMap<String, PerSymbolMargin>,
+}
+
+impl Default for MarginConfig {
+    fn default() -> Self {
+        Self {
+            refresh_interval_secs: default_margin_refresh_secs(),
+            widen_ratio: default_widen_ratio(),
+            stop_ratio: default_stop_ratio(),
+            cancel_ratio: default_cancel_ratio(),
+            max_stale_secs: default_max_stale_secs(),
+            default_mode: MarginModeCfg::Isolated,
+            default_leverage: default_leverage(),
+            per_symbol: Default::default(),
+        }
+    }
+}
+
+impl MarginConfig {
+    /// Resolve effective (`mode`, `leverage`) for a symbol,
+    /// falling back to the defaults.
+    pub fn for_symbol(&self, symbol: &str) -> (MarginModeCfg, u32) {
+        match self.per_symbol.get(symbol) {
+            Some(ps) => (ps.mode, ps.leverage),
+            None => (self.default_mode, self.default_leverage),
+        }
+    }
+
+    /// `widen < stop < cancel`, all ∈ (0, 1]. Returns a
+    /// descriptive error on violation so `validate.rs` can
+    /// surface the bad field without hand-rolled checks.
+    pub fn validate_thresholds(&self) -> Result<(), String> {
+        for (name, v) in [
+            ("widen_ratio", self.widen_ratio),
+            ("stop_ratio", self.stop_ratio),
+            ("cancel_ratio", self.cancel_ratio),
+        ] {
+            if v <= Decimal::ZERO || v > Decimal::ONE {
+                return Err(format!("margin.{name} must be in (0, 1], got {v}"));
+            }
+        }
+        if self.widen_ratio >= self.stop_ratio {
+            return Err(format!(
+                "margin.widen_ratio ({}) must be < stop_ratio ({})",
+                self.widen_ratio, self.stop_ratio
+            ));
+        }
+        if self.stop_ratio >= self.cancel_ratio {
+            return Err(format!(
+                "margin.stop_ratio ({}) must be < cancel_ratio ({})",
+                self.stop_ratio, self.cancel_ratio
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns `true` if any configured entry (default or per-
+    /// symbol) selects cross margin. Startup uses this to
+    /// enforce "cross only safe when hedged" — a cross entry
+    /// without a live `hedge_optimizer` is a boot-time refusal.
+    pub fn uses_cross_margin(&self) -> bool {
+        self.default_mode == MarginModeCfg::Cross
+            || self
+                .per_symbol
+                .values()
+                .any(|ps| ps.mode == MarginModeCfg::Cross)
+    }
+}
+
 /// SLA obligations — what the exchange requires from the MM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlaObligationConfig {
@@ -911,6 +1837,42 @@ pub struct ToxicityConfig {
     pub adverse_selection_lookback_ms: i64,
     /// Enable auto-tuning of parameters based on regime + toxicity.
     pub autotune_enabled: bool,
+    /// Epic D-stage-2 — route trade volume through the
+    /// Easley-López de Prado-O'Hara Bulk Volume Classification
+    /// instead of the per-trade tick-rule on `Trade::taker_side`.
+    /// BVC reads a bar's total volume + price change and splits
+    /// into buy / sell via the Student-t CDF. Cleaner signal on
+    /// fast tapes where `taker_side` is noisy. When `false`
+    /// (default) the engine keeps the legacy `on_trade` path
+    /// byte-identical to pre-stage-2.
+    #[serde(default)]
+    pub bvc_enabled: bool,
+    /// Student-t degrees of freedom ν for the BVC CDF. Easley
+    /// et al. 2012 used `0.25` on S&P E-minis; crypto's heavier
+    /// tails may warrant tuning per venue.
+    #[serde(default = "default_bvc_nu")]
+    pub bvc_nu: Decimal,
+    /// Rolling-window size for the bar-Δ mean / std that
+    /// standardise the Student-t input.
+    #[serde(default = "default_bvc_window")]
+    pub bvc_window: usize,
+    /// Bar length in seconds — duration we aggregate trade
+    /// volume + Δprice over before sending one `(dp, vol)`
+    /// observation to the classifier. Shorter = fresher
+    /// signal, noisier; 1 s is the Easley-Prado default for
+    /// HFT.
+    #[serde(default = "default_bvc_bar_secs")]
+    pub bvc_bar_secs: u64,
+}
+
+fn default_bvc_nu() -> Decimal {
+    dec!(0.25)
+}
+fn default_bvc_window() -> usize {
+    50
+}
+fn default_bvc_bar_secs() -> u64 {
+    1
 }
 
 impl Default for ToxicityConfig {
@@ -922,6 +1884,10 @@ impl Default for ToxicityConfig {
             kyle_window: 100,
             adverse_selection_lookback_ms: 3000,
             autotune_enabled: true,
+            bvc_enabled: false,
+            bvc_nu: default_bvc_nu(),
+            bvc_window: default_bvc_window(),
+            bvc_bar_secs: default_bvc_bar_secs(),
         }
     }
 }
@@ -1088,6 +2054,37 @@ pub struct ClientConfig {
     /// trading.
     #[serde(default)]
     pub daily_loss_limit_usd: Option<Decimal>,
+    /// Client jurisdiction (Epic 40.10) — ISO 3166-1 alpha-2
+    /// country code or `"global"`. Drives product gating:
+    /// `"US"` blocks perp products entirely (Binance/Bybit/OKX/
+    /// HyperLiquid perp access is KYC-gated for US persons; serving
+    /// them through the MM would put the operator in breach).
+    /// Default `"global"` = no restriction. Enforced at
+    /// `POST /api/admin/clients` ingress and at engine startup —
+    /// hard-fails boot if a US-tagged client owns a symbol whose
+    /// config product is not spot. Intentionally strict: the cost
+    /// of an accidental perp order for a US client is regulatory,
+    /// not operational, so we fail closed.
+    #[serde(default = "default_jurisdiction")]
+    pub jurisdiction: String,
+}
+
+fn default_jurisdiction() -> String {
+    "global".to_string()
+}
+
+impl ClientConfig {
+    /// Whether this client is permitted to trade the given
+    /// product type. Returns `false` only for explicitly
+    /// gated combinations (currently `US × perp`). Extend the
+    /// match arm as new jurisdictions are onboarded.
+    pub fn allows_product(&self, product: ProductType) -> bool {
+        let j = self.jurisdiction.to_ascii_uppercase();
+        !matches!(
+            (j.as_str(), product),
+            ("US", ProductType::LinearPerp) | ("US", ProductType::InversePerp)
+        )
+    }
 }
 
 /// Loan configuration for token loan tracking (optional).
@@ -1106,6 +2103,7 @@ impl Default for AppConfig {
         Self {
             exchange: ExchangeConfig {
                 exchange_type: ExchangeType::Custom,
+                product: ProductType::Spot,
                 rest_url: "http://localhost:8080".into(),
                 ws_url: "ws://localhost:8080/ws/v1".into(),
                 api_key: None,
@@ -1131,10 +2129,14 @@ impl Default for AppConfig {
                 market_resilience_enabled: true,
                 otr_enabled: true,
                 hma_enabled: true,
+                adaptive_enabled: false,
+                apply_pair_class_template: false,
                 hma_window: 9,
                 momentum_ofi_enabled: false,
                 momentum_learned_microprice_path: None,
                 momentum_learned_microprice_pair_paths: std::collections::HashMap::new(),
+                momentum_learned_microprice_online: false,
+                momentum_learned_microprice_horizon: default_learned_microprice_horizon(),
                 user_stream_enabled: true,
                 inventory_drift_tolerance: dec!(0.0001),
                 inventory_drift_auto_correct: false,
@@ -1155,6 +2157,12 @@ impl Default for AppConfig {
                 var_guard_ewma_lambda: None,
                 cross_venue_basis_max_staleness_ms: 1500,
                 sor_inline_enabled: false,
+                sor_dispatch_interval_secs: default_sor_dispatch_interval_secs(),
+                sor_urgency: default_sor_urgency(),
+                sor_target_qty_source: SorTargetSource::default(),
+                sor_inventory_threshold: dec!(0),
+                sor_trade_rate_window_secs: default_sor_trade_rate_window_secs(),
+                sor_queue_refresh_secs: default_sor_queue_refresh_secs(),
                 cross_exchange_min_profit_bps: dec!(5),
                 max_cross_venue_divergence_pct: None,
             },
@@ -1190,6 +2198,15 @@ impl Default for AppConfig {
             rebalancer: None,
             portfolio_risk: None,
             clients: Vec::new(),
+            margin: None,
+            sor_extra_venues: Vec::new(),
+            pair_screener: None,
+            archive: None,
+            schedule: None,
+            lead_lag: None,
+            news_retreat: None,
+            sentiment: None,
+            listing_sniper_entry: None,
         }
     }
 }
@@ -1212,6 +2229,7 @@ impl AppConfig {
             api_keys: Vec::new(),
             report_branding: None,
             daily_loss_limit_usd: None,
+            jurisdiction: default_jurisdiction(),
         }]
     }
 }

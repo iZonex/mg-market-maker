@@ -258,6 +258,7 @@ fn run(args: CliArgs) -> Result<()> {
         n_imbalance_buckets: args.imbalance_buckets,
         n_spread_buckets: args.spread_buckets,
         min_bucket_samples: args.min_bucket_samples,
+        ..Default::default()
     };
 
     let model = fit_from_observations(&observations, config);
@@ -334,6 +335,7 @@ mod tests {
             n_imbalance_buckets: 4,
             n_spread_buckets: 1,
             min_bucket_samples: 5,
+            ..Default::default()
         };
         let model = fit_from_observations(&observations, config);
         assert!(model.is_finalized());

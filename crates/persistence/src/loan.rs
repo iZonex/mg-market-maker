@@ -370,4 +370,147 @@ mod tests {
         let loaded = LoanStore::load(&p);
         assert_eq!(loaded.len(), 2);
     }
+
+    // ── Property-based tests (Epic 19) ───────────────────────
+
+    use proptest::prelude::*;
+
+    prop_compose! {
+        fn qty_strat()(raw in 1i64..1_000_000i64) -> Decimal {
+            Decimal::new(raw, 4)
+        }
+    }
+    prop_compose! {
+        fn rate_strat()(pct in 1i64..10_000i64) -> Decimal {
+            Decimal::new(pct, 2)
+        }
+    }
+
+    fn mk_loan(installments: Vec<Decimal>, annual_rate: Decimal) -> LoanAgreement {
+        let now = Utc::now();
+        let total: Decimal = installments.iter().copied().sum();
+        LoanAgreement {
+            id: "x".into(),
+            symbol: "T".into(),
+            client_id: None,
+            terms: LoanTerms {
+                total_qty: total,
+                cost_basis_per_token: dec!(100),
+                annual_rate_pct: annual_rate,
+                option_strike: None,
+                option_expiry: None,
+                start_date: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                end_date: NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
+                counterparty: "TP".into(),
+            },
+            schedule: ReturnSchedule {
+                installments: installments
+                    .into_iter()
+                    .map(|q| ReturnInstallment {
+                        due_date: NaiveDate::from_ymd_opt(2026, 6, 30).unwrap(),
+                        qty: q,
+                        status: InstallmentStatus::Pending,
+                        completed_at: None,
+                    })
+                    .collect(),
+            },
+            status: LoanStatus::Active,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    proptest! {
+        /// returned_qty + remaining_qty == total_qty at every
+        /// point — no phantom balance between the two.
+        #[test]
+        fn returned_plus_remaining_equals_total(
+            qtys in proptest::collection::vec(qty_strat(), 1..8),
+            completed_mask in proptest::collection::vec(proptest::bool::ANY, 1..8),
+        ) {
+            let n = qtys.len().min(completed_mask.len());
+            let mut loan = mk_loan(qtys[..n].to_vec(), dec!(10));
+            for (i, &done) in completed_mask[..n].iter().enumerate() {
+                if done {
+                    loan.complete_installment(i);
+                }
+            }
+            prop_assert_eq!(
+                loan.returned_qty() + loan.remaining_qty(),
+                loan.terms.total_qty
+            );
+        }
+
+        /// return_progress_pct ∈ [0, 100] for every valid state.
+        #[test]
+        fn return_progress_pct_bounded(
+            qtys in proptest::collection::vec(qty_strat(), 1..8),
+            complete_all in proptest::bool::ANY,
+        ) {
+            let n = qtys.len();
+            let mut loan = mk_loan(qtys, dec!(10));
+            if complete_all {
+                for i in 0..n {
+                    loan.complete_installment(i);
+                }
+            }
+            let pct = loan.return_progress_pct();
+            prop_assert!(pct >= dec!(0));
+            prop_assert!(pct <= dec!(100));
+        }
+
+        /// Completing every installment flips status to Returned.
+        /// Catches a regression where partial completion rules
+        /// leak into the full-return branch.
+        #[test]
+        fn complete_all_yields_returned_status(
+            qtys in proptest::collection::vec(qty_strat(), 1..10),
+        ) {
+            let n = qtys.len();
+            let mut loan = mk_loan(qtys, dec!(10));
+            for i in 0..n {
+                prop_assert!(loan.complete_installment(i));
+            }
+            prop_assert_eq!(loan.status, LoanStatus::Returned);
+            prop_assert_eq!(loan.returned_qty(), loan.terms.total_qty);
+            prop_assert_eq!(loan.remaining_qty(), dec!(0));
+        }
+
+        /// daily_cost is linear in total_qty * cost_basis * rate
+        /// / (100 * 365). Catches a constant drift.
+        #[test]
+        fn daily_cost_formula_holds(
+            qtys in proptest::collection::vec(qty_strat(), 1..5),
+            rate in rate_strat(),
+        ) {
+            let loan = mk_loan(qtys, rate);
+            let expected = loan.terms.total_qty * loan.terms.cost_basis_per_token
+                * rate / dec!(100) / dec!(365);
+            prop_assert_eq!(loan.daily_cost(), expected);
+        }
+
+        /// check_overdue marks every PENDING installment whose
+        /// due_date is before `today` as Overdue; Completed
+        /// installments are never touched.
+        #[test]
+        fn check_overdue_marks_stale_pending_only(
+            qtys in proptest::collection::vec(qty_strat(), 1..5),
+            completed_mask in proptest::collection::vec(proptest::bool::ANY, 1..5),
+        ) {
+            let n = qtys.len().min(completed_mask.len());
+            let mut loan = mk_loan(qtys[..n].to_vec(), dec!(10));
+            for (i, &done) in completed_mask[..n].iter().enumerate() {
+                if done { loan.complete_installment(i); }
+            }
+            // Fast-forward past every due_date.
+            loan.check_overdue(NaiveDate::from_ymd_opt(2030, 1, 1).unwrap());
+            for (i, inst) in loan.schedule.installments.iter().enumerate() {
+                if completed_mask.get(i).copied().unwrap_or(false) {
+                    prop_assert_eq!(inst.status, InstallmentStatus::Completed);
+                } else {
+                    prop_assert_eq!(inst.status, InstallmentStatus::Overdue);
+                }
+            }
+        }
+    }
 }

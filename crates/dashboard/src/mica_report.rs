@@ -91,16 +91,16 @@ impl MicaAlgoReport {
             two_sided_required: config.sla.two_sided_required,
         };
 
-        let body = format!(
-            "{}:{}:{}:{}",
-            period_from.to_rfc3339(),
-            period_to.to_rfc3339(),
-            strategy,
-            otr_samples
-        );
-        let signature = hmac_sign(secret, &body);
-
-        Self {
+        // Build the body first WITHOUT the signature, serialise
+        // the full tamper-relevant payload, and sign that. Epic
+        // 36.4 — the previous scheme signed four tokens (period
+        // × strategy × sample_count) and left `avg_otr`,
+        // `max_otr`, risk_controls, sla_obligations unsigned, so
+        // a regulator / internal auditor could tamper with
+        // anything outside the four signed fields and the
+        // signature stayed valid.
+        let generated_at = Utc::now();
+        let unsigned = UnsignedReport {
             period_from,
             period_to,
             strategy_description: strategy.to_string(),
@@ -111,10 +111,66 @@ impl MicaAlgoReport {
             },
             risk_controls,
             sla_obligations: sla,
+            generated_at,
+        };
+        let body = serde_json::to_string(&unsigned)
+            .expect("MicaAlgoReport fields are all serde-safe");
+        let signature = hmac_sign(secret, &body);
+
+        Self {
+            period_from: unsigned.period_from,
+            period_to: unsigned.period_to,
+            strategy_description: unsigned.strategy_description,
+            otr_statistics: unsigned.otr_statistics,
+            risk_controls: unsigned.risk_controls,
+            sla_obligations: unsigned.sla_obligations,
             signature,
-            generated_at: Utc::now(),
+            generated_at: unsigned.generated_at,
         }
     }
+
+    /// Verify the signature covers the full body. Returns `Ok(())`
+    /// when the caller-provided secret produces the recorded
+    /// signature over the deserialised fields (in the canonical
+    /// order used at build time), `Err` otherwise.
+    pub fn verify(&self, secret: &str) -> anyhow::Result<()> {
+        use subtle::ConstantTimeEq;
+        let unsigned = UnsignedReport {
+            period_from: self.period_from,
+            period_to: self.period_to,
+            strategy_description: self.strategy_description.clone(),
+            otr_statistics: self.otr_statistics.clone(),
+            risk_controls: self.risk_controls.clone(),
+            sla_obligations: self.sla_obligations.clone(),
+            generated_at: self.generated_at,
+        };
+        let body = serde_json::to_string(&unsigned)?;
+        let expected = hmac_sign(secret, &body);
+        if expected
+            .as_bytes()
+            .ct_eq(self.signature.as_bytes())
+            .unwrap_u8()
+            == 1
+        {
+            Ok(())
+        } else {
+            anyhow::bail!("MiCA report signature verification failed");
+        }
+    }
+}
+
+/// Canonical signed shape: every tamper-relevant field EXCEPT
+/// the signature itself. Serialised stably via serde so the
+/// sign-then-verify round-trip is deterministic.
+#[derive(Serialize)]
+struct UnsignedReport {
+    period_from: DateTime<Utc>,
+    period_to: DateTime<Utc>,
+    strategy_description: String,
+    otr_statistics: OtrPeriodStats,
+    risk_controls: RiskControlSummary,
+    sla_obligations: SlaSummary,
+    generated_at: DateTime<Utc>,
 }
 
 fn hmac_sign(secret: &str, body: &str) -> String {
@@ -166,13 +222,33 @@ mod tests {
         assert!(report.risk_controls.circuit_breaker_enabled);
     }
 
+    /// Post Epic 36.4 the signature covers `generated_at`, which
+    /// is `Utc::now()` at build time — so two sequential builds
+    /// yield *different* signatures by construction. The test
+    /// still asserts that each build's signature *verifies*
+    /// against the same secret; determinism across processes is
+    /// no longer the property we care about.
     #[test]
-    fn signature_is_deterministic() {
+    fn signature_verifies_round_trip() {
         let config = mm_common::config::AppConfig::default();
         let from = Utc::now();
         let to = Utc::now();
-        let r1 = MicaAlgoReport::build(from, to, "test", &config, dec!(0), dec!(0), 0, "key");
-        let r2 = MicaAlgoReport::build(from, to, "test", &config, dec!(0), dec!(0), 0, "key");
-        assert_eq!(r1.signature, r2.signature);
+        let r = MicaAlgoReport::build(from, to, "test", &config, dec!(0), dec!(0), 0, "key");
+        assert!(r.verify("key").is_ok());
+        assert!(r.verify("wrong-secret").is_err());
+    }
+
+    #[test]
+    fn tampered_field_breaks_signature() {
+        let config = mm_common::config::AppConfig::default();
+        let from = Utc::now();
+        let to = Utc::now();
+        let mut r =
+            MicaAlgoReport::build(from, to, "test", &config, dec!(0), dec!(0), 0, "key");
+        r.otr_statistics.avg_otr = dec!(9999); // tamper outside the 4-token legacy scope
+        assert!(
+            r.verify("key").is_err(),
+            "Epic 36.4: full-body signature must reject tampered avg_otr"
+        );
     }
 }

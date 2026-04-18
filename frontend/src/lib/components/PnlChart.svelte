@@ -12,15 +12,23 @@
     const { createChart, LineSeries } = await import('lightweight-charts')
 
     chart = createChart(container, {
-      layout: { background: { color: '#161b22' }, textColor: '#8b949e' },
-      grid: { vertLines: { color: '#21262d' }, horzLines: { color: '#21262d' } },
+      layout: { background: { color: 'transparent' }, textColor: '#a8acb5', fontFamily: 'JetBrains Mono, monospace', fontSize: 11 },
+      grid: { vertLines: { color: 'rgba(255,255,255,0.04)' }, horzLines: { color: 'rgba(255,255,255,0.04)' } },
       width: container.clientWidth,
-      height: 220,
-      timeScale: { timeVisible: true, secondsVisible: false },
-      rightPriceScale: { borderColor: '#21262d' },
+      height: 200,
+      timeScale: { timeVisible: true, secondsVisible: false, borderColor: 'rgba(255,255,255,0.06)' },
+      rightPriceScale: { borderColor: 'rgba(255,255,255,0.06)' },
+      crosshair: { vertLine: { color: 'rgba(0,208,156,0.4)', labelBackgroundColor: '#00d09c' }, horzLine: { color: 'rgba(0,208,156,0.4)', labelBackgroundColor: '#00d09c' } },
     })
 
-    series = chart.addSeries(LineSeries, { color: '#3fb950', lineWidth: 2 })
+    series = chart.addSeries(LineSeries, {
+      color: '#00d09c',
+      lineWidth: 2,
+      lineType: 0,
+      crosshairMarkerRadius: 4,
+      crosshairMarkerBorderWidth: 2,
+      crosshairMarkerBackgroundColor: '#00d09c',
+    })
 
     const ro = new ResizeObserver(() => {
       if (chart) chart.applyOptions({ width: container.clientWidth })
@@ -52,12 +60,8 @@
   })
 </script>
 
-<div class="chart-panel">
-  <h3>PnL ($)</h3>
-  <div bind:this={container} class="chart-container"></div>
-</div>
+<div bind:this={container} class="chart-container"></div>
 
 <style>
-  h3 { font-size: 12px; color: #8b949e; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
-  .chart-container { width: 100%; }
+  .chart-container { width: 100%; min-height: 200px; }
 </style>

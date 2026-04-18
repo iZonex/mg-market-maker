@@ -5,8 +5,11 @@
 //! does NOT spawn engines — that requires a restart.
 
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use mm_common::config::ProductType;
 use serde::{Deserialize, Serialize};
 
 use crate::state::DashboardState;
@@ -26,6 +29,16 @@ pub struct CreateClientRequest {
     pub symbols: Vec<String>,
     #[serde(default)]
     pub webhook_urls: Vec<String>,
+    /// Epic 40.10 — ISO 3166-1 alpha-2 country code or `"global"`.
+    /// Drives product gating; `"US"` blocks perp products. Default
+    /// `"global"` preserves legacy behaviour for existing API
+    /// consumers.
+    #[serde(default = "default_jurisdiction_ingress")]
+    pub jurisdiction: String,
+}
+
+fn default_jurisdiction_ingress() -> String {
+    "global".to_string()
 }
 
 #[derive(Debug, Serialize)]
@@ -39,16 +52,45 @@ pub struct ClientResponse {
 async fn create_client(
     State(state): State<DashboardState>,
     Json(req): Json<CreateClientRequest>,
-) -> Json<ClientResponse> {
+) -> Response {
+    // Epic 40.10 — jurisdiction gate. Fail-closed on US + perp.
+    // We only know the engine's product here, so gate against it
+    // at registration time: if this engine is running a perp
+    // product and the client claims US jurisdiction, the client
+    // is refused entirely — no partial registration.
+    let j = req.jurisdiction.to_ascii_uppercase();
+    let engine_product = state.engine_product();
+    if j == "US"
+        && matches!(
+            engine_product,
+            Some(ProductType::LinearPerp) | Some(ProductType::InversePerp)
+        )
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "jurisdiction_forbidden",
+                "message": "US-jurisdiction clients cannot be registered on a perp engine.\
+                            Use a spot engine or set jurisdiction != US.",
+                "client_id": req.id,
+                "jurisdiction": req.jurisdiction,
+                "engine_product": engine_product.map(|p| p.label()),
+            })),
+        )
+            .into_response();
+    }
+
     // Check for duplicate client ID.
     let existing_ids = state.client_ids();
     if existing_ids.contains(&req.id) {
-        return Json(ClientResponse {
-            id: req.id,
-            name: Some("ERROR: duplicate client ID".into()),
-            symbols: vec![],
-            registered: false,
-        });
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "duplicate_client_id",
+                "client_id": req.id,
+            })),
+        )
+            .into_response();
     }
 
     // Register client and its symbols.
@@ -69,6 +111,7 @@ async fn create_client(
         symbols: req.symbols,
         registered: true,
     })
+    .into_response()
 }
 
 async fn list_clients(State(state): State<DashboardState>) -> Json<Vec<ClientResponse>> {

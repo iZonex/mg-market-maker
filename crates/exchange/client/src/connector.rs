@@ -29,7 +29,9 @@ impl CustomConnector {
                 supports_fix: false,
                 max_order_rate: 100,
                 supports_funding_rate: false,
-            },
+                supports_margin_info: false,
+                supports_margin_mode: false,
+                        },
         }
     }
 }

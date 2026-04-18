@@ -1,4 +1,4 @@
-use mm_common::config::{AppConfig, ExchangeType, StrategyType};
+use mm_common::config::{AppConfig, ExchangeType, ProductType, StrategyType};
 use rust_decimal_macros::dec;
 use tracing::warn;
 
@@ -334,6 +334,109 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
         }
     }
 
+    // --- Margin guard (Epic 40.4 + 40.7) ---
+    // A perp account without a live margin guard is a boot-time
+    // refusal — silent ratio drift to liquidation is the single
+    // worst failure mode on perps, and the guard is what catches
+    // it. Spot accounts have no margin concept, so `margin` stays
+    // `None` there. Cross margin is safe only when an active
+    // hedge_optimizer covers cross-symbol liquidation cascade
+    // risk; otherwise refuse to boot.
+    let is_perp = matches!(
+        config.exchange.product,
+        ProductType::LinearPerp | ProductType::InversePerp
+    );
+    match (&config.margin, is_perp) {
+        (None, true) => {
+            errors.push(
+                "exchange.product is a perp but no [margin] section is \
+                 configured — MarginGuard would be disabled on a live \
+                 perp account. Add a [margin] block with widen/stop/\
+                 cancel_ratio thresholds before starting."
+                    .to_string(),
+            );
+        }
+        (Some(_), false) => {
+            warnings.push(
+                "[margin] section is set but exchange.product is spot — \
+                 margin guard is a no-op on spot, the section will be \
+                 ignored at runtime"
+                    .to_string(),
+            );
+        }
+        (Some(m), true) => {
+            if let Err(e) = m.validate_thresholds() {
+                errors.push(e);
+            }
+            if m.uses_cross_margin() && config.hedge.is_none() {
+                errors.push(
+                    "margin.*.mode = \"cross\" requires a live [hedge] \
+                     section — cross margin without an active hedge \
+                     exposes the whole account to a single-symbol \
+                     liquidation cascade"
+                        .to_string(),
+                );
+            }
+            if m.refresh_interval_secs == 0 {
+                errors.push("margin.refresh_interval_secs must be > 0".to_string());
+            }
+            if m.max_stale_secs == 0 {
+                errors.push("margin.max_stale_secs must be > 0".to_string());
+            }
+            if m.default_leverage == 0 {
+                errors.push("margin.default_leverage must be > 0".to_string());
+            }
+            for (sym, ps) in &m.per_symbol {
+                if ps.leverage == 0 {
+                    errors.push(format!(
+                        "margin.per_symbol.{sym}.leverage must be > 0"
+                    ));
+                }
+            }
+        }
+        (None, false) => {} // spot + no margin = correct
+    }
+
+    // --- Placeholder-value guard (Epic 25) ---
+    // In live mode the defaults that ship with `config/default.toml`
+    // are deliberately round numbers meant as a starting point for
+    // paper testing — none of them are calibrated against any real
+    // venue. Silently running live with placeholders is the fast
+    // path to a surprise drawdown. Flag the obvious ones loudly in
+    // live; in paper/smoke let them pass quietly.
+    let is_live = config.mode.eq_ignore_ascii_case("live");
+    if is_live {
+        let mut placeholders: Vec<&'static str> = Vec::new();
+        if mm.gamma == dec!(0.1) {
+            placeholders.push("market_maker.gamma=0.1 (default)");
+        }
+        if mm.kappa == dec!(1.5) {
+            placeholders.push("market_maker.kappa=1.5 (default)");
+        }
+        if mm.sigma == dec!(0.02) {
+            placeholders.push("market_maker.sigma=0.02 (default)");
+        }
+        if risk.max_exposure_quote == dec!(10000) {
+            placeholders.push("risk.max_exposure_quote=10000 (default)");
+        }
+        if risk.max_drawdown_quote == dec!(500) {
+            placeholders.push("risk.max_drawdown_quote=500 (default)");
+        }
+        if ks.daily_loss_limit == dec!(1000) {
+            placeholders.push("kill_switch.daily_loss_limit=1000 (default)");
+        }
+        if !placeholders.is_empty() {
+            errors.push(format!(
+                "LIVE MODE with placeholder config values — calibrate before \
+                 trading real money. Offending fields: {}. \
+                 Run `mm-record-live` + `mm-calibrate` to fit σ and κ from \
+                 real venue data, then set risk / kill_switch limits to \
+                 match your actual capital allocation.",
+                placeholders.join(", ")
+            ));
+        }
+    }
+
     // Report.
     for w in &warnings {
         warn!("config warning: {w}");
@@ -353,13 +456,21 @@ mod tests {
     use mm_common::config::{AppConfig, FundingArbCfg, HedgeConfig, HedgePairConfig};
 
     fn base_config() -> AppConfig {
-        AppConfig::default()
+        // Tests exercise strategy/hedge/client logic on the
+        // defaults — switch to paper mode so the live-only
+        // placeholder guard (Epic 25) doesn't trip them. Tests
+        // that want to probe the live path set mode explicitly.
+        AppConfig {
+            mode: "paper".into(),
+            ..AppConfig::default()
+        }
     }
 
     fn valid_hedge() -> HedgeConfig {
         HedgeConfig {
             exchange: mm_common::config::ExchangeConfig {
                 exchange_type: ExchangeType::Custom,
+                product: mm_common::config::ProductType::Spot,
                 rest_url: "http://localhost:8080".to_string(),
                 ws_url: "ws://localhost:8080/ws".to_string(),
                 api_key: Some("k".to_string()),
@@ -477,6 +588,7 @@ mod tests {
                 api_keys: vec![],
                 report_branding: None,
                 daily_loss_limit_usd: None,
+                jurisdiction: "global".to_string(),
             },
             mm_common::config::ClientConfig {
                 id: "bob".into(),
@@ -487,6 +599,7 @@ mod tests {
                 api_keys: vec![],
                 report_branding: None,
                 daily_loss_limit_usd: None,
+                jurisdiction: "global".to_string(),
             },
         ];
         let err = validate_config(&cfg).unwrap_err().to_string();
@@ -507,6 +620,7 @@ mod tests {
                 api_keys: vec![],
                 report_branding: None,
                 daily_loss_limit_usd: None,
+                jurisdiction: "global".to_string(),
             },
             mm_common::config::ClientConfig {
                 id: "alice".into(),
@@ -517,6 +631,7 @@ mod tests {
                 api_keys: vec![],
                 report_branding: None,
                 daily_loss_limit_usd: None,
+                jurisdiction: "global".to_string(),
             },
         ];
         let err = validate_config(&cfg).unwrap_err().to_string();
@@ -536,6 +651,7 @@ mod tests {
                 api_keys: vec![],
                 report_branding: None,
                 daily_loss_limit_usd: None,
+                jurisdiction: "global".to_string(),
             },
             mm_common::config::ClientConfig {
                 id: "bob".into(),
@@ -546,6 +662,7 @@ mod tests {
                 api_keys: vec![],
                 report_branding: None,
                 daily_loss_limit_usd: None,
+                jurisdiction: "global".to_string(),
             },
         ];
         // clients mode — top-level symbols is ignored, but warns
@@ -574,10 +691,131 @@ mod tests {
             api_keys: vec![],
             report_branding: None,
             daily_loss_limit_usd: None,
+                jurisdiction: "global".to_string(),
         }];
         let eff = cfg.effective_clients();
         assert_eq!(eff.len(), 1);
         assert_eq!(eff[0].id, "acme");
+    }
+
+    #[test]
+    fn live_mode_rejects_default_placeholder_config() {
+        let mut cfg = base_config();
+        cfg.mode = "live".into();
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("placeholder"), "{err}");
+        assert!(err.contains("gamma"), "{err}");
+    }
+
+    #[test]
+    fn paper_mode_allows_placeholder_config() {
+        let mut cfg = base_config();
+        cfg.mode = "paper".into();
+        validate_config(&cfg).unwrap();
+    }
+
+    /// Every paper-mode config shipped under `config/*-paper.toml`
+    /// must parse as a valid `AppConfig` and pass `validate_config`
+    /// without error. If one regresses (e.g. a typo or a renamed
+    /// field), `cargo test` catches it before an operator ever
+    /// sees a cryptic deserialisation error at startup.
+    ///
+    /// Venues that need venue-specific secrets (HyperLiquid's
+    /// private key) get a dummy value injected into the parsed
+    /// config before validation — the shipped toml intentionally
+    /// omits secrets, and the test is a parse-shape sanity check,
+    /// not an auth dress rehearsal.
+    #[test]
+    fn shipped_paper_configs_parse_and_validate() {
+        let files = [
+            "../../config/binance-paper.toml",
+            "../../config/bybit-paper.toml",
+            "../../config/hl-paper.toml",
+        ];
+        for path in files {
+            let body = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("missing shipped config {path}: {e}"));
+            let mut cfg: AppConfig = toml::from_str(&body)
+                .unwrap_or_else(|e| panic!("{path} failed to parse: {e}"));
+            assert_eq!(cfg.mode, "paper", "{path} not in paper mode");
+            // Inject a placeholder secret for HL so the
+            // "requires MM_API_SECRET" validation branch is not
+            // the thing under test here.
+            if matches!(
+                cfg.exchange.exchange_type,
+                ExchangeType::HyperLiquid | ExchangeType::HyperLiquidTestnet
+            ) {
+                cfg.exchange.api_secret =
+                    Some("0".repeat(64));
+            }
+            validate_config(&cfg)
+                .unwrap_or_else(|e| panic!("{path} failed validation: {e}"));
+        }
+    }
+
+    #[test]
+    fn live_mode_accepts_calibrated_config() {
+        let mut cfg = base_config();
+        cfg.mode = "live".into();
+        cfg.market_maker.gamma = dec!(0.08);
+        cfg.market_maker.kappa = dec!(42.3);
+        cfg.market_maker.sigma = dec!(0.00005);
+        cfg.risk.max_exposure_quote = dec!(7500);
+        cfg.risk.max_drawdown_quote = dec!(350);
+        cfg.kill_switch.daily_loss_limit = dec!(800);
+        validate_config(&cfg).unwrap();
+    }
+
+    #[test]
+    fn perp_without_margin_section_is_rejected() {
+        let mut cfg = base_config();
+        cfg.exchange.product = mm_common::config::ProductType::LinearPerp;
+        cfg.margin = None;
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("[margin] section"), "{err}");
+    }
+
+    #[test]
+    fn perp_with_margin_thresholds_invalid_order_is_rejected() {
+        let mut cfg = base_config();
+        cfg.exchange.product = mm_common::config::ProductType::LinearPerp;
+        cfg.margin = Some(mm_common::config::MarginConfig {
+            widen_ratio: dec!(0.9),
+            stop_ratio: dec!(0.8),
+            cancel_ratio: dec!(0.95),
+            ..Default::default()
+        });
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("widen_ratio"), "{err}");
+    }
+
+    #[test]
+    fn cross_margin_without_hedge_is_rejected() {
+        let mut cfg = base_config();
+        cfg.exchange.product = mm_common::config::ProductType::LinearPerp;
+        cfg.margin = Some(mm_common::config::MarginConfig {
+            default_mode: mm_common::config::MarginModeCfg::Cross,
+            ..Default::default()
+        });
+        cfg.hedge = None;
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("cross") && err.contains("hedge"), "{err}");
+    }
+
+    #[test]
+    fn perp_with_valid_margin_is_accepted() {
+        let mut cfg = base_config();
+        cfg.exchange.product = mm_common::config::ProductType::LinearPerp;
+        cfg.margin = Some(mm_common::config::MarginConfig::default());
+        validate_config(&cfg).unwrap();
+    }
+
+    #[test]
+    fn spot_with_margin_section_warns_only() {
+        let mut cfg = base_config();
+        cfg.exchange.product = mm_common::config::ProductType::Spot;
+        cfg.margin = Some(mm_common::config::MarginConfig::default());
+        validate_config(&cfg).unwrap();
     }
 
     #[test]

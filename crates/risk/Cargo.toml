@@ -5,7 +5,12 @@ version.workspace = true
 
 [dependencies]
 mm-common = { workspace = true }
+mm-exchange-core = { workspace = true }
 mm-persistence = { path = "../persistence" }
+# Epic G — SentimentTick type consumed by the
+# `SocialRiskEngine`. Pure-types dependency; the collectors /
+# Ollama analyzer never leak into this crate.
+mm-sentiment = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 tracing = { workspace = true }

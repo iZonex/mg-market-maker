@@ -122,7 +122,44 @@ pub async fn run_preflight(
         }
     }
 
-    // 4. Rate limit budget.
+    // 4. Clock-skew check (Epic 36.2). HMAC-signed venues reject
+    // requests outside their `recv_window` (Binance default 5 s,
+    // drift > 1 s on a signed call = −1021). Catch a skewed
+    // system clock BEFORE the first order, not as a mid-session
+    // surprise. Budget: ±500 ms. Venues without a time endpoint
+    // return Ok(None) and the check is silently skipped.
+    match connector.server_time_ms().await {
+        Ok(Some(venue_ms)) => {
+            let local_ms = chrono::Utc::now().timestamp_millis();
+            let drift_ms = (local_ms - venue_ms).abs();
+            let status = if drift_ms <= 500 {
+                CheckStatus::Pass
+            } else if drift_ms <= 2000 {
+                CheckStatus::Warn
+            } else {
+                CheckStatus::Fail
+            };
+            results.push(CheckResult {
+                name: "clock_skew".into(),
+                status,
+                message: format!(
+                    "local vs venue clock drift {drift_ms} ms (budget ±500 ms)"
+                ),
+            });
+        }
+        Ok(None) => {
+            // Venue has no time endpoint — skip silently.
+        }
+        Err(e) => {
+            results.push(CheckResult {
+                name: "clock_skew".into(),
+                status: CheckStatus::Warn,
+                message: format!("server_time_ms failed: {e}"),
+            });
+        }
+    }
+
+    // 5. Rate limit budget.
     let remaining = connector.rate_limit_remaining().await;
     results.push(CheckResult {
         name: "rate_limit".into(),

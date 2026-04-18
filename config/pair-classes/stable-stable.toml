@@ -1,0 +1,30 @@
+# StableStable template — USDC/USDT, BUSD/USDT, FDUSD/USDT and
+# friends. Ultra-tight spread floor, very low γ. Realised vol is
+# essentially measurement noise; κ is high because retail
+# flow dominates and fills arrive constantly.
+#
+# WARNING: stable/stable MM is a low-margin, high-volume game.
+# Make sure fee tier is competitive (ideally maker rebate, not
+# just neutral) before enabling; otherwise fees eat the spread.
+
+[market_maker]
+gamma = "0.01"
+kappa = "50.0"
+sigma = "0.000003"
+time_horizon_secs = 300
+num_levels = 4             # deeper — tight spread means many rungs clear
+refresh_interval_ms = 500
+min_spread_bps = "0.5"     # 0.05 bps is typical mid-to-quote on USDC/USDT
+max_distance_bps = "20"
+momentum_enabled = false    # no directional signal in a de-facto peg
+momentum_window = 200
+market_resilience_enabled = true
+hma_enabled = false         # HMA trend is noise on a peg
+
+[risk]
+max_spread_bps = "10"
+stale_book_timeout_secs = 5
+
+[toxicity]
+vpin_threshold = "0.80"     # takes a lot to signal toxicity on a peg
+kyle_window = 200

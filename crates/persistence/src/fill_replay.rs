@@ -251,4 +251,148 @@ mod tests {
         let issues = validate_checkpoint_against_replay(&cp, &replay, dec!(0.001));
         assert!(issues.len() >= 2); // inventory + fill count
     }
+
+    // ── Property-based tests (Epic 20) ────────────────────────
+
+    use proptest::prelude::*;
+
+    fn write_fill_lines(f: &mut std::fs::File, fills: &[(bool, i64, i64)]) {
+        for (buy, price_raw, qty_raw) in fills {
+            let side = if *buy { "Buy" } else { "Sell" };
+            let line = format!(
+                r#"{{"seq":1,"event_type":"order_filled","symbol":"BTCUSDT","side":"{}","price":{},"qty":{}}}"#,
+                side,
+                Decimal::new(*price_raw, 2),
+                Decimal::new(*qty_raw, 4),
+            );
+            writeln!(f, "{}", line).unwrap();
+        }
+    }
+
+    proptest! {
+        /// fill_count from replay equals the number of order_filled
+        /// events written. Non-fill lines don't inflate it.
+        #[test]
+        fn fill_count_equals_written_fills(
+            fills in proptest::collection::vec(
+                (any::<bool>(), 10_000i64..1_000_000, 1i64..10_000),
+                1..25,
+            ),
+        ) {
+            let p = tmp_path(&format!("prop_count_{}", rand_suffix()));
+            let mut f = std::fs::File::create(&p).unwrap();
+            write_fill_lines(&mut f, &fills);
+            drop(f);
+            let r = replay_fills_from_audit(&p).unwrap();
+            prop_assert_eq!(r.fill_count, fills.len() as u64);
+            let _ = std::fs::remove_file(&p);
+        }
+
+        /// Inventory equals Σ(sign × qty). Catches any regression
+        /// that flips the accumulation direction.
+        #[test]
+        fn inventory_matches_signed_sum(
+            fills in proptest::collection::vec(
+                (any::<bool>(), 10_000i64..1_000_000, 1i64..10_000),
+                1..25,
+            ),
+        ) {
+            let p = tmp_path(&format!("prop_inv_{}", rand_suffix()));
+            let mut f = std::fs::File::create(&p).unwrap();
+            write_fill_lines(&mut f, &fills);
+            drop(f);
+            let r = replay_fills_from_audit(&p).unwrap();
+            let expected: Decimal = fills.iter().map(|(buy, _, q)| {
+                let qty = Decimal::new(*q, 4);
+                if *buy { qty } else { -qty }
+            }).sum();
+            prop_assert_eq!(r.inventory, expected);
+            let _ = std::fs::remove_file(&p);
+        }
+
+        /// total_volume equals Σ(price × qty). Catches a
+        /// regression that uses only qty or only notional.
+        #[test]
+        fn total_volume_matches_product_sum(
+            fills in proptest::collection::vec(
+                (any::<bool>(), 10_000i64..1_000_000, 1i64..10_000),
+                1..20,
+            ),
+        ) {
+            let p = tmp_path(&format!("prop_vol_{}", rand_suffix()));
+            let mut f = std::fs::File::create(&p).unwrap();
+            write_fill_lines(&mut f, &fills);
+            drop(f);
+            let r = replay_fills_from_audit(&p).unwrap();
+            let expected: Decimal = fills.iter().map(|(_, pr, q)| {
+                Decimal::new(*pr, 2) * Decimal::new(*q, 4)
+            }).sum();
+            prop_assert_eq!(r.total_volume, expected);
+            let _ = std::fs::remove_file(&p);
+        }
+
+        /// validate_checkpoint_against_replay: exact match produces
+        /// zero issues. Catches a regression where the validator
+        /// always reports a false positive.
+        #[test]
+        fn validate_exact_match_has_no_issues(
+            inv_raw in -1_000_000i64..1_000_000,
+            fills in 0u64..10_000,
+            vol_raw in 0i64..1_000_000,
+        ) {
+            let inv = Decimal::new(inv_raw, 4);
+            let cp = SymbolCheckpoint {
+                symbol: "X".into(),
+                inventory: inv,
+                avg_entry_price: dec!(50000),
+                open_order_ids: vec![],
+                realized_pnl: dec!(0),
+                total_volume: Decimal::new(vol_raw, 2),
+                total_fills: fills,
+            };
+            let r = FillReplayResult {
+                inventory: inv,
+                realized_pnl: dec!(0),
+                fill_count: fills,
+                total_volume: Decimal::new(vol_raw, 2),
+                last_fill_at: None,
+            };
+            let issues = validate_checkpoint_against_replay(&cp, &r, dec!(0));
+            prop_assert!(issues.is_empty(), "expected clean, got {:?}", issues);
+        }
+
+        /// Fill count mismatch always surfaces an issue.
+        #[test]
+        fn fill_count_mismatch_flagged(
+            cp_fills in 0u64..1000,
+            delta in 1u64..500,
+        ) {
+            let cp = SymbolCheckpoint {
+                symbol: "X".into(),
+                inventory: dec!(0),
+                avg_entry_price: dec!(0),
+                open_order_ids: vec![],
+                realized_pnl: dec!(0),
+                total_volume: dec!(0),
+                total_fills: cp_fills + delta,
+            };
+            let r = FillReplayResult {
+                inventory: dec!(0),
+                realized_pnl: dec!(0),
+                fill_count: cp_fills,
+                total_volume: dec!(0),
+                last_fill_at: None,
+            };
+            let issues = validate_checkpoint_against_replay(&cp, &r, dec!(0));
+            prop_assert!(!issues.is_empty());
+        }
+    }
+
+    fn rand_suffix() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    }
 }

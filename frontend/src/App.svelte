@@ -1,19 +1,15 @@
 <script>
-  import Header from './lib/components/Header.svelte'
-  import PnlChart from './lib/components/PnlChart.svelte'
-  import SpreadChart from './lib/components/SpreadChart.svelte'
-  import OrderBook from './lib/components/OrderBook.svelte'
-  import InventoryPanel from './lib/components/InventoryPanel.svelte'
-  import SignalsPanel from './lib/components/SignalsPanel.svelte'
-  import OpenOrders from './lib/components/OpenOrders.svelte'
-  import FillHistory from './lib/components/FillHistory.svelte'
-  import Controls from './lib/components/Controls.svelte'
-  import AlertLog from './lib/components/AlertLog.svelte'
-  import ConnectivityPanel from './lib/components/ConnectivityPanel.svelte'
-  import AuditStream from './lib/components/AuditStream.svelte'
-  import ClientCircuitPanel from './lib/components/ClientCircuitPanel.svelte'
-  import ParamTuner from './lib/components/ParamTuner.svelte'
+  import Sidebar from './lib/components/Sidebar.svelte'
+  import TopBar from './lib/components/TopBar.svelte'
   import Login from './lib/components/Login.svelte'
+  import Overview from './lib/pages/Overview.svelte'
+  import OrderbookPage from './lib/pages/OrderbookPage.svelte'
+  import HistoryPage from './lib/pages/HistoryPage.svelte'
+  import CalibrationPage from './lib/pages/CalibrationPage.svelte'
+  import CompliancePage from './lib/pages/CompliancePage.svelte'
+  import SettingsPage from './lib/pages/SettingsPage.svelte'
+  import UsersPage from './lib/pages/UsersPage.svelte'
+  import AdminPage from './lib/pages/AdminPage.svelte'
   import { createWsStore } from './lib/ws.svelte.js'
   import { createAuthStore } from './lib/auth.svelte.js'
   import { isDemoMode, createDemoStore } from './lib/demo.svelte.js'
@@ -29,153 +25,93 @@
     auth.state.token = 'demo'
   }
 
-  // Derived values for viewer panels.
-  const sym = $derived(ws.state.symbols[0] || '')
-  const symData = $derived(ws.state.data[sym] || {})
-  const viewerPnl = $derived(symData.pnl || {})
+  let route = $state('overview')
+
+  const activeSymbol = $derived(ws.state.activeSymbol || ws.state.symbols[0] || '')
+  const symData = $derived(ws.state.data[activeSymbol] || {})
+  const rxMs = $derived(symData._rx_ms ?? null)
+
+  // Detect engine mode from the status payload if the backend
+  // surfaces it; default to "paper" so the chip matches the
+  // default run mode.
+  const mode = $derived(symData.mode || 'paper')
+
+  function onSymbolChange(s) { ws.setActiveSymbol?.(s) }
 </script>
 
 {#if !auth.state.loggedIn}
   <Login {auth} />
 {:else}
-  <div class="app">
-    {#if demo}
-      <div class="demo-banner">DEMO MODE — simulated data</div>
-    {/if}
-    <Header data={ws} {auth} />
-
-    <div class="grid">
-      <div class="panel span-2">
-        <PnlChart data={ws} />
-      </div>
-      <div class="panel">
-        <OrderBook data={ws} />
-      </div>
-
-      <div class="panel">
-        <SpreadChart data={ws} />
-      </div>
-      <div class="panel">
-        <InventoryPanel data={ws} />
-      </div>
-      <div class="panel">
-        <SignalsPanel data={ws} />
-      </div>
-
-      <div class="panel">
-        {#if auth.canControl()}
-          <Controls data={ws} {auth} />
-        {:else}
-          <div class="viewer-pnl">
-            <h3>PnL Attribution</h3>
-            <div class="pnl-row"><span>Spread</span><span class="pos">${parseFloat(viewerPnl.spread || 0).toFixed(4)}</span></div>
-            <div class="pnl-row"><span>Inventory</span><span>${parseFloat(viewerPnl.inventory || 0).toFixed(4)}</span></div>
-            <div class="pnl-row"><span>Rebates</span><span class="pos">${parseFloat(viewerPnl.rebates || 0).toFixed(4)}</span></div>
-            <div class="pnl-row"><span>Fees</span><span class="neg">-${parseFloat(viewerPnl.fees || 0).toFixed(4)}</span></div>
-            <div class="pnl-row total"><span>Total</span><span>${parseFloat(viewerPnl.total || 0).toFixed(4)}</span></div>
-          </div>
-        {/if}
-      </div>
-
-      <div class="panel">
-        <OpenOrders data={ws} />
-      </div>
-      <div class="panel">
-        <FillHistory data={ws} />
-      </div>
-      <div class="panel">
-        {#if auth.canViewInternals()}
-          <AlertLog data={ws} />
-        {:else}
-          <div class="viewer-sla">
-            <h3>SLA Compliance</h3>
-            <div class="sla-big">{parseFloat(symData.sla_uptime_pct || 0).toFixed(1)}%</div>
-            <div class="sla-label">Uptime</div>
-          </div>
-        {/if}
-      </div>
-
-      {#if auth.canViewInternals() && !demo}
-        <div class="panel span-2">
-          <AuditStream {auth} />
+  <div class="shell">
+    <Sidebar bind:route {auth} connected={ws.state.connected} {mode} />
+    <div class="main">
+      <TopBar
+        symbols={ws.state.symbols}
+        {activeSymbol}
+        {onSymbolChange}
+        {rxMs}
+        connected={ws.state.connected}
+        {auth}
+        {route}
+        {symData}
+      />
+      {#if demo}
+        <div class="demo-banner">
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+          DEMO MODE — simulated data
         </div>
-        <div class="panel">
-          <ConnectivityPanel {auth} />
-        </div>
-        <div class="panel span-3">
-          <ClientCircuitPanel {auth} />
-        </div>
-        {#if auth.canControl()}
-          <div class="panel span-3">
-            <ParamTuner data={ws} {auth} />
-          </div>
-        {/if}
       {/if}
+      <div class="content">
+        {#if route === 'overview'}
+          <Overview {ws} />
+        {:else if route === 'orderbook'}
+          <OrderbookPage {ws} {auth} />
+        {:else if route === 'history'}
+          <HistoryPage {ws} {auth} />
+        {:else if route === 'calibration'}
+          <CalibrationPage {ws} {auth} />
+        {:else if route === 'compliance'}
+          <CompliancePage {ws} {auth} />
+        {:else if route === 'settings' && auth.canControl()}
+          <SettingsPage {ws} {auth} />
+        {:else if route === 'users' && auth.state.role === 'admin'}
+          <UsersPage {auth} />
+        {:else if route === 'admin' && auth.canControl()}
+          <AdminPage {ws} {auth} />
+        {:else}
+          <Overview {ws} />
+        {/if}
+      </div>
     </div>
-
-    <footer>
-      <span class="user-info">
-        <span class="role-badge {auth.state.role}">{auth.state.role}</span>
-        {auth.state.name}
-      </span>
-      <button class="logout" onclick={() => auth.logout()}>Logout</button>
-    </footer>
   </div>
 {/if}
 
 <style>
-  :global(*) { margin: 0; padding: 0; box-sizing: border-box; }
-  :global(body) {
-    background: #0a0e17; color: #e1e4e8;
-    font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', monospace;
-    font-size: 13px;
+  .shell {
+    display: flex;
+    min-height: 100vh;
+    background: var(--bg-base);
   }
-  .app { min-height: 100vh; padding: 8px; display: flex; flex-direction: column; }
+  .main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .content {
+    flex: 1;
+    min-height: 0;
+  }
   .demo-banner {
-    background: #d29922; color: #000; text-align: center;
-    padding: 4px; font-size: 11px; font-weight: 700;
-    letter-spacing: 1px; border-radius: 4px; margin-bottom: 4px;
+    display: flex; align-items: center; justify-content: center;
+    gap: var(--s-2);
+    padding: var(--s-2);
+    background: var(--warn-bg);
+    color: var(--warn);
+    border-bottom: 1px solid rgba(245, 158, 11, 0.3);
+    font-size: var(--fs-xs);
+    font-weight: 600;
+    letter-spacing: var(--tracking-label);
+    text-transform: uppercase;
   }
-  .grid {
-    display: grid; grid-template-columns: 1fr 1fr 1fr;
-    gap: 8px; margin-top: 8px; flex: 1;
-  }
-  .panel {
-    background: #161b22; border: 1px solid #21262d;
-    border-radius: 6px; padding: 12px; min-height: 250px;
-  }
-  .span-2 { grid-column: span 2; }
-  .span-3 { grid-column: span 3; }
-  footer {
-    display: flex; justify-content: space-between; align-items: center;
-    padding: 8px 12px; margin-top: 8px;
-    background: #161b22; border: 1px solid #21262d; border-radius: 6px;
-  }
-  .user-info { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #8b949e; }
-  .role-badge {
-    padding: 2px 6px; border-radius: 3px; font-size: 10px;
-    font-weight: 700; text-transform: uppercase;
-  }
-  .role-badge.admin { background: #da3633; color: #fff; }
-  .role-badge.operator { background: #d29922; color: #000; }
-  .role-badge.viewer { background: #238636; color: #fff; }
-  .logout {
-    background: none; border: 1px solid #30363d; color: #8b949e;
-    padding: 4px 12px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 11px;
-  }
-  .logout:hover { border-color: #f85149; color: #f85149; }
-  .viewer-pnl h3, .viewer-sla h3 {
-    font-size: 12px; color: #8b949e; margin-bottom: 12px;
-    text-transform: uppercase; letter-spacing: 0.5px;
-  }
-  .pnl-row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; }
-  .pnl-row.total {
-    border-top: 1px solid #21262d; margin-top: 8px; padding-top: 8px;
-    font-weight: 700; font-size: 15px;
-  }
-  .pos { color: #3fb950; }
-  .neg { color: #f85149; }
-  .viewer-sla { text-align: center; padding-top: 40px; }
-  .sla-big { font-size: 48px; font-weight: 700; color: #3fb950; }
-  .sla-label { font-size: 14px; color: #8b949e; margin-top: 8px; }
 </style>

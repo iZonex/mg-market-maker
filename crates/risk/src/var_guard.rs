@@ -133,6 +133,21 @@ pub struct VarGuardConfig {
     /// disables the 99 % tier (but then a strategy can
     /// never be hard-halted by VaR).
     pub limit_99: Option<Decimal>,
+    /// Epic C stage-2 — 95 %-CVaR floor. CVaR (expected
+    /// shortfall at 95 %) measures the *average* loss
+    /// conditional on breaching the 95 %-VaR — a deeper
+    /// tail metric than VaR itself. Breaching this tier
+    /// throttles size to [`THROTTLE_95_TIER`]. Typically
+    /// more negative than `limit_95` since CVaR < VaR by
+    /// construction. `None` skips the tier.
+    pub cvar_limit_95: Option<Decimal>,
+    /// Epic C stage-2 — 99 %-CVaR floor (hard halt). The
+    /// deepest risk metric on the ladder: a 99 %-CVaR
+    /// breach means the average loss *conditional on* a
+    /// 1-in-100 day is worse than tolerated. Triggers
+    /// [`THROTTLE_99_TIER`] = full stop. `None` skips the
+    /// tier.
+    pub cvar_limit_99: Option<Decimal>,
     /// EWMA decay factor λ ∈ (0, 1). Higher = slower decay,
     /// more weight on history. RiskMetrics default is 0.94 for
     /// daily data. `None` disables the EWMA path entirely —
@@ -257,15 +272,28 @@ impl VarGuard {
             return Decimal::ONE;
         }
         let metrics = self.compute_risk_metrics_inner(buf, self.ewma.get(strategy_class));
-        // Hard halt tier first — `min` semantics mean the
-        // tighter of the two wins if both breach simultaneously.
+        // Hard-halt tier first — check VaR_99 AND CVaR_99
+        // (Epic C stage-2). Either breach stops quoting
+        // because the tail is already exceeding the
+        // operator's worst-case budget.
         if let Some(limit_99) = self.config.limit_99 {
             if metrics.var_99 < limit_99 {
                 return THROTTLE_99_TIER;
             }
         }
+        if let Some(cvar_99) = self.config.cvar_limit_99 {
+            if metrics.cvar_99 < cvar_99 {
+                return THROTTLE_99_TIER;
+            }
+        }
+        // Half-size tier — same dual-check pattern.
         if let Some(limit_95) = self.config.limit_95 {
             if metrics.var_95 < limit_95 {
+                return THROTTLE_95_TIER;
+            }
+        }
+        if let Some(cvar_95) = self.config.cvar_limit_95 {
+            if metrics.cvar_95 < cvar_95 {
                 return THROTTLE_95_TIER;
             }
         }
@@ -451,7 +479,85 @@ mod tests {
             limit_95,
             limit_99,
             ewma_lambda: None,
+            cvar_limit_95: None,
+            cvar_limit_99: None,
         }
+    }
+
+    /// Epic C stage-2 — a CVaR_95 breach throttles to
+    /// [`THROTTLE_95_TIER`] even when VaR_95 is comfortably
+    /// above its floor. Fires when the operator wants tail-
+    /// severity (not just tail-frequency) to gate sizing.
+    #[test]
+    fn cvar_95_breach_triggers_half_throttle() {
+        let mut g = VarGuard::new(VarGuardConfig {
+            limit_95: None,
+            limit_99: None,
+            ewma_lambda: None,
+            // CVaR_95 = μ − σ·φ(z_95)/0.05 ≈ μ − 2.063·σ. A
+            // buffer with σ ≈ 0.5 + μ = 0 produces CVaR_95 ≈
+            // −1.03. Floor at −0.5 triggers breach; VaR floors
+            // stay unset so the breach MUST come from CVaR.
+            cvar_limit_95: Some(dec!(-0.5)),
+            cvar_limit_99: None,
+        });
+        // Samples: wide-spread zero-mean normal.
+        for i in 0..50 {
+            let v = if i % 2 == 0 { dec!(-0.5) } else { dec!(0.5) };
+            g.record_pnl_sample("basis", v);
+        }
+        assert_eq!(g.effective_throttle("basis"), THROTTLE_95_TIER);
+    }
+
+    #[test]
+    fn cvar_99_breach_triggers_hard_halt() {
+        let mut g = VarGuard::new(VarGuardConfig {
+            limit_95: None,
+            limit_99: None,
+            ewma_lambda: None,
+            cvar_limit_95: None,
+            // CVaR_99 = μ − σ·φ(z_99)/0.01 ≈ μ − 2.656·σ.
+            // σ ≈ 0.5 → CVaR_99 ≈ −1.33. Floor at −1 triggers.
+            cvar_limit_99: Some(dec!(-1)),
+        });
+        for i in 0..50 {
+            let v = if i % 2 == 0 { dec!(-0.5) } else { dec!(0.5) };
+            g.record_pnl_sample("basis", v);
+        }
+        assert_eq!(g.effective_throttle("basis"), THROTTLE_99_TIER);
+    }
+
+    /// Mixed VaR + CVaR config — VaR floor breach still fires
+    /// first when both are configured, because the VaR check
+    /// comes first in the ladder.
+    #[test]
+    fn var_99_breach_takes_precedence_over_cvar_95() {
+        let mut g = VarGuard::new(VarGuardConfig {
+            limit_95: None,
+            limit_99: Some(dec!(-0.1)),
+            ewma_lambda: None,
+            cvar_limit_95: Some(dec!(-0.01)),
+            cvar_limit_99: None,
+        });
+        // Same symmetric ±0.5 tape: VaR_99 ≈ −1.16 → breaches.
+        // CVaR_95 ≈ −1.03 → also breaches. 99-tier wins.
+        for i in 0..50 {
+            let v = if i % 2 == 0 { dec!(-0.5) } else { dec!(0.5) };
+            g.record_pnl_sample("basis", v);
+        }
+        assert_eq!(g.effective_throttle("basis"), THROTTLE_99_TIER);
+    }
+
+    /// No CVaR config → same behaviour as before stage-2.
+    #[test]
+    fn unset_cvar_limits_preserve_pre_stage2_behaviour() {
+        let mut g = VarGuard::new(config(Some(dec!(-10)), Some(dec!(-20))));
+        for i in 0..50 {
+            let v = if i % 2 == 0 { dec!(-0.5) } else { dec!(0.5) };
+            g.record_pnl_sample("basis", v);
+        }
+        // Wide floors → no breach anywhere → full size.
+        assert_eq!(g.effective_throttle("basis"), Decimal::ONE);
     }
 
     /// Warm-up: fewer than `MIN_SAMPLES_FOR_VAR` samples → the
@@ -677,6 +783,8 @@ mod tests {
             limit_95: Some(dec!(-1000)),
             limit_99: Some(dec!(-2000)),
             ewma_lambda: Some(dec!(0.94)),
+            cvar_limit_95: None,
+            cvar_limit_99: None,
         });
         // 100 calm samples.
         for _ in 0..100 {
@@ -709,12 +817,16 @@ mod tests {
             limit_95: Some(dec!(-1000)),
             limit_99: None,
             ewma_lambda: None,
+            cvar_limit_95: None,
+            cvar_limit_99: None,
         });
         // Guard WITH EWMA.
         let mut g_ewma = VarGuard::new(VarGuardConfig {
             limit_95: Some(dec!(-1000)),
             limit_99: None,
             ewma_lambda: Some(dec!(0.94)),
+            cvar_limit_95: None,
+            cvar_limit_99: None,
         });
         // Same data to both: calm then volatile.
         for _ in 0..80 {
@@ -843,6 +955,8 @@ mod tests {
                 limit_95: Some(dec!(-1)),
                 limit_99: Some(dec!(-10)),
                 ewma_lambda: None,
+                cvar_limit_95: None,
+                cvar_limit_99: None,
             };
             let mut g = VarGuard::new(cfg);
             for s in &samples {
@@ -867,6 +981,8 @@ mod tests {
                 limit_95: Some(Decimal::new(lim_95, 2)),
                 limit_99: Some(Decimal::new(lim_99, 2)),
                 ewma_lambda: None,
+                cvar_limit_95: None,
+                cvar_limit_99: None,
             };
             let mut g = VarGuard::new(cfg);
             for s in &samples {
@@ -890,6 +1006,8 @@ mod tests {
                 limit_95: None,
                 limit_99: None,
                 ewma_lambda: None,
+                cvar_limit_95: None,
+                cvar_limit_99: None,
             });
             for _ in 0..40 {
                 g.record_pnl_sample("flat", value);
@@ -911,6 +1029,8 @@ mod tests {
                 limit_95: Some(dec!(-1000)),
                 limit_99: None,
                 ewma_lambda: None,
+                cvar_limit_95: None,
+                cvar_limit_99: None,
             };
             let mut g = VarGuard::new(cfg);
             for s in &samples_a {

@@ -1,4 +1,5 @@
 pub mod connector;
+pub mod errors;
 pub mod events;
 pub mod metrics;
 pub mod rate_limiter;
@@ -6,6 +7,7 @@ pub mod router;
 pub mod unified_book;
 
 pub use connector::{validate_withdraw_address, ExchangeConnector};
+pub use errors::{VenueError, VenueErrorKind};
 pub use events::MarketEvent;
 pub use metrics::ORDER_ENTRY_LATENCY;
 pub use rate_limiter::RateLimiter;

@@ -1,11 +1,12 @@
 <script>
   import { createApiClient } from '../api.svelte.js'
+  import Icon from './Icon.svelte'
 
   let { data, auth } = $props()
   const api = createApiClient(auth)
 
   const s = $derived(data.state)
-  const sym = $derived(s.symbols[0] || '')
+  const sym = $derived(s.activeSymbol || s.symbols[0] || '')
   const d = $derived(s.data[sym] || {})
   const tunable = $derived(d.tunable_config || {})
 
@@ -92,131 +93,198 @@
   }
 </script>
 
-<div>
-  <h3>
-    Live Tuning <span class="sym">{sym}</span>
-    {#if hasPending()}<span class="dirty">• {Object.keys(pending).length} pending</span>{/if}
-  </h3>
-
-  {#if !tunable || !tunable.gamma}
-    <div class="empty">engine has not published a config snapshot yet</div>
-  {:else}
-    <div class="fields">
-      {#each FIELDS as f (f.key)}
-        {@const v = currentValue(f)}
-        {@const pendingThis = pending[f.key] !== undefined}
-        <div class="row">
-          <label title={f.tooltip}>{f.label}</label>
-          <input
-            type="range"
-            min={f.min}
-            max={f.max}
-            step={f.step}
-            value={v}
-            oninput={(e) => onSlide(f, e.currentTarget.value)}
-          />
-          <input
-            type="number"
-            class="num"
-            min={f.min}
-            max={f.max}
-            step={f.step}
-            value={v}
-            oninput={(e) => onSlide(f, e.currentTarget.value)}
-          />
-          {#if pendingThis}
-            <button class="btn-revert" onclick={() => revertOne(f.key)} title="revert to engine value">↺</button>
-          {/if}
-        </div>
-      {/each}
+{#if !tunable || !tunable.gamma}
+  <div class="empty-state">
+    <span class="empty-state-icon"><Icon name="clock" size={18} /></span>
+    <span class="empty-state-title">Waiting for engine snapshot</span>
+    <span class="empty-state-hint">Tunable config publishes on every refresh tick.</span>
+  </div>
+{:else}
+<div class="tuner">
+  <header class="tuner-head">
+    <div>
+      <span class="label">Live tuning</span>
+      <span class="sym num">{sym}</span>
     </div>
-
-    <div class="toggles">
-      {#each TOGGLES as t (t.key)}
-        {@const v = currentToggle(t)}
-        {@const pendingThis = pending[t.key] !== undefined}
-        <label class="toggle">
-          <input
-            type="checkbox"
-            checked={v}
-            onchange={(e) => onToggle(t, e.currentTarget.checked)}
-          />
-          {t.label}
-          {#if pendingThis}<span class="dirty-dot">●</span>{/if}
-        </label>
-      {/each}
-    </div>
-
-    <div class="actions">
-      <button class="btn-apply" onclick={applyAll} disabled={busy || !hasPending()}>
-        {busy ? 'applying…' : `apply ${Object.keys(pending).length} override(s)`}
-      </button>
-      {#if hasPending()}
-        <button class="btn-discard" onclick={() => (pending = {})} disabled={busy}>discard</button>
-      {/if}
-    </div>
-    {#if lastStatus}
-      <div class="status">{lastStatus}</div>
+    {#if hasPending()}
+      <span class="chip chip-warn">{Object.keys(pending).length} pending</span>
     {/if}
+  </header>
+
+  <div class="fields">
+    {#each FIELDS as f (f.key)}
+      {@const v = currentValue(f)}
+      {@const pendingThis = pending[f.key] !== undefined}
+      {@const pct = f.max > f.min ? ((parseFloat(v || 0) - f.min) / (f.max - f.min)) * 100 : 0}
+      <div class="row" class:pending={pendingThis}>
+        <label class="f-label" title={f.tooltip}>{f.label}</label>
+        <input
+          type="range"
+          class="slider"
+          min={f.min}
+          max={f.max}
+          step={f.step}
+          value={v}
+          style:--value="{Math.max(0, Math.min(100, pct))}%"
+          oninput={(e) => onSlide(f, e.currentTarget.value)}
+        />
+        <input
+          type="number"
+          class="num-input"
+          min={f.min}
+          max={f.max}
+          step={f.step}
+          value={v}
+          oninput={(e) => onSlide(f, e.currentTarget.value)}
+        />
+        <button
+          type="button"
+          class="btn btn-icon btn-sm btn-ghost"
+          class:revert-visible={pendingThis}
+          onclick={() => revertOne(f.key)}
+          title="Revert to engine value"
+          disabled={!pendingThis}
+        >
+          <Icon name="clock" size={12} />
+        </button>
+      </div>
+    {/each}
+  </div>
+
+  <div class="toggles">
+    {#each TOGGLES as t (t.key)}
+      {@const v = currentToggle(t)}
+      {@const pendingThis = pending[t.key] !== undefined}
+      <label class="toggle" class:pending={pendingThis}>
+        <input
+          type="checkbox"
+          class="checkbox"
+          checked={v}
+          onchange={(e) => onToggle(t, e.currentTarget.checked)}
+        />
+        <span>{t.label}</span>
+        {#if pendingThis}<span class="chip chip-warn">edited</span>{/if}
+      </label>
+    {/each}
+  </div>
+
+  <div class="actions">
+    <button type="button" class="btn btn-primary" onclick={applyAll} disabled={busy || !hasPending()}>
+      {#if busy}
+        <span class="spinner"></span>
+        <span>Applying…</span>
+      {:else}
+        <Icon name="check" size={14} />
+        <span>Apply {Object.keys(pending).length} override{Object.keys(pending).length === 1 ? '' : 's'}</span>
+      {/if}
+    </button>
+    {#if hasPending()}
+      <button type="button" class="btn btn-ghost" onclick={() => (pending = {})} disabled={busy}>
+        Discard
+      </button>
+    {/if}
+  </div>
+
+  {#if lastStatus}
+    <div class="status-line">
+      <Icon name="info" size={12} />
+      <span>{lastStatus}</span>
+    </div>
   {/if}
 </div>
+{/if}
 
 <style>
-  h3 {
-    font-size: 12px; color: #8b949e; margin-bottom: 12px;
-    text-transform: uppercase; letter-spacing: 0.5px;
-    display: flex; align-items: center; gap: 8px;
+  .tuner {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-5);
   }
-  .sym { font-size: 10px; color: #79c0ff; font-weight: 700; }
-  .dirty { font-size: 10px; color: #d29922; margin-left: auto; }
-  .empty { color: #8b949e; font-size: 11px; padding: 12px 0; }
-  .fields { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+  .tuner-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s-3);
+  }
+  .tuner-head > div {
+    display: flex;
+    align-items: baseline;
+    gap: var(--s-3);
+  }
+  .sym {
+    font-size: var(--fs-sm);
+    font-weight: 600;
+    color: var(--accent);
+  }
+
+  .fields {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-3);
+  }
   .row {
-    display: grid; grid-template-columns: 130px 1fr 80px 24px;
-    align-items: center; gap: 8px;
+    display: grid;
+    grid-template-columns: 140px 1fr 90px 28px;
+    align-items: center;
+    gap: var(--s-3);
   }
-  label { font-size: 11px; color: #8b949e; cursor: help; }
-  input[type="range"] { width: 100%; }
-  input.num {
-    background: #0d1117; color: #e1e4e8;
-    border: 1px solid #21262d; padding: 3px 6px; border-radius: 3px;
-    font-family: inherit; font-size: 11px;
-    font-variant-numeric: tabular-nums; text-align: right;
+  .f-label {
+    font-size: var(--fs-xs);
+    color: var(--fg-secondary);
+    cursor: help;
+    font-weight: 500;
+    user-select: none;
   }
-  .btn-revert {
-    background: none; border: 1px solid #30363d; color: #8b949e;
-    padding: 1px 6px; border-radius: 3px; cursor: pointer;
-    font-family: inherit; font-size: 11px;
-  }
-  .btn-revert:hover { border-color: #d29922; color: #d29922; }
+  .row.pending .f-label { color: var(--warn); }
+  .btn.revert-visible { opacity: 1; }
+  .btn:disabled { opacity: 0; pointer-events: none; }
+  .revert-visible { opacity: 1 !important; }
+
   .toggles {
-    display: flex; flex-wrap: wrap; gap: 10px;
-    margin-bottom: 14px; padding: 8px;
-    border-top: 1px solid #1b1f27; border-bottom: 1px solid #1b1f27;
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--s-4);
+    padding: var(--s-3);
+    background: var(--bg-chip);
+    border-radius: var(--r-lg);
   }
   .toggle {
-    font-size: 11px; color: #e1e4e8; cursor: pointer;
-    display: flex; align-items: center; gap: 4px;
+    display: flex;
+    align-items: center;
+    gap: var(--s-2);
+    font-size: var(--fs-sm);
+    color: var(--fg-secondary);
+    cursor: pointer;
+    user-select: none;
+    font-weight: 500;
   }
-  .dirty-dot { color: #d29922; font-size: 10px; }
-  .actions { display: flex; gap: 8px; }
-  .btn-apply {
-    background: #238636; color: #fff; border: none;
-    padding: 6px 14px; border-radius: 3px; cursor: pointer;
-    font-family: inherit; font-size: 11px; font-weight: 700;
+  .toggle:hover { color: var(--fg-primary); }
+  .toggle.pending { color: var(--warn); }
+
+  .actions {
+    display: flex;
+    gap: var(--s-2);
   }
-  .btn-apply:hover:not(:disabled) { background: #2ea043; }
-  .btn-apply:disabled { opacity: 0.4; cursor: not-allowed; }
-  .btn-discard {
-    background: none; border: 1px solid #30363d; color: #8b949e;
-    padding: 6px 10px; border-radius: 3px; cursor: pointer;
-    font-family: inherit; font-size: 11px;
+  .spinner {
+    width: 12px; height: 12px;
+    border: 2px solid rgba(0, 0, 0, 0.25);
+    border-top-color: #001510;
+    border-radius: 50%;
+    animation: spin 0.75s linear infinite;
   }
-  .btn-discard:hover:not(:disabled) { border-color: #f85149; color: #f85149; }
-  .status {
-    margin-top: 10px; font-size: 10px; color: #8b949e;
-    background: #0d1117; border: 1px solid #21262d;
-    padding: 6px 8px; border-radius: 3px;
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .status-line {
+    display: flex;
+    align-items: center;
+    gap: var(--s-2);
+    padding: var(--s-2) var(--s-3);
+    background: var(--bg-base);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--r-md);
+    font-family: var(--font-mono);
+    font-size: var(--fs-xs);
+    color: var(--fg-secondary);
     word-break: break-all;
   }
 </style>

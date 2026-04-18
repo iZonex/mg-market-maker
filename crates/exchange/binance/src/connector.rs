@@ -76,6 +76,8 @@ impl BinanceConnector {
                 supports_fix: false,
                 max_order_rate: 300,          // per 10s.
                 supports_funding_rate: false, // spot has no funding
+                supports_margin_info: false,  // spot — margin is N/A
+                supports_margin_mode: false,
             },
             ws_trader: None,
             withdraw_whitelist: None,
@@ -166,6 +168,10 @@ impl ExchangeConnector for BinanceConnector {
         &self.capabilities
     }
 
+    fn classify_error(&self, err: &anyhow::Error) -> mm_exchange_core::VenueError {
+        crate::classify(err)
+    }
+
     fn product(&self) -> VenueProduct {
         // This connector targets Binance SPOT (`/api/v3/*` base). A
         // separate `BinanceFuturesConnector` (Sprint D) handles
@@ -188,7 +194,19 @@ impl ExchangeConnector for BinanceConnector {
             })
             .collect();
         let stream_param = streams.join("/");
-        let url = format!("{}/stream?streams={}", self.ws_url, stream_param);
+        // Binance's two WS endpoints branch off the same host:
+        //   wss://stream.binance.com:9443/ws/<listenKey>      (user-data)
+        //   wss://stream.binance.com:9443/stream?streams=…    (combined)
+        // Historical `ws_url` values include the trailing `/ws`
+        // because the user-data stream needed it. Strip it here so
+        // the combined-stream URL does not become `/ws/stream?…`
+        // (Binance responds 404 to that shape — observed 2026-04-17).
+        let base = self
+            .ws_url
+            .strip_suffix("/ws")
+            .unwrap_or(&self.ws_url)
+            .trim_end_matches('/');
+        let url = format!("{base}/stream?streams={stream_param}");
 
         info!(url = %url, "subscribing to Binance streams");
 
@@ -257,16 +275,23 @@ impl ExchangeConnector for BinanceConnector {
 
     async fn place_order(&self, order: &NewOrder) -> anyhow::Result<OrderId> {
         let side_buy = matches!(order.side, Side::Buy);
+        // PostOnly on Binance Spot is sent as `type=LIMIT_MAKER`,
+        // NOT `timeInForce=POST_ONLY`. The venue rejects the order
+        // if it would cross (−2010 "Order would immediately match")
+        // instead of executing as a taker. Mapping PostOnly to
+        // `GTC` here let taker fills slip through — the exact bug
+        // the MM-pro review caught (Epic 36.1).
+        let is_post_only = matches!(order.time_in_force, Some(TimeInForce::PostOnly));
         let tif_str = match order.time_in_force {
-            Some(TimeInForce::Gtc)
-            | Some(TimeInForce::PostOnly)
-            | Some(TimeInForce::Gtd)
-            | None => "GTC",
+            Some(TimeInForce::Gtc) | Some(TimeInForce::Gtd) | None => "GTC",
             Some(TimeInForce::Ioc) => "IOC",
             Some(TimeInForce::Fok) => "FOK",
             // Binance spot has no `DAY` — fall back to GTC and let
             // the engine cancel at session close if it cares.
             Some(TimeInForce::Day) => "GTC",
+            // LIMIT_MAKER is encoded at the `type=` level below;
+            // the timeInForce field is omitted for that path.
+            Some(TimeInForce::PostOnly) => "GTC", // never serialised
         };
         let order_id = uuid::Uuid::new_v4();
         let cloid = order
@@ -283,13 +308,14 @@ impl ExchangeConnector for BinanceConnector {
                         let qty_str = order.qty.to_string();
                         let ws_t0 = Instant::now();
                         let ws_result = ws
-                            .place_limit_order(
+                            .place_limit_order_opts(
                                 &order.symbol,
                                 side_buy,
                                 &price_str,
                                 &qty_str,
                                 tif_str,
                                 Some(&cloid),
+                                is_post_only,
                             )
                             .await;
                         let ws_elapsed = ws_t0.elapsed().as_secs_f64();
@@ -322,9 +348,12 @@ impl ExchangeConnector for BinanceConnector {
 
         // REST fallback (original path).
         let side = if side_buy { "BUY" } else { "SELL" };
-        let order_type = match order.order_type {
-            OrderType::Limit => "LIMIT",
-            OrderType::Market => "MARKET",
+        let order_type = match (order.order_type, is_post_only) {
+            // Post-only limit — Binance Spot expects LIMIT_MAKER
+            // (no timeInForce field at all).
+            (OrderType::Limit, true) => "LIMIT_MAKER",
+            (OrderType::Limit, false) => "LIMIT",
+            (OrderType::Market, _) => "MARKET",
         };
         let mut params = format!(
             "symbol={}&side={}&type={}&quantity={}",
@@ -333,7 +362,8 @@ impl ExchangeConnector for BinanceConnector {
         if let Some(price) = &order.price {
             params.push_str(&format!("&price={price}"));
         }
-        if order.order_type == OrderType::Limit {
+        // LIMIT_MAKER carries no timeInForce (venue would 400).
+        if order.order_type == OrderType::Limit && !is_post_only {
             params.push_str(&format!("&timeInForce={tif_str}"));
         }
         params.push_str(&format!("&newClientOrderId={cloid}"));
@@ -470,6 +500,32 @@ impl ExchangeConnector for BinanceConnector {
             })
             .filter(|b| b.total > dec!(0))
             .collect())
+    }
+
+    async fn server_time_ms(&self) -> anyhow::Result<Option<i64>> {
+        self.rate_limiter.acquire(1).await;
+        let url = format!("{}/api/v3/time", self.base_url);
+        let resp: Value = self.client.get(&url).send().await?.json().await?;
+        Ok(resp.get("serverTime").and_then(|v| v.as_i64()))
+    }
+
+    async fn get_24h_volume_usd(
+        &self,
+        symbol: &str,
+    ) -> anyhow::Result<Option<rust_decimal::Decimal>> {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+        self.rate_limiter.acquire(1).await;
+        let url = format!("{}/api/v3/ticker/24hr?symbol={}", self.base_url, symbol);
+        let resp: Value = self.client.get(&url).send().await?.json().await?;
+        // quoteVolume = sum of price*qty over 24h, already in quote
+        // currency (USDT for a *USDT pair). Classifier reads this
+        // as a USD-ish proxy for the pair's liquidity tier.
+        let vol = resp
+            .get("quoteVolume")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Decimal::from_str(s).ok());
+        Ok(vol)
     }
 
     async fn get_product_spec(&self, symbol: &str) -> anyhow::Result<ProductSpec> {

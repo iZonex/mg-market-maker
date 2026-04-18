@@ -26,6 +26,29 @@ pub static PNL_INVENTORY: Lazy<GaugeVec> = Lazy::new(|| {
 });
 pub static PNL_REBATES: Lazy<GaugeVec> =
     Lazy::new(|| register_gauge_vec!("mm_pnl_rebates", "Fee rebate income", &["symbol"]).unwrap());
+/// Epic 40.3 — realised funding PnL per symbol, booked at
+/// each venue funding-settlement instant. Included in
+/// `mm_pnl_total` so ops dashboards do not double-count.
+pub static PNL_FUNDING_REALISED: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_pnl_funding_realised",
+        "Realised funding PnL (Epic 40.3) — perp-only",
+        &["symbol"]
+    )
+    .unwrap()
+});
+/// Epic 40.3 — continuous MTM estimate of the funding PnL
+/// accruing during the current period. Display-only;
+/// excluded from `mm_pnl_total` because it flips into
+/// `mm_pnl_funding_realised` at the next settle.
+pub static PNL_FUNDING_MTM: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_pnl_funding_mtm",
+        "Mark-to-market funding PnL inside current period (Epic 40.3)",
+        &["symbol"]
+    )
+    .unwrap()
+});
 
 // Inventory
 pub static INVENTORY: Lazy<GaugeVec> = Lazy::new(|| {
@@ -51,6 +74,32 @@ pub static LIVE_ORDERS: Lazy<GaugeVec> = Lazy::new(|| {
 });
 pub static FILLS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     register_int_counter_vec!("mm_fills_total", "Total fills", &["symbol", "side"]).unwrap()
+});
+
+// Epic A stage-2 #1 — SOR inline dispatch observability.
+pub static SOR_DISPATCH_SUCCESS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "mm_sor_dispatch_success_total",
+        "SOR inline-dispatch tick outcomes where every leg succeeded",
+        &["symbol"]
+    )
+    .unwrap()
+});
+pub static SOR_DISPATCH_ERRORS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "mm_sor_dispatch_errors_total",
+        "SOR inline-dispatch leg-level errors (one increment per failed leg)",
+        &["symbol", "venue"]
+    )
+    .unwrap()
+});
+pub static SOR_DISPATCH_FILLED_QTY: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_sor_dispatch_filled_qty",
+        "Base-asset qty dispatched through SOR on the last tick",
+        &["symbol"]
+    )
+    .unwrap()
 });
 
 // Market Data
@@ -414,4 +463,184 @@ pub fn init() {
     let _ = &*MARKET_IMPACT_MEAN_BPS;
     let _ = &*MARKET_IMPACT_ADVERSE_PCT;
     let _ = &*FILL_SLIPPAGE_AVG_BPS;
+    let _ = &*ARCHIVE_UPLOADS_TOTAL;
+    let _ = &*ARCHIVE_UPLOAD_BYTES_TOTAL;
+    let _ = &*ARCHIVE_UPLOAD_ERRORS_TOTAL;
+    let _ = &*ARCHIVE_LAST_SUCCESS_TS;
+    let _ = &*SCHEDULER_RUNS_TOTAL;
+    let _ = &*SCHEDULER_FAILURES_TOTAL;
+    let _ = &*SCHEDULER_LAST_SUCCESS_TS;
+    let _ = &*SENTIMENT_ARTICLES_TOTAL;
+    let _ = &*SENTIMENT_TICKS_TOTAL;
+    let _ = &*SENTIMENT_MENTIONS_RATE;
+    let _ = &*SENTIMENT_SCORE_5MIN;
+    let _ = &*SOCIAL_KILL_TRIGGERS_TOTAL;
+    let _ = &*SOCIAL_SPREAD_MULT;
+    let _ = &*SOCIAL_SIZE_MULT;
 }
+
+// ── Block B / C — archive + scheduler observability ────────
+
+/// Counter of successful chunk uploads, labelled by logical
+/// stream (`audit`, `fills`, `daily`). Increments once per
+/// `put_object` that returned `Ok`. Derived by the shipper
+/// loop.
+pub static ARCHIVE_UPLOADS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "mm_archive_uploads_total",
+        "Successful archive chunk uploads (Block C)",
+        &["stream"]
+    )
+    .unwrap()
+});
+
+/// Byte counter of uploaded archive payload. Lets ops size
+/// S3 egress + bucket growth without reaching into CloudWatch.
+pub static ARCHIVE_UPLOAD_BYTES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "mm_archive_upload_bytes_total",
+        "Bytes uploaded to the archive bucket",
+        &["stream"]
+    )
+    .unwrap()
+});
+
+/// Error counter — shipper tick that raised, labelled by
+/// logical stream. Non-zero paired with a flat
+/// `mm_archive_uploads_total` is the "S3 is broken" signal.
+pub static ARCHIVE_UPLOAD_ERRORS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "mm_archive_upload_errors_total",
+        "Archive shipper errors",
+        &["stream"]
+    )
+    .unwrap()
+});
+
+/// Unix timestamp (seconds) of the most recent successful
+/// upload for each stream. Alerts key off this — if
+/// `now - gauge > shipper_interval_secs * 2` the bucket is
+/// drifting.
+pub static ARCHIVE_LAST_SUCCESS_TS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_archive_last_success_ts",
+        "Unix seconds since epoch of the last successful archive upload",
+        &["stream"]
+    )
+    .unwrap()
+});
+
+/// Counter of scheduled-report runs, labelled by cadence
+/// (`daily`, `weekly`, `monthly`). Increments once per fire,
+/// regardless of success.
+pub static SCHEDULER_RUNS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "mm_scheduler_runs_total",
+        "Scheduled compliance-report fires (Block B)",
+        &["cadence"]
+    )
+    .unwrap()
+});
+
+/// Counter of scheduler runs that raised an error. Paired
+/// with `mm_scheduler_runs_total` so ops can derive a
+/// success rate.
+pub static SCHEDULER_FAILURES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "mm_scheduler_failures_total",
+        "Scheduled compliance-report failures",
+        &["cadence"]
+    )
+    .unwrap()
+});
+
+/// Unix timestamp of the most recent successful scheduler
+/// run, labelled by cadence.
+pub static SCHEDULER_LAST_SUCCESS_TS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_scheduler_last_success_ts",
+        "Unix seconds since epoch of the last successful scheduled report",
+        &["cadence"]
+    )
+    .unwrap()
+});
+
+// ── Epic G — sentiment / social-risk observability ──────────
+
+/// Counter of sentiment articles analysed per cycle,
+/// labelled by scorer (`ollama` / `keyword`). Lets operators
+/// see when Ollama is down and the keyword fallback is
+/// carrying the pipeline.
+pub static SENTIMENT_ARTICLES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "mm_sentiment_articles_total",
+        "Sentiment articles analysed",
+        &["scorer"]
+    )
+    .unwrap()
+});
+
+/// Counter of SentimentTicks emitted to engines, per asset.
+pub static SENTIMENT_TICKS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "mm_sentiment_ticks_total",
+        "Sentiment ticks broadcast to engines",
+        &["asset"]
+    )
+    .unwrap()
+});
+
+/// Most recent `mentions_rate` per asset. 1.0 = flat
+/// baseline, 2–5 = chatter, 10+ = spike.
+pub static SENTIMENT_MENTIONS_RATE: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_sentiment_mentions_rate",
+        "Last-observed mentions_rate per asset (5min / hourly-avg)",
+        &["asset"]
+    )
+    .unwrap()
+});
+
+/// EWMA sentiment score, per asset. Range `[-1.0, +1.0]`.
+pub static SENTIMENT_SCORE_5MIN: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_sentiment_score_5min",
+        "5-minute EWMA sentiment score per asset (-1..+1)",
+        &["asset"]
+    )
+    .unwrap()
+});
+
+/// Counter of social-risk kill-switch escalations, per
+/// symbol. Non-zero = the fused `rate + vol` signal has
+/// confirmed at least one crowd spike worth flattening on.
+pub static SOCIAL_KILL_TRIGGERS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "mm_social_kill_triggers_total",
+        "Kill switch escalations caused by SocialRiskEngine",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
+/// Last-applied social-risk spread multiplier per symbol.
+/// Always `>= 1.0`.
+pub static SOCIAL_SPREAD_MULT: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_social_spread_mult",
+        "Last social-risk spread multiplier per symbol",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
+/// Last-applied social-risk size multiplier per symbol.
+/// Range `(0, 1]`.
+pub static SOCIAL_SIZE_MULT: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_social_size_mult",
+        "Last social-risk size multiplier per symbol",
+        &["symbol"]
+    )
+    .unwrap()
+});

@@ -199,6 +199,227 @@ impl GreedyRouter {
     }
 }
 
+/// Epic A stage-2 #4 — convex-cost router with iterative
+/// water-filling allocation.
+///
+/// The [`GreedyRouter`] is optimal when per-venue cost is
+/// linear in qty (constant marginal cost). Once the cost
+/// model charges a **convex** slippage term (Stoikov 2018,
+/// Obizhaeva–Wang 2013: slippage ≈ `α · q²` for some α
+/// derived from book depth), greedy can over-fill the
+/// cheapest venue past the point where its marginal cost
+/// exceeds a pricier venue's, giving sub-optimal total cost.
+///
+/// The water-filling allocation solves the Lagrangian KKT
+/// stationarity condition `∂Cost/∂q_i = λ` for every venue
+/// with positive allocation:
+///
+/// ```text
+/// minimize   Σ_i (fee_i · q_i + 0.5 · slip_i · q_i²)
+/// subject to Σ_i q_i = target,  0 ≤ q_i ≤ cap_i
+/// ```
+///
+/// Stationarity: `fee_i + slip_i · q_i = λ`, so
+/// `q_i(λ) = clamp(0, cap_i, (λ − fee_i) / slip_i)`.
+/// Bisection on λ ∈ [min(fee), max(fee + slip·cap)] until
+/// `Σ q_i(λ) = target`. The one-dim root-find converges in
+/// O(log(1/ε)) iterations; each iteration is O(N) over the
+/// venue list. N is bounded by a handful of venues in
+/// practice, so runtime is dominated by bisection.
+///
+/// When `slippage_bps_per_unit == 0` for every venue this
+/// router degenerates to the greedy solution — verified by
+/// a regression test.
+#[derive(Debug, Clone)]
+pub struct ConvexRouter {
+    pub cost_model: VenueCostModel,
+    /// Bisection tolerance on total allocated qty vs target,
+    /// in base-asset units. Smaller = tighter match at the
+    /// cost of more iterations. Default `1e-8` — generously
+    /// sub-pip on any venue we target.
+    pub bisect_tol: Decimal,
+    /// Max bisection iterations. 50 is plenty given the
+    /// tol above; the guard exists so a pathological input
+    /// cannot spin forever.
+    pub max_iter: usize,
+}
+
+impl ConvexRouter {
+    pub fn new(cost_model: VenueCostModel) -> Self {
+        Self {
+            cost_model,
+            bisect_tol: dec!(0.00000001),
+            max_iter: 50,
+        }
+    }
+
+    /// Run the water-filling allocation. Same signature as
+    /// [`GreedyRouter::route`] so operators swap routers via
+    /// config without changing call sites.
+    pub fn route(
+        &self,
+        target_side: Side,
+        target_qty: Decimal,
+        urgency: Decimal,
+        snapshots: &[VenueSnapshot],
+    ) -> RouteDecision {
+        if target_qty <= Decimal::ZERO {
+            return RouteDecision::empty(target_side);
+        }
+        let urgency_c = urgency.max(Decimal::ZERO).min(Decimal::ONE);
+        let is_taker = urgency_c >= TAKER_THRESHOLD;
+
+        // Gather (snapshot, linear_fee_bps, slip_coef_bps) triples
+        // for every available venue. Skip exhausted venues up
+        // front — they do not enter the KKT system.
+        let mut rows: Vec<(VenueSnapshot, Decimal, Decimal)> = snapshots
+            .iter()
+            .filter(|s| s.is_available())
+            .map(|s| {
+                let cost = self.cost_model.price(s, target_side, urgency_c);
+                (s.clone(), cost.effective_cost_bps, s.slippage_bps_per_unit)
+            })
+            .collect();
+        if rows.is_empty() {
+            // No available venues for a non-zero target —
+            // return a non-complete decision that preserves
+            // `target_qty` so callers can distinguish this
+            // from the trivial zero-target case.
+            return RouteDecision {
+                target_side,
+                target_qty,
+                filled_qty: Decimal::ZERO,
+                is_complete: false,
+                legs: Vec::new(),
+            };
+        }
+
+        // Pathological cases: every row has zero slippage
+        // coef → the problem is a pure LP where greedy is
+        // already optimal. Delegate so we don't spin in
+        // bisection with a zero-denominator in the stationarity
+        // formula.
+        let all_linear = rows.iter().all(|(_, _, slip)| *slip <= Decimal::ZERO);
+        if all_linear {
+            let greedy = GreedyRouter::new(self.cost_model.clone());
+            return greedy.route(target_side, target_qty, urgency, snapshots);
+        }
+
+        let total_cap: Decimal = rows.iter().map(|r| r.0.available_qty).sum();
+        let effective_target = target_qty.min(total_cap);
+
+        // λ-bounds: at λ = min(fee), every q_i ≤ 0 so total
+        // allocation is 0. At λ = max(fee + slip · cap),
+        // every venue is at its cap. Bisect between.
+        let mut lo = rows
+            .iter()
+            .map(|(_, fee, _)| *fee)
+            .fold(Decimal::MAX, |acc, v| if v < acc { v } else { acc });
+        let mut hi = rows
+            .iter()
+            .map(|(s, fee, slip)| *fee + *slip * s.available_qty)
+            .fold(Decimal::MIN, |acc, v| if v > acc { v } else { acc });
+
+        // Guard against a degenerate equality (all fees equal,
+        // all caps equal) — stretch the bracket by 1 so the
+        // sign-change exists.
+        if hi <= lo {
+            hi = lo + Decimal::ONE;
+        }
+
+        for _ in 0..self.max_iter {
+            let mid = (lo + hi) / Decimal::from(2u32);
+            let total = self.allocation_total(&rows, mid);
+            if (total - effective_target).abs() <= self.bisect_tol {
+                lo = mid;
+                hi = mid;
+                break;
+            }
+            if total > effective_target {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        let lambda = (lo + hi) / Decimal::from(2u32);
+
+        // Build legs. Sort by ascending fee for deterministic
+        // ordering — `effective_cost_bps` on the output carries
+        // the final marginal cost at this allocation, same
+        // semantics as GreedyRouter.
+        rows.sort_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| (a.0.venue as u8).cmp(&(b.0.venue as u8)))
+        });
+        let mut legs = Vec::new();
+        let mut filled = Decimal::ZERO;
+        for (snap, fee, slip) in &rows {
+            if filled >= effective_target {
+                break;
+            }
+            let q = Self::qty_at_lambda(*fee, *slip, snap.available_qty, lambda);
+            if q <= Decimal::ZERO {
+                continue;
+            }
+            let take = q.min(effective_target - filled);
+            if take <= Decimal::ZERO {
+                continue;
+            }
+            // `expected_cost_bps` reports the AVERAGE cost per
+            // unit so `leg.qty × expected_cost_bps` is the
+            // integrated cost of this leg under the convex
+            // model: C(q) = fee·q + 0.5·slip·q². Matches the
+            // greedy router's semantics where the product is
+            // the leg's total cost.
+            let avg_cost = *fee + *slip * take / Decimal::from(2u32);
+            legs.push(RouteLeg {
+                venue: snap.venue,
+                qty: take,
+                is_taker,
+                expected_cost_bps: avg_cost,
+            });
+            filled += take;
+        }
+
+        let is_complete = filled >= target_qty;
+        RouteDecision {
+            target_side,
+            target_qty,
+            filled_qty: filled,
+            is_complete,
+            legs,
+        }
+    }
+
+    fn allocation_total(
+        &self,
+        rows: &[(VenueSnapshot, Decimal, Decimal)],
+        lambda: Decimal,
+    ) -> Decimal {
+        rows.iter()
+            .map(|(s, fee, slip)| Self::qty_at_lambda(*fee, *slip, s.available_qty, lambda))
+            .sum()
+    }
+
+    /// Closed-form stationarity solution for one venue given
+    /// the Lagrange multiplier `λ`. Clamps to `[0, cap]`.
+    fn qty_at_lambda(fee: Decimal, slip: Decimal, cap: Decimal, lambda: Decimal) -> Decimal {
+        if slip <= Decimal::ZERO {
+            // Linear venue: either take the full cap when
+            // cheaper than λ, or skip entirely. Matches the
+            // LP solution at equal-cost tie-break.
+            if fee < lambda {
+                cap
+            } else {
+                Decimal::ZERO
+            }
+        } else {
+            let raw = (lambda - fee) / slip;
+            raw.max(Decimal::ZERO).min(cap)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,6 +442,31 @@ mod tests {
             best_bid: dec!(50000),
             best_ask: dec!(50010),
             queue_wait_secs,
+            slippage_bps_per_unit: Decimal::ZERO,
+        }
+    }
+
+    /// Variant that carries a non-zero slippage coefficient —
+    /// used by the convex-router tests.
+    fn snap_with_slip(
+        venue: VenueId,
+        available: Decimal,
+        maker_bps: Decimal,
+        taker_bps: Decimal,
+        queue_wait_secs: Decimal,
+        slippage_bps_per_unit: Decimal,
+    ) -> VenueSnapshot {
+        VenueSnapshot {
+            venue,
+            symbol: "BTCUSDT".into(),
+            available_qty: available,
+            rate_limit_remaining: 1000,
+            maker_fee_bps: maker_bps,
+            taker_fee_bps: taker_bps,
+            best_bid: dec!(50000),
+            best_ask: dec!(50010),
+            queue_wait_secs,
+            slippage_bps_per_unit,
         }
     }
 
@@ -461,5 +707,192 @@ mod tests {
         assert!(!decision.is_complete);
         assert_eq!(decision.filled_qty, Decimal::ZERO);
         assert_eq!(decision.target_qty, dec!(5));
+    }
+
+    // ---------------------------------------------------------
+    // Epic A stage-2 #4 — ConvexRouter (water-filling)
+    // ---------------------------------------------------------
+
+    fn zero_cost_model() -> VenueCostModel {
+        VenueCostModel::new(Decimal::ZERO)
+    }
+
+    /// Degenerate case: every venue has zero slippage coef →
+    /// convex router delegates to greedy, so allocation is
+    /// identical to the greedy path.
+    #[test]
+    fn convex_router_matches_greedy_when_no_slippage() {
+        let snaps = vec![
+            snap(VenueId::Binance, dec!(10), dec!(1), dec!(5), Decimal::ZERO),
+            snap(VenueId::Bybit, dec!(10), dec!(2), dec!(6), Decimal::ZERO),
+        ];
+        let greedy = GreedyRouter::new(zero_cost_model()).route(
+            Side::Buy,
+            dec!(7),
+            dec!(1),
+            &snaps,
+        );
+        let convex = ConvexRouter::new(zero_cost_model()).route(
+            Side::Buy,
+            dec!(7),
+            dec!(1),
+            &snaps,
+        );
+        assert_eq!(greedy.legs.len(), convex.legs.len());
+        for (g, c) in greedy.legs.iter().zip(convex.legs.iter()) {
+            assert_eq!(g.venue, c.venue);
+            assert_eq!(g.qty, c.qty);
+        }
+        assert_eq!(greedy.filled_qty, convex.filled_qty);
+    }
+
+    /// Positive slippage forces the router to SPREAD qty
+    /// across venues instead of sending it all to the cheapest
+    /// — the key win over greedy. Two venues with equal fees
+    /// but different slippage coefficients: the router should
+    /// favour the thicker book but still allocate some to the
+    /// thinner one when target > single-venue slippage-optimal.
+    #[test]
+    fn convex_router_spreads_across_venues_under_slippage() {
+        // Both venues fee = 5 bps, but Binance has 10× the
+        // depth → 10× less slippage per unit. The convex router
+        // should still put most qty on Binance, but NOT 100%
+        // — the marginal cost on Binance rises with allocation.
+        let snaps = vec![
+            snap_with_slip(
+                VenueId::Binance,
+                dec!(100),
+                dec!(5),
+                dec!(5),
+                Decimal::ZERO,
+                dec!(0.1),
+            ),
+            snap_with_slip(
+                VenueId::Bybit,
+                dec!(100),
+                dec!(5),
+                dec!(5),
+                Decimal::ZERO,
+                dec!(1.0),
+            ),
+        ];
+        let convex = ConvexRouter::new(zero_cost_model()).route(
+            Side::Buy,
+            dec!(10),
+            dec!(1),
+            &snaps,
+        );
+        assert_eq!(convex.legs.len(), 2,
+            "convex should spread across both venues when slippage differs");
+        let bin_leg = convex.legs.iter().find(|l| l.venue == VenueId::Binance).unwrap();
+        let byb_leg = convex.legs.iter().find(|l| l.venue == VenueId::Bybit).unwrap();
+        // At equilibrium: fee_bin + slip_bin·q_bin = fee_byb + slip_byb·q_byb
+        //   5 + 0.1·q_bin = 5 + 1.0·q_byb  →  q_bin = 10·q_byb
+        // q_bin + q_byb = 10  →  q_byb ≈ 0.909, q_bin ≈ 9.09.
+        assert!(bin_leg.qty > byb_leg.qty,
+            "thicker book should take the bigger slice: bin={}, byb={}",
+            bin_leg.qty, byb_leg.qty);
+        // Sanity: total fills target.
+        assert_eq!(convex.filled_qty, dec!(10));
+        assert!(convex.is_complete);
+    }
+
+    /// Degenerate greedy suboptimality: one cheap thin venue
+    /// along with one pricey thick venue. Evaluate both
+    /// routers' allocations against the same integrated
+    /// convex-cost function `C_i(q) = fee_i·q + 0.5·slip_i·q²`
+    /// so the convex router's allocation has strictly lower
+    /// (or equal) integrated cost.
+    #[test]
+    fn convex_router_beats_greedy_total_cost_under_slippage() {
+        let snaps = vec![
+            // Cheap fee but thin book → heavy slippage penalty
+            // at large qty.
+            snap_with_slip(
+                VenueId::Binance,
+                dec!(10),
+                dec!(1),
+                dec!(1),
+                Decimal::ZERO,
+                dec!(2.0),
+            ),
+            // Pricey fee but thick book → flat slippage. Greedy
+            // ignores this (fee dominates) but convex uses it
+            // at the margin.
+            snap_with_slip(
+                VenueId::Bybit,
+                dec!(10),
+                dec!(10),
+                dec!(10),
+                Decimal::ZERO,
+                dec!(0.01),
+            ),
+        ];
+        let greedy = GreedyRouter::new(zero_cost_model()).route(
+            Side::Buy,
+            dec!(8),
+            dec!(1),
+            &snaps,
+        );
+        let convex = ConvexRouter::new(zero_cost_model()).route(
+            Side::Buy,
+            dec!(8),
+            dec!(1),
+            &snaps,
+        );
+        // Integrated cost function: for qty q on venue with
+        // fee f and slip s → f·q + 0.5·s·q².
+        let cost_under_convex = |legs: &[RouteLeg]| -> Decimal {
+            legs.iter()
+                .map(|leg| {
+                    let s = snaps.iter().find(|s| s.venue == leg.venue).unwrap();
+                    let fee = s.maker_fee_bps; // urgency=1 → taker; but both fees equal here.
+                    let fee = if s.taker_fee_bps != fee { s.taker_fee_bps } else { fee };
+                    fee * leg.qty
+                        + s.slippage_bps_per_unit * leg.qty * leg.qty / Decimal::from(2u32)
+                })
+                .sum()
+        };
+        let greedy_cost = cost_under_convex(&greedy.legs);
+        let convex_cost = cost_under_convex(&convex.legs);
+        assert!(
+            convex_cost <= greedy_cost,
+            "convex integrated cost {convex_cost} must not exceed greedy {greedy_cost}"
+        );
+    }
+
+    /// Zero target returns an empty, complete decision.
+    #[test]
+    fn convex_router_zero_target_is_empty_complete() {
+        let convex = ConvexRouter::new(zero_cost_model()).route(
+            Side::Buy,
+            Decimal::ZERO,
+            dec!(1),
+            &[],
+        );
+        assert!(convex.legs.is_empty());
+        assert_eq!(convex.target_qty, Decimal::ZERO);
+    }
+
+    /// No available venues → empty decision, not-complete.
+    #[test]
+    fn convex_router_no_available_venues_returns_empty_incomplete() {
+        let mut s = snap_with_slip(
+            VenueId::Binance,
+            dec!(0),
+            dec!(1),
+            dec!(5),
+            Decimal::ZERO,
+            dec!(0.1),
+        );
+        s.available_qty = Decimal::ZERO;
+        let convex = ConvexRouter::new(zero_cost_model()).route(
+            Side::Buy,
+            dec!(5),
+            dec!(1),
+            &[s],
+        );
+        assert!(convex.legs.is_empty());
+        assert!(!convex.is_complete);
     }
 }

@@ -82,6 +82,18 @@ pub struct VenueSnapshot {
     /// best bid / ask clears. v1 uses a seeded constant;
     /// stage-2 will compute it from a live trade-rate feed.
     pub queue_wait_secs: Decimal,
+    /// Epic A stage-2 #4 — book-depth slippage coefficient.
+    /// Marginal slippage (bps) the router should charge per
+    /// base-asset unit of qty routed to this venue on top of
+    /// the flat fee. Derived from the venue's live L1 book
+    /// depth: `slippage_bps_per_unit = spread_bps /
+    /// best_depth_qty`. A thin book → high coefficient → the
+    /// router prefers thicker books even when their fees are
+    /// marginally higher.
+    ///
+    /// A zero value disables the convex term → the greedy +
+    /// convex routers produce identical allocations.
+    pub slippage_bps_per_unit: Decimal,
 }
 
 impl VenueSnapshot {
@@ -136,9 +148,20 @@ impl VenueSeed {
 /// bundle on demand. v1 keeps one seeded `VenueSeed` per
 /// venue and refreshes only the rate-limit budget on
 /// `collect`.
+///
+/// Epic A stage-2 #5 — multi-symbol support. The aggregator
+/// is now keyed by `(VenueId, symbol)` so operators running
+/// more than one base asset on the same venue (BTCUSDT +
+/// ETHUSDT on Binance) get one registrable slot per symbol.
+/// Legacy single-symbol call sites keep working: the short
+/// accessors (`register_venue`, `seed`, `venues`,
+/// `update_book`, `update_fees`, `update_queue_wait`)
+/// identify the implicit symbol from the venue's first
+/// registered seed, so a deployment with exactly one symbol
+/// per venue sees byte-identical behaviour.
 #[derive(Debug, Clone, Default)]
 pub struct VenueStateAggregator {
-    seeds: HashMap<VenueId, VenueSeed>,
+    seeds: HashMap<(VenueId, String), VenueSeed>,
 }
 
 impl VenueStateAggregator {
@@ -146,97 +169,162 @@ impl VenueStateAggregator {
         Self::default()
     }
 
-    /// Register (or overwrite) a venue seed. Idempotent —
-    /// re-registering the same venue with new fee rates is
-    /// the update path used by the P1.2 fee-tier refresh
-    /// task.
+    /// Register (or overwrite) a venue seed. The seed's
+    /// `symbol` field is the key used alongside the venue
+    /// id, so multi-symbol deployments call this once per
+    /// `(venue, symbol)` combination. Idempotent on re-
+    /// registration.
     pub fn register_venue(&mut self, venue: VenueId, seed: VenueSeed) {
-        self.seeds.insert(venue, seed);
+        self.seeds.insert((venue, seed.symbol.clone()), seed);
     }
 
-    /// Update the best-bid / best-ask pair for a registered
-    /// venue. Called from the engine's market-data refresh
-    /// path. No-op if the venue is not registered.
-    pub fn update_book(&mut self, venue: VenueId, best_bid: Decimal, best_ask: Decimal) {
-        if let Some(seed) = self.seeds.get_mut(&venue) {
+    /// Update the best-bid / best-ask pair for the seed at
+    /// `(venue, symbol)`. No-op if the slot is unregistered.
+    pub fn update_book_for(
+        &mut self,
+        venue: VenueId,
+        symbol: &str,
+        best_bid: Decimal,
+        best_ask: Decimal,
+    ) {
+        if let Some(seed) = self.seeds.get_mut(&(venue, symbol.to_string())) {
             seed.best_bid = best_bid;
             seed.best_ask = best_ask;
         }
     }
 
-    /// Update the fee rates for a registered venue. Called
-    /// from the engine's P1.2 fee-tier refresh task when
-    /// the venue returns updated maker/taker fees. No-op
-    /// if the venue is not registered. Stage-2 auto-refresh.
-    pub fn update_fees(&mut self, venue: VenueId, maker_fee: Decimal, taker_fee: Decimal) {
-        if let Some(seed) = self.seeds.get_mut(&venue) {
+    /// Convenience wrapper for single-symbol-per-venue
+    /// deployments — finds the first seed on `venue` and
+    /// updates its book.
+    pub fn update_book(&mut self, venue: VenueId, best_bid: Decimal, best_ask: Decimal) {
+        if let Some(sym) = self.first_symbol_on(venue) {
+            self.update_book_for(venue, &sym, best_bid, best_ask);
+        }
+    }
+
+    /// Keyed fee-rate update. Targets exactly the seed at
+    /// `(venue, symbol)`.
+    pub fn update_fees_for(
+        &mut self,
+        venue: VenueId,
+        symbol: &str,
+        maker_fee: Decimal,
+        taker_fee: Decimal,
+    ) {
+        if let Some(seed) = self.seeds.get_mut(&(venue, symbol.to_string())) {
             seed.product.maker_fee = maker_fee;
             seed.product.taker_fee = taker_fee;
         }
     }
 
-    /// Update the queue-wait estimate for a registered
-    /// venue. Engine calls this per tick with the
-    /// `config.market_maker.sor_queue_wait_bps_per_sec`
-    /// cadence × a per-symbol multiplier (stage-2). v1
-    /// takes a fixed constant from the config.
-    pub fn update_queue_wait(&mut self, venue: VenueId, queue_wait_secs: Decimal) {
-        if let Some(seed) = self.seeds.get_mut(&venue) {
+    /// Single-symbol shorthand.
+    pub fn update_fees(&mut self, venue: VenueId, maker_fee: Decimal, taker_fee: Decimal) {
+        if let Some(sym) = self.first_symbol_on(venue) {
+            self.update_fees_for(venue, &sym, maker_fee, taker_fee);
+        }
+    }
+
+    /// Keyed queue-wait update.
+    pub fn update_queue_wait_for(
+        &mut self,
+        venue: VenueId,
+        symbol: &str,
+        queue_wait_secs: Decimal,
+    ) {
+        if let Some(seed) = self.seeds.get_mut(&(venue, symbol.to_string())) {
             seed.queue_wait_secs = queue_wait_secs;
         }
     }
 
-    /// Read-only accessor for a seeded venue — used by the
-    /// router + by tests to confirm registration.
-    pub fn seed(&self, venue: VenueId) -> Option<&VenueSeed> {
-        self.seeds.get(&venue)
+    /// Single-symbol shorthand.
+    pub fn update_queue_wait(&mut self, venue: VenueId, queue_wait_secs: Decimal) {
+        if let Some(sym) = self.first_symbol_on(venue) {
+            self.update_queue_wait_for(venue, &sym, queue_wait_secs);
+        }
     }
 
-    /// Iterator over every registered venue tag. Deterministic
-    /// (sorted by venue enum ordinal) so test assertions are
-    /// stable.
+    /// Keyed accessor.
+    pub fn seed_for(&self, venue: VenueId, symbol: &str) -> Option<&VenueSeed> {
+        self.seeds.get(&(venue, symbol.to_string()))
+    }
+
+    /// Single-symbol convenience accessor. Returns the first
+    /// seed on `venue` in symbol-sorted order.
+    pub fn seed(&self, venue: VenueId) -> Option<&VenueSeed> {
+        let sym = self.first_symbol_on(venue)?;
+        self.seed_for(venue, &sym)
+    }
+
+    /// Distinct venue ids across every registered seed,
+    /// sorted by venue enum ordinal. Legacy accessor.
     pub fn venues(&self) -> Vec<VenueId> {
-        let mut v: Vec<VenueId> = self.seeds.keys().copied().collect();
+        use std::collections::HashSet;
+        let set: HashSet<VenueId> = self.seeds.keys().map(|(v, _)| *v).collect();
+        let mut v: Vec<VenueId> = set.into_iter().collect();
         v.sort_by_key(|venue| *venue as u8);
         v
     }
 
+    /// Every `(VenueId, Symbol)` pair registered, sorted
+    /// deterministically. Use this when the caller actually
+    /// cares about the per-symbol slot (multi-symbol SOR).
+    pub fn venue_symbols(&self) -> Vec<(VenueId, String)> {
+        let mut out: Vec<(VenueId, String)> = self.seeds.keys().cloned().collect();
+        out.sort_by(|a, b| (a.0 as u8).cmp(&(b.0 as u8)).then_with(|| a.1.cmp(&b.1)));
+        out
+    }
+
+    /// First symbol registered on `venue` in symbol-sort
+    /// order. `None` when the venue has no seeds. Private
+    /// helper for the single-symbol convenience wrappers.
+    fn first_symbol_on(&self, venue: VenueId) -> Option<String> {
+        let mut syms: Vec<String> = self
+            .seeds
+            .keys()
+            .filter_map(|(v, s)| if *v == venue { Some(s.clone()) } else { None })
+            .collect();
+        syms.sort();
+        syms.into_iter().next()
+    }
+
     /// Walk the bundle's connectors, pull live rate-limit
     /// budgets, and combine with the seeded state to produce
-    /// one `VenueSnapshot` per registered venue.
-    ///
-    /// A connector in the bundle whose venue is **not**
-    /// seeded is silently skipped — the aggregator only
-    /// emits snapshots for venues the engine has explicitly
-    /// registered. This keeps the seed map authoritative
-    /// and avoids half-built snapshots from a connector the
-    /// operator forgot to configure.
+    /// one `VenueSnapshot` per registered `(venue, symbol)`
+    /// slot. The same connector may contribute multiple
+    /// snapshots when the aggregator holds multiple symbols
+    /// for that venue.
     pub async fn collect(&self, bundle: &ConnectorBundle, _side: Side) -> Vec<VenueSnapshot> {
         let mut out = Vec::new();
         for connector in bundle.all_connectors() {
             let venue = connector.venue_id();
-            let Some(seed) = self.seeds.get(&venue) else {
-                continue;
-            };
             let rate_limit_remaining = connector.rate_limit_remaining().await;
-            out.push(snapshot_from_seed(connector, seed, rate_limit_remaining));
+            for ((v, _sym), seed) in &self.seeds {
+                if *v != venue {
+                    continue;
+                }
+                out.push(snapshot_from_seed(connector, seed, rate_limit_remaining));
+            }
         }
         out
     }
 
     /// Synchronous variant of `collect` used by unit tests.
-    /// Bypasses the live rate-limit query and uses a
-    /// test-supplied `rate_limit_remaining` for every venue.
-    /// Keeps the test surface pure-data and avoids
-    /// bringing tokio into every cost-model test.
+    /// Each `(venue, remaining)` tuple produces one snapshot
+    /// per seeded `(venue, symbol)` pair sharing that venue
+    /// id — so a test that seeds `(Binance, "BTCUSDT")` and
+    /// `(Binance, "ETHUSDT")` and queries `(Binance, 1000)`
+    /// receives two snapshots, one per symbol.
     pub fn collect_synthetic(&self, venues: &[(VenueId, u32)]) -> Vec<VenueSnapshot> {
-        venues
-            .iter()
-            .filter_map(|(venue, remaining)| {
-                let seed = self.seeds.get(venue)?;
-                Some(synthetic_snapshot(*venue, seed, *remaining))
-            })
-            .collect()
+        let mut out = Vec::new();
+        for (venue, remaining) in venues {
+            for ((v, _sym), seed) in &self.seeds {
+                if *v != *venue {
+                    continue;
+                }
+                out.push(synthetic_snapshot(*venue, seed, *remaining));
+            }
+        }
+        out
     }
 }
 
@@ -255,7 +343,31 @@ fn snapshot_from_seed(
         best_bid: seed.best_bid,
         best_ask: seed.best_ask,
         queue_wait_secs: seed.queue_wait_secs,
+        slippage_bps_per_unit: derive_slippage_coef(seed),
     }
+}
+
+/// Derive the convex-slippage coefficient from a seed.
+/// `slippage_bps_per_unit ≈ spread_bps / available_qty` —
+/// routes toward venues with tighter spread / thicker top-
+/// of-book. A seed with no book (best_bid / best_ask both
+/// zero) returns `0` so the cost model falls back to
+/// linear behaviour and we don't produce spurious huge
+/// slippage figures.
+fn derive_slippage_coef(seed: &VenueSeed) -> Decimal {
+    if seed.best_bid <= Decimal::ZERO || seed.best_ask <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    if seed.available_qty <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    let mid = (seed.best_bid + seed.best_ask) / Decimal::from(2u32);
+    if mid <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    let spread = seed.best_ask - seed.best_bid;
+    let spread_bps = spread / mid * Decimal::from(10_000u32);
+    spread_bps / seed.available_qty
 }
 
 fn synthetic_snapshot(
@@ -273,6 +385,7 @@ fn synthetic_snapshot(
         best_bid: seed.best_bid,
         best_ask: seed.best_ask,
         queue_wait_secs: seed.queue_wait_secs,
+        slippage_bps_per_unit: derive_slippage_coef(seed),
     }
 }
 
@@ -432,5 +545,119 @@ mod tests {
         agg.register_venue(VenueId::Binance, seed(dec!(0)));
         let exhausted = agg.collect_synthetic(&[(VenueId::Binance, 100)]);
         assert!(!exhausted[0].is_available());
+    }
+
+    // ---------------------------------------------------------
+    // Epic A stage-2 #5 — multi-symbol per venue
+    // ---------------------------------------------------------
+
+    fn seed_named(symbol: &str, available: Decimal) -> VenueSeed {
+        VenueSeed {
+            symbol: symbol.into(),
+            product: ProductSpec {
+                symbol: symbol.into(),
+                base_asset: symbol[..3].to_string(),
+                quote_asset: "USDT".into(),
+                tick_size: dec!(0.01),
+                lot_size: dec!(0.00001),
+                min_notional: dec!(10),
+                maker_fee: dec!(0.0001),
+                taker_fee: dec!(0.0005),
+                trading_status: Default::default(),
+            },
+            available_qty: available,
+            queue_wait_secs: dec!(10),
+            best_bid: dec!(49990),
+            best_ask: dec!(50010),
+        }
+    }
+
+    /// Two symbols on the same venue produce two distinct
+    /// snapshots from `collect_synthetic`.
+    #[test]
+    fn multi_symbol_same_venue_produces_two_snapshots() {
+        let mut agg = VenueStateAggregator::new();
+        agg.register_venue(VenueId::Binance, seed_named("BTCUSDT", dec!(1)));
+        agg.register_venue(VenueId::Binance, seed_named("ETHUSDT", dec!(10)));
+        let snaps = agg.collect_synthetic(&[(VenueId::Binance, 100)]);
+        assert_eq!(snaps.len(), 2, "expected 2 snapshots, got {snaps:?}");
+        let symbols: std::collections::HashSet<String> =
+            snaps.iter().map(|s| s.symbol.clone()).collect();
+        assert!(symbols.contains("BTCUSDT"));
+        assert!(symbols.contains("ETHUSDT"));
+    }
+
+    /// Keyed `seed_for` / `update_book_for` target a specific
+    /// `(venue, symbol)` slot without touching siblings.
+    #[test]
+    fn keyed_update_book_does_not_leak_to_sibling_symbol() {
+        let mut agg = VenueStateAggregator::new();
+        agg.register_venue(VenueId::Binance, seed_named("BTCUSDT", dec!(1)));
+        agg.register_venue(VenueId::Binance, seed_named("ETHUSDT", dec!(10)));
+        agg.update_book_for(VenueId::Binance, "BTCUSDT", dec!(100), dec!(200));
+        let btc = agg.seed_for(VenueId::Binance, "BTCUSDT").unwrap();
+        let eth = agg.seed_for(VenueId::Binance, "ETHUSDT").unwrap();
+        assert_eq!(btc.best_bid, dec!(100));
+        assert_eq!(btc.best_ask, dec!(200));
+        // ETH sibling is untouched.
+        assert_eq!(eth.best_bid, dec!(49990));
+        assert_eq!(eth.best_ask, dec!(50010));
+    }
+
+    /// `venue_symbols` returns every registered slot,
+    /// deterministically sorted.
+    #[test]
+    fn venue_symbols_lists_all_slots_sorted() {
+        let mut agg = VenueStateAggregator::new();
+        agg.register_venue(VenueId::Bybit, seed_named("ETHUSDT", dec!(10)));
+        agg.register_venue(VenueId::Binance, seed_named("BTCUSDT", dec!(1)));
+        agg.register_venue(VenueId::Binance, seed_named("ETHUSDT", dec!(10)));
+        let pairs = agg.venue_symbols();
+        assert_eq!(pairs.len(), 3);
+        // Sort order: venue ordinal then symbol alpha.
+        assert_eq!(pairs[0], (VenueId::Binance, "BTCUSDT".to_string()));
+        assert_eq!(pairs[1], (VenueId::Binance, "ETHUSDT".to_string()));
+        assert_eq!(pairs[2], (VenueId::Bybit, "ETHUSDT".to_string()));
+    }
+
+    /// `venues` de-dupes — the multi-symbol slot list
+    /// above projects to two distinct venue tags.
+    #[test]
+    fn venues_dedupes_across_symbol_slots() {
+        let mut agg = VenueStateAggregator::new();
+        agg.register_venue(VenueId::Binance, seed_named("BTCUSDT", dec!(1)));
+        agg.register_venue(VenueId::Binance, seed_named("ETHUSDT", dec!(10)));
+        agg.register_venue(VenueId::Bybit, seed_named("ETHUSDT", dec!(10)));
+        let vs = agg.venues();
+        assert_eq!(vs.len(), 2);
+        assert_eq!(vs[0], VenueId::Binance);
+        assert_eq!(vs[1], VenueId::Bybit);
+    }
+
+    /// Single-symbol legacy `seed(venue)` accessor still
+    /// works — picks the first registered symbol.
+    #[test]
+    fn legacy_seed_accessor_returns_first_registered_symbol() {
+        let mut agg = VenueStateAggregator::new();
+        agg.register_venue(VenueId::Binance, seed_named("BTCUSDT", dec!(1)));
+        assert_eq!(agg.seed(VenueId::Binance).unwrap().symbol, "BTCUSDT");
+    }
+
+    /// `update_queue_wait_for` targets only the keyed slot.
+    #[test]
+    fn keyed_update_queue_wait_targets_slot() {
+        let mut agg = VenueStateAggregator::new();
+        agg.register_venue(VenueId::Binance, seed_named("BTCUSDT", dec!(1)));
+        agg.register_venue(VenueId::Binance, seed_named("ETHUSDT", dec!(10)));
+        agg.update_queue_wait_for(VenueId::Binance, "ETHUSDT", dec!(42));
+        assert_eq!(
+            agg.seed_for(VenueId::Binance, "BTCUSDT").unwrap().queue_wait_secs,
+            dec!(10),
+            "BTC slot unchanged"
+        );
+        assert_eq!(
+            agg.seed_for(VenueId::Binance, "ETHUSDT").unwrap().queue_wait_secs,
+            dec!(42)
+        );
     }
 }

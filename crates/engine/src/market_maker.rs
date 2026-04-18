@@ -21,11 +21,14 @@ use mm_risk::inventory::InventoryManager;
 use mm_risk::inventory_drift::InventoryDriftReconciler;
 use mm_risk::kill_switch::{KillLevel, KillSwitch, KillSwitchConfig};
 use mm_risk::lead_lag_guard::LeadLagGuard;
+use mm_risk::margin_guard::{MarginGuard, MarginGuardThresholds};
 use mm_risk::news_retreat::{NewsRetreatState, NewsRetreatStateMachine, NewsRetreatTransition};
 use mm_risk::otr::OrderToTradeRatio;
 use mm_risk::pnl::PnlTracker;
 use mm_risk::sla::{SlaConfig, SlaTracker};
-use mm_risk::toxicity::{AdverseSelectionTracker, KyleLambda, VpinEstimator};
+use mm_risk::toxicity::{
+    AdverseSelectionTracker, BvcBarAggregator, BvcClassifier, KyleLambda, VpinEstimator,
+};
 use mm_risk::var_guard::{VarGuard, VarGuardConfig};
 use mm_strategy::autotune::AutoTuner;
 use mm_strategy::funding_arb_driver::{DriverEvent, FundingArbDriver};
@@ -40,7 +43,7 @@ use mm_strategy::volatility::VolatilityEstimator;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 /// Lossy `Decimal → f64` for Prometheus exposition. The Prometheus
 /// gauge API only speaks `f64`, so a one-shot conversion at the
@@ -233,6 +236,17 @@ pub struct MarketMakerEngine {
     /// Epic A SOR greedy router. Stateless; reused across
     /// every `recommend_route` call.
     sor_router: GreedyRouter,
+    /// Epic A stage-2 #2 — per-venue trade-rate estimators.
+    /// Updated on every `MarketEvent::Trade`; sampled every
+    /// `sor_queue_refresh_secs` seconds and fed into
+    /// `sor_aggregator.update_queue_wait`. Missing entries
+    /// mean the tracker has seen no venue-tagged trades yet;
+    /// the aggregator keeps its seeded constant until the
+    /// first refresh produces a live rate.
+    sor_trade_rates: std::collections::HashMap<
+        mm_exchange_core::connector::VenueId,
+        crate::sor::trade_rate::TradeRateEstimator,
+    >,
     /// Tracks the last throttle value per strategy class so
     /// `VarGuardThrottleApplied` audit events fire only on
     /// **transitions** rather than every refresh tick while
@@ -265,6 +279,16 @@ pub struct MarketMakerEngine {
 
     // Toxicity.
     vpin: VpinEstimator,
+    /// Epic D stage-2 — optional Bulk Volume Classification path
+    /// for VPIN. When `Some`, the engine routes each closed bar
+    /// through `classify → vpin.on_bvc_bar`; when `None` the
+    /// legacy `vpin.on_trade` tick-rule path stays in use.
+    /// Gated on `toxicity.bvc_enabled`.
+    bvc_classifier: Option<BvcClassifier>,
+    /// Time-bucket aggregator feeding the classifier. Always
+    /// constructed alongside `bvc_classifier` — absence means
+    /// BVC is disabled.
+    bvc_bar_agg: Option<BvcBarAggregator>,
     kyle_lambda: KyleLambda,
     adverse_selection: AdverseSelectionTracker,
     /// Event-driven Market Resilience detector. Reads every
@@ -302,6 +326,14 @@ pub struct MarketMakerEngine {
     // Strategy augmentation.
     momentum: MomentumSignals,
     auto_tuner: AutoTuner,
+    /// Epic 30 — online closed-loop controller sitting on top of
+    /// `auto_tuner`. Off by default; `market_maker.adaptive_enabled`
+    /// flips it on. See `docs/research/adaptive-calibration.md`.
+    adaptive_tuner: mm_strategy::AdaptiveTuner,
+    /// Epic 31 — pair-class tag set by the server at startup via
+    /// `classify_symbol`. Emitted verbatim in
+    /// `AdaptiveStateSnapshot.pair_class`.
+    pair_class: Option<mm_common::PairClass>,
     adv_inventory: AdvancedInventoryManager,
     twap: Option<TwapExecutor>,
     /// Paired-unwind executor for kill-switch L4 on a basis /
@@ -354,6 +386,44 @@ pub struct MarketMakerEngine {
     /// class transitions escalate the kill switch to L2; all
     /// transitions write audit records.
     news_retreat: Option<NewsRetreatStateMachine>,
+
+    /// Epic G — social-risk engine. Consumes
+    /// `SentimentTick`s broadcast via
+    /// `ConfigOverride::SentimentTick` and produces
+    /// spread/size/skew adjustments fused with the engine's
+    /// own volatility + OFI cross-check. `None` = sentiment
+    /// layer disabled (all multipliers pinned at 1.0).
+    social_risk: Option<mm_risk::social_risk::SocialRiskEngine>,
+    /// Epic G — reservation-price skew contribution from the
+    /// most recent social evaluation. Bumped by
+    /// `SocialRiskState.inv_skew_bps` on every tick and
+    /// composited alongside the momentum-alpha skew when the
+    /// engine computes its reservation mid.
+    social_skew_bps: Decimal,
+
+    /// Pre-liquidation margin ratio guard (Epic 40.4). `Some`
+    /// when the venue reports margin info (perp connectors) AND
+    /// `config.margin` is configured; `None` on spot or when
+    /// the operator disabled the guard. Refresh cadence is
+    /// driven by `config.margin.refresh_interval_secs` via the
+    /// engine's select loop. Decisions feed
+    /// `kill_switch.update_margin_ratio` and the pre-order
+    /// hook gates new quotes on `projected_ratio`.
+    margin_guard: Option<MarginGuard>,
+    /// Tick modulus that throttles `account_margin_info` polls
+    /// to once every N `tick_second` ticks (N = refresh_secs).
+    /// Keeps the cadence integer-aligned to the 1 Hz driver
+    /// clock so the poll window is deterministic regardless
+    /// of wall-clock jitter. `0` disables the poll entirely
+    /// (spot + guard absent).
+    margin_poll_modulus: u64,
+    /// Effective leverage per symbol (Epic 40.7). Resolved at
+    /// startup from `config.margin.per_symbol` with fallback
+    /// to `default_leverage`. Fed into
+    /// `MarginGuard::projected_ratio` so the pre-order hook's
+    /// post-fill forecast reflects the venue's actual IM
+    /// requirement, not a conservative 1x placeholder.
+    margin_leverage: u32,
 
     // Tracking.
     sla_tracker: SlaTracker,
@@ -436,12 +506,30 @@ impl MarketMakerEngine {
             config.toxicity.vpin_bucket_size,
             config.toxicity.vpin_num_buckets,
         );
+        let (bvc_classifier, bvc_bar_agg) = if config.toxicity.bvc_enabled {
+            (
+                Some(BvcClassifier::new(
+                    config.toxicity.bvc_nu,
+                    config.toxicity.bvc_window.max(2),
+                )),
+                Some(BvcBarAggregator::new(config.toxicity.bvc_bar_secs)),
+            )
+        } else {
+            (None, None)
+        };
 
         let hedge_book = connectors
             .pair
             .as_ref()
             .map(|pair| BookKeeper::new(&pair.hedge_symbol));
-        let hedge_order_manager = connectors.hedge.as_ref().map(|_| OrderManager::new());
+        let paper_mode = config.mode.eq_ignore_ascii_case("paper");
+        let hedge_order_manager = connectors.hedge.as_ref().map(|_| {
+            if paper_mode {
+                OrderManager::new_paper()
+            } else {
+                OrderManager::new()
+            }
+        });
         let borrow_manager = if config.market_maker.borrow_enabled {
             Some(BorrowManager::new(
                 &product.base_asset,
@@ -474,6 +562,8 @@ impl MarketMakerEngine {
                     limit_95: config.market_maker.var_guard_limit_95,
                     limit_99: config.market_maker.var_guard_limit_99,
                     ewma_lambda: config.market_maker.var_guard_ewma_lambda,
+                    cvar_limit_95: None,
+                    cvar_limit_99: None,
                 }))
             } else {
                 None
@@ -499,22 +589,33 @@ impl MarketMakerEngine {
                 agg
             },
             sor_router: GreedyRouter::new(VenueCostModel::default_v1()),
+            sor_trade_rates: std::collections::HashMap::new(),
             var_guard_last_throttle: None,
             var_guard_last_total_pnl: dec!(0),
             portfolio_risk_mult: dec!(1),
             ab_split: None,
             event_recorder: None,
             hedge_order_manager,
-            order_manager: OrderManager::new(),
+            order_manager: if paper_mode {
+                OrderManager::new_paper()
+            } else {
+                OrderManager::new()
+            },
             inventory_manager: InventoryManager::new(),
             exposure_manager: ExposureManager::new(dec!(0)),
             circuit_breaker: CircuitBreaker::new(),
             volatility_estimator: vol_est,
             kill_switch: KillSwitch::new(ks_config),
             audit,
-            balance_cache: BalanceCache::new(),
+            balance_cache: if paper_mode {
+                BalanceCache::new_paper_for(mm_common::types::WalletType::Spot)
+            } else {
+                BalanceCache::new()
+            },
             order_id_map: OrderIdMap::new(),
             vpin,
+            bvc_classifier,
+            bvc_bar_agg,
             kyle_lambda: KyleLambda::new(config.toxicity.kyle_window),
             adverse_selection: AdverseSelectionTracker::new(200),
             market_resilience: MarketResilienceCalculator::new(MrConfig::default()),
@@ -571,12 +672,37 @@ impl MarketMakerEngine {
                         std::path::Path::new(path),
                     ) {
                         Ok(model) => {
-                            ms = ms.with_learned_microprice(model);
-                            info!(
-                                symbol = %symbol,
-                                path = %path,
-                                "MomentumSignals: learned microprice model loaded"
-                            );
+                            // Epic D stage-2 — opt-in online fit.
+                            // When `momentum_learned_microprice_online`
+                            // is true, attach via the online builder
+                            // so every L1 snapshot feeds the model's
+                            // ring and the g-matrix drifts with the
+                            // live tape. Horizon must match the
+                            // offline CLI's `--horizon` setting;
+                            // defaults to 10 to match the CLI
+                            // binary default.
+                            if config.market_maker.momentum_learned_microprice_online {
+                                ms = ms.with_learned_microprice_online(
+                                    model,
+                                    config
+                                        .market_maker
+                                        .momentum_learned_microprice_horizon
+                                        .max(1),
+                                );
+                                info!(
+                                    symbol = %symbol,
+                                    path = %path,
+                                    horizon = config.market_maker.momentum_learned_microprice_horizon,
+                                    "MomentumSignals: learned microprice model loaded with online fit"
+                                );
+                            } else {
+                                ms = ms.with_learned_microprice(model);
+                                info!(
+                                    symbol = %symbol,
+                                    path = %path,
+                                    "MomentumSignals: learned microprice model loaded (offline-only)"
+                                );
+                            }
                         }
                         Err(e) => {
                             warn!(
@@ -590,7 +716,31 @@ impl MarketMakerEngine {
                 }
                 ms
             },
-            auto_tuner: AutoTuner::new(200),
+            auto_tuner: {
+                let mut t = AutoTuner::new(200);
+                // Epic 40.8 — per-research (docs/research/
+                // spot-vs-perp-mm-apr17.md §Microstructure), VPIN
+                // and Kyle's λ run ~1.3-1.5× hotter on perp than
+                // spot for the same book depth, because informed
+                // flow + leverage concentrates on perp. Bump the
+                // toxicity widen multiplier on any perp product
+                // so our L1 WidenSpreads response pulls quotes in
+                // faster when those signals spike.
+                if config.exchange.product.has_funding() {
+                    t.set_product_widen_mult(dec!(1.4));
+                }
+                t
+            },
+            adaptive_tuner: {
+                let mut t = mm_strategy::AdaptiveTuner::new(
+                    mm_strategy::AdaptiveConfig::default(),
+                );
+                if config.market_maker.adaptive_enabled {
+                    t.enable(true);
+                }
+                t
+            },
+            pair_class: None,
             adv_inventory: AdvancedInventoryManager::new(config.risk.max_inventory),
             twap: None,
             paired_unwind: None,
@@ -601,8 +751,38 @@ impl MarketMakerEngine {
             lead_lag_guard: None,
             lead_lag_active: false,
             news_retreat: None,
+            social_risk: None,
+            social_skew_bps: Decimal::ZERO,
+            margin_guard: config.margin.as_ref().map(|m| {
+                MarginGuard::new(MarginGuardThresholds::from_config(m))
+            }),
+            margin_poll_modulus: config
+                .margin
+                .as_ref()
+                .map(|m| m.refresh_interval_secs.max(1))
+                .unwrap_or(0),
+            margin_leverage: config
+                .margin
+                .as_ref()
+                .map(|m| m.for_symbol(&symbol).1)
+                .unwrap_or(1),
             sla_tracker: SlaTracker::new(sla_config),
-            pnl_tracker: PnlTracker::new(product.maker_fee, product.taker_fee),
+            // Paper-mode fee override — lets operators run a clean
+            // "spread capture without fee drag" demo. Parsed as bps;
+            // unset leaves the real exchange-fetched fee in place.
+            pnl_tracker: {
+                let maker = std::env::var("MM_PAPER_FEE_MAKER_BPS")
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .map(|bps| Decimal::from_f64_retain(bps / 10_000.0).unwrap_or(product.maker_fee))
+                    .unwrap_or(product.maker_fee);
+                let taker = std::env::var("MM_PAPER_FEE_TAKER_BPS")
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .map(|bps| Decimal::from_f64_retain(bps / 10_000.0).unwrap_or(product.taker_fee))
+                    .unwrap_or(product.taker_fee);
+                PnlTracker::new(maker, taker)
+            },
             volume_limiter: mm_risk::VolumeLimitTracker::new(
                 config.risk.max_daily_volume_quote,
                 config.risk.max_hourly_volume_quote,
@@ -627,6 +807,15 @@ impl MarketMakerEngine {
     /// Attach a webhook dispatcher for client event delivery.
     pub fn with_webhooks(mut self, wh: mm_dashboard::webhooks::WebhookDispatcher) -> Self {
         self.webhooks = Some(wh);
+        self
+    }
+
+    /// Epic 31 — tag this engine with its pair-class. Consumed
+    /// only for dashboard display; does not change any runtime
+    /// behaviour today (per-class parameter selection happens at
+    /// config-load time via the template merger).
+    pub fn with_pair_class(mut self, class: mm_common::PairClass) -> Self {
+        self.pair_class = Some(class);
         self
     }
 
@@ -891,6 +1080,7 @@ impl MarketMakerEngine {
     /// `recommend_route` inside the pipeline, and a
     /// `tracing::info!` line records the dispatch outcome so
     /// ops can grep "sor dispatch outcome" in the log stream.
+    #[instrument(skip(self), fields(symbol = %self.symbol, ?side, %qty, %urgency))]
     pub async fn dispatch_route(
         &mut self,
         side: mm_common::types::Side,
@@ -915,6 +1105,149 @@ impl MarketMakerEngine {
             "sor dispatch outcome"
         );
         outcome
+    }
+
+    /// Epic A stage-2 #2 — refresh `queue_wait_secs` on the
+    /// SOR aggregator from the live trade-rate estimators.
+    /// Uses the seeded `VenueSeed.available_qty` as the
+    /// "depth ahead of us" proxy — operators wanting a
+    /// per-tick book-depth reading can extend this to walk
+    /// the `book_keeper` for the primary or the bundle's
+    /// per-venue best-bid / best-ask.
+    ///
+    /// Estimators that haven't hit `MIN_SAMPLES` yet leave
+    /// the seeded constant in place so a freshly-booted
+    /// engine still produces a route decision.
+    fn refresh_sor_queue_wait(&mut self) {
+        let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let venues = self.sor_aggregator.venues();
+        for venue in venues {
+            let Some(seed) = self.sor_aggregator.seed(venue) else {
+                continue;
+            };
+            let depth = seed.available_qty;
+            let Some(est) = self.sor_trade_rates.get_mut(&venue) else {
+                continue;
+            };
+            if let Some(wait) = est.expected_queue_wait_secs(now_ns, depth) {
+                self.sor_aggregator.update_queue_wait(venue, wait);
+            }
+        }
+    }
+
+    /// Epic A stage-2 #1 — automatic inline SOR dispatch
+    /// tick. Computes a target `(side, qty, urgency)` from the
+    /// configured [`mm_common::config::SorTargetSource`], fires
+    /// [`Self::dispatch_route`], and pipes the outcome into
+    /// Prometheus + the audit trail. A no-op when the qty
+    /// source produces zero (no excess inventory / empty hedge
+    /// basket), so the tick is safe to fire at a tight
+    /// cadence.
+    ///
+    /// Failure routing: leg-level errors increment
+    /// `SOR_DISPATCH_ERRORS` per venue and flow into the
+    /// audit `detail`. Only fully-zero-dispatched ticks skip
+    /// the audit write — partial successes always leave a
+    /// row behind so the operator can reconstruct the
+    /// decision.
+    async fn run_sor_dispatch_tick(&mut self) {
+        use mm_common::config::SorTargetSource;
+        use mm_common::types::Side;
+
+        let urgency = self.config.market_maker.sor_urgency;
+        let (side, qty) = match self.config.market_maker.sor_target_qty_source {
+            SorTargetSource::InventoryExcess => {
+                let inv = self.inventory_manager.inventory();
+                let threshold = self.config.market_maker.sor_inventory_threshold;
+                let excess = inv.abs() - threshold.abs();
+                if excess <= Decimal::ZERO {
+                    return;
+                }
+                // Long inventory → SELL to reduce; short → BUY.
+                let side = if inv > Decimal::ZERO {
+                    Side::Sell
+                } else {
+                    Side::Buy
+                };
+                (side, excess)
+            }
+            SorTargetSource::HedgeBudget => {
+                // Pick the first hedge-basket entry that targets
+                // this engine's base asset. The optimizer is
+                // cross-symbol; we only act on the leg that
+                // matches the symbol we manage.
+                let basket = &self.last_hedge_basket;
+                if basket.is_empty() {
+                    return;
+                }
+                let Some((_sym, entry_qty)) = basket
+                    .entries
+                    .iter()
+                    .find(|(sym, _)| *sym == self.symbol)
+                else {
+                    return;
+                };
+                if *entry_qty == Decimal::ZERO {
+                    return;
+                }
+                let side = if *entry_qty > Decimal::ZERO {
+                    Side::Buy
+                } else {
+                    Side::Sell
+                };
+                (side, entry_qty.abs())
+            }
+        };
+
+        let outcome = self.dispatch_route(side, qty, urgency).await;
+
+        // No legs at all → router produced an empty decision
+        // (no venue could serve the qty). Skip the audit +
+        // metrics write; the router already logged its own
+        // "no route" line.
+        if outcome.legs.is_empty() {
+            return;
+        }
+
+        // Metrics — success counter on fully-dispatched, per-
+        // venue error counter otherwise.
+        if outcome.is_fully_dispatched() {
+            mm_dashboard::metrics::SOR_DISPATCH_SUCCESS
+                .with_label_values(&[&self.symbol])
+                .inc();
+        }
+        for leg in &outcome.legs {
+            if leg.error.is_some() {
+                mm_dashboard::metrics::SOR_DISPATCH_ERRORS
+                    .with_label_values(&[&self.symbol, &format!("{:?}", leg.venue)])
+                    .inc();
+            }
+        }
+        use rust_decimal::prelude::ToPrimitive;
+        mm_dashboard::metrics::SOR_DISPATCH_FILLED_QTY
+            .with_label_values(&[&self.symbol])
+            .set(outcome.total_dispatched_qty.to_f64().unwrap_or(0.0));
+
+        // Audit — one row per dispatch with per-leg detail.
+        let mut detail = format!(
+            "side={side:?}, target_qty={}, dispatched={}, legs=[",
+            outcome.total_target_qty, outcome.total_dispatched_qty
+        );
+        for (i, leg) in outcome.legs.iter().enumerate() {
+            if i > 0 {
+                detail.push_str(", ");
+            }
+            match &leg.error {
+                Some(err) => detail.push_str(&format!("{:?}:ERR({err})", leg.venue)),
+                None => detail.push_str(&format!(
+                    "{:?}:qty={},cost_bps={}",
+                    leg.venue, leg.dispatched_qty, leg.expected_cost_bps
+                )),
+            }
+        }
+        detail.push(']');
+        self.audit
+            .risk_event(&self.symbol, AuditEventType::RouteDispatched, &detail);
     }
 
     /// Pick the PnL attribution class for a fill on this
@@ -973,6 +1306,15 @@ impl MarketMakerEngine {
     /// only — the driver tracks its state machine and emits
     /// intent events but does not dispatch leg orders. Stage-2
     /// wires inline leg execution through `OrderManager`.
+    ///
+    /// # Wiring gap
+    /// `AppConfig` lacks a `stat_arb: Option<StatArbDriverCfg>`
+    /// entry, so server boot never constructs a driver. To
+    /// activate: mirror the `funding_arb: Option<FundingArbCfg>`
+    /// pattern in `common::config`, build a
+    /// `StatArbDriver` in `run_symbol` from `config.stat_arb`,
+    /// and invoke `.with_stat_arb_driver(driver, tick)` in the
+    /// engine builder chain.
     pub fn with_stat_arb_driver(
         mut self,
         driver: StatArbDriver,
@@ -994,10 +1336,106 @@ impl MarketMakerEngine {
         self
     }
 
+    /// Epic G — attach a `SocialRiskEngine`. Once attached,
+    /// every `ConfigOverride::SentimentTick` routed to the
+    /// engine is evaluated against the current volatility +
+    /// OFI state; the fused output pushes spread / size /
+    /// skew multipliers into the autotuner and — on extreme
+    /// rate+vol confirmation — escalates the kill switch to
+    /// L2. The orchestrator (`mm-sentiment`-driven, in
+    /// `server/src/main.rs`) is the canonical producer of
+    /// these ticks.
+    pub fn with_social_risk(
+        mut self,
+        engine: mm_risk::social_risk::SocialRiskEngine,
+    ) -> Self {
+        self.social_risk = Some(engine);
+        self
+    }
+
+    /// Apply a freshly-received `SentimentTick` to the social
+    /// risk engine. Pure internal helper: takes the caller-
+    /// measured realised vol + OFI z-score as the market-side
+    /// cross-validation inputs. Routed here from the
+    /// `ConfigOverride::SentimentTick` branch.
+    fn on_sentiment_tick(&mut self, tick: mm_sentiment::SentimentTick) {
+        let Some(engine) = self.social_risk.as_mut() else {
+            return;
+        };
+        // Use the engine's own realised vol (already EWMA'd
+        // from mid returns) and 0-OFI as a conservative
+        // default — the CKS OFI signal is per-tick and not
+        // always available; expanding this is an easy follow-up.
+        let realised_vol = self
+            .volatility_estimator
+            .volatility()
+            .unwrap_or(Decimal::ZERO);
+        // Epic G follow-up — live OFI z-score from the
+        // momentum tracker. `None` until the OFI path has
+        // seen two snapshots; zero is the safe conservative
+        // fallback (no confirmation → widen only, no skew).
+        let ofi_z = self.momentum.ofi_z().unwrap_or(Decimal::ZERO);
+        let market = mm_risk::social_risk::MarketContext {
+            realised_vol,
+            ofi_z,
+        };
+        let state = engine.evaluate(&tick, market, chrono::Utc::now());
+        self.auto_tuner.set_social_spread_mult(state.vol_multiplier);
+        self.auto_tuner.set_social_size_mult(state.size_multiplier);
+        self.social_skew_bps = state.inv_skew_bps;
+
+        // Prometheus — last-applied multipliers per symbol.
+        use rust_decimal::prelude::ToPrimitive;
+        mm_dashboard::metrics::SOCIAL_SPREAD_MULT
+            .with_label_values(&[&self.symbol])
+            .set(state.vol_multiplier.to_f64().unwrap_or(1.0));
+        mm_dashboard::metrics::SOCIAL_SIZE_MULT
+            .with_label_values(&[&self.symbol])
+            .set(state.size_multiplier.to_f64().unwrap_or(1.0));
+
+        if state.kill_trigger {
+            self.kill_switch.manual_trigger(
+                mm_risk::kill_switch::KillLevel::StopNewOrders,
+                "social risk: mentions_rate + vol confirmed spike",
+            );
+            self.audit.risk_event(
+                &self.symbol,
+                mm_risk::audit::AuditEventType::KillSwitchEscalated,
+                &format!(
+                    "social: rate={} vol={} asset={}",
+                    tick.mentions_rate, realised_vol, tick.asset
+                ),
+            );
+            mm_dashboard::metrics::SOCIAL_KILL_TRIGGERS_TOTAL
+                .with_label_values(&[&self.symbol])
+                .inc();
+            error!(
+                symbol = %self.symbol,
+                asset = %tick.asset,
+                rate = %tick.mentions_rate,
+                vol = %realised_vol,
+                "social risk escalated kill switch to L2"
+            );
+        } else if state.vol_multiplier > Decimal::ONE {
+            debug!(
+                symbol = %self.symbol,
+                asset = %tick.asset,
+                spread_mult = %state.vol_multiplier,
+                size_mult = %state.size_multiplier,
+                skew_bps = %state.inv_skew_bps,
+                reason = state.reason,
+                "social risk adjustment applied"
+            );
+        }
+    }
+
     /// Attach a [`NewsRetreatStateMachine`] (Epic F sub-component
-    /// #2). Operators feed headlines via the public
-    /// [`Self::on_news_headline`] method. Critical-class
-    /// transitions escalate the kill switch to L2.
+    /// #2). Operators feed headlines through the dashboard's
+    /// `POST /api/admin/config` broadcast endpoint using
+    /// `ConfigOverride::News(text)`; the engine's config-
+    /// override handler routes those directly into
+    /// [`Self::on_news_headline`]. Critical-class transitions
+    /// escalate the kill switch to L2.
     pub fn with_news_retreat(mut self, sm: NewsRetreatStateMachine) -> Self {
         self.news_retreat = Some(sm);
         self
@@ -1108,6 +1546,7 @@ impl MarketMakerEngine {
     /// `hedge_rx`; events from that channel only update the hedge
     /// `BookKeeper` and never place orders — the primary leg is
     /// still the only one touched by `OrderManager`.
+    #[instrument(skip_all, fields(symbol = %self.symbol, strategy = self.strategy.name()))]
     pub async fn run_with_hedge(
         &mut self,
         mut ws_rx: mpsc::UnboundedReceiver<MarketEvent>,
@@ -1232,6 +1671,24 @@ impl MarketMakerEngine {
             tokio::time::interval(tokio::time::Duration::from_secs(lifecycle_secs));
         let pair_lifecycle_enabled = self.pair_lifecycle.is_some()
             && self.config.market_maker.pair_lifecycle_refresh_secs > 0;
+
+        // Epic A stage-2 #1 — auto-dispatch SOR tick. Skips the
+        // first tick so a fresh process doesn't fire a route
+        // decision against a cold book snapshot.
+        let sor_secs = self.config.market_maker.sor_dispatch_interval_secs.max(1);
+        let mut sor_dispatch_interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(sor_secs));
+        sor_dispatch_interval.tick().await;
+        let sor_dispatch_enabled = self.config.market_maker.sor_inline_enabled;
+
+        // Epic A stage-2 #2 — queue-wait refresh tick. Publishes
+        // live `trade_rate → queue_wait_secs` into the SOR
+        // aggregator so cost decisions reflect fresh tape.
+        let sor_queue_secs = self.config.market_maker.sor_queue_refresh_secs.max(1);
+        let mut sor_queue_refresh_interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(sor_queue_secs));
+        sor_queue_refresh_interval.tick().await;
+
         self.cycle_start = Instant::now();
 
         loop {
@@ -1313,6 +1770,12 @@ impl MarketMakerEngine {
                 }
                 _ = pair_lifecycle_interval.tick(), if pair_lifecycle_enabled => {
                     self.refresh_pair_lifecycle().await;
+                }
+                _ = sor_dispatch_interval.tick(), if sor_dispatch_enabled => {
+                    self.run_sor_dispatch_tick().await;
+                }
+                _ = sor_queue_refresh_interval.tick() => {
+                    self.refresh_sor_queue_wait();
                 }
                 _ = funding_arb_interval.tick(),
                     if self.funding_arb_driver.is_some() =>
@@ -1581,6 +2044,7 @@ impl MarketMakerEngine {
     }
 
     /// Refresh balances from exchange.
+    #[instrument(skip(self), fields(symbol = %self.symbol))]
     async fn refresh_balances(&mut self) {
         if let Ok(balances) = self.connectors.primary.get_balances().await {
             let quote_balance = balances
@@ -1592,9 +2056,55 @@ impl MarketMakerEngine {
             self.balance_cache.update_from_exchange(&balances);
             info!(quote_balance = %quote_balance, "balances refreshed");
         }
+        // Epic 22: publish a per-venue snapshot for every connector
+        // in the bundle (primary + hedge + SOR extras). The engine
+        // already calls `get_balances()` on the primary above; here
+        // we additionally probe the others so the dashboard's
+        // drilldown panel can render a full cross-venue picture.
+        self.publish_venue_balances().await;
+    }
+
+    /// Push a `VenueBalanceSnapshot` for every connector in the
+    /// bundle to the dashboard. Skips silently when no dashboard
+    /// is attached (tests / headless mode).
+    async fn publish_venue_balances(&self) {
+        let Some(ds) = &self.dashboard else { return };
+        let now = chrono::Utc::now();
+        let mut snaps: Vec<mm_dashboard::state::VenueBalanceSnapshot> = Vec::new();
+        for conn in self.connectors.all_connectors() {
+            let venue = conn.venue_id().to_string();
+            let product = format!("{:?}", conn.product());
+            match conn.get_balances().await {
+                Ok(balances) => {
+                    for b in balances {
+                        // Skip dust rows — they clutter the UI and
+                        // the operator cares about venues that hold
+                        // real positions.
+                        if b.total.is_zero() && b.available.is_zero() && b.locked.is_zero() {
+                            continue;
+                        }
+                        snaps.push(mm_dashboard::state::VenueBalanceSnapshot {
+                            venue: venue.clone(),
+                            product: product.clone(),
+                            asset: b.asset,
+                            wallet: format!("{:?}", b.wallet),
+                            total: b.total,
+                            available: b.available,
+                            locked: b.locked,
+                            updated_at: now,
+                        });
+                    }
+                }
+                Err(e) => {
+                    warn!(%venue, error = %e, "venue balance fetch failed");
+                }
+            }
+        }
+        ds.update_venue_balances(&self.symbol, snaps);
     }
 
     /// Periodic reconciliation: compare internal state vs exchange.
+    #[instrument(skip(self), fields(symbol = %self.symbol, iter = self.reconcile_counter))]
     async fn reconcile(&mut self) {
         self.reconcile_counter += 1;
 
@@ -1724,6 +2234,25 @@ impl MarketMakerEngine {
         self.kill_switch.tick_second();
         self.adv_inventory.tick(self.inventory_manager.inventory());
 
+        // Epic D stage-2 — drain quiet BVC bars. When a symbol
+        // sees no trades for a full bar window, `push()` would
+        // never fire — we'd lose the chance to record zero-
+        // volume bars (which are themselves informative:
+        // classifier's rolling std would otherwise be skewed
+        // by gaps). `flush_if_due` returns the closed bar
+        // without resetting the trade anchor mid-bar.
+        if let (Some(agg), Some(classifier)) = (
+            self.bvc_bar_agg.as_mut(),
+            self.bvc_classifier.as_mut(),
+        ) {
+            let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+            if let Some((dp, vol)) = agg.flush_if_due(now_ns) {
+                if let Some((buy, sell)) = classifier.classify(dp, vol) {
+                    self.vpin.on_bvc_bar(buy, sell);
+                }
+            }
+        }
+
         // Epic C sub-component #4: feed the VaR guard one
         // PnL-delta sample per minute. Gated on
         // `tick_count % 60 == 0` so the sampling cadence is
@@ -1761,6 +2290,60 @@ impl MarketMakerEngine {
 
             let position_value = self.inventory_manager.inventory().abs() * mid;
             self.kill_switch.update_position_value(position_value);
+
+            // Epic 40.4 — margin guard poll. Fired once every
+            // `refresh_interval_secs` ticks (1 s driver ticks).
+            // Failure paths: a venue error counts as a stale
+            // snapshot; the guard auto-widens via
+            // `MarginGuardDecision::Stale` on the next
+            // `decide(now)` call.
+            if self.margin_poll_modulus > 0
+                && self.tick_count.is_multiple_of(self.margin_poll_modulus)
+            {
+                self.refresh_margin_guard().await;
+            }
+
+            // Epic 40.3 — funding accrual. Only perp engines
+            // do anything here; spot connectors short-circuit
+            // at the `has_funding()` gate. Three operations:
+            //   1. Poll the venue for a fresh `FundingRate`
+            //      every 30 s (same cadence design doc
+            //      specifies) so rate + next-funding drift in
+            //      the tracker stay under a minute.
+            //   2. Recompute the MTM funding PnL every tick
+            //      from the live inventory + mark. Stateless
+            //      so a mid-period restart is handled.
+            //   3. At/after `next_funding_time`, book the
+            //      realised delta and emit a `FundingAccrued`
+            //      audit event.
+            if self.config.exchange.product.has_funding() {
+                self.pnl_tracker.set_inventory_for_funding(
+                    self.inventory_manager.inventory(),
+                );
+                if self.tick_count.is_multiple_of(30) {
+                    self.refresh_funding_rate().await;
+                }
+                let now_utc = chrono::Utc::now();
+                self.pnl_tracker.accrue_funding_mtm(now_utc, mid);
+                if let Some(delta) = self.pnl_tracker.settle_funding(now_utc, mid) {
+                    let inv = self.inventory_manager.inventory();
+                    let rate = self.pnl_tracker.funding_rate().unwrap_or_default();
+                    self.audit.risk_event(
+                        &self.symbol,
+                        AuditEventType::FundingAccrued,
+                        &format!(
+                            "rate={rate}, mark={mid}, inventory={inv}, delta={delta}"
+                        ),
+                    );
+                    info!(
+                        symbol = %self.symbol,
+                        rate = %rate,
+                        delta = %delta,
+                        inventory = %inv,
+                        "funding settled"
+                    );
+                }
+            }
 
             // TWAP execution (if active).
             if let Some(twap) = &mut self.twap {
@@ -1999,8 +2582,53 @@ impl MarketMakerEngine {
                     self.market_resilience.on_book(&bids, &asks, now_ns);
                 }
             }
-            MarketEvent::Trade { trade, .. } => {
-                self.vpin.on_trade(trade);
+            MarketEvent::Trade { venue, trade } => {
+                let trade_venue = *venue;
+                // Epic A stage-2 #2 — feed the per-venue
+                // trade-rate estimator so queue-wait
+                // projections track live tape activity. The
+                // window length comes from config; the
+                // estimator prunes stale samples internally.
+                {
+                    let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                    let window = self
+                        .config
+                        .market_maker
+                        .sor_trade_rate_window_secs
+                        .max(1);
+                    self.sor_trade_rates
+                        .entry(trade_venue)
+                        .or_insert_with(|| {
+                            crate::sor::trade_rate::TradeRateEstimator::new(window)
+                        })
+                        .record(now_ns, trade.qty);
+                }
+                // Epic D stage-2 — two classification paths for
+                // VPIN's volume source:
+                //   1. BVC (config opt-in): bar-bucket the trade
+                //      stream, call `classify` on each closed
+                //      bar, route the (buy, sell) split into
+                //      `vpin.on_bvc_bar`. Cleaner signal on
+                //      fast tapes where `taker_side` is noisy.
+                //   2. Legacy tick-rule: hand the trade straight
+                //      to `vpin.on_trade`, which reads
+                //      `Trade::taker_side` via Lee-Ready. Kept
+                //      as the default so byte-identical
+                //      behaviour holds for every deployment
+                //      that didn't opt into BVC.
+                if let (Some(agg), Some(classifier)) = (
+                    self.bvc_bar_agg.as_mut(),
+                    self.bvc_classifier.as_mut(),
+                ) {
+                    let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                    if let Some((dp, vol)) = agg.push(now_ns, trade.price, trade.qty) {
+                        if let Some((buy, sell)) = classifier.classify(dp, vol) {
+                            self.vpin.on_bvc_bar(buy, sell);
+                        }
+                    }
+                } else {
+                    self.vpin.on_trade(trade);
+                }
                 self.momentum.on_trade(trade);
                 if self.config.market_maker.otr_enabled {
                     self.otr.on_trade();
@@ -2020,6 +2648,29 @@ impl MarketMakerEngine {
                 }
                 if let Some(v) = self.vpin.vpin() {
                     self.auto_tuner.set_toxicity(v);
+                }
+
+                // Paper-mode fill simulation. Drive every resting
+                // paper quote that was crossed by this taker trade
+                // through the same MarketEvent::Fill code path a
+                // real fill would take, so PnL / inventory / SLA
+                // accumulate end-to-end without touching the
+                // venue. No-op in live mode.
+                if self.order_manager.is_paper() {
+                    let synthetic = self
+                        .order_manager
+                        .paper_match_trade(trade.price, trade.taker_side);
+                    for fill in synthetic {
+                        info!(
+                            order_id = %fill.order_id,
+                            side = ?fill.side,
+                            price = %fill.price,
+                            qty = %fill.qty,
+                            trade_price = %trade.price,
+                            "[PAPER] simulated fill"
+                        );
+                        self.handle_ws_event(MarketEvent::Fill { venue: trade_venue, fill });
+                    }
                 }
             }
             MarketEvent::Fill { fill, .. } => {
@@ -2045,6 +2696,35 @@ impl MarketMakerEngine {
                 self.sla_tracker.on_fill();
                 self.kill_switch.on_fill();
                 self.volume_limiter.on_trade(fill.price * fill.qty);
+
+                // Epic 30 — feed the adaptive tuner. Derive edge
+                // in bps from the current mid: buy earns (mid -
+                // price)/mid, sell earns (price - mid)/mid. Fee
+                // rate depends on maker/taker status.
+                if let Some(mid) = self.book_keeper.book.mid_price() {
+                    let edge_bps = if mid.is_zero() {
+                        dec!(0)
+                    } else {
+                        match fill.side {
+                            mm_common::types::Side::Buy => {
+                                (mid - fill.price) / mid * dec!(10_000)
+                            }
+                            mm_common::types::Side::Sell => {
+                                (fill.price - mid) / mid * dec!(10_000)
+                            }
+                        }
+                    };
+                    let fee_rate = if fill.is_maker {
+                        self.product.maker_fee
+                    } else {
+                        self.product.taker_fee
+                    };
+                    let fee_bps = fee_rate * dec!(10_000);
+                    self.adaptive_tuner
+                        .on_fill(fill.price, fill.qty, edge_bps, fee_bps);
+                }
+                self.adaptive_tuner
+                    .on_inventory(self.inventory_manager.inventory());
 
                 // Feed the shared multi-currency portfolio. The
                 // qty passed to `on_fill` is signed — positive on
@@ -2079,6 +2759,11 @@ impl MarketMakerEngine {
                 if let Some(mid) = self.book_keeper.book.mid_price() {
                     self.pnl_tracker.on_fill(fill, mid);
                     self.adverse_selection.on_fill(fill.price, fill.side, mid);
+                    if let Some(bps) = self.adverse_selection.adverse_selection_bps() {
+                        // Feed the adaptive tuner so it can widen
+                        // γ when the desk is being picked off.
+                        self.adaptive_tuner.on_adverse(bps);
+                    }
 
                     // Market impact tracking.
                     let side_sign = match fill.side {
@@ -2210,6 +2895,77 @@ impl MarketMakerEngine {
         }
     }
 
+    /// Poll the primary connector for a fresh funding rate
+    /// snapshot (Epic 40.3). Only called when
+    /// `product.has_funding()`; errors log-and-continue —
+    /// accrual math falls through to the last-known rate
+    /// until the next successful poll.
+    async fn refresh_funding_rate(&mut self) {
+        match self
+            .connectors
+            .primary
+            .get_funding_rate(&self.symbol)
+            .await
+        {
+            Ok(rate) => {
+                self.pnl_tracker.on_funding_update(
+                    rate.rate,
+                    rate.next_funding_time,
+                    chrono::Duration::from_std(rate.interval)
+                        .unwrap_or_else(|_| chrono::Duration::hours(8)),
+                );
+            }
+            Err(mm_exchange_core::connector::FundingRateError::NotSupported) => {
+                // Capability mismatch — connector claims
+                // funding support in `has_funding()` but the
+                // trait returns NotSupported. Would be a
+                // venue wiring bug; tolerate without spam.
+            }
+            Err(e) => {
+                warn!(symbol = %self.symbol, error = %e, "funding rate poll failed");
+            }
+        }
+    }
+
+    /// Pull a fresh `AccountMarginInfo` from the primary
+    /// connector and feed both the guard and the kill switch.
+    /// Called once every `config.margin.refresh_interval_secs`
+    /// seconds from `tick_second` when the guard is active.
+    ///
+    /// Error policy: a venue call failure does NOT escalate by
+    /// itself — the guard's own staleness check handles the
+    /// absence of a fresh snapshot. We log once per failure so
+    /// an ongoing venue outage is visible without spamming.
+    /// `NotSupported` is a programmer bug (capability mismatch
+    /// between connector and config), so it falls through the
+    /// same path — the guard will auto-widen via `Stale`.
+    async fn refresh_margin_guard(&mut self) {
+        let Some(guard) = self.margin_guard.as_mut() else {
+            return;
+        };
+        match self.connectors.primary.account_margin_info().await {
+            Ok(info) => {
+                guard.update(info);
+            }
+            Err(e) => {
+                warn!(
+                    symbol = %self.symbol,
+                    error = %e,
+                    "margin info poll failed — guard will auto-widen on stale decision"
+                );
+            }
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let decision = guard.decide(now_ms);
+        self.kill_switch.update_margin_ratio(decision);
+        if let Some(dash) = &self.dashboard {
+            if let Some(info) = guard.last() {
+                dash.set_margin_ratio(&self.symbol, info.margin_ratio);
+            }
+        }
+    }
+
+    #[instrument(skip(self), fields(symbol = %self.symbol, tick = self.tick_count))]
     async fn refresh_quotes(&mut self) -> Result<()> {
         self.tick_count += 1;
 
@@ -2342,6 +3098,36 @@ impl MarketMakerEngine {
                 self.balance_cache.reset_reservations();
             }
             return Ok(());
+        }
+
+        // Epic 40.4 — pre-order margin projection. Forecast the
+        // post-fill margin ratio if the engine were to add a
+        // full two-sided notional footprint (`2 * order_size *
+        // mid`). If the projected ratio crosses `stop_ratio`,
+        // skip this tick's refresh — the guard's periodic poll
+        // will have already widened the kill switch; this just
+        // keeps us from dispatching a quote whose *fill* would
+        // push us over a threshold that the *observed* ratio
+        // hasn't yet crossed.
+        if let (Some(guard), Some(mid)) = (
+            self.margin_guard.as_ref(),
+            self.book_keeper.book.mid_price(),
+        ) {
+            let notional_delta =
+                self.config.market_maker.order_size * mid * Decimal::from(2u64);
+            if let Some(projected) =
+                guard.projected_ratio(notional_delta, self.margin_leverage)
+            {
+                if projected >= guard.thresholds().stop_ratio {
+                    warn!(
+                        symbol = %self.symbol,
+                        projected = %projected,
+                        stop_ratio = %guard.thresholds().stop_ratio,
+                        "margin projection would cross stop_ratio — skipping quote refresh"
+                    );
+                    return Ok(());
+                }
+            }
         }
 
         // Circuit breaker.
@@ -2595,13 +3381,33 @@ impl MarketMakerEngine {
         // Portfolio risk multiplier (Epic 3).
         eff_spread *= self.portfolio_risk_mult;
 
+        // Epic 30 — adaptive tuner multiplier layer. Tick the
+        // tuner on every refresh so a new 1-minute bucket rolls
+        // over when due; then fold its γ factor into the stack.
+        // `gamma_factor()` returns 1.0 unless
+        // `market_maker.adaptive_enabled = true`, so existing
+        // deployments see byte-identical γ.
+        self.adaptive_tuner.tick(std::time::Instant::now());
+        let adaptive_factor = self.adaptive_tuner.gamma_factor();
+        eff_gamma *= adaptive_factor;
+
         // Momentum alpha.
-        let alpha_mid = if self.config.market_maker.momentum_enabled {
+        let mut alpha_mid = if self.config.market_maker.momentum_enabled {
             let alpha = self.momentum.alpha(&self.book_keeper.book, mid);
             mid + alpha * mid * t_remaining
         } else {
             mid
         };
+        // Epic G — social risk skew. `social_skew_bps` is set
+        // by `on_sentiment_tick` when sentiment + OFI agree;
+        // at 0 bps this is a no-op. Applied additively on top
+        // of the momentum alpha so the two skew paths
+        // compose: momentum handles per-tick micro-structure
+        // signal, social handles slower regime shift.
+        if self.social_skew_bps != Decimal::ZERO {
+            let social_shift = alpha_mid * self.social_skew_bps / dec!(10000);
+            alpha_mid += social_shift;
+        }
 
         let mut tuned = self.config.market_maker.clone();
         tuned.gamma = eff_gamma;
@@ -2675,11 +3481,20 @@ impl MarketMakerEngine {
             }
         }
 
-        let borrow_cost_bps = self
-            .borrow_manager
-            .as_ref()
-            .map(|bm| bm.effective_carry_bps())
-            .filter(|bps| !bps.is_zero());
+        // Epic 40.9 — borrow cost applies only to **spot-short**
+        // legs. Perp short has no borrow requirement (funding P&L
+        // is separately accounted by Epic 40.3 once wired). Gate
+        // the shim on `product == Spot` so a perp-product engine
+        // never threads a spurious borrow_cost_bps through the
+        // strategy's reservation price.
+        let borrow_cost_bps = if self.config.exchange.product == mm_common::config::ProductType::Spot {
+            self.borrow_manager
+                .as_ref()
+                .map(|bm| bm.effective_carry_bps())
+                .filter(|bps| !bps.is_zero())
+        } else {
+            None
+        };
         // Cross-venue staleness reading (P1.4 stage-1). Computed
         // here so the strategy gate has a single canonical value
         // per refresh tick rather than a re-derived one.
@@ -3047,6 +3862,19 @@ impl MarketMakerEngine {
                 );
                 return;
             }
+            ConfigOverride::News(text) => {
+                info!(
+                    symbol = %self.symbol,
+                    chars = text.len(),
+                    "news headline received"
+                );
+                self.on_news_headline(&text);
+                return;
+            }
+            ConfigOverride::SentimentTick(tick) => {
+                self.on_sentiment_tick(tick);
+                return;
+            }
             ConfigOverride::ManualKillSwitchReset { reason } => {
                 info!(symbol = %self.symbol, reason = %reason, "manual kill switch reset from ops API");
                 self.kill_switch.reset();
@@ -3118,8 +3946,30 @@ impl MarketMakerEngine {
         let regime = self.auto_tuner.regime_detector.regime();
         let regime_str = format!("{regime:?}");
 
+        let venue_label = match self.config.exchange.exchange_type {
+            mm_common::config::ExchangeType::Binance
+            | mm_common::config::ExchangeType::BinanceTestnet => "binance",
+            mm_common::config::ExchangeType::Bybit
+            | mm_common::config::ExchangeType::BybitTestnet => "bybit",
+            mm_common::config::ExchangeType::HyperLiquid
+            | mm_common::config::ExchangeType::HyperLiquidTestnet => "hyperliquid",
+            mm_common::config::ExchangeType::Custom => "custom",
+        }
+        .to_string();
+        let pair_class_label = self
+            .pair_class
+            .as_ref()
+            .map(|c| format!("{c:?}").to_lowercase());
         ds.update(SymbolState {
             symbol: self.symbol.clone(),
+            mode: self.config.mode.clone(),
+            strategy: self.strategy.name().to_string(),
+            // Product label — authoritative source is
+            // `config.exchange.product` (Epic 40.1). Label stays
+            // stable: "spot", "linear_perp", "inverse_perp".
+            product: self.config.exchange.product.label().to_string(),
+            venue: venue_label,
+            pair_class: pair_class_label,
             mid_price: self.last_mid,
             spread_bps: self.book_keeper.book.spread_bps().unwrap_or(dec!(0)),
             inventory: self.inventory_manager.inventory(),
@@ -3132,6 +3982,8 @@ impl MarketMakerEngine {
                 inventory: self.pnl_tracker.attribution.inventory_pnl,
                 rebates: self.pnl_tracker.attribution.rebate_income,
                 fees: self.pnl_tracker.attribution.fees_paid,
+                funding: self.pnl_tracker.attribution.funding_pnl_realised,
+                funding_mtm: self.pnl_tracker.attribution.funding_pnl_mtm,
                 round_trips: self.pnl_tracker.attribution.round_trips,
                 volume: self.pnl_tracker.attribution.total_volume,
             },
@@ -3215,13 +4067,54 @@ impl MarketMakerEngine {
                 amend_max_ticks: self.config.market_maker.amend_max_ticks,
                 otr_enabled: self.config.market_maker.otr_enabled,
             }),
+            adaptive_state: Some(mm_dashboard::state::AdaptiveStateSnapshot {
+                pair_class: self
+                    .pair_class
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "unclassified".to_string()),
+                enabled: self.config.market_maker.adaptive_enabled,
+                gamma_factor: self.adaptive_tuner.gamma_factor(),
+                last_reason: format!("{:?}", self.adaptive_tuner.last_reason())
+                    .to_lowercase(),
+            }),
+            open_orders: self
+                .order_manager
+                .live_orders_snapshot()
+                .into_iter()
+                .map(|(id, side, price, qty, status)| {
+                    let side_str = match side {
+                        mm_common::types::Side::Buy => "buy",
+                        mm_common::types::Side::Sell => "sell",
+                    };
+                    mm_dashboard::state::OrderSnapshot {
+                        client_order_id: id.to_string(),
+                        side: side_str.to_string(),
+                        price,
+                        qty,
+                        status: status.to_string(),
+                    }
+                })
+                .collect(),
         });
 
         // Push PnL time-series sample for charting.
+        let now_ms = chrono::Utc::now().timestamp_millis();
         ds.push_pnl_sample(
             &self.symbol,
-            chrono::Utc::now().timestamp_millis(),
+            now_ms,
             self.pnl_tracker.attribution.total_pnl(),
+        );
+        // UX-2 — spread + inventory rolling history so charts
+        // can render the full window on page load rather than
+        // warming up from live ticks. Spread comes from the
+        // book keeper, inventory from the tracker.
+        if let Some(spread_bps) = self.book_keeper.book.spread_bps() {
+            ds.push_spread_sample(&self.symbol, now_ms, spread_bps);
+        }
+        ds.push_inventory_sample(
+            &self.symbol,
+            now_ms,
+            self.inventory_manager.inventory(),
         );
 
         // Push market impact metrics to Prometheus.
@@ -5921,5 +6814,274 @@ mod stage2_track1_integration {
         );
         let engine = engine.with_stat_arb_driver(driver, std::time::Duration::from_millis(50));
         assert_eq!(engine.pnl_strategy_class(), "stat_arb_BTCUSDT_ETHUSDT");
+    }
+
+    // ---------------------------------------------------------
+    // Epic D stage-2 — BVC classifier engine wiring
+    // ---------------------------------------------------------
+
+    fn make_engine_with_toxicity(cfg: mm_common::config::ToxicityConfig) -> MarketMakerEngine {
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        let app_cfg = AppConfig {
+            toxicity: cfg,
+            ..AppConfig::default()
+        };
+        MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            app_cfg,
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        )
+    }
+
+    fn synth_trade(price: Decimal, qty: Decimal, side: mm_common::types::Side) -> mm_common::types::Trade {
+        mm_common::types::Trade {
+            trade_id: 1,
+            symbol: "BTCUSDT".to_string(),
+            price,
+            qty,
+            taker_side: side,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn bvc_disabled_keeps_aggregator_none() {
+        let cfg = mm_common::config::ToxicityConfig {
+            bvc_enabled: false,
+            ..Default::default()
+        };
+        let engine = make_engine_with_toxicity(cfg);
+        assert!(engine.bvc_classifier.is_none());
+        assert!(engine.bvc_bar_agg.is_none());
+    }
+
+    #[test]
+    fn bvc_enabled_constructs_both_components() {
+        let cfg = mm_common::config::ToxicityConfig {
+            bvc_enabled: true,
+            bvc_bar_secs: 1,
+            ..Default::default()
+        };
+        let engine = make_engine_with_toxicity(cfg);
+        assert!(engine.bvc_classifier.is_some());
+        assert!(engine.bvc_bar_agg.is_some());
+    }
+
+    /// Disabled path: the legacy tick-rule feed into VPIN stays
+    /// wired. Tiny bucket size + enough one-sided buys registers
+    /// at the VPIN level.
+    #[test]
+    fn bvc_disabled_tick_rule_still_feeds_vpin() {
+        let cfg = mm_common::config::ToxicityConfig {
+            bvc_enabled: false,
+            vpin_bucket_size: dec!(100),
+            vpin_num_buckets: 4,
+            ..Default::default()
+        };
+        let mut engine = make_engine_with_toxicity(cfg);
+        for _ in 0..20 {
+            let t = synth_trade(dec!(100), dec!(2), mm_common::types::Side::Buy);
+            engine.handle_ws_event(MarketEvent::Trade {
+                venue: VenueId::Binance,
+                trade: t,
+            });
+        }
+        let v = engine.vpin.vpin().expect("vpin produced");
+        assert!(v > dec!(0), "expected positive vpin, got {v}");
+    }
+
+    /// Enabled path: within a single bar window the aggregator
+    /// holds the trade (no bar has closed yet), so the VPIN
+    /// buckets should remain empty — proves the engine is
+    /// NOT calling `vpin.on_trade` on the BVC path.
+    #[test]
+    fn bvc_enabled_suppresses_legacy_on_trade_within_bar() {
+        let cfg = mm_common::config::ToxicityConfig {
+            bvc_enabled: true,
+            // Long bar — no chance of closing during the test.
+            bvc_bar_secs: 3600,
+            vpin_bucket_size: dec!(100),
+            vpin_num_buckets: 4,
+            ..Default::default()
+        };
+        let mut engine = make_engine_with_toxicity(cfg);
+        for _ in 0..20 {
+            let t = synth_trade(dec!(100), dec!(2), mm_common::types::Side::Buy);
+            engine.handle_ws_event(MarketEvent::Trade {
+                venue: VenueId::Binance,
+                trade: t,
+            });
+        }
+        assert!(engine.vpin.vpin().is_none(),
+            "bvc path should not call on_trade — VPIN must stay empty mid-bar");
+        assert!(engine.bvc_bar_agg.is_some());
+    }
+
+    // ---------------------------------------------------------
+    // Epic A stage-2 #1 — inline SOR dispatch tick
+    // ---------------------------------------------------------
+
+    /// No inventory, default config → the tick is a no-op. No
+    /// place_order call, no legs, no audit write.
+    #[tokio::test]
+    async fn sor_tick_inventory_excess_zero_inventory_is_noop() {
+        let mock = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        mock.set_mid(dec!(50_000));
+        let bundle = ConnectorBundle::single(mock.clone() as Arc<dyn ExchangeConnector>);
+        let mut engine = make_engine_with_bundle(bundle);
+        engine.run_sor_dispatch_tick().await;
+        assert_eq!(mock.place_single_calls(), 0);
+    }
+
+    /// Long inventory above threshold → tick fires a SELL
+    /// dispatch for the excess.
+    #[tokio::test]
+    async fn sor_tick_dispatches_sell_when_long_inventory_exceeds_threshold() {
+        let mock = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        mock.set_mid(dec!(50_000));
+        let bundle = ConnectorBundle::single(mock.clone() as Arc<dyn ExchangeConnector>);
+        let mut engine = make_engine_with_bundle(bundle);
+        // Seed the aggregator so the router finds a venue.
+        let mut seed = VenueSeed::new("BTCUSDT", sample_product("BTCUSDT"), dec!(1));
+        seed.best_bid = dec!(49_999);
+        seed.best_ask = dec!(50_001);
+        engine = engine.with_sor_venue(VenueId::Binance, seed);
+        // Simulate a long position above the default threshold.
+        engine.config.market_maker.sor_inventory_threshold = dec!(0.01);
+        // Urgency > 0.5 forces taker legs so mock.place_single_calls() fires.
+        engine.config.market_maker.sor_urgency = dec!(0.9);
+        engine.inventory_manager.force_reset_inventory_to(dec!(0.05));
+
+        engine.run_sor_dispatch_tick().await;
+        assert_eq!(mock.place_single_calls(), 1, "one taker leg expected");
+    }
+
+    /// Short inventory (negative) above threshold → BUY dispatch.
+    #[tokio::test]
+    async fn sor_tick_dispatches_buy_when_short_inventory_exceeds_threshold() {
+        let mock = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        mock.set_mid(dec!(50_000));
+        let bundle = ConnectorBundle::single(mock.clone() as Arc<dyn ExchangeConnector>);
+        let mut engine = make_engine_with_bundle(bundle);
+        let mut seed = VenueSeed::new("BTCUSDT", sample_product("BTCUSDT"), dec!(1));
+        seed.best_bid = dec!(49_999);
+        seed.best_ask = dec!(50_001);
+        engine = engine.with_sor_venue(VenueId::Binance, seed);
+        engine.config.market_maker.sor_inventory_threshold = dec!(0.01);
+        engine.config.market_maker.sor_urgency = dec!(0.9);
+        engine.inventory_manager.force_reset_inventory_to(dec!(-0.05));
+
+        engine.run_sor_dispatch_tick().await;
+        assert_eq!(mock.place_single_calls(), 1);
+    }
+
+    /// Inventory at exactly threshold → no-op (strictly above
+    /// policy, so a position at the limit doesn't churn).
+    #[tokio::test]
+    async fn sor_tick_at_threshold_is_noop() {
+        let mock = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        mock.set_mid(dec!(50_000));
+        let bundle = ConnectorBundle::single(mock.clone() as Arc<dyn ExchangeConnector>);
+        let mut engine = make_engine_with_bundle(bundle);
+        engine.config.market_maker.sor_inventory_threshold = dec!(0.05);
+        engine.inventory_manager.force_reset_inventory_to(dec!(0.05));
+        engine.run_sor_dispatch_tick().await;
+        assert_eq!(mock.place_single_calls(), 0);
+    }
+
+    /// HedgeBudget source with an empty basket → no-op.
+    #[tokio::test]
+    async fn sor_tick_hedge_budget_empty_basket_is_noop() {
+        use mm_common::config::SorTargetSource;
+        let mock = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        mock.set_mid(dec!(50_000));
+        let bundle = ConnectorBundle::single(mock.clone() as Arc<dyn ExchangeConnector>);
+        let mut engine = make_engine_with_bundle(bundle);
+        engine.config.market_maker.sor_target_qty_source = SorTargetSource::HedgeBudget;
+        // last_hedge_basket starts empty by default.
+        engine.run_sor_dispatch_tick().await;
+        assert_eq!(mock.place_single_calls(), 0);
+    }
+
+    // ---------------------------------------------------------
+    // Epic A stage-2 #2 — trade-rate → queue-wait refresh
+    // ---------------------------------------------------------
+
+    /// A trade event seeds the per-venue estimator.
+    #[test]
+    fn sor_trade_event_feeds_rate_estimator() {
+        let mock = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(mock as Arc<dyn ExchangeConnector>);
+        let mut engine = make_engine_with_bundle(bundle);
+        assert_eq!(engine.sor_trade_rates.len(), 0);
+        let t = synth_trade(dec!(100), dec!(2), mm_common::types::Side::Buy);
+        engine.handle_ws_event(MarketEvent::Trade {
+            venue: VenueId::Binance,
+            trade: t,
+        });
+        assert_eq!(engine.sor_trade_rates.len(), 1);
+        let est = engine.sor_trade_rates.get(&VenueId::Binance).unwrap();
+        assert_eq!(est.sample_count(), 1);
+        assert_eq!(est.total_qty(), dec!(2));
+    }
+
+    /// refresh_sor_queue_wait leaves seeded value in place when
+    /// the estimator hasn't reached MIN_SAMPLES yet.
+    #[test]
+    fn sor_queue_refresh_keeps_seed_before_min_samples() {
+        let mock = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(mock as Arc<dyn ExchangeConnector>);
+        let mut engine = make_engine_with_bundle(bundle);
+        // Seed Binance on the aggregator with a distinctive
+        // queue_wait so we can detect whether it was overwritten.
+        let mut seed = VenueSeed::new("BTCUSDT", sample_product("BTCUSDT"), dec!(1));
+        seed.best_bid = dec!(49_999);
+        seed.best_ask = dec!(50_001);
+        seed.queue_wait_secs = dec!(123);
+        engine = engine.with_sor_venue(VenueId::Binance, seed);
+
+        // One trade — far below MIN_SAMPLES = 5.
+        let t = synth_trade(dec!(100), dec!(1), mm_common::types::Side::Buy);
+        engine.handle_ws_event(MarketEvent::Trade {
+            venue: VenueId::Binance,
+            trade: t,
+        });
+        engine.refresh_sor_queue_wait();
+        let seed_after = engine.sor_aggregator.seed(VenueId::Binance).unwrap();
+        assert_eq!(seed_after.queue_wait_secs, dec!(123),
+            "seed must not be overwritten before MIN_SAMPLES");
+    }
+
+    /// Enough trades → refresh_sor_queue_wait publishes a fresh
+    /// (non-seeded) queue_wait derived from the estimator.
+    #[test]
+    fn sor_queue_refresh_publishes_rate_derived_wait_after_min_samples() {
+        let mock = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(mock as Arc<dyn ExchangeConnector>);
+        let mut engine = make_engine_with_bundle(bundle);
+        let mut seed = VenueSeed::new("BTCUSDT", sample_product("BTCUSDT"), dec!(1));
+        seed.best_bid = dec!(49_999);
+        seed.best_ask = dec!(50_001);
+        seed.queue_wait_secs = dec!(999); // Clearly-wrong seed.
+        engine = engine.with_sor_venue(VenueId::Binance, seed);
+        // Stream 10 trades so the estimator clears its MIN_SAMPLES
+        // threshold (5).
+        for _ in 0..10 {
+            let t = synth_trade(dec!(100), dec!(1), mm_common::types::Side::Buy);
+            engine.handle_ws_event(MarketEvent::Trade {
+                venue: VenueId::Binance,
+                trade: t,
+            });
+        }
+        engine.refresh_sor_queue_wait();
+        let seed_after = engine.sor_aggregator.seed(VenueId::Binance).unwrap();
+        assert_ne!(seed_after.queue_wait_secs, dec!(999),
+            "refresh must replace the seeded value once enough trades arrive");
+        assert!(seed_after.queue_wait_secs > dec!(0));
     }
 }

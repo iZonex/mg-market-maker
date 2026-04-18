@@ -13,6 +13,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::Timelike;
+
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use mm_common::types::{
@@ -20,7 +22,8 @@ use mm_common::types::{
     WalletType,
 };
 use mm_exchange_core::connector::{
-    ExchangeConnector, NewOrder, VenueCapabilities, VenueId, VenueProduct,
+    AccountMarginInfo, ExchangeConnector, FundingRate, FundingRateError, MarginError, MarginMode,
+    NewOrder, PositionMargin, VenueCapabilities, VenueId, VenueProduct,
 };
 use mm_exchange_core::events::MarketEvent;
 use mm_exchange_core::metrics::ORDER_ENTRY_LATENCY;
@@ -143,6 +146,10 @@ impl HyperLiquidConnector {
                 max_order_rate: 100,
                 // Spot has no funding; perp does.
                 supports_funding_rate: !is_spot,
+                // HL perp publishes margin via clearinghouseState;
+                // spot has no margin concept.
+                supports_margin_info: !is_spot,
+                supports_margin_mode: !is_spot,
             },
             asset_map: Arc::new(RwLock::new(HashMap::new())),
             asset_index_to_name: Arc::new(RwLock::new(HashMap::new())),
@@ -432,6 +439,10 @@ impl ExchangeConnector for HyperLiquidConnector {
 
     fn capabilities(&self) -> &VenueCapabilities {
         &self.capabilities
+    }
+
+    fn classify_error(&self, err: &anyhow::Error) -> mm_exchange_core::VenueError {
+        crate::classify(err)
     }
 
     fn product(&self) -> VenueProduct {
@@ -841,6 +852,40 @@ impl ExchangeConnector for HyperLiquidConnector {
         ))
     }
 
+    async fn get_24h_volume_usd(
+        &self,
+        symbol: &str,
+    ) -> anyhow::Result<Option<rust_decimal::Decimal>> {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+        // HL bundles 24h notional volume in `metaAndAssetCtxs`
+        // (perp) / `spotMetaAndAssetCtxs` (spot). The response is
+        // [meta_with_universe, asset_ctxs_parallel_array]; the
+        // asset index matches `meta.universe`. We look up the
+        // index via our cached asset map rather than re-parsing
+        // meta inline.
+        let asset = self.asset_for(symbol).await?;
+        let req_type = if self.is_spot {
+            "spotMetaAndAssetCtxs"
+        } else {
+            "metaAndAssetCtxs"
+        };
+        let resp = self
+            .info_post(serde_json::json!({ "type": req_type }))
+            .await?;
+        let ctxs = resp
+            .as_array()
+            .and_then(|a: &Vec<serde_json::Value>| a.get(1))
+            .and_then(|c: &serde_json::Value| c.as_array());
+        let Some(ctxs) = ctxs else { return Ok(None) };
+        let ctx = ctxs.get(asset.index as usize);
+        let vol = ctx
+            .and_then(|c: &serde_json::Value| c.get("dayNtlVlm"))
+            .and_then(|v: &serde_json::Value| v.as_str())
+            .and_then(|s: &str| Decimal::from_str(s).ok());
+        Ok(vol)
+    }
+
     /// List every asset in the HL universe for **this** connector's
     /// product (perp vs spot). Queries `/info {type: "meta"}` for
     /// perp and `/info {type: "spotMeta"}` for spot, then maps each
@@ -882,6 +927,249 @@ impl ExchangeConnector for HyperLiquidConnector {
     async fn rate_limit_remaining(&self) -> u32 {
         self.rate_limiter.remaining().await
     }
+
+    /// HyperLiquid perp funding rate via
+    /// `POST /info {type:"metaAndAssetCtxs"}` (Epic 40.3). The
+    /// response is a two-element array `[meta, ctxs]` where
+    /// `ctxs[i].funding` is the rate for `meta.universe[i]`
+    /// and the asset index we resolve through `asset_for` is
+    /// the same shared index. Cadence is **hardcoded to 1 h** —
+    /// HL is the outlier (most venues settle 8 h); the API
+    /// does not publish cadence on this endpoint, so we
+    /// consume the protocol-level constant and document it in
+    /// `docs/protocols/hyperliquid.md`. Spot returns
+    /// `NotSupported` before touching the wire.
+    async fn get_funding_rate(&self, symbol: &str) -> Result<FundingRate, FundingRateError> {
+        if self.is_spot {
+            return Err(FundingRateError::NotSupported);
+        }
+        let asset = self
+            .asset_for(symbol)
+            .await
+            .map_err(|e| FundingRateError::Other(anyhow::anyhow!("{e}")))?;
+        let resp = self
+            .info_post(json!({ "type": "metaAndAssetCtxs" }))
+            .await
+            .map_err(|e| FundingRateError::Other(anyhow::anyhow!("{e}")))?;
+        parse_hl_funding_rate(&resp, asset.index as usize).ok_or_else(|| {
+            FundingRateError::Other(anyhow::anyhow!(
+                "no funding rate for {symbol} (index {})",
+                asset.index
+            ))
+        })
+    }
+
+    /// Account margin snapshot via `POST /info
+    /// {type:"clearinghouseState"}` (Epic 40.4). HL exposes
+    /// `marginSummary` (cross-margin totals) and
+    /// `assetPositions[]` with per-position
+    /// `{leverage, liquidationPx, marginUsed, positionValue}`.
+    /// Spot connectors refuse before hitting the wire — HL
+    /// spot has no margin concept.
+    async fn account_margin_info(&self) -> Result<AccountMarginInfo, MarginError> {
+        if self.is_spot {
+            return Err(MarginError::NotSupported);
+        }
+        let resp = self
+            .info_post(json!({
+                "type": "clearinghouseState",
+                "user": self.key.address_hex()
+            }))
+            .await
+            .map_err(MarginError::Other)?;
+        parse_hl_clearinghouse_margin(&resp)
+            .ok_or_else(|| MarginError::Other(anyhow::anyhow!(
+                "malformed HL clearinghouseState response"
+            )))
+    }
+
+    /// Set per-symbol margin mode + leverage via
+    /// `POST /exchange {action: updateLeverage}` (Epic 40.7).
+    /// HL couples the two — updating leverage also toggles
+    /// `isCross`. We keep the two trait calls separate so
+    /// higher-level code can reason about them independently;
+    /// the implementation reads back the current leverage from
+    /// the asset map and passes it through.
+    async fn set_margin_mode(
+        &self,
+        symbol: &str,
+        mode: MarginMode,
+    ) -> Result<(), MarginError> {
+        if self.is_spot {
+            return Err(MarginError::NotSupported);
+        }
+        let asset = self
+            .asset_for(symbol)
+            .await
+            .map_err(MarginError::Other)?;
+        // HL requires a leverage value on every updateLeverage
+        // call. Pick a conservative default (1x) when we don't
+        // know the current setting; the subsequent
+        // `set_leverage` call overrides it.
+        let action = json!({
+            "type": "updateLeverage",
+            "asset": asset.index,
+            "isCross": matches!(mode, MarginMode::Cross),
+            "leverage": 1,
+        });
+        self.exchange_post(&action)
+            .await
+            .map(|_| ())
+            .map_err(MarginError::Other)
+    }
+
+    async fn set_leverage(
+        &self,
+        symbol: &str,
+        leverage: u32,
+    ) -> Result<(), MarginError> {
+        if self.is_spot {
+            return Err(MarginError::NotSupported);
+        }
+        let asset = self
+            .asset_for(symbol)
+            .await
+            .map_err(MarginError::Other)?;
+        // HL's updateLeverage accepts `isCross`; we preserve
+        // the account's current mode by defaulting to `false`
+        // (isolated). Operators setting cross mode should
+        // always call `set_margin_mode(Cross)` *after*
+        // set_leverage so the isCross flag is canonical.
+        let action = json!({
+            "type": "updateLeverage",
+            "asset": asset.index,
+            "isCross": false,
+            "leverage": leverage,
+        });
+        self.exchange_post(&action)
+            .await
+            .map(|_| ())
+            .map_err(MarginError::Other)
+    }
+}
+
+/// Parse a `/info {type: "metaAndAssetCtxs"}` response into a
+/// [`FundingRate`] for the asset at `index` (Epic 40.3). HL's
+/// funding cadence is a protocol constant (1 h) — consumed
+/// verbatim here since the endpoint does not publish it.
+pub(crate) fn parse_hl_funding_rate(resp: &Value, index: usize) -> Option<FundingRate> {
+    // Shape: [ { universe:[…] }, [ { funding:"…", … }, … ] ].
+    let arr = resp.as_array()?;
+    let ctxs = arr.get(1)?.as_array()?;
+    let ctx = ctxs.get(index)?;
+    let rate: Decimal = ctx.get("funding")?.as_str()?.parse().ok()?;
+    // HL settles on the top of every hour UTC. Round `now` up
+    // to the next hour to produce the anchoring timestamp —
+    // the ticker doesn't publish a per-asset next-funding.
+    let now = chrono::Utc::now();
+    let mins = now.minute();
+    let secs = now.second();
+    let offset_secs = 3600 - (mins as i64 * 60 + secs as i64);
+    let next_funding_time = now + chrono::Duration::seconds(offset_secs);
+    Some(FundingRate {
+        rate,
+        next_funding_time,
+        interval: std::time::Duration::from_secs(3600),
+    })
+}
+
+/// Parse a `/info {type: "clearinghouseState"}` response into an
+/// [`AccountMarginInfo`] (Epic 40.4). HL surfaces cross-margin
+/// totals in `marginSummary` plus per-position detail in
+/// `assetPositions[].position`. Liquidation price is published
+/// as `liquidationPx` — we consume it verbatim rather than
+/// recomputing (HL's tiered MMR model is not reimplemented
+/// locally).
+pub(crate) fn parse_hl_clearinghouse_margin(resp: &Value) -> Option<AccountMarginInfo> {
+    let parse_dec = |v: Option<&Value>| -> Decimal {
+        v.and_then(|x| x.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(Decimal::ZERO)
+    };
+    let margin_summary = resp.get("marginSummary")?;
+    let total_equity = parse_dec(margin_summary.get("accountValue"));
+    let total_initial_margin = parse_dec(margin_summary.get("totalMarginUsed"));
+    // `crossMaintenanceMarginUsed` is the aggregate MM for
+    // cross positions. Isolated buckets have their own MM
+    // inside `assetPositions[].position.marginUsed` but HL
+    // reports cross MM separately; we use the cross value as
+    // the floor and add isolated MMs on top only if the wire
+    // shape exposes them — currently HL does not publish a
+    // per-isolated MM, so we approximate MM as
+    // max(crossMM, 0).
+    let total_maintenance_margin = parse_dec(resp.get("crossMaintenanceMarginUsed"));
+    let available_balance = parse_dec(resp.get("withdrawable"));
+    let margin_ratio = if total_equity > Decimal::ZERO {
+        total_maintenance_margin / total_equity
+    } else {
+        Decimal::ONE
+    };
+    let positions = resp
+        .get("assetPositions")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(parse_hl_position_margin).collect())
+        .unwrap_or_default();
+    Some(AccountMarginInfo {
+        total_equity,
+        total_initial_margin,
+        total_maintenance_margin,
+        available_balance,
+        margin_ratio,
+        positions,
+        reported_at_ms: chrono::Utc::now().timestamp_millis(),
+    })
+}
+
+fn parse_hl_position_margin(entry: &Value) -> Option<PositionMargin> {
+    let pos = entry.get("position")?;
+    let parse_dec = |v: Option<&Value>| -> Decimal {
+        v.and_then(|x| x.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(Decimal::ZERO)
+    };
+    let coin = pos.get("coin")?.as_str()?.to_string();
+    // HL publishes `szi` = signed size; sign encodes side, raw
+    // absolute value is the size.
+    let szi_str = pos.get("szi")?.as_str()?;
+    let szi: Decimal = szi_str.parse().ok()?;
+    if szi == Decimal::ZERO {
+        return None;
+    }
+    let side = if szi > Decimal::ZERO {
+        Side::Buy
+    } else {
+        Side::Sell
+    };
+    let entry_price = parse_dec(pos.get("entryPx"));
+    // Mark price is inside marginSummary per-position table
+    // on some HL API versions; fall back to entry if missing.
+    let mark_price = pos
+        .get("markPx")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<Decimal>().ok())
+        .unwrap_or(entry_price);
+    // Isolated buckets expose `marginUsed`; cross positions
+    // have `crossUsage` or leave marginUsed = 0.
+    let isolated_margin = pos
+        .get("marginUsed")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<Decimal>().ok())
+        .filter(|d| *d > Decimal::ZERO);
+    let liq_price = pos
+        .get("liquidationPx")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && *s != "null")
+        .and_then(|s| s.parse::<Decimal>().ok())
+        .filter(|d| *d > Decimal::ZERO);
+    Some(PositionMargin {
+        symbol: coin,
+        side,
+        size: szi.abs(),
+        entry_price,
+        mark_price,
+        isolated_margin,
+        liq_price,
+    })
 }
 
 /// Parse a `/info {type: "meta"}` response (HL perp) into the list
@@ -1301,6 +1589,119 @@ mod tests {
         assert_eq!(cloid.len(), 2 + 32);
         let back = HyperLiquidConnector::cloid_to_uuid(&cloid).unwrap();
         assert_eq!(u, back);
+    }
+
+    /// Epic 40.4 — HL `clearinghouseState` wire shape. Pin
+    /// the decode so a future HL API change fails the test
+    /// instead of silently zeroing the guard's ratio.
+    #[test]
+    fn clearinghouse_margin_parser_extracts_ratio_and_positions() {
+        let resp = serde_json::json!({
+            "withdrawable": "5000",
+            "crossMaintenanceMarginUsed": "500",
+            "marginSummary": {
+                "accountValue": "10000",
+                "totalMarginUsed": "2000",
+                "totalNtlPos": "8000"
+            },
+            "assetPositions": [
+                {
+                    "type": "oneWay",
+                    "position": {
+                        "coin": "ETH",
+                        "szi": "1.5",
+                        "entryPx": "3000",
+                        "markPx": "3050",
+                        "marginUsed": "450",
+                        "liquidationPx": "2800",
+                        "leverage": {"type":"isolated","value":10}
+                    }
+                },
+                {
+                    "type": "oneWay",
+                    "position": {
+                        "coin": "BTC",
+                        "szi": "-0.1",
+                        "entryPx": "50000",
+                        "markPx": "50500",
+                        "marginUsed": "0",
+                        "liquidationPx": "55000",
+                        "leverage": {"type":"cross","value":5}
+                    }
+                },
+                {
+                    "type": "oneWay",
+                    "position": {
+                        "coin": "SOL",
+                        "szi": "0",
+                        "entryPx": "0",
+                        "markPx": "0",
+                        "marginUsed": "0",
+                        "liquidationPx": ""
+                    }
+                }
+            ]
+        });
+        let info = parse_hl_clearinghouse_margin(&resp).unwrap();
+        assert_eq!(info.total_equity, dec!(10000));
+        assert_eq!(info.total_maintenance_margin, dec!(500));
+        assert_eq!(info.margin_ratio, dec!(0.05));
+        // SOL zero-size filtered; ETH + BTC kept.
+        assert_eq!(info.positions.len(), 2);
+        let eth = info.positions.iter().find(|p| p.symbol == "ETH").unwrap();
+        assert_eq!(eth.side, Side::Buy);
+        assert_eq!(eth.size, dec!(1.5));
+        assert_eq!(eth.isolated_margin, Some(dec!(450)));
+        assert_eq!(eth.liq_price, Some(dec!(2800)));
+        let btc = info.positions.iter().find(|p| p.symbol == "BTC").unwrap();
+        assert_eq!(btc.side, Side::Sell);
+        assert_eq!(btc.size, dec!(0.1));
+        // Cross-margin position — no isolated margin surfaced.
+        assert!(btc.isolated_margin.is_none());
+    }
+
+    /// Epic 40.3 — HL `metaAndAssetCtxs` funding wire shape.
+    /// Pins the `[meta, ctxs]` two-element array layout and
+    /// the 1-hour cadence constant.
+    #[test]
+    fn funding_rate_parser_reads_ctx_at_index() {
+        let resp = serde_json::json!([
+            { "universe": [{"name":"BTC"},{"name":"ETH"}] },
+            [
+                { "funding": "0.000125", "markPx": "50000" },
+                { "funding": "-0.00003", "markPx": "3000" }
+            ]
+        ]);
+        let btc = parse_hl_funding_rate(&resp, 0).unwrap();
+        assert_eq!(btc.rate, dec!(0.000125));
+        assert_eq!(btc.interval, std::time::Duration::from_secs(3600));
+        let eth = parse_hl_funding_rate(&resp, 1).unwrap();
+        assert_eq!(eth.rate, dec!(-0.00003));
+    }
+
+    #[test]
+    fn funding_rate_parser_out_of_bounds_returns_none() {
+        let resp = serde_json::json!([
+            { "universe": [{"name":"BTC"}] },
+            [{ "funding": "0.0001" }]
+        ]);
+        assert!(parse_hl_funding_rate(&resp, 99).is_none());
+    }
+
+    #[test]
+    fn clearinghouse_margin_parser_zero_equity_saturates_ratio() {
+        let resp = serde_json::json!({
+            "withdrawable": "0",
+            "crossMaintenanceMarginUsed": "0",
+            "marginSummary": {
+                "accountValue": "0",
+                "totalMarginUsed": "0",
+                "totalNtlPos": "0"
+            },
+            "assetPositions": []
+        });
+        let info = parse_hl_clearinghouse_margin(&resp).unwrap();
+        assert_eq!(info.margin_ratio, Decimal::ONE);
     }
 
     #[test]

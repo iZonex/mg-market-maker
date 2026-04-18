@@ -114,11 +114,42 @@ impl BinanceWsTrader {
         time_in_force: &str,
         client_order_id: Option<&str>,
     ) -> Result<Value> {
+        self.place_limit_order_opts(
+            symbol,
+            side_buy,
+            price,
+            quantity,
+            time_in_force,
+            client_order_id,
+            false,
+        )
+        .await
+    }
+
+    /// Variant that passes `post_only = true` — the caller gets
+    /// a `type=LIMIT_MAKER` order (no `timeInForce`) which the
+    /// venue rejects instead of crossing as a taker.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn place_limit_order_opts(
+        &self,
+        symbol: &str,
+        side_buy: bool,
+        price: &str,
+        quantity: &str,
+        time_in_force: &str,
+        client_order_id: Option<&str>,
+        post_only: bool,
+    ) -> Result<Value> {
         let mut params: BTreeMap<String, String> = BTreeMap::new();
         params.insert("symbol".into(), symbol.into());
         params.insert("side".into(), if side_buy { "BUY" } else { "SELL" }.into());
-        params.insert("type".into(), "LIMIT".into());
-        params.insert("timeInForce".into(), time_in_force.into());
+        if post_only {
+            params.insert("type".into(), "LIMIT_MAKER".into());
+            // LIMIT_MAKER carries no timeInForce — skip the field.
+        } else {
+            params.insert("type".into(), "LIMIT".into());
+            params.insert("timeInForce".into(), time_in_force.into());
+        }
         params.insert("price".into(), price.into());
         params.insert("quantity".into(), quantity.into());
         if let Some(cloid) = client_order_id {

@@ -51,11 +51,27 @@ max_exposure_quote = 1000
 max_drawdown_quote = 100
 ```
 
-Set secrets via environment (NEVER in config files):
+Set secrets via environment (NEVER in config files). Credentials are
+**venue-scoped** — the legacy shared `MM_API_KEY` / `MM_API_SECRET`
+fallback was removed. Export only the pairs for venues you actually
+trade on:
 
 ```bash
-export MM_API_KEY="your-api-key"
-export MM_API_SECRET="your-api-secret"
+# Binance spot + USDT-M futures (one pair for both)
+export MM_BINANCE_API_KEY="your-binance-key"
+export MM_BINANCE_API_SECRET="your-binance-secret"
+
+# Bybit V5
+export MM_BYBIT_API_KEY="your-bybit-key"
+export MM_BYBIT_API_SECRET="your-bybit-secret"
+
+# HyperLiquid (hex private key; address is derived)
+export MM_HL_PRIVATE_KEY="0x..."
+
+# Dashboard session-token HMAC — 32+ random bytes. Rotate to
+# invalidate every outstanding token.
+export MM_AUTH_SECRET="$(openssl rand -base64 48)"
+
 export MM_MODE="paper"   # paper | live | smoke
 ```
 

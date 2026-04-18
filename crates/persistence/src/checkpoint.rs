@@ -616,5 +616,90 @@ mod tests {
 
             let _ = std::fs::remove_file(&path);
         }
+
+        /// Checkpoint::validate() returns no issues on a
+        /// consistent state: zero-inventory symbols or those with
+        /// matching price/volume/fill counts.
+        #[test]
+        fn validate_clean_on_consistent_state(
+            inv_cents in 1i64..1_000_000,
+            price_cents in 1i64..1_000_000_000,
+            vol_cents in 1i64..1_000_000_000,
+            fills in 1u64..1000,
+        ) {
+            let mut cp = Checkpoint::new();
+            cp.symbols.insert("BTCUSDT".into(), SymbolCheckpoint {
+                symbol: "BTCUSDT".into(),
+                inventory: Decimal::new(inv_cents, 4),
+                avg_entry_price: Decimal::new(price_cents, 2),
+                open_order_ids: vec![],
+                realized_pnl: dec!(0),
+                total_volume: Decimal::new(vol_cents, 2),
+                total_fills: fills,
+            });
+            prop_assert!(cp.validate().is_empty(),
+                "clean state flagged: {:?}", cp.validate());
+        }
+
+        /// validate() flags negative avg_entry_price — an
+        /// invariant we rely on to catch bit-flip / migration
+        /// corruption.
+        #[test]
+        fn validate_flags_negative_entry_price(
+            neg_cents in 1i64..1_000_000,
+        ) {
+            let mut cp = Checkpoint::new();
+            cp.symbols.insert("BTCUSDT".into(), SymbolCheckpoint {
+                symbol: "BTCUSDT".into(),
+                inventory: dec!(0),
+                avg_entry_price: -Decimal::new(neg_cents, 2),
+                open_order_ids: vec![],
+                realized_pnl: dec!(0),
+                total_volume: dec!(0),
+                total_fills: 0,
+            });
+            prop_assert!(!cp.validate().is_empty(),
+                "negative entry price not flagged");
+        }
+
+        /// validate() flags non-zero inventory with zero entry
+        /// price — an impossible state that indicates a corrupted
+        /// checkpoint.
+        #[test]
+        fn validate_flags_inventory_without_entry_price(
+            inv_cents in 1i64..1_000_000,
+        ) {
+            let mut cp = Checkpoint::new();
+            cp.symbols.insert("BTCUSDT".into(), SymbolCheckpoint {
+                symbol: "BTCUSDT".into(),
+                inventory: Decimal::new(inv_cents, 4),
+                avg_entry_price: dec!(0),
+                open_order_ids: vec![],
+                realized_pnl: dec!(0),
+                total_volume: dec!(0),
+                total_fills: 0,
+            });
+            prop_assert!(!cp.validate().is_empty(),
+                "inventory without entry price not flagged");
+        }
+
+        /// update_pnl is idempotent on equal inputs and always
+        /// last-write-wins. Catches a regression where the
+        /// manager batches or smooths PnL updates.
+        #[test]
+        fn update_pnl_is_last_write_wins(
+            a_daily in -1_000_000i64..1_000_000,
+            a_total in -1_000_000i64..1_000_000,
+            b_daily in -1_000_000i64..1_000_000,
+            b_total in -1_000_000i64..1_000_000,
+        ) {
+            let path = fresh_path_prop("pnl");
+            let mut mgr = CheckpointManager::new_with_secret(&path, 100, None);
+            mgr.update_pnl(Decimal::new(a_daily, 2), Decimal::new(a_total, 2));
+            mgr.update_pnl(Decimal::new(b_daily, 2), Decimal::new(b_total, 2));
+            prop_assert_eq!(mgr.current().daily_pnl, Decimal::new(b_daily, 2));
+            prop_assert_eq!(mgr.current().total_realized_pnl, Decimal::new(b_total, 2));
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }

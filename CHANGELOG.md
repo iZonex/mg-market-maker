@@ -5,11 +5,218 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.0] — 2026-04-16
+## [Unreleased]
+
+## [0.5.0] - 2026-04-17
+
+Production-hardening release. Closes the April 17 audit findings, lands
+six new epics of deploy-blocker fixes (backend + UI + auth), expands
+proptest coverage by ten epics, and ships a full strategy catalog +
+competitor gap analysis. Workspace tests: **1213 → 1431** (+218),
+`cargo clippy --all-targets -- -D warnings` clean.
 
 ### Added
 
-- **Roadmap v2 complete: 8 epics, 4 phases.**
+#### Strategy & adaptive calibration (Epics 30, 31, 33)
+
+- `PairClass` enum — `MajorSpot / AltSpot / MemeSpot / MajorPerp /
+  AltPerp / StableStable` — with automatic classifier using 24 h volume +
+  symbol heuristics.
+- Per-class config templates (`config/pair_class_templates.toml`) for
+  gamma / kappa / spread / inventory defaults; opt-in via
+  `apply_pair_class_template = true`.
+- `AdaptiveTuner` online feedback controller — rolling fill rate +
+  inventory volatility + adverse-selection drive a bounded γ multiplier
+  in `[gamma_factor_min, gamma_factor_max]`; adjustment reasons surfaced
+  to dashboard (`TightenForFills`, `WidenForInventory`,
+  `WidenForAdverse`, `WidenForNegativeEdge`, `RateLimited`, `Clamped`,
+  `NoOp`).
+- `ExchangeConnector::get_24h_volume(symbol)` trait method on every
+  connector (Binance spot + futures, Bybit, HyperLiquid).
+- Dashboard `AdaptivePanel` — per-symbol class badge, live γ, adaptive
+  state.
+- Hyperopt recalibrate admin flow:
+  - `POST /api/admin/optimize/trigger` — kick off random-search run.
+  - `GET /api/admin/optimize/status` / `/results` / `/pending` — job
+    state.
+  - `POST /api/admin/optimize/apply` / `/discard` — operator sign-off on
+    pending calibrations.
+  - `PendingCalibration` dashboard state — per-symbol results awaiting
+    sign-off.
+
+#### Dashboard UI (Epic 37)
+
+- `StaleBadge.svelte` component — fresh (≤ 2 s green) / stale (≤ 5 s
+  amber) / frozen (> 5 s red pulse) based on `_rx_ms` timestamp stamped
+  on every WS payload.
+- `KillConfirmModal.svelte` — typed-echo confirmation for destructive
+  kill-switch actions (L3 Cancel All, L4 Flatten); operator must type
+  `{symbol} {action}`, then 3 s cooldown with visible countdown, then
+  fire button. Esc cancels; backdrop click cancels.
+- Symbol switcher pills in Header — drive `activeSymbol` state flowing
+  to every panel via `ws.svelte.js` setter.
+- Latency panel placeholder in Header (backend `ORDER_ENTRY_LATENCY`
+  histogram already exported; UI fetch from `/metrics` pending in a
+  follow-up).
+- `tokens.css` — centralised design tokens: backgrounds (`--bg-0` →
+  `--bg-5`), foregrounds (`--fg-primary/secondary/muted/subtle`),
+  semantic (`--pos/--neg/--warn/--critical/--accent`), pair-class
+  colours, 4 pt spacing grid, typography scale, radii.
+- `prefers-reduced-motion` handler tames animations globally.
+- `:focus-visible` default outline on every interactive element.
+
+#### Dashboard auth (Epic 38)
+
+- `POST /api/auth/logout` endpoint — auth-protected, emits
+  `LogoutSucceeded` audit row. Tokens are stateless HMAC so the endpoint
+  is advisory (the client drops the token; the 24 h `exp` is the real
+  bound).
+- `AuditEventType` variants `LoginSucceeded` / `LoginFailed` /
+  `LogoutSucceeded`; login handler now reads `ConnectInfo<SocketAddr>`
+  and records source IP + user_id on success, IP + 6-char key prefix +
+  reason on failure.
+- `AuthState::with_audit(Arc<AuditLog>)` builder — threads the shared
+  audit sink into the auth layer.
+- Operations-guide section "Dashboard Auth & Network Exposure" — HTTPS
+  reverse-proxy requirement, `MM_AUTH_SECRET` rotation procedure, full
+  auth-surface table (path × method × role).
+
+#### Documentation
+
+- `docs/guides/strategy-catalog.md` (1535 lines) — selection matrix by
+  PairClass / inventory posture / market regime, formulas + gotchas for
+  every strategy + signal + modulator, engine pipeline diagram, per-
+  PairClass config recipes, operational troubleshooting.
+- `docs/research/competitor-gap-analysis-apr17.md` — gap assessment vs.
+  Hummingbot, Tribeca, CCXT-pro, prop-desk public discussion; ranked
+  action list.
+- `docs/audits/` — three new audit reports:
+  - `test-coverage-gaps-apr17.md` — 11 H + 10 M + 4 L severity gaps
+    with file:line anchors and effort estimates.
+  - `bottleneck-analysis-apr17.md` — 6 real findings ranked by impact
+    (Portfolio mutex contention = largest).
+  - `live-trading-risk-synthesis-apr17.md` — tier-ranked list of what
+    must be fixed before live, within first 2 weeks live, for full
+    production.
+
+### Changed
+
+- **Binance PostOnly** is now mapped to `LIMIT_MAKER` order type
+  (previously silently fell back to `timeInForce=GTC`, losing post-only
+  semantics). REST fallback + WS trade both honour the `post_only`
+  flag.
+- **Rate limiter** rewritten as continuous-refill token bucket with
+  fractional tokens; `record_used(weight)` for venue-header feedback
+  (`X-MBX-USED-WEIGHT`) snap-to-truth; `pause_for(secs)` for `Retry-
+  After` honouring.
+- **MiCA report HMAC signature** now covers the full `UnsignedReport`
+  (period, strategy description, OTR statistics, risk controls, SLA
+  obligations, generated_at), not just four cherry-picked fields.
+  Tampering any inner field now breaks verification.
+- **Exchange credentials** are venue-scoped. The legacy shared
+  `MM_API_KEY` / `MM_API_SECRET` fallback was removed — set
+  `MM_BINANCE_*`, `MM_BYBIT_*`, `MM_HL_PRIVATE_KEY` pairs for the
+  venues you use.
+- **README / CLAUDE.md / operations.md / configuration-reference.md /
+  quickstart.md** updated — venue-scoped env vars, auth-surface table,
+  new Strategy Catalog link, test count 1213 → 1431, LOC 62 K → 83 K.
+
+### Fixed
+
+- **Clock skew** — every connector now exposes `server_time_ms()`;
+  preflight fails in live mode at drift > 2 s, warns at > 500 ms.
+  Previously the first order could silently 1021-fail in live.
+- **Binance `-2010` classification** — distinguished `PostOnlyCross`
+  from `InsufficientBalance` by matching "immediately match" /
+  "would immediately match" in the message.
+- **WCAG AA contrast** — muted text bumped from `#8b949e` (≈ 4.0:1 on
+  panel bg) to `#a8b1bb` (≈ 4.6:1, AA compliant).
+- **`apply_snapshot` semantics** for Binance `@depth20@100ms`
+  clarified as intentional full-replacement — investigated and
+  confirmed correct per Binance spec (E36.6 closed as not-a-bug;
+  external review was incorrect).
+
+### Security
+
+- **Audit log tamper-evidence** — `AuditEvent.prev_hash` chains every
+  record with SHA-256; the chain is seeded from the last line of an
+  existing file on restart so readers see an unbroken sequence across
+  process boundaries.
+- **Durable critical events** — regulatory-critical events
+  (`OrderFilled`, `KillSwitchEscalated`, `CircuitBreakerTripped`)
+  `flush` + `fsync` before returning. Non-critical events remain
+  buffered for throughput.
+- **Auth credential hardening** — login failures logged with source
+  IP + 6-char key prefix (never the full key); timing-equalisation
+  dummy `verify_token` call on failure; `Authorization: Bearer` +
+  `X-API-Key` header paths (no query-param tokens on HTTP routes).
+- **Constant-time token comparison** — `subtle::ConstantTimeEq` on
+  token signature bytes.
+- **Default `MM_AUTH_SECRET` refused** — warns at startup if the
+  placeholder `change-me-in-production` is used or if the secret is
+  < 32 bytes.
+
+### Test coverage
+
+- **+218 library tests** (1213 → 1431) across 18 crates.
+- Epic 9-18 property-test expansion (`proptest`):
+  - 9: inventory, audit gzip, upload hook.
+  - 10: PnL, checkpoint, BookKeeper.
+  - 11: SLA, market_impact, OTR.
+  - 12: kill_switch, toxicity — fixed VPIN overflow bug.
+  - 13: Kyle Lambda, market_resilience, news_retreat, lead_lag.
+  - 14: portfolio, var_guard, hedge — fixed correlation clamp.
+  - 15: volume_limit, exposure, circuit_breaker, performance.
+  - 16: inventory_drift, borrow, dca.
+  - 17: Avellaneda, GLFT, Grid strategies.
+  - 18: SMA, RSI, Hawkes indicators.
+- Dashboard auth tests (Epic 38): token round-trip + tamper, audit rows
+  for success/failure/logout, audit sink optional.
+
+### Deprecated
+
+- None in 0.5.0. (Legacy shared `MM_API_KEY` / `MM_API_SECRET` fallback
+  was already removed pre-0.5.0; the venue-scoped env vars are the
+  only supported surface.)
+
+### Removed
+
+- None in 0.5.0.
+
+### Migration notes
+
+- **Env vars:** if you still export `MM_API_KEY` / `MM_API_SECRET`,
+  rename them to venue-scoped equivalents
+  (`MM_BINANCE_API_KEY` + `MM_BINANCE_API_SECRET`,
+  `MM_BYBIT_API_KEY` + `MM_BYBIT_API_SECRET`,
+  `MM_HL_PRIVATE_KEY`). Startup will log which venue each key is
+  associated with.
+- **Auth secret:** if you have not set `MM_AUTH_SECRET`, do so now.
+  `openssl rand -base64 48` is a reasonable one-liner. The default
+  placeholder is refused with a warning at startup. Rotating the
+  secret invalidates every outstanding token — use this for operator
+  offboarding.
+- **Binance PostOnly:** no config change needed. If you had a
+  workaround that expected `timeInForce=GTC` on a `PostOnly` intent,
+  the connector now emits `LIMIT_MAKER` and the workaround can be
+  removed.
+- **Audit chain:** new fields (`prev_hash`) are additive; existing
+  audit-log readers that ignore unknown fields remain compatible. A
+  new reader that verifies the chain can be run against an archive
+  going back to the first 0.5.0-written event.
+- **UI:** `confirm()` dialog on kill-switch L3 / L4 is replaced by the
+  typed-echo modal — keyboard-habit "just hit space" no longer
+  dismisses.
+
+---
+
+## [0.4.0] - 2026-04-16
+
+Roadmap v2 complete: 8 epics, 4 phases. Multi-client isolation,
+cross-symbol portfolio risk, cross-venue execution, MiCA compliance
+reporting, disaster recovery, paper-trading parity.
+
+### Added
 
 #### Epic 1: Multi-Client Isolation
 - `ClientConfig` with per-client symbols, SLA targets, webhook URLs, API keys.
@@ -33,7 +240,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `PortfolioVarGuard` — parametric Gaussian VaR on portfolio PnL deltas.
 - Shared `FactorCovarianceEstimator` with `merge_observation()` for auto-registering factors.
 - `correlation_matrix()` for pairwise factor correlations.
-- Background tokio task (30s interval): evaluate risk, broadcast `ConfigOverride::PortfolioRiskMult`.
+- Background tokio task (30 s interval): evaluate risk, broadcast `ConfigOverride::PortfolioRiskMult`.
 - Dashboard: `GET /api/v1/portfolio/risk`, `GET /api/v1/portfolio/correlation`.
 
 #### Epic 4: Cross-Venue Execution
@@ -88,11 +295,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Stats
 
 - 1128 → 1213 tests (+85)
-- ~55K → ~62K LoC (+7K)
+- ~55 K → ~62 K LoC (+7 K)
 - 19 new files, ~40 modified files
 - Zero clippy warnings
 
-## [Unreleased]
+---
+
+## [Unreleased — pre-0.5.0 catch-up]
+
+> These entries were authored under `[Unreleased]` prior to the
+> 0.5.0 cut. Kept below as reference for anyone reconstructing the
+> history; not re-released.
 
 ### Added
 
@@ -1562,7 +1775,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     through the synthetic runner only; the full
     `MarketMakerEngine` end-to-end drive is deferred).
 
-## [0.4.0] - 2026-04-15
+## [0.3.2] - 2026-04-15
 
 **Production-spot-MM gap closure epic.** Closes the eight-item
 ROADMAP audit from April 2026 against how production prop desks
@@ -3058,3 +3271,13 @@ across symbols.
 - Strategy benchmarks (criterion.rs)
 - MIT license
 - Full documentation (README, CONTRIBUTING, SECURITY, CODE_OF_CONDUCT, docs/)
+
+---
+
+[Unreleased]: https://github.com/iZonex/mg-market-maker/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/iZonex/mg-market-maker/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/iZonex/mg-market-maker/compare/v0.3.2...v0.4.0
+[0.3.2]: https://github.com/iZonex/mg-market-maker/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/iZonex/mg-market-maker/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/iZonex/mg-market-maker/compare/v0.1.0...v0.3.0
+[0.1.0]: https://github.com/iZonex/mg-market-maker/releases/tag/v0.1.0

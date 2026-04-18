@@ -1,0 +1,25 @@
+# AltPerp template — mid-cap perpetual. Slightly more γ than
+# MajorPerp (thinner depth) but κ stays moderate because perp
+# flow is typically deeper than the underlying spot.
+
+[market_maker]
+gamma = "0.20"
+kappa = "5.0"
+sigma = "0.00015"
+time_horizon_secs = 300
+num_levels = 3
+refresh_interval_ms = 500
+min_spread_bps = "10"
+max_distance_bps = "120"
+momentum_enabled = true
+momentum_window = 200
+market_resilience_enabled = true
+hma_enabled = true
+
+[risk]
+max_spread_bps = "200"
+stale_book_timeout_secs = 10
+
+[toxicity]
+vpin_threshold = "0.75"
+kyle_window = 100

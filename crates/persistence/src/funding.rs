@@ -73,7 +73,8 @@ pub struct FundingArbEngine {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FundingArbConfig {
-    /// Minimum funding rate to enter (annualized %).
+    /// Minimum funding rate to enter (annualized %). Baseline
+    /// threshold applied when a symbol has no explicit override.
     pub min_rate_annual_pct: Decimal,
     /// Maximum position size in base asset.
     pub max_position: Decimal,
@@ -81,15 +82,61 @@ pub struct FundingArbConfig {
     pub max_basis_bps: Decimal,
     /// Enable the strategy.
     pub enabled: bool,
+    /// Epic 40.5 — per-pair threshold overrides. Key is the
+    /// primary symbol (`"BTCUSDT"`, `"ETHUSDT"`, …); value is the
+    /// minimum annualised funding rate (%) required to enter on
+    /// that specific pair. Rationale: majors (BTC/ETH) run tight
+    /// funding; 10% APR is unrealistic and would never fire.
+    /// Alts funding can spike to 100%+ APR, so a flat 10% floor
+    /// under-filters them. Operators calibrate per pair from
+    /// historical distributions.
+    ///
+    /// Example config:
+    /// ```toml
+    /// [funding_arb.per_pair_min_rate_annual_pct]
+    /// BTCUSDT = 5
+    /// ETHUSDT = 5
+    /// SOLUSDT = 15
+    /// DOGEUSDT = 25
+    /// ```
+    #[serde(default)]
+    pub per_pair_min_rate_annual_pct:
+        std::collections::HashMap<String, Decimal>,
+    /// Epic 40.5 — estimated cross-venue transfer latency cost,
+    /// in bps. Subtracted from the expected carry when the
+    /// strategy evaluates entry profitability on a symbol that
+    /// requires moving collateral between venues. Conservative
+    /// default is 8 bps (≈ 3-day transfer × 10% APR borrow cost,
+    /// per Amberdata funding-arb guide).
+    #[serde(default = "default_transfer_latency_cost_bps")]
+    pub transfer_latency_cost_bps: Decimal,
+}
+
+fn default_transfer_latency_cost_bps() -> Decimal {
+    dec!(8)
+}
+
+impl FundingArbConfig {
+    /// Resolve the entry threshold for a specific symbol. Falls
+    /// back to the baseline `min_rate_annual_pct` when no
+    /// per-pair override is configured.
+    pub fn threshold_for(&self, symbol: &str) -> Decimal {
+        self.per_pair_min_rate_annual_pct
+            .get(symbol)
+            .copied()
+            .unwrap_or(self.min_rate_annual_pct)
+    }
 }
 
 impl Default for FundingArbConfig {
     fn default() -> Self {
         Self {
-            min_rate_annual_pct: dec!(10), // 10% APR minimum.
-            max_position: dec!(0.1),       // 0.1 BTC max.
-            max_basis_bps: dec!(50),       // 50 bps max basis deviation.
-            enabled: false,                // Off by default.
+            min_rate_annual_pct: dec!(10), // 10% APR baseline
+            max_position: dec!(0.1),       // 0.1 BTC max
+            max_basis_bps: dec!(50),       // 50 bps max basis
+            enabled: false,                // Off by default
+            per_pair_min_rate_annual_pct: std::collections::HashMap::new(),
+            transfer_latency_cost_bps: default_transfer_latency_cost_bps(),
         }
     }
 }
@@ -281,6 +328,7 @@ mod tests {
             max_position: dec!(0.1),
             max_basis_bps: dec!(50),
             enabled: true,
+            ..Default::default()
         };
         let mut engine = FundingArbEngine::new("BTCUSDT", config);
 
@@ -299,11 +347,161 @@ mod tests {
             max_position: dec!(0.1),
             max_basis_bps: dec!(50),
             enabled: true,
+            ..Default::default()
         };
         let mut engine = FundingArbEngine::new("BTCUSDT", config);
 
         // 0.001% per 8h ≈ 1.095% APR → too low.
         let signal = engine.evaluate(dec!(0.00001), dec!(50000), dec!(50001));
         assert!(matches!(signal, FundingSignal::Hold));
+    }
+
+    // ── Property-based tests (Epic 20) ────────────────────────
+
+    use proptest::prelude::*;
+
+    fn mk_config(min_pct: Decimal) -> FundingArbConfig {
+        FundingArbConfig {
+            min_rate_annual_pct: min_pct,
+            max_position: dec!(0.1),
+            max_basis_bps: dec!(50),
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    proptest! {
+        /// When disabled, every evaluation returns Hold regardless
+        /// of inputs. Catches a regression where enable-flag fails
+        /// to short-circuit.
+        #[test]
+        fn disabled_engine_always_holds(
+            rate_raw in -100i64..100,
+            spot_raw in 10_000i64..100_000,
+            perp_raw in 10_000i64..100_000,
+        ) {
+            let cfg = FundingArbConfig { enabled: false, ..FundingArbConfig::default() };
+            let mut e = FundingArbEngine::new("BTCUSDT", cfg);
+            let rate = Decimal::new(rate_raw, 5);
+            let spot = Decimal::new(spot_raw, 0);
+            let perp = Decimal::new(perp_raw, 0);
+            let sig = e.evaluate(rate, spot, perp);
+            prop_assert!(matches!(sig, FundingSignal::Hold));
+        }
+
+        /// Entry side selection: positive funding rate → long spot +
+        /// short perp. Negative → sell spot + long perp. Invariant
+        /// the strategy's P&L hinges on.
+        #[test]
+        fn entry_side_matches_funding_sign(
+            rate_raw in 1i64..1000,  // non-zero rate magnitude
+            positive in any::<bool>(),
+        ) {
+            let cfg = mk_config(dec!(5));
+            let mut e = FundingArbEngine::new("BTCUSDT", cfg);
+            // Build rate that annualizes above threshold.
+            let magnitude = Decimal::new(rate_raw, 4); // 0.0001..=0.1
+            let rate = if positive { magnitude } else { -magnitude };
+            let sig = e.evaluate(rate, dec!(50_000), dec!(50_010));
+            match sig {
+                FundingSignal::Enter { spot_side, perp_side, .. } => {
+                    if positive {
+                        prop_assert!(matches!(spot_side, SpotAction::Buy));
+                        prop_assert!(matches!(perp_side, PerpAction::Short));
+                    } else {
+                        prop_assert!(matches!(spot_side, SpotAction::Sell));
+                        prop_assert!(matches!(perp_side, PerpAction::Long));
+                    }
+                }
+                FundingSignal::Hold => {
+                    // Below threshold — acceptable.
+                }
+                FundingSignal::Exit { .. } => prop_assert!(false, "fresh engine should not exit"),
+            }
+        }
+
+        /// Fills accumulate: apply_spot_fill(a) + apply_spot_fill(b)
+        /// equals one fill of (a+b). net_delta stays the sum of legs.
+        #[test]
+        fn fills_accumulate_additively(
+            spot_fills in proptest::collection::vec(-100i64..100, 1..20),
+            perp_fills in proptest::collection::vec(-100i64..100, 1..20),
+        ) {
+            let mut e = FundingArbEngine::new("BTCUSDT", FundingArbConfig::default());
+            let mut spot_sum = dec!(0);
+            let mut perp_sum = dec!(0);
+            for s in &spot_fills {
+                let q = Decimal::new(*s, 2);
+                e.apply_spot_fill(q);
+                spot_sum += q;
+            }
+            for p in &perp_fills {
+                let q = Decimal::new(*p, 2);
+                e.apply_perp_fill(q);
+                perp_sum += q;
+            }
+            prop_assert_eq!(e.state().spot_position, spot_sum);
+            prop_assert_eq!(e.state().perp_position, perp_sum);
+            prop_assert_eq!(e.state().net_delta, spot_sum + perp_sum);
+        }
+
+        /// total_pnl = accumulated_funding + basis_pnl. Simple
+        /// algebraic invariant; catches a refactor that drops a term.
+        #[test]
+        fn total_pnl_sum_invariant(
+            funding_raw in -1_000_000i64..1_000_000,
+            basis_raw in -1_000_000i64..1_000_000,
+        ) {
+            let mut s = FundingArbState::new("BTCUSDT");
+            s.accumulated_funding = Decimal::new(funding_raw, 2);
+            s.basis_pnl = Decimal::new(basis_raw, 2);
+            prop_assert_eq!(s.total_pnl(), s.accumulated_funding + s.basis_pnl);
+        }
+
+        /// on_funding_payment: cumulative sum equals individual
+        /// payments; period count equals call count.
+        #[test]
+        fn funding_payments_accumulate(
+            payments in proptest::collection::vec(-1_000_000i64..1_000_000, 0..30),
+        ) {
+            let mut e = FundingArbEngine::new("BTCUSDT", FundingArbConfig::default());
+            let mut expected_total = dec!(0);
+            for p in &payments {
+                let d = Decimal::new(*p, 2);
+                e.on_funding_payment(d);
+                expected_total += d;
+            }
+            prop_assert_eq!(e.state().accumulated_funding, expected_total);
+            prop_assert_eq!(e.state().funding_periods, payments.len() as u64);
+        }
+
+        /// on_exit flattens all positions. Regardless of prior state
+        /// spot/perp/net_delta land at zero.
+        #[test]
+        fn on_exit_flattens_positions(
+            spot in -1_000_000i64..1_000_000,
+            perp in -1_000_000i64..1_000_000,
+        ) {
+            let mut e = FundingArbEngine::new("BTCUSDT", FundingArbConfig::default());
+            e.apply_spot_fill(Decimal::new(spot, 2));
+            e.apply_perp_fill(Decimal::new(perp, 2));
+            e.on_exit();
+            prop_assert_eq!(e.state().spot_position, dec!(0));
+            prop_assert_eq!(e.state().perp_position, dec!(0));
+            prop_assert_eq!(e.state().net_delta, dec!(0));
+        }
+
+        /// is_open() iff at least one leg is non-zero.
+        #[test]
+        fn is_open_matches_any_nonzero_leg(
+            spot in -100i64..100,
+            perp in -100i64..100,
+        ) {
+            let mut s = FundingArbState::new("BTCUSDT");
+            s.spot_position = Decimal::new(spot, 2);
+            s.perp_position = Decimal::new(perp, 2);
+            let expected = !s.spot_position.is_zero() || !s.perp_position.is_zero();
+            prop_assert_eq!(s.is_open(), expected);
+        }
     }
 }

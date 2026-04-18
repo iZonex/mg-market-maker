@@ -84,7 +84,15 @@ impl Strategy for CrossExchangeStrategy {
             _ => return vec![],
         };
         let min_profit = bps_to_frac(self.min_profit_bps) * hedge_mid;
-        let total_fees = self.hedge_taker_fee + self.maker_fee.abs();
+        // Fee accounting with rebate support (Epic 40.2). `maker_fee`
+        // is signed: positive = we pay, negative = venue pays us.
+        // A rebate must REDUCE total_fees, not increase it — the old
+        // `.abs()` treated every rebate as a cost, which eroded the
+        // profit floor by 2× the rebate magnitude. On Binance spot
+        // MM-program (−0.5 bps rebate) that was a 1 bps/side error,
+        // enough to flip a profitable quote into a loss on thin
+        // spread targets.
+        let total_fees = self.hedge_taker_fee + self.maker_fee;
         let fee_cost = total_fees * hedge_mid;
 
         // Our ask must be high enough that: our_ask - hedge_ask - fees > min_profit.
@@ -215,10 +223,14 @@ mod tests {
             market_resilience_enabled: true,
             otr_enabled: true,
             hma_enabled: true,
+            adaptive_enabled: false,
+            apply_pair_class_template: false,
             hma_window: 9,
             momentum_ofi_enabled: false,
             momentum_learned_microprice_path: None,
             momentum_learned_microprice_pair_paths: std::collections::HashMap::new(),
+            momentum_learned_microprice_online: false,
+            momentum_learned_microprice_horizon: 10,
             user_stream_enabled: true,
             inventory_drift_tolerance: dec!(0.0001),
             inventory_drift_auto_correct: false,
@@ -241,6 +253,12 @@ mod tests {
             cross_exchange_min_profit_bps: dec!(5),
             max_cross_venue_divergence_pct: None,
             sor_inline_enabled: false,
+            sor_dispatch_interval_secs: 5,
+            sor_urgency: rust_decimal_macros::dec!(0.4),
+            sor_target_qty_source: mm_common::config::SorTargetSource::InventoryExcess,
+            sor_inventory_threshold: rust_decimal::Decimal::ZERO,
+            sor_trade_rate_window_secs: 60,
+            sor_queue_refresh_secs: 2,
         };
         let mut book = LocalOrderBook::new("BTCUSDT".into());
         book.apply_snapshot(
@@ -328,10 +346,14 @@ mod tests {
             market_resilience_enabled: true,
             otr_enabled: true,
             hma_enabled: true,
+            adaptive_enabled: false,
+            apply_pair_class_template: false,
             hma_window: 9,
             momentum_ofi_enabled: false,
             momentum_learned_microprice_path: None,
             momentum_learned_microprice_pair_paths: std::collections::HashMap::new(),
+            momentum_learned_microprice_online: false,
+            momentum_learned_microprice_horizon: 10,
             user_stream_enabled: true,
             inventory_drift_tolerance: dec!(0.0001),
             inventory_drift_auto_correct: false,
@@ -354,6 +376,12 @@ mod tests {
             cross_exchange_min_profit_bps: dec!(5),
             max_cross_venue_divergence_pct: None,
             sor_inline_enabled: false,
+            sor_dispatch_interval_secs: 5,
+            sor_urgency: rust_decimal_macros::dec!(0.4),
+            sor_target_qty_source: mm_common::config::SorTargetSource::InventoryExcess,
+            sor_inventory_threshold: rust_decimal::Decimal::ZERO,
+            sor_trade_rate_window_secs: 60,
+            sor_queue_refresh_secs: 2,
         };
         let mut book = LocalOrderBook::new("BTCUSDT".into());
         book.apply_snapshot(

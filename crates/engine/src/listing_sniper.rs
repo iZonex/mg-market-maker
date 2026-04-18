@@ -195,6 +195,32 @@ pub struct ListingSniperRunner {
     alerts: Option<mm_dashboard::alerts::AlertManager>,
     scan_interval: std::time::Duration,
     alert_on_discovery: bool,
+    /// Epic F stage-3 — real entry policy. `None` keeps the
+    /// runner in observer-only mode (audit + alert, no
+    /// orders).
+    entry_cfg: Option<mm_common::config::ListingSniperEntryConfig>,
+    /// Epic F stage-3 — pending entries awaiting the
+    /// quarantine window to expire. Keyed by `(venue,
+    /// symbol)`. Populated on every `Discovered` event;
+    /// drained on every scan tick by `try_execute_pending`.
+    pending_entries: std::collections::HashMap<
+        (mm_exchange_core::connector::VenueId, String),
+        PendingEntry,
+    >,
+    /// Epic F stage-3 — active entries counter. Incremented
+    /// when `try_execute_pending` places a real IOC; never
+    /// decremented automatically (sniper does not track
+    /// fills). Operators reset on restart. Caps at
+    /// `entry_cfg.max_active_entries`.
+    active_entries: u32,
+}
+
+/// Epic F stage-3 — one quarantined listing waiting to fire
+/// its entry IOC.
+#[derive(Debug, Clone)]
+struct PendingEntry {
+    first_seen: std::time::Instant,
+    spec: ProductSpec,
 }
 
 impl ListingSniperRunner {
@@ -212,7 +238,22 @@ impl ListingSniperRunner {
             alerts,
             scan_interval: std::time::Duration::from_secs(scan_interval_secs),
             alert_on_discovery,
+            entry_cfg: None,
+            pending_entries: std::collections::HashMap::new(),
+            active_entries: 0,
         }
+    }
+
+    /// Builder-style attachment of the Epic F stage-3 real-
+    /// entry policy. Without this call the runner stays in
+    /// observer-only mode (byte-identical to pre-stage-3
+    /// behaviour).
+    pub fn with_entry_policy(
+        mut self,
+        cfg: mm_common::config::ListingSniperEntryConfig,
+    ) -> Self {
+        self.entry_cfg = Some(cfg);
+        self
     }
 
     /// Run the scan loop until the shutdown signal fires.
@@ -233,6 +274,12 @@ impl ListingSniperRunner {
                 }
                 _ = interval.tick() => {
                     self.scan_all_venues().await;
+                    // Epic F stage-3 — fire any pending
+                    // entries that cleared the quarantine
+                    // window on this tick.
+                    if self.entry_cfg.is_some() {
+                        self.try_execute_pending().await;
+                    }
                 }
             }
         }
@@ -273,6 +320,23 @@ impl ListingSniperRunner {
                                         );
                                     }
                                 }
+                                // Epic F stage-3 — stash in
+                                // the pending queue so the
+                                // next scan(s) can fire an
+                                // entry once the quarantine
+                                // window expires. Only when
+                                // `entry_cfg` is set —
+                                // observer-only runs skip
+                                // this branch.
+                                if self.entry_cfg.is_some() {
+                                    self.pending_entries.insert(
+                                        (*venue, symbol.clone()),
+                                        PendingEntry {
+                                            first_seen: std::time::Instant::now(),
+                                            spec: spec.clone(),
+                                        },
+                                    );
+                                }
                             }
                             ListingEvent::Removed { venue, symbol } => {
                                 let detail = format!("venue={venue:?} symbol={symbol}");
@@ -292,12 +356,148 @@ impl ListingSniperRunner {
                                         );
                                     }
                                 }
+                                // Drop matching pending
+                                // entry — the venue decided
+                                // this listing is gone, we
+                                // should not snipe it.
+                                self.pending_entries.remove(&(*venue, symbol.clone()));
                             }
                         }
                     }
                 }
                 Err(e) => {
                     debug!(venue = ?venue, error = %e, "listing sniper scan failed (venue may not support list_symbols)");
+                }
+            }
+        }
+    }
+
+    /// Epic F stage-3 — walk the pending-entries queue and
+    /// fire IOC BUYs for every symbol that has cleared the
+    /// quarantine window. Respects `max_active_entries`,
+    /// `require_trading_status`, `max_notional_usd`.
+    /// Rejections are audited with a reason so
+    /// post-mortems can reconstruct the decision.
+    async fn try_execute_pending(&mut self) {
+        use mm_common::types::{OrderType, Side, TimeInForce, TradingStatus};
+        use mm_exchange_core::connector::NewOrder;
+        use mm_risk::audit::AuditEventType;
+        use rust_decimal::Decimal;
+        use tracing::{info, warn};
+
+        let Some(cfg) = self.entry_cfg.clone() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let quarantine = std::time::Duration::from_secs(cfg.quarantine_secs);
+        let ready: Vec<(mm_exchange_core::connector::VenueId, String, PendingEntry)> = self
+            .pending_entries
+            .iter()
+            .filter(|(_, pe)| now.saturating_duration_since(pe.first_seen) >= quarantine)
+            .map(|((v, s), pe)| (*v, s.clone(), pe.clone()))
+            .collect();
+        if ready.is_empty() {
+            return;
+        }
+
+        for (venue, symbol, pe) in ready {
+            // Always pop from pending so a failed attempt
+            // doesn't retry forever. Ops can monitor the
+            // audit `ListingEntryRejected` and re-trigger
+            // manually.
+            self.pending_entries.remove(&(venue, symbol.clone()));
+
+            let audit_symbol = symbol.clone();
+            let reject = |reason: &str| {
+                let detail = format!("venue={venue:?} symbol={symbol} reason={reason}");
+                warn!(%detail, "listing sniper entry rejected");
+                self.audit.risk_event(
+                    &audit_symbol,
+                    AuditEventType::ListingEntryRejected,
+                    &detail,
+                );
+            };
+
+            // Guard 1: master switch.
+            if !cfg.enter_on_discovery {
+                reject("disabled");
+                continue;
+            }
+            // Guard 2: status gate.
+            if cfg.require_trading_status && pe.spec.trading_status != TradingStatus::Trading {
+                reject(&format!("status={:?}", pe.spec.trading_status));
+                continue;
+            }
+            // Guard 3: active cap.
+            if self.active_entries >= cfg.max_active_entries {
+                reject("max_active");
+                continue;
+            }
+            // Guard 4: resolve connector + top-of-book.
+            let Some(connector) = self.connectors.iter().find(|c| c.venue_id() == venue) else {
+                reject("no_connector");
+                continue;
+            };
+            let book = match connector.get_orderbook(&symbol, 1).await {
+                Ok(b) => b,
+                Err(e) => {
+                    reject(&format!("book_err({e})"));
+                    continue;
+                }
+            };
+            let Some(ask_level) = book.1.first() else {
+                reject("no_book");
+                continue;
+            };
+            let ask = ask_level.price;
+            if ask <= Decimal::ZERO {
+                reject("zero_ask");
+                continue;
+            }
+            // Guard 5: qty sizing + min-notional.
+            let raw_qty = cfg.max_notional_usd / ask;
+            let qty = pe.spec.round_qty(raw_qty);
+            if qty <= Decimal::ZERO {
+                reject("zero_qty");
+                continue;
+            }
+            let notional = qty * ask;
+            if notional < pe.spec.min_notional {
+                reject(&format!(
+                    "below_min_notional(notional={notional}, min={})",
+                    pe.spec.min_notional
+                ));
+                continue;
+            }
+            // Fire an IOC BUY. Use pessimistic price =
+            // ask × 1.001 (10 bps slippage tolerance) so
+            // the IOC still clears a thin book moving one
+            // tick between snapshot and send.
+            let limit = pe.spec.round_price(ask + ask / Decimal::from(1_000u32));
+            let order = NewOrder {
+                symbol: symbol.clone(),
+                side: Side::Buy,
+                order_type: OrderType::Limit,
+                price: Some(limit),
+                qty,
+                time_in_force: Some(TimeInForce::Ioc),
+                client_order_id: Some(uuid::Uuid::new_v4().to_string()),
+            };
+            match connector.place_order(&order).await {
+                Ok(_) => {
+                    self.active_entries = self.active_entries.saturating_add(1);
+                    let detail = format!(
+                        "venue={venue:?} symbol={symbol} qty={qty} price={limit} notional={notional}"
+                    );
+                    info!(%detail, "listing sniper entry placed");
+                    self.audit.risk_event(
+                        &audit_symbol,
+                        AuditEventType::ListingEntered,
+                        &detail,
+                    );
+                }
+                Err(e) => {
+                    reject(&format!("place_err({e})"));
                 }
             }
         }

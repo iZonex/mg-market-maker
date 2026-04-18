@@ -490,6 +490,23 @@ pub struct AutoTuner {
     /// `NewsRetreatStateMachine::current_multiplier()` on
     /// every state-machine read.
     news_retreat_mult: Decimal,
+    /// Product-specific widening multiplier (Epic 40.8). Perp
+    /// order flow is measurably more informed than spot — VPIN /
+    /// Kyle's λ run 1.3–1.5× hotter on the same book depth.
+    /// Default `1.0` (spot); engine sets ~`1.4` on perp so the
+    /// toxicity response keeps us out of informed-flow fills.
+    product_widen_mult: Decimal,
+    /// Epic G — spread-widen multiplier from the
+    /// `SocialRiskEngine`'s fused sentiment + market signal.
+    /// Clamped at `1.0` on the low side (never narrow),
+    /// capped at `max_vol_multiplier` (default 3.0) on the
+    /// high side inside the risk engine itself.
+    social_spread_mult: Decimal,
+    /// Epic G — size-shrink multiplier from the
+    /// `SocialRiskEngine`. Unlike widening, this CAN be
+    /// below 1.0 (it SHRINKS quotes under crowd spikes).
+    /// Floored at `min_size_multiplier` by the risk engine.
+    social_size_mult: Decimal,
 }
 
 impl AutoTuner {
@@ -503,7 +520,19 @@ impl AutoTuner {
             market_resilience: None,
             lead_lag_mult: dec!(1),
             news_retreat_mult: dec!(1),
+            product_widen_mult: dec!(1),
+            social_spread_mult: dec!(1),
+            social_size_mult: dec!(1),
         }
+    }
+
+    /// Set the product-specific toxicity-widen multiplier. Pass
+    /// `1.0` for spot (default), `1.4` for perp per Epic-40.8
+    /// research (informed-flow density ≈ 1.3–1.5× higher on perp
+    /// than spot for the same book depth). Engine calls this
+    /// once at startup based on `SymbolConfig::product`.
+    pub fn set_product_widen_mult(&mut self, mult: Decimal) {
+        self.product_widen_mult = mult.max(dec!(1.0));
     }
 
     /// Attach a closed-form inventory/time γ policy. Returns
@@ -548,13 +577,18 @@ impl AutoTuner {
         }
     }
 
-    /// Get effective size multiplier.
+    /// Get effective size multiplier. Regime × toxicity-
+    /// derived shrink × social-risk shrink. The social layer
+    /// is multiplicative with the existing toxicity path so
+    /// a simultaneously toxic + socially-spiked market
+    /// compounds the size cut (exactly the desired
+    /// "tighten-up" behaviour from Epic G).
     pub fn effective_size_mult(&self) -> Decimal {
         let regime_params = RegimeParams::for_regime(self.regime_detector.regime());
         // Reduce size when toxic.
         let toxicity_size = dec!(2) - self.toxicity_spread_mult; // [1, -1] → invert
         let toxicity_size = toxicity_size.max(dec!(0.2)); // Floor at 0.2x.
-        regime_params.size_mult * toxicity_size
+        regime_params.size_mult * toxicity_size * self.social_size_mult
     }
 
     /// Set the latest Market Resilience score. Values outside
@@ -603,11 +637,37 @@ impl AutoTuner {
         self.news_retreat_mult
     }
 
+    /// Epic G — push the spread widening coming out of the
+    /// `SocialRiskEngine`. Floor at 1.0 (same invariant as
+    /// lead-lag / news-retreat: external multipliers can
+    /// only WIDEN).
+    pub fn set_social_spread_mult(&mut self, mult: Decimal) {
+        self.social_spread_mult = mult.max(Decimal::ONE);
+    }
+
+    /// Read the cached social-risk spread multiplier.
+    pub fn social_spread_mult(&self) -> Decimal {
+        self.social_spread_mult
+    }
+
+    /// Epic G — push the size-shrink coming out of the
+    /// `SocialRiskEngine`. Clamped to `(0, 1]`: social can
+    /// only SHRINK quotes, never grow them past baseline.
+    pub fn set_social_size_mult(&mut self, mult: Decimal) {
+        self.social_size_mult = mult.max(dec!(0.1)).min(dec!(1));
+    }
+
+    /// Read the cached social-risk size multiplier.
+    pub fn social_size_mult(&self) -> Decimal {
+        self.social_size_mult
+    }
+
     /// Get effective spread multiplier. The product is:
-    /// `regime · toxicity · (1 / max(mr, 0.2)) · lead_lag · news_retreat`.
-    /// When `lead_lag` and `news_retreat` are at their
-    /// defaults (`1.0`) the formula is byte-identical to the
-    /// pre-Epic-F shape.
+    /// `regime · toxicity · (1 / max(mr, 0.2)) · lead_lag · news_retreat · product`.
+    /// When `lead_lag`, `news_retreat`, and `product` are at
+    /// their defaults (`1.0`) the formula is byte-identical to
+    /// the pre-Epic-F shape. `product` applies on perp only
+    /// (Epic 40.8).
     pub fn effective_spread_mult(&self) -> Decimal {
         let regime_params = RegimeParams::for_regime(self.regime_detector.regime());
         let base = regime_params.spread_mult * self.toxicity_spread_mult;
@@ -617,7 +677,11 @@ impl AutoTuner {
         } else {
             base
         };
-        with_mr * self.lead_lag_mult * self.news_retreat_mult
+        with_mr
+            * self.lead_lag_mult
+            * self.news_retreat_mult
+            * self.product_widen_mult
+            * self.social_spread_mult
     }
 
     /// Get effective refresh interval multiplier.

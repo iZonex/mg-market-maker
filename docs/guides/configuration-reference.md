@@ -4,16 +4,25 @@ All config via TOML file (`config/default.toml` or `MM_CONFIG` env). Secrets via
 
 ## Environment Variables
 
+Exchange credentials are **venue-scoped**. The legacy shared
+`MM_API_KEY` / `MM_API_SECRET` fallback was removed — set only the
+pair(s) for venues you actually trade on.
+
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `MM_API_KEY` | Yes | Exchange API key |
-| `MM_API_SECRET` | Yes | Exchange API secret |
-| `MM_MODE` | No | `live` (default), `paper`, `smoke` |
+| `MM_BINANCE_API_KEY` | Per-venue | Binance spot + futures API key |
+| `MM_BINANCE_API_SECRET` | Per-venue | Binance HMAC secret |
+| `MM_BYBIT_API_KEY` | Per-venue | Bybit V5 API key |
+| `MM_BYBIT_API_SECRET` | Per-venue | Bybit V5 secret |
+| `MM_HL_PRIVATE_KEY` | Per-venue | HyperLiquid 32-byte hex secp256k1 (address is derived) |
+| `MM_MODE` | No | `live`, `paper` (default), `smoke` |
 | `MM_CONFIG` | No | Config file path (default: `config/default.toml`) |
 | `MM_TELEGRAM_TOKEN` | No | Telegram bot token for alerts |
 | `MM_TELEGRAM_CHAT` | No | Telegram chat ID |
-| `MM_ADMIN_KEY` | No | Default admin API key |
-| `MM_AUTH_SECRET` | No | HMAC secret for API tokens |
+| `MM_ADMIN_KEY` | No | Default admin API key (prefer `[[users]]` in config) |
+| `MM_AUTH_SECRET` | **Yes for dashboard** | 32+ random bytes, HMAC secret for session tokens. Default placeholder warns at startup. Rotate on operator offboarding — it invalidates every outstanding token. |
+| `MM_SENTRY_DSN` | No | Sentry DSN; when set, errors stream to Sentry with release + env tags |
+| `MM_AUDIT_ARCHIVE_CMD` | No | Post-rotation archival shell command (`{file}` = absolute path to gzipped log) |
 
 ## [exchange]
 
@@ -22,8 +31,8 @@ All config via TOML file (`config/default.toml` or `MM_CONFIG` env). Secrets via
 | `exchange_type` | string | `"custom"` | `custom`, `binance`, `binance_testnet`, `bybit`, `bybit_testnet`, `hyper_liquid`, `hyper_liquid_testnet` |
 | `rest_url` | string | — | REST API base URL (ignored for HyperLiquid) |
 | `ws_url` | string | — | WebSocket URL (ignored for HyperLiquid) |
-| `api_key` | string | — | Override (prefer `MM_API_KEY` env) |
-| `api_secret` | string | — | Override (prefer `MM_API_SECRET` env) |
+| `api_key` | string | — | Override (prefer venue-scoped env, e.g. `MM_BINANCE_API_KEY`) |
+| `api_secret` | string | — | Override (prefer venue-scoped env, e.g. `MM_BINANCE_API_SECRET`) |
 
 ## [market_maker]
 

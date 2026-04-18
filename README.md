@@ -14,47 +14,53 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/language-Rust-orange?logo=rust" alt="Rust">
-  <img src="https://img.shields.io/badge/tests-1213_passing-brightgreen" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-1431_passing-brightgreen" alt="Tests">
   <img src="https://img.shields.io/badge/clippy-zero_warnings-brightgreen" alt="Clippy">
   <img src="https://img.shields.io/badge/crates-18-blue" alt="Crates">
-  <img src="https://img.shields.io/badge/lines-62K-blue" alt="LoC">
+  <img src="https://img.shields.io/badge/lines-83K-blue" alt="LoC">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
 
 ---
 
-High-performance, multi-venue market making engine with institutional-grade risk management, toxicity detection, and MiCA compliance. `Decimal` arithmetic everywhere — never `f64` for money. 18 crates, 62K lines, 1213 tests.
+High-performance, multi-venue market making engine with institutional-grade risk management, toxicity detection, and MiCA compliance. `Decimal` arithmetic everywhere — never `f64` for money. 18 crates, 83K lines, 1431 tests.
 
 ## Why MG?
 
 | | MG Market Maker | Hummingbot | Freqtrade | NautilusTrader |
 |---|:---:|:---:|:---:|:---:|
 | **Language** | Rust | Python | Python | Rust+Python |
-| **Strategies** | 6 (A-S, GLFT, Grid, Basis, CrossVenue, FundingArb) | 5 | 3 | 4 |
-| **Venues** | 4 (Binance, Bybit, HyperLiquid, Custom) | 20+ | 10+ | 5 |
+| **Strategies** | 9+ (A-S, GLFT, Grid, Basis, XEMM, FundingArb, StatArb, PairedUnwind, ExecAlgos) | 5 | 3 | 4 |
+| **Venues** | 4 × dual-product (Binance spot+USDM futures, Bybit spot+linear+inverse, HyperLiquid spot+perps, Custom) | 20+ | 10+ | 5 |
 | **Latency** | ~2us/quote | ~1ms | ~10ms | ~50us |
-| **Kill Switch** | 5-level auto-escalation | Manual | No | No |
-| **Toxicity (VPIN/Kyle)** | Built-in | No | No | No |
-| **MiCA Audit Trail** | JSONL + HMAC signed export | No | No | No |
-| **Portfolio Risk** | Factor VaR + correlation matrix | No | No | Partial |
+| **Kill Switch** | 5-level auto-escalation + typed-echo confirm | Manual | No | No |
+| **Toxicity (VPIN/Kyle/AS)** | Built-in | No | No | No |
+| **MiCA Audit Trail** | JSONL + SHA-256 hash chain + HMAC signed export | No | No | No |
+| **Portfolio Risk** | Factor VaR + correlation matrix + Markowitz hedge | No | No | Partial |
 | **Multi-Client** | Per-client isolation + SLA certificates | No | No | No |
 | **FIX 4.4** | Session engine + codec | No | No | Partial |
+| **Adaptive Calibration** | PairClass templates + hyperopt recalibrate flow | No | No | No |
+| **Auth Surface** | Role-gated (Admin/Operator/Viewer), HMAC tokens, audited login/logout | Basic | No | Basic |
 
 ## Features
 
 <details>
-<summary><b>Strategies</b> — 6 built-in, write your own in one file</summary>
+<summary><b>Strategies</b> — 9+ built-in, write your own in one file</summary>
 
 - **Avellaneda-Stoikov** — optimal spread with inventory skew (gamma/kappa/sigma)
 - **GLFT** — Guéant-Lehalle-Fernandez-Tapia with live order flow calibration
 - **Grid** — symmetric grid quoting around mid
 - **Basis** — spot + reference price from hedge leg
-- **Cross-Venue Basis** — make on venue A, hedge on venue B
-- **Funding Arb** — atomic spot-perp funding rate arbitrage
+- **Cross-Venue** — make on venue A, hedge on venue B
+- **XEMM** — dedicated cross-exchange executor with slippage band
+- **Funding Arb** — atomic spot-perp funding rate arbitrage with compensating-reversal on break
+- **Stat Arb** — cointegrated pairs (Engle-Granger + Kalman + z-score driver)
+- **Paired Unwind** — L4 kill-switch flatten for paired basis/funding positions
+- **Exec Algos** — TWAP / VWAP / POV / Iceberg
 
-Alpha pipeline: book imbalance, trade flow, microprice, OFI (Cont-Kukanov-Stoikov), HMA slope, learned microprice (Stoikov 2018).
+Alpha pipeline: book imbalance, trade flow, microprice, OFI (Cont-Kukanov-Stoikov), HMA slope, learned microprice (Stoikov 2018), Cartea adverse-selection spread.
 
-Regime detection: Quiet / Trending / Volatile / MeanReverting with per-regime auto-tuning.
+Regime detection: Quiet / Trending / Volatile / MeanReverting with per-regime auto-tuning. Pair-class templates: MajorSpot / AltSpot / MemeSpot / MajorPerp / AltPerp / StableStable with adaptive γ feedback loop.
 
 **[Writing custom strategies](docs/guides/writing-strategies.md)** — implement one trait, get order management, risk, PnL for free.
 </details>
@@ -73,14 +79,19 @@ Regime detection: Quiet / Trending / Volatile / MeanReverting with per-regime au
 </details>
 
 <details>
-<summary><b>Exchange Connectivity</b> — 4 venues, WS order entry, FIX 4.4</summary>
+<summary><b>Exchange Connectivity</b> — 4 venues, both spot + derivatives, WS order entry, FIX 4.4</summary>
 
-- **Binance** — spot + USDM futures, WS API order entry, listen-key user data, batch orders
-- **Bybit** — V5 API (spot/linear/inverse), batch 20, native amend, WS Trade
-- **HyperLiquid** — perps + spot, EIP-712 signing (secp256k1), WS post
-- **Custom Exchange** — full REST + WS connector
-- **FIX 4.4** — session engine + codec (for institutional venues)
-- **Shared Protocol Layer** — one WS-RPC abstraction, many adapters
+Every CEX/DEX in the roster supports both spot and derivatives. Each
+product-type is a separate connector instance (so an engine can run
+`binance_spot + binance_futures + bybit_spot + bybit_linear +
+hyperliquid_spot + hyperliquid_perp` side-by-side).
+
+- **Binance** — spot + USDM futures. WS API order entry, listen-key user data, batch orders. `LIMIT_MAKER` for post-only (no more `timeInForce=GTC` fallback bug). Clock-skew preflight catches `-1021` before startup.
+- **Bybit V5** — spot + linear (USDT-M) + inverse (coin-margined) perps. Unified category-parametrised API, batch 20, native amend, WS Trade.
+- **HyperLiquid** — spot + perps (two constructors: `new()` for perps, `spot()` for spot; asset index offset handled internally). EIP-712 signing (secp256k1), WS post. USDC-only collateral.
+- **Custom Exchange** — full REST + WS connector.
+- **FIX 4.4** — session engine + codec (for institutional venues).
+- **Shared Protocol Layer** — one WS-RPC abstraction, many adapters.
 
 **[Adding a new exchange](docs/guides/adding-exchange.md)** — implement one trait, 8 steps.
 </details>
@@ -89,12 +100,30 @@ Regime detection: Quiet / Trending / Volatile / MeanReverting with per-regime au
 <summary><b>Multi-Client & Compliance</b> — per-client isolation, MiCA audit, SLA tracking</summary>
 
 - **Multi-Client Isolation** — each client owns symbols with separate PnL, fills, webhooks, API auth
-- **MiCA Audit Trail** — append-only JSONL, microsecond timestamps, 5-year retention, HMAC-signed export
+- **MiCA Audit Trail** — append-only JSONL, microsecond timestamps, 5-year retention, **SHA-256 hash chain** (tamper-evident, restart-safe), HMAC-signed export
+- **fsync on critical events** — OrderFilled / KillSwitchEscalated / CircuitBreakerTripped durably land before returning
+- **MiCA HMAC Full-Body Signature** — reports sign the full UnsignedReport (period, strategy, OTR, risk controls, SLA, timestamp), not cherry-picked fields; constant-time verify
 - **SLA Tracking** — per-minute presence buckets, spread compliance, two-sided quoting obligations
 - **SLA Certificates** — HMAC-signed JSON for client reporting
 - **Article 17 Report** — algorithmic trading report template (strategy, OTR stats, risk controls)
 - **Token Lending** — loan agreements, utilization tracking, return schedules, PnL cost amortization
 - **Webhook Delivery** — per-client event routing (SLA breach, kill switch, large fill, reports)
+</details>
+
+<details>
+<summary><b>Dashboard & Auth</b> — Svelte 5, role-gated, audited, WCAG AA</summary>
+
+- **Svelte 5 runes** — modern reactivity (`$state`, `$derived`, `$effect`, `$props`)
+- **Role-based auth** — Admin / Operator / Viewer with HMAC-signed 24 h Bearer tokens + X-API-Key header
+- **Login / logout audited** — `LoginSucceeded` / `LoginFailed` / `LogoutSucceeded` rows in MiCA trail with source IP + user_id / key prefix
+- **IP rate-limit on login** — 20/min per source IP to blunt credential stuffing
+- **Timing-equalization** on login failure — no trivial oracle on key membership
+- **Typed-echo kill confirmation** — operator must type `{symbol} {action}` (e.g. `BTCUSDT FLATTEN`) for L3/L4 destructive ops; 3-second cooldown with countdown before fire button arms
+- **Stale-data indicators** — every WS payload stamped with `_rx_ms`; `StaleBadge` component shows fresh (≤2s green) / stale (≤5s amber) / frozen (>5s red pulse)
+- **Symbol switcher** — header pills drive `activeSymbol` flowing to every panel
+- **Design tokens + WCAG AA** — centralised `tokens.css` for background, foreground, semantic, pair-class colours, 4pt spacing grid, typography scale; muted text passes AA contrast; `prefers-reduced-motion` handler; `:focus-visible` default ring on every interactive
+- **Adaptive panel** — live γ / pair class / feedback state per symbol
+- **Preflight** — clock-skew (±500 ms / ±2000 ms budgets), rate-limit budget, venue server time, exchange info, balance sanity — fails live startup on hard errors
 </details>
 
 <details>
@@ -134,9 +163,20 @@ cargo build --release
 
 ### 2. Smoke Test (validate connectivity)
 
+Exchange keys are venue-scoped (no shared `MM_API_KEY` fallback). Auth
+secret protects the dashboard — 32+ random bytes in production.
+
 ```bash
-export MM_API_KEY=your-key
-export MM_API_SECRET=your-secret
+# Pick the venues you care about — each pair is optional.
+export MM_BINANCE_API_KEY=...
+export MM_BINANCE_API_SECRET=...
+export MM_BYBIT_API_KEY=...
+export MM_BYBIT_API_SECRET=...
+export MM_HL_PRIVATE_KEY=...        # 0x-prefixed hex secp256k1
+
+# Dashboard auth secret (32+ bytes). Rotate to invalidate all tokens.
+export MM_AUTH_SECRET="$(openssl rand -base64 48)"
+
 MM_MODE=smoke cargo run --release -p mm-server
 ```
 
@@ -208,11 +248,30 @@ docker compose up -d
 |----------|-------------|
 | `POST /api/admin/config/{symbol}` | Hot-reload config per symbol |
 | `POST /api/admin/config` | Broadcast config to all |
+| `POST /api/admin/config/bulk` | Bulk per-symbol config patch |
 | `POST /api/admin/symbols/{symbol}/pause` | Pause quoting |
 | `POST /api/admin/symbols/{symbol}/resume` | Resume quoting |
 | `POST /api/admin/clients` | Create client |
 | `POST /api/admin/loans` | Create loan agreement |
+| `POST /api/admin/optimize/trigger` | Kick off hyperopt random-search |
 | `GET /api/admin/optimize/status` | Hyperopt run status |
+| `GET /api/admin/optimize/results` | Completed jobs summary |
+| `GET /api/admin/optimize/pending` | Calibrations awaiting sign-off |
+| `POST /api/admin/optimize/apply` | Apply pending calibration to live config |
+| `POST /api/admin/optimize/discard` | Drop pending calibration |
+
+### Auth
+
+| Endpoint | Method | Auth | Role |
+|---|---|---|---|
+| `/api/auth/login` | POST | — | — (IP rate-limited 20/min) |
+| `/api/auth/logout` | POST | Bearer | any |
+| `/api/status`, `/api/v1/*` (read-only) | GET | Bearer | any |
+| `/metrics` | GET | Bearer | Admin / Operator |
+| `/api/v1/ops/*`, `/api/admin/*` | POST | Bearer | Admin only |
+| `/ws` | GET upgrade | `?token=…` | role-derived |
+
+Destructive operator endpoints (`/api/v1/ops/widen|stop|cancel-all|flatten|disconnect|reset`) are Admin-only and rate-limited. WebSocket accepts `?token=` only because browsers cannot set headers on the upgrade — this is not an HTTP path. See [docs/guides/operations.md](docs/guides/operations.md#dashboard-auth--network-exposure) for the full HTTPS / secret-rotation playbook.
 
 ## Architecture
 
@@ -328,7 +387,7 @@ cargo bench -p mm-strategy
 ## Testing
 
 ```bash
-cargo test                                    # 1213 tests
+cargo test                                    # 1431 tests
 cargo clippy --all-targets -- -D warnings     # zero warnings
 cargo bench -p mm-strategy                    # strategy benchmarks
 ```
@@ -338,11 +397,15 @@ cargo bench -p mm-strategy                    # strategy benchmarks
 | Guide | Audience | Topics |
 |-------|----------|--------|
 | **[Quick Start](docs/guides/quickstart.md)** | New users | Build, configure, smoke test, paper, live |
+| **[Strategy Catalog](docs/guides/strategy-catalog.md)** | Everyone | Every strategy + signal + modulator — formulas, params, gotchas, selection matrix, per-PairClass recipes |
 | **[Writing Strategies](docs/guides/writing-strategies.md)** | Strategy devs | Trait, context, alpha signals, testing |
 | **[Architecture](docs/guides/architecture.md)** | System devs | Crate graph, data flow, persistence |
-| **[Operations](docs/guides/operations.md)** | Operators | Modes, troubleshooting, daily checklist |
+| **[Operations](docs/guides/operations.md)** | Operators | Modes, troubleshooting, daily checklist, auth surface |
 | **[Adding Exchanges](docs/guides/adding-exchange.md)** | Connector devs | 8-step guide, auth, capabilities |
 | **[Config Reference](docs/guides/configuration-reference.md)** | Everyone | Every TOML field + env vars |
+| **[Adaptive Calibration](docs/guides/adaptive-calibration.md)** | Strategy devs | PairClass templates, tuner feedback loop, hyperopt flow |
+| **[Crash Recovery](docs/guides/crash-recovery.md)** | Operators | Checkpoint restore, fill replay from audit log |
+| **[Competitor Gap Analysis](docs/research/competitor-gap-analysis-apr17.md)** | Planning | What peers have we don't — STP, OCO, drop-copy, queue model |
 
 ## Contributing
 
@@ -350,7 +413,7 @@ cargo bench -p mm-strategy                    # strategy benchmarks
 2. Create a feature branch (`git checkout -b feat/my-feature`)
 3. Add tests for new functionality
 4. Ensure `cargo clippy --all-targets -- -D warnings` passes
-5. Ensure `cargo test` passes (1213+ tests)
+5. Ensure `cargo test` passes (1431+ tests)
 6. Open a PR with a clear description
 
 ## License

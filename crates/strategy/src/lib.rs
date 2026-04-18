@@ -1,4 +1,5 @@
 pub mod ab_split;
+pub mod adaptive;
 pub mod autotune;
 pub mod avellaneda;
 pub mod basis;
@@ -22,6 +23,7 @@ pub mod twap;
 pub mod volatility;
 pub mod xemm;
 
+pub use adaptive::{AdaptiveConfig, AdaptiveTuner, AdjustmentReason};
 pub use autotune::{AutoTuner, MarketRegime, RegimeParams};
 pub use avellaneda::AvellanedaStoikov;
 pub use basis::BasisStrategy;

@@ -208,6 +208,38 @@ impl KillSwitch {
         }
     }
 
+    /// Ingest the latest [`MarginGuard`] decision (Epic 40.4).
+    /// The engine polls the venue's margin endpoint, feeds the
+    /// snapshot through `MarginGuard::decide`, and passes the
+    /// bucketed result here so threshold-mapping logic lives in
+    /// one place and kill-switch escalation stays monotonic.
+    ///
+    /// `Normal` is a no-op; every other decision escalates to
+    /// the level returned by
+    /// [`MarginGuardDecision::kill_level`]. A `Stale` decision
+    /// widens the same as an elevated ratio — a dark feed is
+    /// not a safe feed.
+    pub fn update_margin_ratio(&mut self, decision: crate::MarginGuardDecision) {
+        if let Some(level) = decision.kill_level() {
+            let reason = match decision {
+                crate::MarginGuardDecision::Normal => return,
+                crate::MarginGuardDecision::WidenSpreads => {
+                    "margin ratio elevated (>= widen_ratio)"
+                }
+                crate::MarginGuardDecision::StopNewOrders => {
+                    "margin ratio high (>= stop_ratio)"
+                }
+                crate::MarginGuardDecision::CancelAll => {
+                    "margin ratio critical (>= cancel_ratio) — pre-liquidation"
+                }
+                crate::MarginGuardDecision::Stale => {
+                    "margin feed stale — venue data outage, widening pre-emptively"
+                }
+            };
+            self.escalate(level, reason);
+        }
+    }
+
     /// Feed the current Market Resilience reading. Escalates
     /// the switch to [`KillLevel::WidenSpreads`] when the score
     /// stays below [`MR_LOW_THRESHOLD`] for at least
@@ -593,5 +625,57 @@ mod tests {
             }
             prop_assert_eq!(ks.level(), before);
         }
+    }
+
+    /// E40.4 — margin-ratio escalations flow through
+    /// `update_margin_ratio` and must satisfy the same
+    /// monotonic invariant as every other subsystem: a
+    /// transient "recovery" (ratio back under widen_ratio) must
+    /// not de-escalate the switch.
+    #[test]
+    fn margin_ratio_escalation_is_monotonic() {
+        use crate::MarginGuardDecision;
+
+        let mut ks = KillSwitch::new(KillSwitchConfig::default());
+        assert_eq!(ks.level(), KillLevel::Normal);
+
+        ks.update_margin_ratio(MarginGuardDecision::WidenSpreads);
+        assert_eq!(ks.level(), KillLevel::WidenSpreads);
+
+        ks.update_margin_ratio(MarginGuardDecision::StopNewOrders);
+        assert_eq!(ks.level(), KillLevel::StopNewOrders);
+
+        // Transient recovery — guard returns Normal, kill switch
+        // must stay at StopNewOrders until manual reset.
+        ks.update_margin_ratio(MarginGuardDecision::Normal);
+        assert_eq!(ks.level(), KillLevel::StopNewOrders);
+
+        ks.update_margin_ratio(MarginGuardDecision::CancelAll);
+        assert_eq!(ks.level(), KillLevel::CancelAll);
+
+        // Stale feed can only widen; above CancelAll it's a
+        // no-op (widen < cancel).
+        ks.update_margin_ratio(MarginGuardDecision::Stale);
+        assert_eq!(ks.level(), KillLevel::CancelAll);
+    }
+
+    #[test]
+    fn margin_stale_from_normal_widens() {
+        use crate::MarginGuardDecision;
+
+        let mut ks = KillSwitch::new(KillSwitchConfig::default());
+        ks.update_margin_ratio(MarginGuardDecision::Stale);
+        assert_eq!(ks.level(), KillLevel::WidenSpreads);
+        assert!(ks.reason().contains("stale"), "reason={}", ks.reason());
+    }
+
+    #[test]
+    fn margin_normal_is_noop() {
+        use crate::MarginGuardDecision;
+
+        let mut ks = KillSwitch::new(KillSwitchConfig::default());
+        ks.update_margin_ratio(MarginGuardDecision::Normal);
+        assert_eq!(ks.level(), KillLevel::Normal);
+        assert!(ks.reason().is_empty(), "reason={}", ks.reason());
     }
 }

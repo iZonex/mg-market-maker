@@ -510,4 +510,176 @@ mod tests {
         let p = Protections::new(ProtectionsConfig::default());
         assert!(!p.is_locked("BTCUSDT", Instant::now()).is_locked());
     }
+
+    // ── Property-based tests (Epic 19) ────────────────────────
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// CooldownPeriod::trigger sets a lockout that expires after
+        /// exactly `duration`. Status is Locked for any query strictly
+        /// before expiry and None afterwards. Catches an off-by-one in
+        /// the `now < until` comparison.
+        #[test]
+        fn cooldown_locks_until_duration_elapses(
+            duration_secs in 1u64..600,
+            probe_secs in 0u64..1200,
+        ) {
+            let mut c = CooldownPeriod::new(CooldownConfig {
+                duration: Duration::from_secs(duration_secs),
+            });
+            let t0 = Instant::now();
+            c.trigger("P", t0);
+            let probe = t0 + Duration::from_secs(probe_secs);
+            let status = c.status("P", probe);
+            if probe_secs < duration_secs {
+                prop_assert!(status.is_some());
+                prop_assert!(status.unwrap().is_locked());
+            } else {
+                prop_assert!(status.is_none());
+            }
+        }
+
+        /// CooldownPeriod is per-pair: triggering one pair does not
+        /// affect the other's status.
+        #[test]
+        fn cooldown_is_isolated_across_pairs(
+            duration_secs in 1u64..600,
+            probe_secs in 0u64..300,
+        ) {
+            let mut c = CooldownPeriod::new(CooldownConfig {
+                duration: Duration::from_secs(duration_secs),
+            });
+            let t0 = Instant::now();
+            c.trigger("A", t0);
+            let probe = t0 + Duration::from_secs(probe_secs);
+            prop_assert!(c.status("B", probe).is_none());
+        }
+
+        /// MaxDrawdownPause: peak equity is monotonic — update_equity
+        /// never lowers it regardless of the incoming value.
+        #[test]
+        fn max_drawdown_peak_is_monotonic(
+            equities in proptest::collection::vec(-1_000_000i64..1_000_000, 1..30),
+        ) {
+            let cfg = MaxDrawdownConfig {
+                max_drawdown_quote: dec!(1_000_000_000),
+                lockout: Duration::from_secs(60),
+                recovery_fraction: dec!(1),
+            };
+            let mut mdd = MaxDrawdownPause::new(cfg);
+            let t0 = Instant::now();
+            let mut prev_peak = Decimal::from(equities[0]);
+            for (i, eq) in equities.iter().enumerate() {
+                let eq_dec = Decimal::from(*eq);
+                mdd.update("P", eq_dec, t0 + Duration::from_secs(i as u64));
+                let peak = mdd.per_pair.get("P").unwrap().peak;
+                prop_assert!(peak >= prev_peak,
+                    "peak regressed {} → {}", prev_peak, peak);
+                prev_peak = peak;
+            }
+        }
+
+        /// MaxDrawdownPause triggers once drawdown hits the threshold.
+        /// The first update after peak sets the peak; a subsequent
+        /// drop of exactly `max_drawdown_quote` or more must lock.
+        #[test]
+        fn max_drawdown_triggers_at_threshold(
+            peak_val in 100_000i64..1_000_000,
+            dd_above_threshold in 0i64..500_000,
+        ) {
+            let threshold = dec!(10_000);
+            let cfg = MaxDrawdownConfig {
+                max_drawdown_quote: threshold,
+                lockout: Duration::from_secs(3600),
+                recovery_fraction: dec!(99), // disable early recovery
+            };
+            let mut mdd = MaxDrawdownPause::new(cfg);
+            let t0 = Instant::now();
+            let peak = Decimal::from(peak_val);
+            mdd.update("P", peak, t0);
+            // Drop by threshold + extra. Must lock.
+            let drop_amount = threshold + Decimal::from(dd_above_threshold);
+            let new_eq = peak - drop_amount;
+            mdd.update("P", new_eq, t0 + Duration::from_secs(1));
+            let status = mdd.status("P", t0 + Duration::from_secs(2));
+            prop_assert!(status.is_some());
+            prop_assert!(status.unwrap().is_locked());
+        }
+
+        /// MaxDrawdownPause does NOT trigger while drawdown stays
+        /// strictly below the threshold.
+        #[test]
+        fn max_drawdown_silent_below_threshold(
+            peak_val in 100_000i64..1_000_000,
+            dd_below in 0i64..9_999,
+        ) {
+            let threshold = dec!(10_000);
+            let cfg = MaxDrawdownConfig {
+                max_drawdown_quote: threshold,
+                lockout: Duration::from_secs(3600),
+                recovery_fraction: dec!(1),
+            };
+            let mut mdd = MaxDrawdownPause::new(cfg);
+            let t0 = Instant::now();
+            let peak = Decimal::from(peak_val);
+            mdd.update("P", peak, t0);
+            // Drop strictly less than threshold.
+            let new_eq = peak - Decimal::from(dd_below);
+            mdd.update("P", new_eq, t0 + Duration::from_secs(1));
+            prop_assert!(mdd.status("P", t0 + Duration::from_secs(2)).is_none());
+        }
+
+        /// StoplossGuard: lockout activates iff `max_stops` events
+        /// land inside the rolling window. Fewer = no lock; enough
+        /// inside = lock.
+        #[test]
+        fn stoploss_guard_triggers_exactly_on_max_stops(
+            max_stops in 2usize..6,
+            extra_stops in 0usize..5,
+        ) {
+            let cfg = StoplossGuardConfig {
+                window: Duration::from_secs(600),
+                max_stops,
+                lockout: Duration::from_secs(300),
+            };
+            let mut g = StoplossGuard::new(cfg);
+            let t0 = Instant::now();
+            // Record exactly (max_stops - 1) — must NOT lock.
+            for i in 0..(max_stops - 1) {
+                g.record_stop("P", t0 + Duration::from_secs(i as u64));
+            }
+            prop_assert!(g
+                .status("P", t0 + Duration::from_secs(max_stops as u64))
+                .is_none());
+            // Push to at least max_stops — must lock.
+            let total = max_stops + extra_stops;
+            for i in (max_stops - 1)..total {
+                g.record_stop("P", t0 + Duration::from_secs(i as u64));
+            }
+            let status = g.status("P", t0 + Duration::from_secs(total as u64 + 1));
+            prop_assert!(status.is_some());
+            prop_assert!(status.unwrap().is_locked());
+        }
+
+        /// ProtectionStatus::is_locked() agrees with the enum
+        /// discriminant — Clear is never locked; Locked is always
+        /// locked. Invariant guards against a refactor that adds a
+        /// third variant without updating is_locked().
+        #[test]
+        fn protection_status_is_locked_matches_variant(
+            locked in any::<bool>(),
+            secs_ahead in 1u64..3600,
+        ) {
+            let s = if locked {
+                ProtectionStatus::Locked {
+                    reason: "x".into(),
+                    until: Some(Instant::now() + Duration::from_secs(secs_ahead)),
+                }
+            } else {
+                ProtectionStatus::Clear
+            };
+            prop_assert_eq!(s.is_locked(), locked);
+        }
+    }
 }

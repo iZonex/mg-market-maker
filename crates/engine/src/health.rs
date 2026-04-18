@@ -175,4 +175,101 @@ mod tests {
         mgr.evaluate();
         assert_eq!(*mgr.mode(), HealthMode::Normal);
     }
+
+    // ── Property-based tests (Epic 23) ────────────────────────
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Error count monotonicity: after N consecutive errors,
+        /// the state is Normal when N < 5, Degraded when 5 ≤ N < 20,
+        /// Critical when N ≥ 20. Mirrors the thresholds baked into
+        /// `HealthManager::new()`.
+        #[test]
+        fn error_count_thresholds(err_count in 0u32..40) {
+            let mut mgr = HealthManager::new();
+            for _ in 0..err_count {
+                mgr.record_error();
+            }
+            mgr.evaluate();
+            let is_critical = matches!(mgr.mode(), HealthMode::Critical { .. });
+            let is_degraded = matches!(mgr.mode(), HealthMode::Degraded { .. });
+            if err_count >= 20 {
+                prop_assert!(is_critical);
+            } else if err_count >= 5 {
+                prop_assert!(is_degraded);
+            } else {
+                prop_assert_eq!(mgr.mode(), &HealthMode::Normal);
+            }
+        }
+
+        /// `record_success` resets the error counter and returns
+        /// the state to Normal on the next evaluate, regardless
+        /// of how many errors accumulated (short of Critical by
+        /// staleness, which needs a timer).
+        #[test]
+        fn success_resets_state(err_count in 0u32..40) {
+            let mut mgr = HealthManager::new();
+            for _ in 0..err_count {
+                mgr.record_error();
+            }
+            mgr.record_success();
+            mgr.evaluate();
+            prop_assert_eq!(mgr.mode(), &HealthMode::Normal);
+        }
+
+        /// spread_multiplier matches the current mode deterministically:
+        /// Normal = 1, Degraded = 2, Critical = 0. Catches a
+        /// regression where a refactor drops a branch.
+        #[test]
+        fn spread_multiplier_matches_mode(err_count in 0u32..40) {
+            let mut mgr = HealthManager::new();
+            for _ in 0..err_count {
+                mgr.record_error();
+            }
+            mgr.evaluate();
+            match mgr.mode() {
+                HealthMode::Normal => prop_assert_eq!(mgr.spread_multiplier(), dec!(1)),
+                HealthMode::Degraded { .. } => prop_assert_eq!(mgr.spread_multiplier(), dec!(2)),
+                HealthMode::Critical { .. } => prop_assert_eq!(mgr.spread_multiplier(), dec!(0)),
+            }
+        }
+
+        /// should_cancel_all iff in Critical. Catches a refactor
+        /// that adds a 4th variant without updating the guard.
+        #[test]
+        fn cancel_all_exactly_when_critical(err_count in 0u32..40) {
+            let mut mgr = HealthManager::new();
+            for _ in 0..err_count {
+                mgr.record_error();
+            }
+            mgr.evaluate();
+            let is_critical = matches!(mgr.mode(), HealthMode::Critical { .. });
+            prop_assert_eq!(mgr.should_cancel_all(), is_critical);
+        }
+
+        /// Error count is monotonic: calling record_error more
+        /// times never reduces severity (absent a success call).
+        /// Checks that the state transitions in the expected
+        /// order: Normal → Degraded → Critical.
+        #[test]
+        fn severity_is_non_decreasing(
+            step_count in 1u32..25,
+        ) {
+            let mut mgr = HealthManager::new();
+            let mut prev_rank: u8 = 0;
+            for _ in 0..step_count {
+                mgr.record_error();
+                mgr.evaluate();
+                let rank: u8 = match mgr.mode() {
+                    HealthMode::Normal => 0,
+                    HealthMode::Degraded { .. } => 1,
+                    HealthMode::Critical { .. } => 2,
+                };
+                prop_assert!(rank >= prev_rank,
+                    "severity dropped {} → {}", prev_rank, rank);
+                prev_rank = rank;
+            }
+        }
+    }
 }

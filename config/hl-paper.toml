@@ -1,0 +1,108 @@
+# HyperLiquid perp DEX paper-trading config — real feed, simulated egress.
+#
+# HL endpoints (REST at api.hyperliquid.xyz, WS at
+# api.hyperliquid.xyz/ws) are hardcoded inside the connector
+# (see `crates/exchange/hyperliquid/src/connector.rs:40-48`).
+# The `rest_url` / `ws_url` fields below are ignored; they are
+# filled in only so config deserialisation succeeds on a shared
+# `[exchange]` schema.
+#
+# Important HL quirks:
+# - Auth is EIP-712 over a secp256k1 key. Set `MM_API_SECRET` to
+#   the hex-encoded 32-byte private key (0x prefix optional). The
+#   `api_key` field is IGNORED — the address is derived from the
+#   private key.
+# - USDC-only collateral at time of writing. Don't configure a
+#   USDT-denominated risk limit without checking that the venue
+#   still treats it as a synonym.
+# - Public read endpoints (`/info` POST for book + metadata) work
+#   without a key, but the engine needs a valid MM_API_SECRET
+#   even for paper mode because the connector derives the wallet
+#   address at construction. For fully keyless validation, use
+#   `exchange_type = "custom"` pointed at a mock.
+
+symbols = ["BTC"]
+mode = "paper"
+dashboard_port = 9090
+checkpoint_path = "data/checkpoint-hl-paper.json"
+log_file = ""
+
+[exchange]
+# "hyper_liquid" | "hyper_liquid_testnet"
+exchange_type = "hyper_liquid"
+rest_url = "unused"
+ws_url = "unused"
+# MM_API_SECRET = hex wallet private key (required).
+# MM_API_KEY    = ignored by the connector.
+
+[market_maker]
+strategy = "avellaneda_stoikov"
+
+# Placeholder parameters — recalibrate on HL's own flow. HL perps
+# have different tick sizes and microstructure than Binance spot;
+# the σ / κ values below are rough starting points only.
+gamma = "0.1000"
+kappa = "5.0000"
+sigma = "0.0001"
+time_horizon_secs = 300
+
+num_levels = 3
+order_size = "0.001"
+refresh_interval_ms = 500
+min_spread_bps = "5"
+max_distance_bps = "100"
+
+momentum_enabled = true
+momentum_window = 200
+market_resilience_enabled = true
+otr_enabled = true
+hma_enabled = true
+hma_window = 9
+
+# HL has no listen-key stream; user events multiplex over the
+# public market-data WS. user_stream_enabled is a no-op here —
+# leave false.
+user_stream_enabled = false
+inventory_drift_tolerance = "0.0001"
+inventory_drift_auto_correct = false
+
+[risk]
+# Reference: a tiny-balance paper run. HL minimum order size varies
+# per asset; check via `mm-server … --dry-run` before sizing up.
+max_inventory = "0.001"
+max_exposure_quote = "100"
+max_drawdown_quote = "20"
+inventory_skew_factor = "1.0"
+max_spread_bps = "200"
+stale_book_timeout_secs = 10
+max_order_size = "0.005"
+max_daily_volume_quote = "1000"
+max_hourly_volume_quote = "300"
+
+[kill_switch]
+daily_loss_limit = "20"
+daily_loss_warning = "10"
+max_position_value = "100"
+max_message_rate = 50
+max_consecutive_errors = 10
+
+[sla]
+max_spread_bps = "100"
+min_depth_quote = "2000"
+min_uptime_pct = "95"
+two_sided_required = true
+max_requote_secs = 5
+min_order_rest_secs = 3
+
+[toxicity]
+vpin_bucket_size = "50000"
+vpin_num_buckets = 50
+vpin_threshold = "0.7"
+kyle_window = 100
+adverse_selection_lookback_ms = 3000
+autotune_enabled = true
+
+[listing_sniper]
+enabled = false
+scan_interval_secs = 300
+alert_on_discovery = true

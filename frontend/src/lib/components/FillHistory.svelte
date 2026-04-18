@@ -1,52 +1,121 @@
 <script>
   let { data } = $props()
   const fills = $derived(data.state.fills || [])
+  const visible = $derived(fills.slice(0, 20))
+
+  function fmtTime(t) {
+    try { return new Date(t || Date.now()).toLocaleTimeString() }
+    catch { return '—' }
+  }
 </script>
 
-<div>
-  <h3>Fill History <span class="count">{fills.length}</span></h3>
-
-  <div class="scroll">
+{#if visible.length === 0}
+  <div class="empty-state">
+    <span class="empty-state-icon">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 12a9 9 0 1 0 9-9"/>
+        <polyline points="3 4 3 12 11 12"/>
+      </svg>
+    </span>
+    <span class="empty-state-title">No fills yet</span>
+    <span class="empty-state-hint">Paper-mode fills synthesise from public trades that cross our quotes.</span>
+  </div>
+{:else}
+  <div class="fills scroll">
     <table>
       <thead>
         <tr>
           <th>Time</th>
           <th>Side</th>
-          <th>Price</th>
-          <th>Qty</th>
+          <th class="right">Price</th>
+          <th class="right">Qty</th>
           <th>Role</th>
         </tr>
       </thead>
       <tbody>
-        {#each fills.slice(0, 20) as fill}
+        {#each visible as fill}
           <tr>
-            <td class="time">{new Date(fill.timestamp || Date.now()).toLocaleTimeString()}</td>
-            <td class:buy={fill.side === 'buy'} class:sell={fill.side === 'sell'}>
-              {fill.side?.toUpperCase()}
+            <td class="time">{fmtTime(fill.timestamp)}</td>
+            <td>
+              <span class="side" data-side={fill.side?.toLowerCase()}>{fill.side?.toUpperCase()}</span>
             </td>
-            <td>{fill.price}</td>
-            <td>{fill.qty}</td>
-            <td class="role">{fill.is_maker ? 'MAKER' : 'TAKER'}</td>
+            <td class="num right">{fill.price}</td>
+            <td class="num right">{fill.qty}</td>
+            <td>
+              <span class="role" class:maker={fill.is_maker} class:taker={!fill.is_maker}>
+                {fill.is_maker ? 'MAKER' : 'TAKER'}
+              </span>
+            </td>
           </tr>
         {/each}
-        {#if fills.length === 0}
-          <tr><td colspan="5" class="empty">No fills yet</td></tr>
-        {/if}
       </tbody>
     </table>
   </div>
-</div>
+{/if}
 
 <style>
-  h3 { font-size: 12px; color: #8b949e; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
-  .count { color: #58a6ff; margin-left: 6px; }
-  .scroll { max-height: 200px; overflow-y: auto; }
-  table { width: 100%; border-collapse: collapse; }
-  th { font-size: 10px; color: #484f58; text-align: left; padding: 4px; border-bottom: 1px solid #21262d; position: sticky; top: 0; background: #161b22; }
-  td { font-size: 11px; padding: 2px 4px; border-bottom: 1px solid #0a0e17; }
-  .time { color: #8b949e; }
-  .buy { color: #3fb950; font-weight: 600; }
-  .sell { color: #f85149; font-weight: 600; }
-  .role { color: #d2a8ff; font-size: 10px; }
-  .empty { color: #484f58; text-align: center; padding: 20px; }
+  .fills {
+    max-height: 260px;
+    overflow-y: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--font-sans);
+  }
+  th {
+    font-size: var(--fs-2xs);
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-label);
+    color: var(--fg-muted);
+    text-align: left;
+    padding: var(--s-2) var(--s-3);
+    border-bottom: 1px solid var(--border-subtle);
+    position: sticky;
+    top: 0;
+    background: var(--bg-raised);
+    font-weight: 500;
+  }
+  th.right { text-align: right; }
+  td {
+    padding: var(--s-2) var(--s-3);
+    border-bottom: 1px solid var(--border-subtle);
+    font-size: var(--fs-sm);
+    color: var(--fg-primary);
+  }
+  td.num {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+  td.right { text-align: right; }
+  .time {
+    color: var(--fg-muted);
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: var(--fs-xs);
+  }
+  .side {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px var(--s-2);
+    border-radius: var(--r-sm);
+    font-size: var(--fs-2xs);
+    font-weight: 700;
+    letter-spacing: var(--tracking-label);
+    font-family: var(--font-mono);
+  }
+  .side[data-side='buy']  { background: var(--pos-bg); color: var(--pos); }
+  .side[data-side='sell'] { background: var(--neg-bg); color: var(--neg); }
+  .role {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px var(--s-2);
+    border-radius: var(--r-sm);
+    font-size: var(--fs-2xs);
+    font-weight: 600;
+    letter-spacing: var(--tracking-label);
+    font-family: var(--font-mono);
+  }
+  .role.maker { background: var(--info-bg); color: var(--info); }
+  .role.taker { background: var(--bg-chip); color: var(--fg-muted); }
 </style>

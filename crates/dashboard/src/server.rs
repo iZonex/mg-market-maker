@@ -11,11 +11,11 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{info, warn};
 
 use crate::auth::{
-    admin_middleware, auth_middleware, internal_view_middleware, login_handler, ApiUser,
-    AuthState, Role,
+    admin_middleware, auth_middleware, internal_view_middleware, login_handler, logout_handler,
+    ApiUser, AuthState, Role,
 };
 use crate::rate_limit::{rate_limit_middleware, RateLimiter};
-use crate::state::{ConfigOverride, DashboardState, SymbolState};
+use crate::state::{ConfigOverride, DashboardState, SymbolState, VenueBalanceSnapshot};
 use crate::websocket::{ws_handler, WsBroadcast};
 
 /// Start the dashboard HTTP + WebSocket server with authentication.
@@ -70,6 +70,11 @@ pub async fn start(
     let protected_api = Router::new()
         .route("/api/status", get(get_status))
         .route("/api/v1/venues/status", get(venues_status))
+        .route("/api/v1/inventory/venues", get(inventory_venues_all))
+        .route(
+            "/api/v1/inventory/venues/{symbol}",
+            get(inventory_venues_symbol),
+        )
         .route("/api/v1/clients/loss-state", get(clients_loss_state))
         .merge(crate::client_api::client_routes())
         .merge(crate::client_portal::client_portal_routes())
@@ -78,6 +83,17 @@ pub async fn start(
             auth_middleware,
         ))
         .with_state(state.clone());
+
+    // Logout — auth-protected so we know who is walking out the
+    // door; the endpoint itself only emits an audit event since
+    // tokens are stateless HMAC.
+    let logout = Router::new()
+        .route("/api/auth/logout", post(logout_handler))
+        .route_layer(middleware::from_fn_with_state(
+            auth_state.clone(),
+            auth_middleware,
+        ))
+        .with_state(auth_state.clone());
 
     // Prometheus metrics — auth + internal-view role gate.
     let metrics_route = Router::new()
@@ -120,6 +136,11 @@ pub async fn start(
         .route("/api/admin/loans", get(admin_list_loans))
         .route("/api/admin/optimize/status", get(admin_optimize_status))
         .route("/api/admin/optimize/results", get(admin_optimize_results))
+        .route("/api/admin/optimize/trigger", post(admin_optimize_trigger))
+        .route("/api/admin/optimize/pending", get(admin_optimize_pending))
+        .route("/api/admin/optimize/apply", post(admin_optimize_apply))
+        .route("/api/admin/optimize/discard", post(admin_optimize_discard))
+        .route("/api/admin/sentiment/headline", post(admin_sentiment_headline))
         .merge(crate::admin_clients::admin_client_routes())
         .with_state(state.clone());
 
@@ -151,6 +172,7 @@ pub async fn start(
     let app = Router::new()
         .merge(public)
         .merge(login)
+        .merge(logout)
         .merge(probes)
         .merge(protected_api)
         .merge(metrics_route)
@@ -252,6 +274,24 @@ async fn readiness(State(state): State<DashboardState>) -> axum::http::StatusCod
 
 async fn get_status(State(state): State<DashboardState>) -> Json<Vec<SymbolState>> {
     Json(state.get_all())
+}
+
+/// Per-venue inventory drilldown for a single symbol. Returns the
+/// balance snapshots the engine last published from each connector
+/// in the bundle (primary, hedge, SOR extras).
+async fn inventory_venues_symbol(
+    State(state): State<DashboardState>,
+    Path(symbol): Path<String>,
+) -> Json<Vec<VenueBalanceSnapshot>> {
+    Json(state.venue_balances(&symbol))
+}
+
+/// All per-venue inventory snapshots keyed by symbol. Used by the
+/// overview panel to render the cross-symbol picture in one shot.
+async fn inventory_venues_all(
+    State(state): State<DashboardState>,
+) -> Json<std::collections::HashMap<String, Vec<VenueBalanceSnapshot>>> {
+    Json(state.all_venue_balances())
 }
 
 async fn prometheus_metrics() -> String {
@@ -659,6 +699,156 @@ async fn admin_optimize_results(
         })),
         None => axum::Json(serde_json::json!({"status": "no optimization run"})),
     }
+}
+
+// ── Epic 33 — hyperopt re-calibrate flow ────────────────────
+
+/// Kick off a hyperopt run against a pre-recorded JSONL. The
+/// worker task in the server reads `HyperoptTrigger` payloads
+/// from the channel registered at startup, runs the optimiser,
+/// and stages the best trial as `PendingCalibration` for
+/// operator review.
+async fn admin_optimize_trigger(
+    State(state): State<DashboardState>,
+    axum::Json(trigger): axum::Json<crate::state::HyperoptTrigger>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    if !state.send_hyperopt_trigger(trigger.clone()) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "error": "hyperopt worker not registered — server startup may still be racing",
+            })),
+        )
+            .into_response();
+    }
+    axum::Json(serde_json::json!({
+        "status": "queued",
+        "symbol": trigger.symbol,
+        "trials": trigger.num_trials,
+        "recording_path": trigger.recording_path,
+    }))
+    .into_response()
+}
+
+/// List pending calibrations — one per symbol if any hyperopt
+/// runs have completed since the last apply / discard.
+async fn admin_optimize_pending(
+    State(state): State<DashboardState>,
+) -> axum::Json<Vec<crate::state::PendingCalibration>> {
+    axum::Json(state.all_calibrations())
+}
+
+#[derive(serde::Deserialize)]
+struct SymbolBody {
+    symbol: String,
+}
+
+/// Apply the pending calibration for `symbol`: convert each
+/// suggested parameter into the matching `ConfigOverride` and
+/// dispatch. Clears the pending entry.
+async fn admin_optimize_apply(
+    State(state): State<DashboardState>,
+    axum::Json(body): axum::Json<SymbolBody>,
+) -> axum::Json<serde_json::Value> {
+    use crate::state::ConfigOverride;
+    let Some(pending) = state.get_calibration(&body.symbol) else {
+        return axum::Json(serde_json::json!({
+            "status": "none_pending",
+            "symbol": body.symbol,
+        }));
+    };
+    let mut applied = 0u32;
+    let mut skipped: Vec<String> = Vec::new();
+    for (key, value) in &pending.suggested {
+        let ovr = match key.as_str() {
+            "gamma" => ConfigOverride::Gamma(*value),
+            "min_spread_bps" => ConfigOverride::MinSpreadBps(*value),
+            "order_size" => ConfigOverride::OrderSize(*value),
+            "max_distance_bps" => ConfigOverride::MaxDistanceBps(*value),
+            "num_levels" => {
+                use rust_decimal::prelude::ToPrimitive;
+                let n = value.to_u64().unwrap_or(0) as usize;
+                ConfigOverride::NumLevels(n)
+            }
+            "max_inventory" => ConfigOverride::MaxInventory(*value),
+            // κ and σ are strategy inputs but not hot-reloadable
+            // through the existing ConfigOverride surface yet —
+            // skip with a note so the operator can patch config
+            // manually if they were part of the suggestion.
+            _ => {
+                skipped.push(key.clone());
+                continue;
+            }
+        };
+        if state.send_config_override(&body.symbol, ovr) {
+            applied += 1;
+        } else {
+            skipped.push(format!("{key} (send failed)"));
+        }
+    }
+    state.clear_calibration(&body.symbol);
+    axum::Json(serde_json::json!({
+        "status": "applied",
+        "symbol": body.symbol,
+        "applied": applied,
+        "skipped": skipped,
+    }))
+}
+
+async fn admin_optimize_discard(
+    State(state): State<DashboardState>,
+    axum::Json(body): axum::Json<SymbolBody>,
+) -> axum::Json<serde_json::Value> {
+    let cleared = state.clear_calibration(&body.symbol).is_some();
+    axum::Json(serde_json::json!({
+        "status": if cleared { "discarded" } else { "none_pending" },
+        "symbol": body.symbol,
+    }))
+}
+
+// ── Epic G follow-up — manual headline push ────────────────
+//
+// Operators with faster eyes than the RSS / Twitter poll
+// cycle can inject a headline directly. The endpoint
+// broadcasts `ConfigOverride::News(text)` so every engine's
+// `NewsRetreatStateMachine` re-evaluates on it — same path
+// the automated pipeline uses. The distinction is purely
+// provenance: automated pipeline goes via the orchestrator's
+// SentimentTick; this endpoint skips straight to the
+// retreat-state-machine branch for immediate effect.
+
+#[derive(serde::Deserialize)]
+struct HeadlinePayload {
+    /// Free text — regex tables in `NewsRetreatConfig` decide
+    /// the severity class.
+    text: String,
+}
+
+async fn admin_sentiment_headline(
+    State(state): State<DashboardState>,
+    axum::Json(body): axum::Json<HeadlinePayload>,
+) -> axum::Json<serde_json::Value> {
+    if body.text.trim().is_empty() {
+        return axum::Json(serde_json::json!({
+            "status": "rejected",
+            "reason": "empty text",
+        }));
+    }
+    let recipients = state.broadcast_config_override(
+        crate::state::ConfigOverride::News(body.text.clone()),
+    );
+    tracing::info!(
+        chars = body.text.len(),
+        recipients,
+        "operator-pushed headline broadcast"
+    );
+    axum::Json(serde_json::json!({
+        "status": "broadcast",
+        "recipients": recipients,
+        "chars": body.text.len(),
+    }))
 }
 
 // ── Ops endpoints — manual kill switch control ───────────────

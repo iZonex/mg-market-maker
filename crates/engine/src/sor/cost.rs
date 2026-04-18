@@ -148,6 +148,7 @@ mod tests {
             best_bid: dec!(50000),
             best_ask: dec!(50010),
             queue_wait_secs,
+            slippage_bps_per_unit: Decimal::ZERO,
         }
     }
 

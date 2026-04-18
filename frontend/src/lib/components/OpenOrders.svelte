@@ -1,48 +1,91 @@
 <script>
   let { data } = $props()
   const s = $derived(data.state)
-  const sym = $derived(s.symbols[0] || '')
+  const sym = $derived(s.activeSymbol || s.symbols[0] || '')
   const d = $derived(s.data[sym] || {})
+  const orders = $derived(d.open_orders || [])
 </script>
 
-<div>
-  <h3>Open Orders <span class="count">{d.live_orders || 0}</span></h3>
-
-  <table>
+{#if orders.length === 0}
+  <div class="empty-state">
+    <span class="empty-state-icon">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="9"/>
+        <line x1="12" y1="8" x2="12" y2="12"/>
+        <line x1="12" y1="16" x2="12.01" y2="16"/>
+      </svg>
+    </span>
+    <span class="empty-state-title">No open orders</span>
+    <span class="empty-state-hint">Orders will appear once the strategy completes a refresh tick.</span>
+  </div>
+{:else}
+  <table class="orders">
     <thead>
       <tr>
         <th>Side</th>
         <th>Price</th>
-        <th>Size</th>
+        <th class="right">Size</th>
         <th>Status</th>
       </tr>
     </thead>
     <tbody>
-      {#if d.open_orders}
-        {#each d.open_orders as order}
-          <tr>
-            <td class:buy={order.side === 'buy'} class:sell={order.side === 'sell'}>
-              {order.side?.toUpperCase()}
-            </td>
-            <td>{order.price}</td>
-            <td>{order.qty}</td>
-            <td>{order.status}</td>
-          </tr>
-        {/each}
-      {:else}
-        <tr><td colspan="4" class="empty">Waiting for data...</td></tr>
-      {/if}
+      {#each orders as order}
+        <tr>
+          <td>
+            <span class="side" data-side={order.side?.toLowerCase()}>{order.side?.toUpperCase()}</span>
+          </td>
+          <td class="num">{order.price}</td>
+          <td class="num right">{order.qty}</td>
+          <td><span class="status">{order.status}</span></td>
+        </tr>
+      {/each}
     </tbody>
   </table>
-</div>
+{/if}
 
 <style>
-  h3 { font-size: 12px; color: #8b949e; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
-  .count { color: #58a6ff; margin-left: 6px; }
-  table { width: 100%; border-collapse: collapse; }
-  th { font-size: 10px; color: #484f58; text-align: left; padding: 4px; border-bottom: 1px solid #21262d; }
-  td { font-size: 12px; padding: 3px 4px; border-bottom: 1px solid #161b22; }
-  .buy { color: #3fb950; }
-  .sell { color: #f85149; }
-  .empty { color: #484f58; text-align: center; padding: 20px; }
+  .orders {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--font-sans);
+    font-size: var(--fs-sm);
+  }
+  th {
+    font-size: var(--fs-2xs);
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-label);
+    color: var(--fg-muted);
+    text-align: left;
+    padding: var(--s-2) var(--s-3);
+    border-bottom: 1px solid var(--border-subtle);
+    font-weight: 500;
+  }
+  th.right { text-align: right; }
+  td {
+    padding: var(--s-2) var(--s-3);
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--fg-primary);
+  }
+  td.num {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: var(--fs-sm);
+  }
+  td.right { text-align: right; }
+  .side {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px var(--s-2);
+    border-radius: var(--r-sm);
+    font-size: var(--fs-2xs);
+    font-weight: 700;
+    letter-spacing: var(--tracking-label);
+    font-family: var(--font-mono);
+  }
+  .side[data-side='buy']  { background: var(--pos-bg); color: var(--pos); }
+  .side[data-side='sell'] { background: var(--neg-bg); color: var(--neg); }
+  .status {
+    font-size: var(--fs-xs);
+    color: var(--fg-secondary);
+  }
 </style>

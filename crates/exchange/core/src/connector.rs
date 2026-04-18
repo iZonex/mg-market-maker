@@ -239,6 +239,104 @@ pub struct VenueCapabilities {
     /// `get_funding_rate` returns a real value on this connector.
     /// Spot connectors set this to `false`.
     pub supports_funding_rate: bool,
+    /// Epic 40.4 — venue exposes an account margin / position
+    /// margin endpoint (`/fapi/v2/account`, `/v5/account/
+    /// wallet-balance`, `/info clearinghouseState`). Spot
+    /// connectors and the custom test connector set this to
+    /// `false`; the `MarginGuard` skips the poll entirely.
+    pub supports_margin_info: bool,
+    /// Epic 40.7 — venue accepts `set_margin_mode` / `set_leverage`
+    /// (Binance `/fapi/v1/marginType`, Bybit
+    /// `/v5/account/set-margin-mode`, HL `updateLeverage`). Spot
+    /// connectors set this to `false`.
+    pub supports_margin_mode: bool,
+}
+
+/// Account-level margin snapshot (Epic 40.4). One per venue; the
+/// engine polls it every ~5 s and feeds the result through
+/// `MarginGuard` into `kill_switch::update_margin_ratio`.
+#[derive(Debug, Clone)]
+pub struct AccountMarginInfo {
+    /// `totalMarginBalance` / `totalEquity` / `accountValue` —
+    /// our total notional including unrealised PnL.
+    pub total_equity: rust_decimal::Decimal,
+    /// `totalInitialMargin` — sum of IM across open positions.
+    pub total_initial_margin: rust_decimal::Decimal,
+    /// `totalMaintMargin` — sum of MM across open positions. The
+    /// guard's primary ratio `MM / equity` drives kill-switch
+    /// escalation.
+    pub total_maintenance_margin: rust_decimal::Decimal,
+    /// Free cash available for new-order IM.
+    pub available_balance: rust_decimal::Decimal,
+    /// `MM / total_equity` ∈ [0, 1]. Venue publishes this
+    /// directly on some APIs (Bybit `accountMMRate`); we compute
+    /// it client-side otherwise. Guard reads THIS value, not
+    /// the individual fields, for escalation decisions.
+    pub margin_ratio: rust_decimal::Decimal,
+    /// Per-position detail. Keyed-by-symbol lookup inside the
+    /// guard lets us answer "will adding N notional to BTC push
+    /// us over the line?".
+    pub positions: Vec<PositionMargin>,
+    /// Wall-clock timestamp the venue reported this snapshot,
+    /// in unix-millis. Used by the guard's staleness check.
+    pub reported_at_ms: i64,
+}
+
+/// Per-position margin detail from the venue (Epic 40.4).
+#[derive(Debug, Clone)]
+pub struct PositionMargin {
+    pub symbol: String,
+    pub side: mm_common::types::Side,
+    pub size: rust_decimal::Decimal,
+    pub entry_price: rust_decimal::Decimal,
+    pub mark_price: rust_decimal::Decimal,
+    /// Isolated-margin allocation (if the position is isolated).
+    /// `None` for cross-margin positions.
+    pub isolated_margin: Option<rust_decimal::Decimal>,
+    /// Liquidation price from the venue. Never recomputed locally
+    /// — venues publish the canonical value per their tiered MMR
+    /// brackets which our engine does not model.
+    pub liq_price: Option<rust_decimal::Decimal>,
+}
+
+/// Margin mode selection for perp accounts (Epic 40.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarginMode {
+    /// Per-symbol isolated IM. Losses capped to the position's
+    /// isolated bucket; other positions unaffected. Default.
+    Isolated,
+    /// Cross-margin — one shared IM pool across all positions.
+    /// More capital-efficient but exposes the engine to
+    /// cross-symbol liquidation cascades. Only safe when a live
+    /// `hedge_optimizer` is in play (validated at startup).
+    Cross,
+}
+
+impl MarginMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MarginMode::Isolated => "isolated",
+            MarginMode::Cross => "cross",
+        }
+    }
+}
+
+/// Margin-related errors from venue calls (Epic 40.4).
+#[derive(Debug, thiserror::Error)]
+pub enum MarginError {
+    /// The venue has no margin concept (spot connectors,
+    /// custom-exchange test). Guard treats this as "skip".
+    #[error("venue does not support margin info")]
+    NotSupported,
+    /// Snapshot is older than the guard's staleness budget.
+    /// Guard escalates to WidenSpreads.
+    #[error("margin snapshot stale ({0} seconds old)")]
+    Stale(i64),
+    /// Anything else — network error, auth rejection, unexpected
+    /// response shape. Guard treats repeated errors as a kill-
+    /// switch escalation cue via existing `on_error` cascade.
+    #[error("{0}")]
+    Other(#[from] anyhow::Error),
 }
 
 /// The core exchange connector trait.
@@ -251,6 +349,20 @@ pub trait ExchangeConnector: Send + Sync {
 
     fn venue_id(&self) -> VenueId;
     fn capabilities(&self) -> &VenueCapabilities;
+
+    /// Lower a venue-specific error string into the shared
+    /// [`crate::errors::VenueErrorKind`] taxonomy so the engine
+    /// can branch retry policy / metrics / alerts without
+    /// substring-matching raw `anyhow::Error` messages.
+    ///
+    /// Default implementation returns `VenueErrorKind::Other`
+    /// wrapping the full message. Venue crates override this to
+    /// call their own `classify` module. Engines that do not
+    /// care about classification (tests, custom connectors) keep
+    /// working verbatim.
+    fn classify_error(&self, err: &anyhow::Error) -> crate::errors::VenueError {
+        crate::errors::VenueError::other(err.to_string())
+    }
 
     /// Which product this connector trades. One connector instance
     /// = one venue × one product; a venue exposing spot and
@@ -284,6 +396,84 @@ pub trait ExchangeConnector: Send + Sync {
     /// skips the periodic refresh entirely.
     async fn get_borrow_rate(&self, _asset: &str) -> Result<BorrowRateInfo, BorrowError> {
         Err(BorrowError::NotSupported)
+    }
+
+    /// Venue-side server time in milliseconds since Unix epoch.
+    /// Consumed by the clock-skew preflight check so a ±500 ms
+    /// drift is surfaced before the first signed request — HMAC
+    /// auth rejects signatures signed outside the venue's
+    /// `recv_window`, which is otherwise a cryptic `-1021` at
+    /// trade time.
+    ///
+    /// Returns `Ok(None)` when the venue has no time endpoint.
+    /// Default impl is `Ok(None)` so older connectors stay
+    /// silent.
+    async fn server_time_ms(&self) -> anyhow::Result<Option<i64>> {
+        Ok(None)
+    }
+
+    /// Account-level margin snapshot (Epic 40.4). Returns
+    /// `MarginError::NotSupported` for spot connectors or the
+    /// custom test connector. Perp connectors override to hit
+    /// `/fapi/v2/account` (Binance), `/v5/account/wallet-balance
+    /// + /v5/position/list` (Bybit), or
+    /// `POST /info {type:"clearinghouseState"}` (HyperLiquid).
+    ///
+    /// The engine's `MarginGuard` polls this every ~5 s and
+    /// escalates the kill switch based on `margin_ratio`.
+    async fn account_margin_info(&self) -> Result<AccountMarginInfo, MarginError> {
+        Err(MarginError::NotSupported)
+    }
+
+    /// Set per-symbol margin mode (Epic 40.7) — Isolated or
+    /// Cross. Binance uses `POST /fapi/v1/marginType` per-symbol;
+    /// Bybit uses `POST /v5/account/set-margin-mode` account-wide
+    /// (the connector ignores `symbol` when the venue is Bybit);
+    /// HyperLiquid uses `POST /exchange { updateLeverage }` per-
+    /// asset with `isCross` flag. Spot connectors return
+    /// `NotSupported`.
+    ///
+    /// Idempotent: a venue returning "already in this mode"
+    /// (Binance `-4046`, Bybit `110026`) is treated as `Ok(())`
+    /// by the wrapper; only new errors propagate.
+    async fn set_margin_mode(
+        &self,
+        _symbol: &str,
+        _mode: MarginMode,
+    ) -> Result<(), MarginError> {
+        Err(MarginError::NotSupported)
+    }
+
+    /// Set per-symbol leverage (Epic 40.7). Leverage cap applies
+    /// on top of the venue's own bracket limits — venues clamp
+    /// to their tier-maximum silently. Spot connectors return
+    /// `NotSupported`.
+    async fn set_leverage(
+        &self,
+        _symbol: &str,
+        _leverage: u32,
+    ) -> Result<(), MarginError> {
+        Err(MarginError::NotSupported)
+    }
+
+    /// 24-hour quote-currency volume (turnover) for `symbol`.
+    /// Consumed by the Epic 30 `PairClass` classifier at engine
+    /// startup to tag the symbol's liquidity tier.
+    ///
+    /// Returns `Ok(None)` when the venue exposes a ticker but the
+    /// response didn't include a volume field; the classifier
+    /// treats `None` as "unknown" and falls back to its
+    /// conservative default.
+    ///
+    /// Default impl returns `Ok(None)` so venues that don't want
+    /// to wire this yet stay at the conservative default without
+    /// any connector change. Each supported venue overrides with
+    /// its native 24h ticker endpoint.
+    async fn get_24h_volume_usd(
+        &self,
+        _symbol: &str,
+    ) -> anyhow::Result<Option<rust_decimal::Decimal>> {
+        Ok(None)
     }
 
     /// Open a margin loan for `qty` of `asset` (P1.3 stage-2).

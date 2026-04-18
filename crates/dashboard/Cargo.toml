@@ -6,6 +6,7 @@ version.workspace = true
 [dependencies]
 mm-common = { workspace = true }
 mm-risk = { workspace = true }
+mm-sentiment = { workspace = true }
 mm-exchange-core = { workspace = true }
 mm-persistence = { path = "../persistence" }
 mm-portfolio = { workspace = true }
@@ -29,3 +30,31 @@ hex = { workspace = true }
 getrandom = { workspace = true }
 subtle = { workspace = true }
 once_cell = "1"
+# Epic 42.2 — multi-sheet XLSX monthly compliance export. Pure-Rust
+# writer, no C/Python deps, minimal binary-size impact.
+rust_xlsxwriter = "0.90"
+# Epic 42.1 — PDF daily / monthly compliance reports. Pure-Rust, no
+# external wkhtmltopdf / chromium process. Uses the built-in
+# Helvetica (PDF core font) so no external font files required.
+printpdf = "0.8"
+# Epic 42.3 — SMTP email delivery of daily / monthly reports.
+# `rustls-tls` feature keeps the build OpenSSL-free. `smtp-transport`
+# enables the async tokio transport, `builder` the friendly
+# MessageBuilder surface.
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1", "tokio1-rustls-tls", "ring"] }
+# Epic 42.4 — cron scheduler for automated daily / weekly / monthly
+# report generation. Tokio-native, supports standard crontab syntax,
+# catch-up semantics for missed runs during downtime.
+tokio-cron-scheduler = { version = "0.13", default-features = false }
+async-trait = { workspace = true }
+# Block C — S3 archive pipeline. `behavior-version-latest` silences
+# the behavior-major-version warning introduced in aws-sdk-s3 1.x;
+# it pins us to the latest behavior explicitly so upgrades don't
+# surprise us. `rustls` feature keeps the build OpenSSL-free and
+# consistent with the rest of the workspace.
+aws-sdk-s3 = { version = "1.73", default-features = false, features = ["behavior-version-latest", "rustls", "rt-tokio"] }
+aws-config = { version = "1.6", default-features = false, features = ["behavior-version-latest", "rustls", "rt-tokio", "credentials-process"] }
+aws-smithy-types = "1.3"
+# Block C — in-memory zip assembler for the /api/v1/export/bundle
+# endpoint. `zip` is pure-Rust, no deflate-external dependencies.
+zip = { version = "2.2", default-features = false, features = ["deflate-flate2", "flate2"] }

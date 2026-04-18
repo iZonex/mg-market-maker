@@ -26,6 +26,12 @@ pub struct BalanceCache {
     /// Wallet the convenience methods (without a wallet arg) act on.
     /// Set by the engine from its connector's `product().default_wallet()`.
     configured_wallet: WalletType,
+    /// When true, `can_afford` / `can_afford_in` always returns true
+    /// and `reserve` is a no-op-success. Used by `MM_MODE=paper` so
+    /// a venue-side balance of zero USDT doesn't gate the paper
+    /// order stream. Real balance refreshes still write through so
+    /// the dashboard continues to show the true account state.
+    paper_mode: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +62,18 @@ impl BalanceCache {
         Self {
             balances: HashMap::new(),
             configured_wallet: wallet,
+            paper_mode: false,
+        }
+    }
+
+    /// Paper-mode constructor: `can_afford` always returns true,
+    /// `reserve` short-circuits to success. See `paper_mode` field
+    /// docs for the rationale.
+    pub fn new_paper_for(wallet: WalletType) -> Self {
+        Self {
+            balances: HashMap::new(),
+            configured_wallet: wallet,
+            paper_mode: true,
         }
     }
 
@@ -133,6 +151,9 @@ impl BalanceCache {
         quote_asset: &str,
         wallet: WalletType,
     ) -> bool {
+        if self.paper_mode {
+            return true;
+        }
         match side {
             Side::Buy => {
                 let required = price * qty;
@@ -171,6 +192,9 @@ impl BalanceCache {
         quote_asset: &str,
         wallet: WalletType,
     ) -> bool {
+        if self.paper_mode {
+            return true;
+        }
         let (asset, amount) = match side {
             Side::Buy => (quote_asset, price * qty),
             Side::Sell => (base_asset, qty),

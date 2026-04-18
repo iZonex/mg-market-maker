@@ -396,7 +396,9 @@ mod tests {
                     supports_fix: false,
                     max_order_rate: 100,
                     supports_funding_rate: product.has_funding(),
-                },
+                    supports_margin_info: false,
+                supports_margin_mode: false,
+                            },
                 bids: Mutex::new(vec![PriceLevel {
                     price: mid - dec!(1),
                     qty: dec!(10),
@@ -549,6 +551,7 @@ mod tests {
                 max_position: dec!(0.1),
                 max_basis_bps: dec!(200),
                 enabled: true,
+                ..Default::default()
             },
         }
     }

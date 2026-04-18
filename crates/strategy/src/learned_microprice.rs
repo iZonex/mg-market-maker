@@ -41,6 +41,7 @@ use anyhow::{Context, Result};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::Path;
 
 /// Tuning knobs for the G-function fit. See
@@ -58,6 +59,27 @@ pub struct LearnedMicropriceConfig {
     /// a non-zero prediction. Under-sampled buckets clamp to
     /// zero after [`LearnedMicroprice::finalize`]. Default 100.
     pub min_bucket_samples: usize,
+    /// Epic D stage-2 — cap on the online observation ring
+    /// used by [`LearnedMicroprice::update_online`]. Older
+    /// observations drop off the back as new ones arrive.
+    /// Default 10 000 — ≈ 1 hour of 3 Hz L1 snapshots. Set
+    /// smaller on thinner tapes (smaller window adapts faster
+    /// but noisier), larger on deeper books.
+    #[serde(default = "default_online_ring_capacity")]
+    pub online_ring_capacity: usize,
+    /// Epic D stage-2 — re-fit cadence. The online ring is
+    /// appended every update, but the `g_matrix` is
+    /// rebuilt only every `refit_every` calls to amortise the
+    /// scan. Default 500 ≈ every 3 minutes at 3 Hz.
+    #[serde(default = "default_refit_every")]
+    pub refit_every: usize,
+}
+
+fn default_online_ring_capacity() -> usize {
+    10_000
+}
+fn default_refit_every() -> usize {
+    500
 }
 
 impl Default for LearnedMicropriceConfig {
@@ -66,6 +88,8 @@ impl Default for LearnedMicropriceConfig {
             n_imbalance_buckets: 20,
             n_spread_buckets: 5,
             min_bucket_samples: 100,
+            online_ring_capacity: default_online_ring_capacity(),
+            refit_every: default_refit_every(),
         }
     }
 }
@@ -104,6 +128,20 @@ pub struct LearnedMicroprice {
     g_matrix: Vec<Vec<Decimal>>,
     /// `true` after [`Self::finalize`] has run.
     finalized: bool,
+    /// Epic D stage-2 — bounded ring of recent observations
+    /// consumed by [`Self::update_online`] to periodically
+    /// rebuild the g-matrix against the freshest window of
+    /// data. `#[serde(skip)]` keeps persisted TOML stable
+    /// (the offline fit already captures the training-window
+    /// state; the ring is a live-only structure).
+    #[serde(skip, default)]
+    online_ring: VecDeque<(Decimal, Decimal, Decimal)>,
+    /// Epic D stage-2 — counter ticked on every
+    /// [`Self::update_online`] call. Re-fits fire when
+    /// `counter % refit_every == 0`, so updates amortise a
+    /// full rebuild over `refit_every` observations.
+    #[serde(skip, default)]
+    online_counter: usize,
 }
 
 impl LearnedMicroprice {
@@ -130,6 +168,8 @@ impl LearnedMicroprice {
             spread_edges: Vec::new(),
             g_matrix,
             finalized: false,
+            online_ring: VecDeque::new(),
+            online_counter: 0,
         }
     }
 
@@ -242,11 +282,26 @@ impl LearnedMicroprice {
             self.spread_edges = edges;
         }
 
+        self.rebuild_g_matrix();
+
+        self.spread_samples.clear();
+        self.spread_samples.shrink_to_fit();
+        self.finalized = true;
+    }
+
+    /// Shared "seed well-sampled buckets + inverse-distance
+    /// neighbour fill for sparse ones" machinery used by both
+    /// [`Self::finalize_iterative`] and [`Self::update_online`].
+    /// Assumes `bucket_sum` + `bucket_count` have been populated
+    /// and `spread_edges` are set — does NOT mutate them; only
+    /// writes the `g_matrix`.
+    fn rebuild_g_matrix(&mut self) {
         let ni = self.config.n_imbalance_buckets;
         let ns = self.config.n_spread_buckets;
         let min_samples = self.config.min_bucket_samples;
 
-        // Seed well-sampled buckets.
+        // Seed well-sampled buckets with their empirical mean;
+        // sparse buckets start at zero and get filled below.
         for i in 0..ni {
             for s in 0..ns {
                 let count = self.bucket_count[i][s];
@@ -258,61 +313,115 @@ impl LearnedMicroprice {
             }
         }
 
-        // Iterative fill: for sparse buckets, borrow from
-        // nearest well-sampled neighbors (4-connected: up, down,
-        // left, right in the imbalance × spread grid). Weight
-        // by inverse Manhattan distance.
-        // Single-pass fill: for each sparse bucket, compute
-        // inverse-distance weighted average from ALL well-sampled
-        // (count ≥ min_samples) buckets. No iteration needed —
-        // the well-sampled values are fixed anchors.
-        {
-            let mut _changed = false;
-            for i in 0..ni {
-                for s in 0..ns {
-                    if self.bucket_count[i][s] >= min_samples {
-                        continue;
-                    }
-                    let mut weighted_sum = Decimal::ZERO;
-                    let mut total_weight = Decimal::ZERO;
-                    for d in 1..=(ni.max(ns)) {
-                        for (di, ds) in neighbor_ring(d) {
-                            let ni_idx = i as i64 + di;
-                            let ns_idx = s as i64 + ds;
-                            if ni_idx < 0
-                                || ni_idx >= ni as i64
-                                || ns_idx < 0
-                                || ns_idx >= ns as i64
-                            {
-                                continue;
-                            }
-                            let ni_u = ni_idx as usize;
-                            let ns_u = ns_idx as usize;
-                            // Only borrow from well-sampled anchors
-                            // to avoid oscillation between sparse buckets.
-                            if self.bucket_count[ni_u][ns_u] >= min_samples {
-                                let w = Decimal::ONE / Decimal::from(d as u64);
-                                weighted_sum += w * self.g_matrix[ni_u][ns_u];
-                                total_weight += w;
-                            }
+        // Neighbour fill: inverse-Manhattan-distance weighted
+        // average from every well-sampled bucket to every
+        // sparse one. Single-pass — anchors stay fixed, so
+        // iteration isn't needed.
+        for i in 0..ni {
+            for s in 0..ns {
+                if self.bucket_count[i][s] >= min_samples {
+                    continue;
+                }
+                let mut weighted_sum = Decimal::ZERO;
+                let mut total_weight = Decimal::ZERO;
+                for d in 1..=(ni.max(ns)) {
+                    for (di, ds) in neighbor_ring(d) {
+                        let ni_idx = i as i64 + di;
+                        let ns_idx = s as i64 + ds;
+                        if ni_idx < 0
+                            || ni_idx >= ni as i64
+                            || ns_idx < 0
+                            || ns_idx >= ns as i64
+                        {
+                            continue;
                         }
-                        // Don't break on first ring — collect all
-                        // well-sampled neighbors for better estimate.
-                    }
-                    if total_weight > Decimal::ZERO {
-                        let new_val = weighted_sum / total_weight;
-                        if new_val != self.g_matrix[i][s] {
-                            _changed = true;
+                        let ni_u = ni_idx as usize;
+                        let ns_u = ns_idx as usize;
+                        if self.bucket_count[ni_u][ns_u] >= min_samples {
+                            let w = Decimal::ONE / Decimal::from(d as u64);
+                            weighted_sum += w * self.g_matrix[ni_u][ns_u];
+                            total_weight += w;
                         }
-                        self.g_matrix[i][s] = new_val;
                     }
+                }
+                if total_weight > Decimal::ZERO {
+                    self.g_matrix[i][s] = weighted_sum / total_weight;
                 }
             }
         }
+    }
 
-        self.spread_samples.clear();
-        self.spread_samples.shrink_to_fit();
-        self.finalized = true;
+    /// Epic D stage-2 — push one fresh observation into the
+    /// online ring and (if the refit cadence has been reached)
+    /// rebuild the g-matrix against the most recent
+    /// `online_ring_capacity` observations.
+    ///
+    /// Must be called on an already-finalised model: the
+    /// spread edges are consumed as-is so the online path
+    /// stays consistent with the offline training window's
+    /// spread-quantile definition. Calls on an un-finalised
+    /// model are a silent no-op so an operator wiring the
+    /// live callback before the fit loads can't accidentally
+    /// overwrite an empty g-matrix with meaningless
+    /// defaults.
+    ///
+    /// `imbalance` must be in `[-1, 1]`, `spread ≥ 0`,
+    /// `delta_mid` is the observed forward-mid change at
+    /// the same horizon the offline fit used.
+    pub fn update_online(
+        &mut self,
+        imbalance: Decimal,
+        spread: Decimal,
+        delta_mid: Decimal,
+    ) {
+        if !self.finalized {
+            return;
+        }
+        // Push + evict.
+        if self.online_ring.len() >= self.config.online_ring_capacity.max(1) {
+            self.online_ring.pop_front();
+        }
+        self.online_ring.push_back((imbalance, spread, delta_mid));
+        self.online_counter = self.online_counter.wrapping_add(1);
+
+        let refit_every = self.config.refit_every.max(1);
+        if !self.online_counter.is_multiple_of(refit_every) {
+            return;
+        }
+
+        // Rebuild: zero the buckets, re-accumulate from the ring
+        // against the already-established `spread_edges`, then
+        // rerun the seed + neighbour fill.
+        for row in self.bucket_sum.iter_mut() {
+            for cell in row.iter_mut() {
+                *cell = Decimal::ZERO;
+            }
+        }
+        for row in self.bucket_count.iter_mut() {
+            for cell in row.iter_mut() {
+                *cell = 0;
+            }
+        }
+        for (imb, sp, dm) in &self.online_ring {
+            let i = imbalance_bucket(*imb, self.config.n_imbalance_buckets);
+            let s = spread_bucket(*sp, &self.spread_edges);
+            self.bucket_sum[i][s] += *dm;
+            self.bucket_count[i][s] += 1;
+        }
+        self.rebuild_g_matrix();
+    }
+
+    /// Read-only accessor for the online ring length. Used in
+    /// tests and observability surfaces; always ≤
+    /// `config.online_ring_capacity`.
+    pub fn online_ring_len(&self) -> usize {
+        self.online_ring.len()
+    }
+
+    /// Number of `update_online` calls since construction.
+    /// Wraps on overflow (64-bit wrap ≈ never in practice).
+    pub fn online_counter(&self) -> usize {
+        self.online_counter
     }
 
     /// Predict `Δmid` given the current `(imbalance, spread)`
@@ -497,6 +606,7 @@ mod tests {
             n_imbalance_buckets: 4,
             n_spread_buckets: 1,
             min_bucket_samples: 5,
+            ..Default::default()
         }
     }
 
@@ -587,6 +697,7 @@ mod tests {
             n_imbalance_buckets: 2,
             n_spread_buckets: 2,
             min_bucket_samples: 2,
+            ..Default::default()
         };
         let mut mp = LearnedMicroprice::empty(config);
         mp.with_spread_edges(vec![dec!(0.05)]);
@@ -635,6 +746,7 @@ mod tests {
             n_imbalance_buckets: 1,
             n_spread_buckets: 1,
             min_bucket_samples: 1,
+            ..Default::default()
         });
     }
 
@@ -699,6 +811,7 @@ mod tests {
             n_imbalance_buckets: 2,
             n_spread_buckets: 3,
             min_bucket_samples: 1,
+            ..Default::default()
         };
         let mut mp = LearnedMicroprice::empty(config);
         mp.with_spread_edges(vec![dec!(0.02), dec!(0.08)]);
@@ -721,6 +834,7 @@ mod tests {
             n_imbalance_buckets: 4,
             n_spread_buckets: 2,
             min_bucket_samples: 2,
+            ..Default::default()
         };
         let mut mp = LearnedMicroprice::empty(config);
         mp.with_spread_edges(vec![dec!(0.05)]);
@@ -753,6 +867,7 @@ mod tests {
             n_imbalance_buckets: 4,
             n_spread_buckets: 1,
             min_bucket_samples: 3,
+            ..Default::default()
         };
         let mut mp = LearnedMicroprice::empty(config);
         // Bucket 0: Δmid = −0.4
@@ -796,6 +911,7 @@ mod tests {
             n_imbalance_buckets: 4,
             n_spread_buckets: 1,
             min_bucket_samples: 5,
+            ..Default::default()
         };
         let mut mp = LearnedMicroprice::empty(cfg);
         // Train only bucket 0 (imbalance ~ -0.75) and bucket 3
@@ -829,6 +945,7 @@ mod tests {
             n_imbalance_buckets: 4,
             n_spread_buckets: 1,
             min_bucket_samples: 5,
+            ..Default::default()
         };
 
         // Standard finalize.
@@ -880,4 +997,200 @@ mod tests {
             );
         }
     }
+
+    // ---------------------------------------------------------
+    // Epic D stage-2 — online streaming fit
+    // ---------------------------------------------------------
+
+    fn seed_finalised_fit() -> LearnedMicroprice {
+        let cfg = LearnedMicropriceConfig {
+            n_imbalance_buckets: 4,
+            n_spread_buckets: 1,
+            min_bucket_samples: 2,
+            online_ring_capacity: 50,
+            refit_every: 10,
+        };
+        let mut mp = LearnedMicroprice::empty(cfg);
+        // Seed with a mild upward drift so the offline fit is
+        // not identically zero, otherwise update_online parity
+        // tests can't distinguish "no effect" from "reset to
+        // zero".
+        for _ in 0..4 {
+            mp.accumulate(dec!(-0.75), dec!(0.01), dec!(-0.1));
+        }
+        for _ in 0..4 {
+            mp.accumulate(dec!(0.75), dec!(0.01), dec!(0.1));
+        }
+        mp.finalize_iterative(5);
+        mp
+    }
+
+    #[test]
+    fn update_online_on_unfinalised_model_is_noop() {
+        let cfg = LearnedMicropriceConfig {
+            n_imbalance_buckets: 4,
+            n_spread_buckets: 1,
+            min_bucket_samples: 2,
+            online_ring_capacity: 50,
+            refit_every: 10,
+        };
+        let mut mp = LearnedMicroprice::empty(cfg);
+        mp.update_online(dec!(0.5), dec!(0.01), dec!(1.0));
+        // Silent no-op: counter stays zero, ring stays empty.
+        assert_eq!(mp.online_ring_len(), 0);
+        assert_eq!(mp.online_counter(), 0);
+    }
+
+    #[test]
+    fn update_online_appends_every_call_refits_on_boundary() {
+        let mut mp = seed_finalised_fit();
+        let initial_g = mp.g_matrix().to_vec();
+        for i in 1..=9 {
+            mp.update_online(dec!(0.5), dec!(0.01), dec!(0.2));
+            // Ring grows; g-matrix should be unchanged until
+            // refit_every=10 is reached.
+            assert_eq!(mp.online_ring_len(), i);
+            assert_eq!(mp.g_matrix(), initial_g.as_slice(),
+                "g-matrix must not refit before the {i}th update");
+        }
+        // 10th update triggers the rebuild.
+        mp.update_online(dec!(0.5), dec!(0.01), dec!(0.2));
+        assert_eq!(mp.online_counter(), 10);
+        assert_ne!(mp.g_matrix(), initial_g.as_slice(),
+            "refit at boundary must update g-matrix");
+    }
+
+    #[test]
+    fn update_online_bounded_ring_does_not_grow_unbounded() {
+        let mut mp = seed_finalised_fit();
+        for _ in 0..200 {
+            mp.update_online(dec!(0.0), dec!(0.01), dec!(0.0));
+        }
+        assert_eq!(mp.online_ring_len(), 50,
+            "ring must cap at online_ring_capacity=50");
+        assert_eq!(mp.online_counter(), 200);
+    }
+
+    #[test]
+    fn update_online_preserves_spread_edges() {
+        // Build a multi-spread-bucket fit via the two-pass
+        // path, then online-push some observations and verify
+        // the edges stay byte-for-byte equal.
+        let cfg = LearnedMicropriceConfig {
+            n_imbalance_buckets: 4,
+            n_spread_buckets: 3,
+            min_bucket_samples: 1,
+            online_ring_capacity: 50,
+            refit_every: 5,
+        };
+        let mut mp = LearnedMicroprice::empty(cfg);
+        mp.with_spread_edges(vec![dec!(0.02), dec!(0.08)]);
+        for _ in 0..3 {
+            mp.accumulate_with_edges(dec!(-0.5), dec!(0.01), dec!(-0.2));
+            mp.accumulate_with_edges(dec!(0.5), dec!(0.05), dec!(0.3));
+        }
+        mp.finalize();
+        let edges_before: Vec<Decimal> = mp.spread_edges().to_vec();
+
+        for _ in 0..20 {
+            mp.update_online(dec!(0.7), dec!(0.2), dec!(0.5));
+        }
+        assert_eq!(mp.spread_edges(), edges_before.as_slice(),
+            "online fit must not mutate spread edges");
+    }
+
+    #[test]
+    fn update_online_shifts_prediction_toward_new_observations() {
+        // Fit a model on mildly positive data, then flood the
+        // online ring with strongly negative observations at
+        // the +0.75 imbalance bucket. After the refit, the
+        // prediction for that imbalance should move negative.
+        let mut mp = seed_finalised_fit();
+        let before = mp.predict(dec!(0.75), dec!(0.01));
+        assert!(before > dec!(0), "seed should produce positive prediction at +0.75, got {before}");
+        // Push enough observations to fill and refit the ring
+        // a few times over. Stream length > ring capacity so
+        // the original seed observations are pushed out.
+        for _ in 0..60 {
+            mp.update_online(dec!(0.75), dec!(0.01), dec!(-0.3));
+        }
+        let after = mp.predict(dec!(0.75), dec!(0.01));
+        assert!(after < dec!(0),
+            "online fit should flip prediction negative after 60 negative updates, got {after}");
+    }
+
+    #[test]
+    fn update_online_matches_offline_fit_on_same_observations() {
+        // Parity: pushing exactly the same observations through
+        // the online path should yield an identical g-matrix to
+        // accumulating them through the offline single-bucket
+        // path (both applied on top of the same seed).
+        //
+        // Build two models with identical config, seed both the
+        // same way, then on model A push 10 observations
+        // through update_online; on model B wipe + rebuild
+        // using direct accumulate on a fresh fit sharing the
+        // same spread_edges. Assert prediction parity.
+        let mut mp_online = seed_finalised_fit();
+        let obs: Vec<(Decimal, Decimal, Decimal)> = (0..10)
+            .map(|_| (dec!(0.75), dec!(0.01), dec!(-0.3)))
+            .collect();
+        for (i, s, d) in &obs {
+            mp_online.update_online(*i, *s, *d);
+        }
+        // Build the offline equivalent: same config, direct
+        // accumulate of just the 10 online obs (no seed — the
+        // online path throws out the seed once the refit
+        // happens against the ring contents).
+        let cfg = LearnedMicropriceConfig {
+            n_imbalance_buckets: 4,
+            n_spread_buckets: 1,
+            min_bucket_samples: 2,
+            online_ring_capacity: 50,
+            refit_every: 10,
+        };
+        let mut mp_offline = LearnedMicroprice::empty(cfg);
+        for (i, s, d) in &obs {
+            mp_offline.accumulate(*i, *s, *d);
+        }
+        mp_offline.finalize_iterative(5);
+        // All 10 observations land in bucket 3 (+0.75).
+        // Parity check on the imbalance bucket that got data.
+        assert_eq!(
+            mp_online.predict(dec!(0.75), dec!(0.01)),
+            mp_offline.predict(dec!(0.75), dec!(0.01)),
+            "online refit parity failed"
+        );
+    }
+
+    #[test]
+    fn toml_roundtrip_default_online_fields_preserved() {
+        let cfg = LearnedMicropriceConfig {
+            n_imbalance_buckets: 4,
+            n_spread_buckets: 1,
+            min_bucket_samples: 2,
+            online_ring_capacity: 500,
+            refit_every: 42,
+        };
+        let mut mp = LearnedMicroprice::empty(cfg);
+        mp.accumulate(dec!(-0.5), dec!(0.01), dec!(-0.1));
+        mp.accumulate(dec!(0.5), dec!(0.01), dec!(0.1));
+        mp.accumulate(dec!(-0.5), dec!(0.01), dec!(-0.2));
+        mp.accumulate(dec!(0.5), dec!(0.01), dec!(0.2));
+        mp.finalize();
+        let path = tmp_path("online_fields");
+        mp.to_toml(&path).expect("write");
+        let reloaded = LearnedMicroprice::from_toml(&path).expect("read");
+        // The online fields are `#[serde(skip)]` so they
+        // default back on load — but the *config* fields
+        // (ring_capacity + refit_every) must round-trip
+        // exactly since they are serialised.
+        assert_eq!(reloaded.config.online_ring_capacity, 500);
+        assert_eq!(reloaded.config.refit_every, 42);
+        // Online state resets to empty.
+        assert_eq!(reloaded.online_ring_len(), 0);
+        assert_eq!(reloaded.online_counter(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
 }

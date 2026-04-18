@@ -36,10 +36,22 @@ pub fn client_routes() -> Router<DashboardState> {
         .route("/api/v1/audit/recent", get(get_audit_recent))
         .route("/api/v1/system/diagnostics", get(get_diagnostics))
         .route("/api/v1/pnl/timeseries", get(get_pnl_timeseries))
+        .route("/api/v1/spread/timeseries", get(get_spread_timeseries))
+        .route("/api/v1/inventory/timeseries", get(get_inventory_timeseries))
         .route("/api/v1/risk/summary", get(get_risk_summary))
         .route("/api/v1/trade-flow", get(get_trade_flow))
         .route("/api/v1/portfolio", get(get_portfolio))
         .route("/api/v1/system/preflight", get(get_system_preflight))
+        .route("/api/v1/config/snapshot", get(get_config_snapshot))
+        .route("/api/v1/report/monthly.json", get(get_monthly_json))
+        .route("/api/v1/report/monthly.csv", get(get_monthly_csv))
+        .route("/api/v1/report/monthly.xlsx", get(get_monthly_xlsx))
+        .route("/api/v1/report/monthly.pdf", get(get_monthly_pdf))
+        .route("/api/v1/report/monthly.manifest", get(get_monthly_manifest))
+        .route("/api/v1/export/bundle", get(get_export_bundle))
+        .route("/api/v1/archive/health", get(get_archive_health))
+        .route("/api/v1/sentiment/snapshot", get(get_sentiment_snapshot))
+        .route("/api/v1/sentiment/history", get(get_sentiment_history))
         .route("/api/v1/loans", get(get_loans))
         .route("/api/v1/loans/{symbol}", get(get_loan_by_symbol))
         .route(
@@ -638,6 +650,332 @@ async fn get_diagnostics(State(state): State<DashboardState>) -> Json<Diagnostic
     })
 }
 
+/// UX-5 — read-only snapshot of the effective `AppConfig` the
+/// server booted with. The response is the config struct
+/// serialised verbatim; secrets never land in the struct (they
+/// come from env), so this is safe to expose to the operator UI.
+async fn get_config_snapshot(
+    State(state): State<DashboardState>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    match state.app_config() {
+        Some(cfg) => {
+            let val = serde_json::to_value(&*cfg)
+                .unwrap_or(serde_json::Value::Null);
+            (StatusCode::OK, Json(val)).into_response()
+        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "config snapshot not registered yet",
+            })),
+        )
+            .into_response(),
+    }
+}
+
+// ── A1 — MiCA monthly report on-demand ─────────────────────
+//
+// Query params: `from=YYYY-MM-DD` (required), `to=YYYY-MM-DD`
+// (required), `client_id=<id>` (optional; when omitted the
+// bundle contains every symbol the dashboard knows about).
+//
+// The four body endpoints all share one aggregation step and
+// differ only in how the body is rendered (JSON / CSV / XLSX /
+// PDF). The `.manifest` endpoint returns the HMAC-signed
+// manifest separately so auditors can verify counts + signature
+// without downloading the bulk body first.
+
+#[derive(Debug, Deserialize)]
+struct MonthlyQuery {
+    from: String,
+    to: String,
+    #[serde(default)]
+    client_id: Option<String>,
+}
+
+fn parse_period(
+    q: &MonthlyQuery,
+) -> Result<(chrono::NaiveDate, chrono::NaiveDate), String> {
+    let from = chrono::NaiveDate::parse_from_str(&q.from, "%Y-%m-%d")
+        .map_err(|e| format!("bad from: {e}"))?;
+    let to = chrono::NaiveDate::parse_from_str(&q.to, "%Y-%m-%d")
+        .map_err(|e| format!("bad to: {e}"))?;
+    Ok((from, to))
+}
+
+fn build_report(
+    state: &DashboardState,
+    q: &MonthlyQuery,
+) -> Result<crate::report_export::MonthlyReportData, (axum::http::StatusCode, String)> {
+    use axum::http::StatusCode;
+    let (from, to) = parse_period(q).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let audit_path = state.audit_log_path();
+    let client_name = q.client_id.as_deref().unwrap_or("all");
+    crate::monthly_report::build_monthly_report(
+        state,
+        q.client_id.as_deref(),
+        client_name,
+        from,
+        to,
+        audit_path.as_deref(),
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
+}
+
+async fn get_monthly_json(
+    State(state): State<DashboardState>,
+    Query(q): Query<MonthlyQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    match build_report(&state, &q) {
+        Ok(data) => (StatusCode::OK, Json(data)).into_response(),
+        Err((code, msg)) => (code, msg).into_response(),
+    }
+}
+
+async fn get_monthly_csv(
+    State(state): State<DashboardState>,
+    Query(q): Query<MonthlyQuery>,
+) -> axum::response::Response {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+    match build_report(&state, &q) {
+        Ok(data) => {
+            let body = crate::report_export::render_csv(&data);
+            let filename =
+                format!("monthly-{}-{}-to-{}.csv", data.client_id, data.period_from, data.period_to);
+            ([
+                (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+                (header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{filename}\"")),
+            ], body)
+                .into_response()
+        }
+        Err((code, msg)) => (code, msg).into_response(),
+    }
+}
+
+async fn get_monthly_xlsx(
+    State(state): State<DashboardState>,
+    Query(q): Query<MonthlyQuery>,
+) -> axum::response::Response {
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+    match build_report(&state, &q) {
+        Ok(data) => {
+            let secret = state.report_secret();
+            let manifest = match crate::report_export::build_manifest(
+                &data, &["xlsx"], &secret,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                }
+            };
+            let bytes = match crate::report_export::render_xlsx(&data, &manifest) {
+                Ok(b) => b,
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                }
+            };
+            let filename = format!(
+                "monthly-{}-{}-to-{}.xlsx",
+                data.client_id, data.period_from, data.period_to
+            );
+            ([
+                (
+                    header::CONTENT_TYPE,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                ),
+                (header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{filename}\"")),
+            ], bytes)
+                .into_response()
+        }
+        Err((code, msg)) => (code, msg).into_response(),
+    }
+}
+
+async fn get_monthly_pdf(
+    State(state): State<DashboardState>,
+    Query(q): Query<MonthlyQuery>,
+) -> axum::response::Response {
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+    match build_report(&state, &q) {
+        Ok(data) => {
+            let secret = state.report_secret();
+            let manifest = match crate::report_export::build_manifest(
+                &data, &["pdf"], &secret,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                }
+            };
+            let bytes = match crate::pdf_report::render_pdf(&data, &manifest) {
+                Ok(b) => b,
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                }
+            };
+            let filename = format!(
+                "monthly-{}-{}-to-{}.pdf",
+                data.client_id, data.period_from, data.period_to
+            );
+            ([
+                (header::CONTENT_TYPE, "application/pdf"),
+                (header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{filename}\"")),
+            ], bytes)
+                .into_response()
+        }
+        Err((code, msg)) => (code, msg).into_response(),
+    }
+}
+
+// ── Epic G — sentiment snapshot for UI ─────────────────────
+
+async fn get_sentiment_snapshot(
+    State(state): State<DashboardState>,
+) -> Json<Vec<mm_sentiment::SentimentTick>> {
+    let mut snap = state.get_sentiment_snapshot();
+    snap.sort_by(|a, b| a.asset.cmp(&b.asset));
+    Json(snap)
+}
+
+#[derive(Deserialize)]
+struct SentimentHistoryQuery {
+    asset: String,
+    #[serde(default = "default_sentiment_history_limit")]
+    limit: usize,
+}
+fn default_sentiment_history_limit() -> usize {
+    240
+}
+
+async fn get_sentiment_history(
+    State(state): State<DashboardState>,
+    Query(q): Query<SentimentHistoryQuery>,
+) -> Json<Vec<mm_sentiment::SentimentTick>> {
+    Json(state.get_sentiment_history(&q.asset, q.limit.min(1440)))
+}
+
+// ── Block D — archive health probe ─────────────────────────
+
+async fn get_archive_health(
+    State(state): State<DashboardState>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    match state.archive_client() {
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "reason": "archive not configured",
+            })),
+        )
+            .into_response(),
+        Some(client) => match client.health_check().await {
+            Ok(()) => {
+                let cfg = client.config();
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "bucket": cfg.s3_bucket,
+                        "region": cfg.s3_region,
+                        "endpoint": cfg.s3_endpoint_url,
+                        "prefix": cfg.s3_prefix,
+                        "retention_days": cfg.retention_days,
+                    })),
+                )
+                    .into_response()
+            }
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "reason": e.to_string(),
+                })),
+            )
+                .into_response(),
+        },
+    }
+}
+
+// ── Block C — compliance bundle export ─────────────────────
+
+#[derive(Debug, Deserialize)]
+struct BundleQuery {
+    from: String,
+    to: String,
+    #[serde(default)]
+    client_id: Option<String>,
+}
+
+async fn get_export_bundle(
+    State(state): State<DashboardState>,
+    Query(q): Query<BundleQuery>,
+) -> axum::response::Response {
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+    let from = match chrono::NaiveDate::parse_from_str(&q.from, "%Y-%m-%d") {
+        Ok(d) => d,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad from: {e}")).into_response(),
+    };
+    let to = match chrono::NaiveDate::parse_from_str(&q.to, "%Y-%m-%d") {
+        Ok(d) => d,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad to: {e}")).into_response(),
+    };
+    let client_name = q.client_id.as_deref().unwrap_or("all");
+    let req = crate::archive::bundle::BundleRequest {
+        state: &state,
+        client_id: q.client_id.as_deref(),
+        client_name,
+        from,
+        to,
+    };
+    match crate::archive::bundle::build_zip(req) {
+        Ok(out) => {
+            let filename =
+                format!("bundle-{client_name}-{from}-to-{to}.zip");
+            ([
+                (header::CONTENT_TYPE, "application/zip"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    &format!("attachment; filename=\"{filename}\""),
+                ),
+            ], out.bytes)
+                .into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn get_monthly_manifest(
+    State(state): State<DashboardState>,
+    Query(q): Query<MonthlyQuery>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    match build_report(&state, &q) {
+        Ok(data) => {
+            let secret = state.report_secret();
+            match crate::report_export::build_manifest(
+                &data,
+                &["csv", "xlsx", "pdf"],
+                &secret,
+            ) {
+                Ok(m) => (StatusCode::OK, Json(m)).into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            }
+        }
+        Err((code, msg)) => (code, msg).into_response(),
+    }
+}
+
 /// PnL time-series for charting.
 #[derive(Debug, Deserialize)]
 struct PnlTimeseriesQuery {
@@ -649,6 +987,24 @@ async fn get_pnl_timeseries(
     Query(query): Query<PnlTimeseriesQuery>,
 ) -> Json<Vec<crate::state::PnlTimePoint>> {
     Json(state.get_pnl_timeseries(&query.symbol))
+}
+
+/// UX-2 — spread-bps rolling history endpoint. Mirrors the
+/// PnL path so the frontend can backfill both charts on
+/// symbol change.
+async fn get_spread_timeseries(
+    State(state): State<DashboardState>,
+    Query(query): Query<PnlTimeseriesQuery>,
+) -> Json<Vec<crate::state::SeriesPoint>> {
+    Json(state.get_spread_timeseries(&query.symbol))
+}
+
+/// UX-2 — inventory rolling history endpoint.
+async fn get_inventory_timeseries(
+    State(state): State<DashboardState>,
+    Query(query): Query<PnlTimeseriesQuery>,
+) -> Json<Vec<crate::state::SeriesPoint>> {
+    Json(state.get_inventory_timeseries(&query.symbol))
 }
 
 /// Order book analytics — depth, imbalance, liquidity score.

@@ -253,6 +253,123 @@ impl BvcClassifier {
     }
 }
 
+/// Time-bucketed aggregator that feeds a [`BvcClassifier`]
+/// (Epic D stage-2). Collects every trade inside a fixed-length
+/// bar window (by wall-clock ns) and emits one
+/// `(delta_price, total_volume_quote)` observation per closed
+/// bar. Volume is quote-asset notional (`price × qty`), price
+/// change is the difference between the bar's first and last
+/// trade print — matches the Easley-Prado 2012 input shape.
+///
+/// Time injection keeps the aggregator deterministic: the
+/// engine owns the clock and calls [`Self::flush_if_due`] on
+/// each trade and on every `tick_second`.
+///
+/// The aggregator is silent on empty bars (no trades in the
+/// window) — the classifier's rolling mean/std must not be
+/// polluted with zero-volume anchor points, which would make
+/// σ collapse toward zero and push the classifier into its
+/// `std.is_zero()` short-circuit.
+#[derive(Debug, Clone)]
+pub struct BvcBarAggregator {
+    bar_len_ns: i64,
+    /// Wall-clock ns at which the current bar opened. `None`
+    /// until the first trade arrives.
+    bar_open_ns: Option<i64>,
+    first_px: Decimal,
+    last_px: Decimal,
+    total_vol: Decimal,
+}
+
+impl BvcBarAggregator {
+    /// `bar_secs` is the bar length in seconds. Values `< 1` are
+    /// rounded up to 1 s so the aggregator never gets stuck in
+    /// a zero-window hot loop.
+    pub fn new(bar_secs: u64) -> Self {
+        let secs = bar_secs.max(1);
+        Self {
+            bar_len_ns: (secs as i64) * 1_000_000_000,
+            bar_open_ns: None,
+            first_px: Decimal::ZERO,
+            last_px: Decimal::ZERO,
+            total_vol: Decimal::ZERO,
+        }
+    }
+
+    /// Ingest one trade and (if the bar just closed) return the
+    /// newly-finalised `(delta_price, total_volume)` pair. The
+    /// trade itself is counted in the NEXT bar — the closing
+    /// print anchors the finalised bar. This matches the
+    /// standard bar-compile convention (low / high / close
+    /// windows aren't bled into the next).
+    pub fn push(
+        &mut self,
+        now_ns: i64,
+        price: Decimal,
+        qty: Decimal,
+    ) -> Option<(Decimal, Decimal)> {
+        let notional = price * qty;
+        match self.bar_open_ns {
+            None => {
+                // First-ever trade: seed the bar and return nothing.
+                self.bar_open_ns = Some(now_ns);
+                self.first_px = price;
+                self.last_px = price;
+                self.total_vol = notional;
+                None
+            }
+            Some(open_ns) if now_ns - open_ns >= self.bar_len_ns => {
+                // This trade crossed the bar boundary — finalise
+                // the previous bar, start a new one anchored at
+                // `now_ns`.
+                let dp = self.last_px - self.first_px;
+                let vol = self.total_vol;
+                self.bar_open_ns = Some(now_ns);
+                self.first_px = price;
+                self.last_px = price;
+                self.total_vol = notional;
+                Some((dp, vol))
+            }
+            Some(_) => {
+                // Same bar — fold the trade in.
+                self.last_px = price;
+                self.total_vol += notional;
+                None
+            }
+        }
+    }
+
+    /// Called from the engine's 1 Hz tick so a quiet symbol
+    /// (no trades in the window) still surfaces its closed bar
+    /// instead of stalling forever on the last trade's stale
+    /// price anchor. Returns `None` when the current bar is
+    /// still open or there are no trades to report.
+    ///
+    /// On flush the aggregator resets `bar_open_ns` to `None`
+    /// — a follow-up `push` will seed a new bar.
+    pub fn flush_if_due(&mut self, now_ns: i64) -> Option<(Decimal, Decimal)> {
+        let open_ns = self.bar_open_ns?;
+        if now_ns - open_ns < self.bar_len_ns {
+            return None;
+        }
+        let dp = self.last_px - self.first_px;
+        let vol = self.total_vol;
+        self.bar_open_ns = None;
+        self.first_px = Decimal::ZERO;
+        self.last_px = Decimal::ZERO;
+        self.total_vol = Decimal::ZERO;
+        if vol.is_zero() {
+            return None;
+        }
+        Some((dp, vol))
+    }
+
+    /// Exposed for the engine's observability surface.
+    pub fn bar_len_ns(&self) -> i64 {
+        self.bar_len_ns
+    }
+}
+
 /// Newton's method sqrt for `Decimal`. Local copy to keep
 /// `mm-risk::toxicity` free of cross-module helper
 /// dependencies (same pattern as `var_guard`'s local copy).
@@ -831,6 +948,72 @@ mod tests {
     #[should_panic(expected = "nu must be positive")]
     fn bvc_panics_on_nonpositive_nu() {
         BvcClassifier::new(Decimal::ZERO, 10);
+    }
+
+    // ---------------------------------------------------------
+    // Epic D stage-2 — BvcBarAggregator tests
+    // ---------------------------------------------------------
+
+    const BAR_NS: i64 = 1_000_000_000;
+
+    #[test]
+    fn aggregator_first_trade_seeds_bar_without_emitting() {
+        let mut agg = BvcBarAggregator::new(1);
+        let out = agg.push(100, dec!(100), dec!(1));
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn aggregator_same_bar_folds_trades() {
+        let mut agg = BvcBarAggregator::new(1);
+        agg.push(100, dec!(100), dec!(1));
+        agg.push(200, dec!(101), dec!(2));
+        // Still inside the 1s bar — no emission, last_px tracks
+        // rolling latest.
+        let out = agg.push(500, dec!(102), dec!(3));
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn aggregator_emits_on_boundary_crossing() {
+        let mut agg = BvcBarAggregator::new(1);
+        agg.push(0, dec!(100), dec!(1));
+        agg.push(500_000_000, dec!(102), dec!(2));
+        // Crosses 1s boundary.
+        let emitted = agg.push(BAR_NS, dec!(105), dec!(1));
+        assert_eq!(emitted, Some((dec!(2), dec!(100) + dec!(204)))); // dp = 102-100, vol = 100+204
+    }
+
+    #[test]
+    fn aggregator_flush_if_due_emits_when_bar_closed_and_quiet() {
+        let mut agg = BvcBarAggregator::new(1);
+        agg.push(0, dec!(100), dec!(1));
+        agg.push(100_000_000, dec!(100), dec!(2));
+        // Well past boundary but no trade to carry it over —
+        // flush_if_due surfaces the closed bar.
+        let emitted = agg.flush_if_due(2 * BAR_NS);
+        assert_eq!(emitted, Some((dec!(0), dec!(300))));
+        // Subsequent flush with no new push is a no-op.
+        assert_eq!(agg.flush_if_due(10 * BAR_NS), None);
+    }
+
+    #[test]
+    fn aggregator_flush_before_boundary_is_noop() {
+        let mut agg = BvcBarAggregator::new(1);
+        agg.push(0, dec!(100), dec!(1));
+        assert_eq!(agg.flush_if_due(BAR_NS / 2), None);
+    }
+
+    #[test]
+    fn aggregator_flush_without_any_trade_is_noop() {
+        let mut agg = BvcBarAggregator::new(1);
+        assert_eq!(agg.flush_if_due(BAR_NS * 10), None);
+    }
+
+    #[test]
+    fn aggregator_bar_secs_zero_gets_clamped_to_one() {
+        let agg = BvcBarAggregator::new(0);
+        assert_eq!(agg.bar_len_ns(), BAR_NS);
     }
 
     // ---------------------------------------------------------

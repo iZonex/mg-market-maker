@@ -1,0 +1,31 @@
+# MemeSpot template — memecoin / low-liquidity spot. Wide default
+# spread, high γ, aggressive VPIN threshold. We quote reluctantly
+# and pull away fast if flow turns toxic.
+#
+# IMPORTANT: these defaults assume the operator has deliberately
+# chosen to quote a meme pair. Do not use this template for thin
+# majors — if a major shows up tagged MemeSpot via the classifier,
+# it's because daily volume dropped below $100 M, and the right
+# response is usually to NOT quote, not to quote tight.
+
+[market_maker]
+gamma = "0.40"
+kappa = "3.0"
+sigma = "0.001"
+time_horizon_secs = 300
+num_levels = 2             # fewer rungs — thin book can't absorb many
+refresh_interval_ms = 500
+min_spread_bps = "30"
+max_distance_bps = "300"
+momentum_enabled = true
+momentum_window = 200
+market_resilience_enabled = true
+hma_enabled = true
+
+[risk]
+max_spread_bps = "500"
+stale_book_timeout_secs = 15   # bookings update slower on thin venues
+
+[toxicity]
+vpin_threshold = "0.60"        # bail on any flow asymmetry
+kyle_window = 50

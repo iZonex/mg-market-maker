@@ -1,3 +1,4 @@
+use chrono::{DateTime, Duration, Utc};
 use mm_common::types::{Fill, Price, Side};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -23,6 +24,19 @@ pub struct PnlAttribution {
     pub fees_paid: Decimal,
     /// Amortized loan cost (Epic 2). Subtracted from total PnL.
     pub loan_cost_amortized: Decimal,
+    /// Funding P&L booked at venue settlement instants (Epic
+    /// 40.3). Sign convention: positive = we received funding,
+    /// negative = we paid. Included in `total_pnl()`.
+    #[serde(default)]
+    pub funding_pnl_realised: Decimal,
+    /// Between-settlement MTM estimate of the current funding
+    /// period (Epic 40.3). Recomputed from scratch every tick
+    /// so there is nothing to drift; informational only —
+    /// **not** part of `total_pnl()` because it will flip into
+    /// `funding_pnl_realised` at the next settle and would
+    /// double-count otherwise.
+    #[serde(default)]
+    pub funding_pnl_mtm: Decimal,
     /// Number of round-trips completed.
     pub round_trips: u64,
     /// Total volume traded (both sides).
@@ -31,7 +45,7 @@ pub struct PnlAttribution {
 
 impl PnlAttribution {
     pub fn total_pnl(&self) -> Decimal {
-        self.spread_pnl + self.inventory_pnl + self.rebate_income
+        self.spread_pnl + self.inventory_pnl + self.rebate_income + self.funding_pnl_realised
             - self.fees_paid
             - self.loan_cost_amortized
     }
@@ -58,6 +72,23 @@ pub struct PnlTracker {
     taker_fee: Decimal,
     /// Daily loan cost for amortization (Epic 2).
     loan_daily_cost: Decimal,
+    /// Most-recent funding rate reported by the venue. `None`
+    /// on spot engines and on perp engines before the first
+    /// `on_funding_update` call. Sign follows venue convention
+    /// (positive → longs pay shorts).
+    funding_rate: Option<Decimal>,
+    /// Venue's reported next-funding-time UTC instant.
+    next_funding_time: Option<DateTime<Utc>>,
+    /// Current funding-period start — set to the previous
+    /// settlement instant. Needed so a mid-period operator
+    /// restart doesn't integrate MTM from the start of the
+    /// interval and over-report.
+    period_start: Option<DateTime<Utc>>,
+    /// Funding cadence from the venue (Binance 8h, HL 1h,
+    /// Bybit mostly 8h, some 4h). Honored verbatim — the
+    /// engine never hardcodes a schedule; accrual math only
+    /// uses wall-clock fractions.
+    funding_interval: Option<Duration>,
 }
 
 impl PnlTracker {
@@ -69,6 +100,10 @@ impl PnlTracker {
             maker_fee,
             taker_fee,
             loan_daily_cost: dec!(0),
+            funding_rate: None,
+            next_funding_time: None,
+            period_start: None,
+            funding_interval: None,
         }
     }
 
@@ -163,6 +198,139 @@ impl PnlTracker {
         self.attribution.loan_cost_amortized += cost;
     }
 
+    /// Ingest a fresh funding-rate snapshot from the venue
+    /// (Epic 40.3). Called on the engine's periodic poll tick
+    /// for every perp symbol. `next` is the venue-reported
+    /// next-funding-time UTC instant; `interval` is the
+    /// venue-reported cadence. The first call after boot also
+    /// seeds `period_start` so the first MTM tick has a
+    /// defined elapsed fraction.
+    ///
+    /// Idempotent on repeat of the same `next`: no re-seeding
+    /// of `period_start`, so mid-period rate updates are
+    /// consumed without resetting the accrual clock.
+    pub fn on_funding_update(
+        &mut self,
+        rate: Decimal,
+        next: DateTime<Utc>,
+        interval: Duration,
+    ) {
+        self.funding_rate = Some(rate);
+        self.funding_interval = Some(interval);
+        // If we've never seen a funding update or the venue
+        // has moved the settlement horizon forward, reseat
+        // the period boundaries. `period_start` anchors the
+        // elapsed fraction math in `accrue_funding_mtm`.
+        match self.next_funding_time {
+            None => {
+                self.period_start = Some(next - interval);
+                self.next_funding_time = Some(next);
+            }
+            Some(prev_next) if next > prev_next => {
+                // Venue advanced next-settle without us having
+                // called `settle_funding` (missed settle tick,
+                // e.g. clock skew). Re-anchor — we accept the
+                // venue's view as canonical.
+                self.period_start = Some(next - interval);
+                self.next_funding_time = Some(next);
+            }
+            _ => {}
+        }
+    }
+
+    /// Continuously recompute the MTM funding P&L for the
+    /// current period (Epic 40.3). **Stateless in inventory**
+    /// — call every `tick_second` with the live inventory
+    /// and mark and the stored MTM is overwritten; never
+    /// integrate incrementally, or rate / inventory changes
+    /// mid-period will drift.
+    ///
+    /// No-op when either:
+    /// - the venue has not reported a funding rate yet
+    ///   (`on_funding_update` was never called);
+    /// - the engine has no inventory (`inventory == 0` →
+    ///   nothing to accrue).
+    pub fn accrue_funding_mtm(&mut self, now: DateTime<Utc>, mark: Price) {
+        let (Some(rate), Some(next), Some(_start), Some(interval)) = (
+            self.funding_rate,
+            self.next_funding_time,
+            self.period_start,
+            self.funding_interval,
+        ) else {
+            self.attribution.funding_pnl_mtm = dec!(0);
+            return;
+        };
+        if self.inventory.is_zero() {
+            self.attribution.funding_pnl_mtm = dec!(0);
+            return;
+        }
+        // Elapsed fraction ∈ [0, 1]. `Duration::num_seconds`
+        // drops sub-second precision which is fine at an 8 h
+        // period; also fine at HL's 1 h cadence (worst-case
+        // 1/3600 rounding = 0.028 % of a single accrual).
+        let period_secs = interval.num_seconds().max(1);
+        let remaining_secs = (next - now).num_seconds().clamp(0, period_secs);
+        // Prefer `remaining` when we have a next anchor — that
+        // way a partial-hour start (operator restarts mid
+        // period) uses `1 − remaining/interval` which is what
+        // the venue will actually settle.
+        let elapsed = period_secs - remaining_secs;
+        let elapsed_fraction = Decimal::from(elapsed) / Decimal::from(period_secs);
+        // `−inventory × mark × rate × elapsed_frac` — positive
+        // rate + long = payment (MTM negative). Recompute
+        // fresh every tick, do not accumulate.
+        self.attribution.funding_pnl_mtm =
+            -self.inventory * mark * rate * elapsed_fraction;
+    }
+
+    /// Book the current funding period into `realised` (Epic
+    /// 40.3). Called by the engine when `now ≥
+    /// next_funding_time`. Resets MTM to zero and advances
+    /// the period boundaries by one `interval`. Returns the
+    /// booked delta so the caller can route it into the audit
+    /// trail.
+    pub fn settle_funding(&mut self, now: DateTime<Utc>, mark: Price) -> Option<Decimal> {
+        let (Some(rate), Some(next), Some(interval)) = (
+            self.funding_rate,
+            self.next_funding_time,
+            self.funding_interval,
+        ) else {
+            return None;
+        };
+        if now < next {
+            return None;
+        }
+        let delta = -self.inventory * mark * rate;
+        self.attribution.funding_pnl_realised += delta;
+        self.attribution.funding_pnl_mtm = dec!(0);
+        self.period_start = Some(next);
+        self.next_funding_time = Some(next + interval);
+        Some(delta)
+    }
+
+    /// Engine-side setter for the tracker's view of live
+    /// inventory (Epic 40.3). `on_fill` already updates the
+    /// internal `inventory` field on every fill, but the
+    /// source of truth for funding accrual is the
+    /// [`InventoryManager`] (which reconciles fills against
+    /// the venue). This lets the engine push a corrected
+    /// figure in once per tick so the guard's reported MTM
+    /// matches the real position even after a reconcile
+    /// force-correction.
+    pub fn set_inventory_for_funding(&mut self, inventory: Decimal) {
+        self.inventory = inventory;
+    }
+
+    /// Read the last-observed funding rate. Dashboard surface.
+    pub fn funding_rate(&self) -> Option<Decimal> {
+        self.funding_rate
+    }
+
+    /// Read the next settlement instant, if known.
+    pub fn next_funding_time(&self) -> Option<DateTime<Utc>> {
+        self.next_funding_time
+    }
+
     /// Log a periodic PnL summary.
     pub fn log_summary(&self) {
         let a = &self.attribution;
@@ -172,6 +340,8 @@ impl PnlTracker {
             inventory = %a.inventory_pnl,
             rebates = %a.rebate_income,
             fees = %a.fees_paid,
+            funding_realised = %a.funding_pnl_realised,
+            funding_mtm = %a.funding_pnl_mtm,
             round_trips = a.round_trips,
             volume = %a.total_volume,
             efficiency_bps = %( a.pnl_per_volume() * dec!(10_000)),
@@ -312,7 +482,7 @@ mod tests {
             }
             tracker.mark_to_market(mid);
             let a = &tracker.attribution;
-            let expected = a.spread_pnl + a.inventory_pnl + a.rebate_income
+            let expected = a.spread_pnl + a.inventory_pnl + a.rebate_income + a.funding_pnl_realised
                 - a.fees_paid - a.loan_cost_amortized;
             prop_assert_eq!(a.total_pnl(), expected);
         }
@@ -386,5 +556,155 @@ mod tests {
                 "taker fee leaked into rebate_income");
             prop_assert!(tracker.attribution.fees_paid >= dec!(0));
         }
+    }
+
+    // ── Epic 40.3 funding accrual tests ─────────────────────
+
+    fn seed_long_one_btc(tracker: &mut PnlTracker, mid: Decimal) {
+        let f = fill(Side::Buy, "50000", "1", true);
+        tracker.on_fill(&f, mid);
+        // Zero out rebates + spread so the later funding total
+        // math isn't polluted by the on_fill side-effects.
+        tracker.attribution = PnlAttribution::default();
+    }
+
+    #[test]
+    fn funding_update_seeds_period_boundaries() {
+        let mut t = PnlTracker::new(dec!(0), dec!(0));
+        let next = Utc::now() + Duration::seconds(3600);
+        t.on_funding_update(dec!(0.0001), next, Duration::seconds(8 * 3600));
+        assert_eq!(t.funding_rate(), Some(dec!(0.0001)));
+        assert_eq!(t.next_funding_time(), Some(next));
+    }
+
+    #[test]
+    fn funding_mtm_is_zero_before_rate_known() {
+        let mut t = PnlTracker::new(dec!(0), dec!(0));
+        seed_long_one_btc(&mut t, dec!(50000));
+        t.accrue_funding_mtm(Utc::now(), dec!(50000));
+        assert_eq!(t.attribution.funding_pnl_mtm, dec!(0));
+    }
+
+    #[test]
+    fn funding_mtm_long_positive_rate_is_negative() {
+        // Long 1 BTC, positive rate 0.01% → long pays short →
+        // MTM negative at period end.
+        let mut t = PnlTracker::new(dec!(0), dec!(0));
+        seed_long_one_btc(&mut t, dec!(50000));
+        let interval = Duration::seconds(8 * 3600);
+        let now = Utc::now();
+        t.on_funding_update(dec!(0.0001), now + interval, interval);
+        // Jump to just before settle so elapsed ≈ full period.
+        let near_settle = now + interval - Duration::seconds(1);
+        t.accrue_funding_mtm(near_settle, dec!(50000));
+        assert!(
+            t.attribution.funding_pnl_mtm < dec!(0),
+            "expected negative MTM, got {}",
+            t.attribution.funding_pnl_mtm
+        );
+    }
+
+    #[test]
+    fn funding_mtm_short_positive_rate_is_positive() {
+        let mut t = PnlTracker::new(dec!(0), dec!(0));
+        // Short via a sell fill against zero inventory.
+        let f = fill(Side::Sell, "50000", "1", true);
+        t.on_fill(&f, dec!(50000));
+        t.attribution = PnlAttribution::default();
+        let interval = Duration::seconds(8 * 3600);
+        let now = Utc::now();
+        t.on_funding_update(dec!(0.0001), now + interval, interval);
+        t.accrue_funding_mtm(now + interval - Duration::seconds(1), dec!(50000));
+        assert!(t.attribution.funding_pnl_mtm > dec!(0));
+    }
+
+    #[test]
+    fn funding_mtm_flat_is_always_zero() {
+        let mut t = PnlTracker::new(dec!(0), dec!(0));
+        let interval = Duration::seconds(3600);
+        let now = Utc::now();
+        t.on_funding_update(dec!(0.001), now + interval, interval);
+        t.accrue_funding_mtm(now + Duration::seconds(1800), dec!(50000));
+        assert_eq!(t.attribution.funding_pnl_mtm, dec!(0));
+    }
+
+    #[test]
+    fn funding_mtm_is_idempotent_at_same_timestamp() {
+        let mut t = PnlTracker::new(dec!(0), dec!(0));
+        seed_long_one_btc(&mut t, dec!(50000));
+        let interval = Duration::seconds(8 * 3600);
+        let now = Utc::now();
+        t.on_funding_update(dec!(0.0001), now + interval, interval);
+        t.accrue_funding_mtm(now + Duration::seconds(3600), dec!(50000));
+        let a = t.attribution.funding_pnl_mtm;
+        t.accrue_funding_mtm(now + Duration::seconds(3600), dec!(50000));
+        let b = t.attribution.funding_pnl_mtm;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn funding_settle_books_realised_and_zeros_mtm() {
+        let mut t = PnlTracker::new(dec!(0), dec!(0));
+        seed_long_one_btc(&mut t, dec!(50000));
+        let interval = Duration::seconds(8 * 3600);
+        let now = Utc::now();
+        let next = now + interval;
+        t.on_funding_update(dec!(0.0001), next, interval);
+        // Accrue a bit of MTM then settle.
+        t.accrue_funding_mtm(now + Duration::seconds(7200), dec!(50000));
+        let delta = t.settle_funding(next + Duration::seconds(5), dec!(50000));
+        assert!(delta.is_some(), "settle returned None at/after next");
+        assert_eq!(t.attribution.funding_pnl_mtm, dec!(0));
+        // Long 1 @ 50k, rate 0.0001 → delta = −1×50000×0.0001 = −5
+        assert_eq!(t.attribution.funding_pnl_realised, dec!(-5));
+        // Next horizon advanced by one interval.
+        assert_eq!(t.next_funding_time(), Some(next + interval));
+    }
+
+    #[test]
+    fn funding_settle_refuses_before_next_time() {
+        let mut t = PnlTracker::new(dec!(0), dec!(0));
+        seed_long_one_btc(&mut t, dec!(50000));
+        let interval = Duration::seconds(8 * 3600);
+        let now = Utc::now();
+        t.on_funding_update(dec!(0.0001), now + interval, interval);
+        let r = t.settle_funding(now + Duration::seconds(100), dec!(50000));
+        assert!(r.is_none());
+        assert_eq!(t.attribution.funding_pnl_realised, dec!(0));
+    }
+
+    #[test]
+    fn funding_settle_delta_scales_linearly_with_rate() {
+        let interval = Duration::seconds(8 * 3600);
+        let mk = |rate: Decimal| {
+            let mut t = PnlTracker::new(dec!(0), dec!(0));
+            seed_long_one_btc(&mut t, dec!(50000));
+            let now = Utc::now();
+            let next = now + interval;
+            t.on_funding_update(rate, next, interval);
+            t.settle_funding(next + Duration::seconds(5), dec!(50000))
+                .unwrap()
+        };
+        let a = mk(dec!(0.0001));
+        let b = mk(dec!(0.0002));
+        // Double the rate → double the delta.
+        assert_eq!(a * dec!(2), b);
+    }
+
+    #[test]
+    fn total_pnl_includes_funding_realised() {
+        let mut t = PnlTracker::new(dec!(0), dec!(0));
+        t.attribution.spread_pnl = dec!(10);
+        t.attribution.funding_pnl_realised = dec!(5);
+        assert_eq!(t.attribution.total_pnl(), dec!(15));
+    }
+
+    #[test]
+    fn total_pnl_excludes_funding_mtm() {
+        let mut t = PnlTracker::new(dec!(0), dec!(0));
+        t.attribution.spread_pnl = dec!(10);
+        t.attribution.funding_pnl_mtm = dec!(5);
+        // MTM is display-only; total_pnl never counts it.
+        assert_eq!(t.attribution.total_pnl(), dec!(10));
     }
 }

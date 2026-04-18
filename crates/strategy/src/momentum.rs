@@ -55,10 +55,34 @@ pub struct MomentumSignals {
     /// lockstep with `ofi` — reset to `None` when `with_ofi`
     /// is re-called.
     ofi_ewma: Option<Decimal>,
+    /// Epic G — EWMA of squared OFI observations, so we can
+    /// expose `ofi_z = ofi_ewma / sqrt(ofi_ewma_sq)`. Same
+    /// α as `ofi_ewma`, so the two decay together.
+    ofi_ewma_sq: Option<Decimal>,
     /// Optional learned-microprice model. When attached,
     /// `alpha()` folds `(mp_learned − mid) / mid` as a
     /// micro-price drift component.
     learned_mp: Option<LearnedMicroprice>,
+    /// Epic D stage-2 — ring of recent `(imbalance, spread,
+    /// mid)` snapshots used to feed the model's online fit.
+    /// `Some` iff `with_learned_microprice_online` was called;
+    /// on every `on_l1_snapshot` the oldest entry (at
+    /// horizon depth) gets paired with the current mid as
+    /// a `Δmid` observation and routed through
+    /// `LearnedMicroprice::update_online`.
+    online_mp_ring: Option<LearnedMpOnlineRing>,
+}
+
+/// Bounded snapshot ring that pairs a horizon-k-old
+/// `(imbalance, spread)` with the current mid to produce
+/// `Δmid` observations for the online lMP fit. `horizon`
+/// must match the horizon the offline fit was built against
+/// — otherwise the online path would bias against a
+/// different lookahead than the g-matrix was trained on.
+#[derive(Debug, Clone)]
+struct LearnedMpOnlineRing {
+    horizon: usize,
+    snapshots: VecDeque<(Decimal, Decimal, Decimal)>,
 }
 
 impl MomentumSignals {
@@ -70,7 +94,9 @@ impl MomentumSignals {
             hma_prev: None,
             ofi: None,
             ofi_ewma: None,
+            ofi_ewma_sq: None,
             learned_mp: None,
+            online_mp_ring: None,
         }
     }
 
@@ -92,6 +118,7 @@ impl MomentumSignals {
     pub fn with_ofi(mut self) -> Self {
         self.ofi = Some(OfiTracker::new());
         self.ofi_ewma = None;
+        self.ofi_ewma_sq = None;
         self
     }
 
@@ -104,10 +131,40 @@ impl MomentumSignals {
         self
     }
 
+    /// Attach a Stoikov 2018 learned micro-price model with
+    /// **online streaming fit** (Epic D stage-2). In addition
+    /// to the read-path `predict`, every
+    /// [`Self::on_l1_snapshot`] call feeds the oldest
+    /// horizon-k-ago `(imbalance, spread)` paired with the
+    /// current mid as a `Δmid` observation into the model's
+    /// [`LearnedMicroprice::update_online`]. The model's
+    /// `refit_every` config controls how often the g-matrix
+    /// is rebuilt from the ring; this ring here just tracks
+    /// the horizon alignment.
+    ///
+    /// `horizon` MUST match the horizon the offline fit was
+    /// built with — otherwise the online path biases the
+    /// g-matrix against a different lookahead than it was
+    /// trained on. `1 ≤ horizon ≤ 10 000`.
+    pub fn with_learned_microprice_online(
+        mut self,
+        model: LearnedMicroprice,
+        horizon: usize,
+    ) -> Self {
+        assert!(horizon >= 1, "horizon must be >= 1");
+        self.learned_mp = Some(model);
+        self.online_mp_ring = Some(LearnedMpOnlineRing {
+            horizon,
+            snapshots: VecDeque::with_capacity(horizon + 1),
+        });
+        self
+    }
+
     /// Feed a top-of-book L1 snapshot into the optional OFI
-    /// tracker. No-op when [`with_ofi`] has not been called.
-    /// Callers should invoke this on every book update so the
-    /// tracker sees the full event stream.
+    /// tracker and — if the online lMP fit is attached — into
+    /// the g-matrix refresh ring. No-op when neither is
+    /// configured. Callers should invoke this on every book
+    /// update so the tracker sees the full event stream.
     pub fn on_l1_snapshot(
         &mut self,
         bid_px: Decimal,
@@ -115,23 +172,68 @@ impl MomentumSignals {
         ask_px: Decimal,
         ask_qty: Decimal,
     ) {
-        let Some(tracker) = self.ofi.as_mut() else {
-            return;
-        };
-        if let Some(obs) = tracker.update(bid_px, bid_qty, ask_px, ask_qty) {
-            // Normalise by average depth so the EWMA stays
-            // dimensionless — a 10-qty arrival on a BTC book
-            // should not swamp a 0.1-qty arrival on an SOL book.
-            let depth = bid_qty + ask_qty;
-            let normalised = if depth.is_zero() {
+        // OFI update (optional).
+        if let Some(tracker) = self.ofi.as_mut() {
+            if let Some(obs) = tracker.update(bid_px, bid_qty, ask_px, ask_qty) {
+                // Normalise by average depth so the EWMA stays
+                // dimensionless — a 10-qty arrival on a BTC book
+                // should not swamp a 0.1-qty arrival on an SOL
+                // book.
+                let depth = bid_qty + ask_qty;
+                let normalised = if depth.is_zero() {
+                    Decimal::ZERO
+                } else {
+                    obs / depth
+                };
+                self.ofi_ewma = Some(match self.ofi_ewma {
+                    None => normalised,
+                    Some(prev) => OFI_EWMA_ALPHA * normalised + (dec!(1) - OFI_EWMA_ALPHA) * prev,
+                });
+                // Epic G — track E[x²] in the same α so
+                // `ofi_z` is ready on the same timeline as
+                // `ofi_ewma`. Using squared observation (not
+                // centred around running mean) is the
+                // Cont-Kukanov-Stoikov "signal-to-RMS" form:
+                // a one-sided-flow regime shows up as
+                // `|ewma| / √sq ≈ 1`, while a symmetric
+                // quiet regime gives ≈ 0.
+                let sq = normalised * normalised;
+                self.ofi_ewma_sq = Some(match self.ofi_ewma_sq {
+                    None => sq,
+                    Some(prev) => OFI_EWMA_ALPHA * sq + (dec!(1) - OFI_EWMA_ALPHA) * prev,
+                });
+            }
+        }
+
+        // Epic D stage-2 — online lMP fit pipeline.
+        if let (Some(model), Some(ring)) = (self.learned_mp.as_mut(), self.online_mp_ring.as_mut())
+        {
+            // Current-tick state. Top-level imbalance + absolute
+            // spread — same shape the offline fit consumed.
+            let total_qty = bid_qty + ask_qty;
+            let imbalance = if total_qty.is_zero() {
                 Decimal::ZERO
             } else {
-                obs / depth
+                (bid_qty - ask_qty) / total_qty
             };
-            self.ofi_ewma = Some(match self.ofi_ewma {
-                None => normalised,
-                Some(prev) => OFI_EWMA_ALPHA * normalised + (dec!(1) - OFI_EWMA_ALPHA) * prev,
-            });
+            let spread = ask_px - bid_px;
+            let mid = (bid_px + ask_px) / dec!(2);
+
+            ring.snapshots.push_back((imbalance, spread, mid));
+            // When the ring exceeds `horizon + 1` entries, the
+            // oldest snapshot pairs with the current mid as an
+            // `(imbalance_{t-h}, spread_{t-h}, Δmid)` observation.
+            // We keep horizon entries in the ring after the
+            // emission so subsequent ticks keep finding a
+            // horizon-aligned partner.
+            if ring.snapshots.len() > ring.horizon {
+                let (old_imb, old_spread, old_mid) = ring
+                    .snapshots
+                    .pop_front()
+                    .expect("len > horizon implies non-empty");
+                let delta_mid = mid - old_mid;
+                model.update_online(old_imb, old_spread, delta_mid);
+            }
         }
     }
 
@@ -139,6 +241,36 @@ impl MomentumSignals {
     /// before the first observation has landed.
     pub fn ofi_ewma(&self) -> Option<Decimal> {
         self.ofi_ewma
+    }
+
+    /// Epic G — signed OFI z-score in the signal-to-RMS form:
+    /// `ofi_ewma / sqrt(max(ofi_ewma_sq, ε))`. Result stays
+    /// in `[-1, +1]` roughly (single-sided pressure
+    /// saturates at ±1; balanced tape at ≈ 0). Consumed by
+    /// `SocialRiskEngine` for the `mentions × OFI`
+    /// cross-validation gate.
+    pub fn ofi_z(&self) -> Option<Decimal> {
+        let (x, sq) = (self.ofi_ewma?, self.ofi_ewma_sq?);
+        if sq <= dec!(0.000000001) {
+            return Some(Decimal::ZERO);
+        }
+        // Newton iteration on Decimal for √sq — we avoid
+        // f64 round-trip to keep the workspace's
+        // "Decimal-for-signal" discipline. Six iterations
+        // from a seed of `sq / 2` converge to ~12 digits
+        // for values in `(0, 100]`.
+        let mut s = sq / dec!(2);
+        for _ in 0..10 {
+            if s.is_zero() {
+                s = sq;
+            }
+            s = (s + sq / s) / dec!(2);
+        }
+        if s.is_zero() {
+            Some(Decimal::ZERO)
+        } else {
+            Some(x / s)
+        }
     }
 
     /// Feed a mid-price update into the optional HMA stream.
@@ -524,6 +656,46 @@ mod tests {
     }
 
     #[test]
+    fn ofi_z_saturates_near_one_on_one_sided_stream() {
+        // Same one-sided bid-growth stream as above — the z
+        // score should settle above 0.5 since every
+        // observation contributes the same sign.
+        let mut m = MomentumSignals::new(20).with_ofi();
+        m.on_l1_snapshot(dec!(99), dec!(10), dec!(101), dec!(10));
+        for n in 1..=30 {
+            let bid_qty = dec!(10) + Decimal::from(n);
+            m.on_l1_snapshot(dec!(99), bid_qty, dec!(101), dec!(10));
+        }
+        let z = m.ofi_z().expect("z populated");
+        assert!(z > dec!(0.5), "expected strong positive z, got {z}");
+        assert!(z <= dec!(1.5), "z should be bounded near signal/RMS, got {z}");
+    }
+
+    #[test]
+    fn ofi_z_near_zero_on_balanced_tape() {
+        // Alternate aggressive bids + aggressive asks —
+        // mean near zero, RMS positive → z ≈ 0.
+        let mut m = MomentumSignals::new(20).with_ofi();
+        m.on_l1_snapshot(dec!(99), dec!(10), dec!(101), dec!(10));
+        for i in 0..30 {
+            let (bq, aq) = if i % 2 == 0 {
+                (dec!(15), dec!(10))
+            } else {
+                (dec!(10), dec!(15))
+            };
+            m.on_l1_snapshot(dec!(99), bq, dec!(101), aq);
+        }
+        let z = m.ofi_z().expect("z populated");
+        assert!(z.abs() < dec!(0.5), "balanced tape z should be near 0, got {z}");
+    }
+
+    #[test]
+    fn ofi_z_none_before_any_snapshot() {
+        let m = MomentumSignals::new(20).with_ofi();
+        assert!(m.ofi_z().is_none());
+    }
+
+    #[test]
     fn ofi_alpha_tilts_versus_baseline() {
         // Direct alpha comparison: balanced book → baseline = 0.
         // Attach OFI + feed positive depth growth → alpha tilts up.
@@ -586,6 +758,7 @@ mod tests {
             n_imbalance_buckets: 4,
             n_spread_buckets: 1,
             min_bucket_samples: 2,
+            ..Default::default()
         };
         let mut model = crate::learned_microprice::LearnedMicroprice::empty(cfg);
         for _ in 0..5 {
@@ -622,5 +795,77 @@ mod tests {
             "LMP-attached alpha should be pulled below baseline by negative prediction: \
              base={base}, lmp={lmp_alpha}"
         );
+    }
+
+    // ---------------------------------------------------------
+    // Epic D stage-2 — online lMP fit via on_l1_snapshot
+    // ---------------------------------------------------------
+
+    /// Feeding `on_l1_snapshot` with a steady stream of
+    /// bid-heavy books AND rising mids should make the online
+    /// fit attribute a positive `Δmid` to positive-imbalance
+    /// buckets. Within refit_every counts the g-matrix
+    /// shouldn't change; past the boundary it should.
+    #[test]
+    fn online_lmp_refits_g_matrix_after_horizon_and_refit_cadence() {
+        use crate::learned_microprice::{LearnedMicroprice, LearnedMicropriceConfig};
+
+        // Build + finalise a model with a neutral seed so the
+        // initial g-matrix is non-zero; refit_every=5 so the
+        // test runs quickly.
+        let cfg = LearnedMicropriceConfig {
+            n_imbalance_buckets: 4,
+            n_spread_buckets: 1,
+            min_bucket_samples: 2,
+            online_ring_capacity: 30,
+            refit_every: 5,
+        };
+        let mut model = LearnedMicroprice::empty(cfg);
+        for _ in 0..3 {
+            model.accumulate(dec!(-0.75), dec!(0.01), dec!(-0.1));
+            model.accumulate(dec!(0.75), dec!(0.01), dec!(0.1));
+        }
+        model.finalize_iterative(5);
+        let initial_g = model.g_matrix().to_vec();
+
+        // Horizon of 2 snapshots — very short so we emit
+        // observations quickly.
+        let mut m = MomentumSignals::new(10).with_learned_microprice_online(model, 2);
+
+        // Push 20 bid-heavy snapshots with monotonically rising
+        // mid. Horizon=2 → first two snapshots buffer, third
+        // emits the first `update_online` call with a positive
+        // Δmid on the +0.75 imbalance bucket. After 5 emits
+        // the refit triggers. We need >= horizon + refit_every
+        // + epsilon = 2 + 5 + buffer = ~10 ticks.
+        for t in 0..20 {
+            let mid = dec!(100) + Decimal::from(t);
+            let bid = mid - dec!(0.005);
+            let ask = mid + dec!(0.005);
+            // Bid-heavy book.
+            m.on_l1_snapshot(bid, dec!(10), ask, dec!(1));
+        }
+
+        // After 20 ticks the model should have fired at least
+        // one refit. The g-matrix at imbalance +0.75 should now
+        // skew STRONGER positive than the seed (more recent
+        // data has larger Δmid = +1 per tick × horizon 2 = +2,
+        // vs. seed +0.1).
+        let new_g = m
+            .learned_mp
+            .as_ref()
+            .map(|mp| mp.g_matrix().to_vec())
+            .expect("model attached");
+        assert_ne!(new_g, initial_g, "online fit should have mutated g-matrix");
+    }
+
+    #[test]
+    fn online_lmp_builder_panics_on_zero_horizon() {
+        use crate::learned_microprice::{LearnedMicroprice, LearnedMicropriceConfig};
+        let model = LearnedMicroprice::empty(LearnedMicropriceConfig::default());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = MomentumSignals::new(10).with_learned_microprice_online(model, 0);
+        }));
+        assert!(result.is_err(), "horizon=0 must panic");
     }
 }

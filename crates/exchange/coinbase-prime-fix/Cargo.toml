@@ -1,0 +1,21 @@
+[package]
+name = "mm-exchange-coinbase-prime-fix"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+mm-common = { workspace = true }
+mm-exchange-core = { workspace = true }
+mm-protocols-fix = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+base64 = "0.22"

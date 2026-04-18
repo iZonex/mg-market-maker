@@ -7,6 +7,7 @@ members = [
     "crates/exchange/binance",
     "crates/exchange/bybit",
     "crates/exchange/hyperliquid",
+    "crates/exchange/coinbase-prime-fix",
     "crates/protocols/fix",
     "crates/protocols/ws_rpc",
     "crates/hyperopt",
@@ -14,6 +15,7 @@ members = [
     "crates/portfolio",
     "crates/strategy",
     "crates/risk",
+    "crates/sentiment",
     "crates/engine",
     "crates/backtester",
     "crates/dashboard",
@@ -58,6 +60,10 @@ regex = "1"
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
+# Internal — published so other workspace crates can depend on
+# each other via `{ workspace = true }` instead of relative paths.
+mm-sentiment = { path = "crates/sentiment" }
+
 # Errors
 anyhow = "1"
 thiserror = "2"
@@ -87,6 +93,7 @@ mm-exchange-client = { path = "crates/exchange/client" }
 mm-exchange-binance = { path = "crates/exchange/binance" }
 mm-exchange-bybit = { path = "crates/exchange/bybit" }
 mm-exchange-hyperliquid = { path = "crates/exchange/hyperliquid" }
+mm-exchange-coinbase-prime-fix = { path = "crates/exchange/coinbase-prime-fix" }
 mm-protocols-fix = { path = "crates/protocols/fix" }
 mm-protocols-ws-rpc = { path = "crates/protocols/ws_rpc" }
 mm-hyperopt = { path = "crates/hyperopt" }

@@ -1,0 +1,6 @@
+<svg width="1024" height="256" viewBox="0 0 1024 256" xmlns="http://www.w3.org/2000/svg">
+<rect width="1024" height="256" fill="#0A0E14"/>
+<text x="100" y="170" font-family="Inter, Arial, sans-serif" font-size="100" font-weight="600" fill="#F2F4F7" letter-spacing="6">MEAT</text>
+<text x="460" y="170" font-family="Inter, Arial, sans-serif" font-size="100" font-weight="600" fill="#00D1B2">|</text>
+<text x="520" y="170" font-family="Inter, Arial, sans-serif" font-size="100" font-weight="600" fill="#F2F4F7" letter-spacing="6">GRINDER</text>
+</svg>

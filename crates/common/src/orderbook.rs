@@ -294,4 +294,34 @@ mod tests {
         assert_eq!(book.bid_depth_within_pct_quote(dec!(1)), dec!(0));
         assert_eq!(book.ask_depth_within_pct_quote(dec!(1)), dec!(0));
     }
+
+    /// Pins the bps scale so future refactors don't silently
+    /// downshift the output to a fraction. A 99/101 book at
+    /// mid=100 is a 2% spread → 200 bps.
+    #[test]
+    fn test_spread_bps_scale() {
+        let mut book = LocalOrderBook::new("TEST".into());
+        book.apply_snapshot(vec![level("99", "1.0")], vec![level("101", "1.0")], 1);
+        assert_eq!(book.mid_price(), Some(dec!(100)));
+        assert_eq!(book.spread(), Some(dec!(2)));
+        assert_eq!(book.spread_bps(), Some(dec!(200)));
+    }
+
+    /// Tight one-tick spread on a BTC-sized price (the real
+    /// Binance BTCUSDT case) — 0.01/77000 * 10000 ≈ 0.001298.
+    /// Confirms the formula still lands in bps units and not
+    /// in a fraction.
+    #[test]
+    fn test_spread_bps_tight_btc_book() {
+        let mut book = LocalOrderBook::new("BTCUSDT".into());
+        book.apply_snapshot(
+            vec![level("77000.00", "1.0")],
+            vec![level("77000.01", "1.0")],
+            1,
+        );
+        let bps = book.spread_bps().unwrap();
+        // Spread = 0.01, mid = 77000.005, bps = 0.01/77000.005*10000
+        // ≈ 0.001298940861516.
+        assert!(bps > dec!(0.001) && bps < dec!(0.002));
+    }
 }

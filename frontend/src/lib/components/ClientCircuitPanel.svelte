@@ -1,26 +1,25 @@
 <script>
   import { createApiClient } from '../api.svelte.js'
+  import Icon from './Icon.svelte'
 
   let { auth } = $props()
   const api = createApiClient(auth)
 
   let rows = $state([])
   let error = $state('')
-  let lastUpdated = $state(0)
   let busy = $state(false)
 
   async function refresh() {
     try {
       rows = await api.getJson('/api/v1/clients/loss-state')
       error = ''
-      lastUpdated = Date.now()
     } catch (e) {
       error = e.message
     }
   }
 
   async function resetClient(cid) {
-    if (!confirm(`Reset per-client loss circuit for ${cid}?\n\nNOTE: each engine's kill switch must be reset separately via /api/v1/ops/reset/{symbol} — this only clears the aggregate breaker.`)) {
+    if (!confirm(`Reset per-client loss circuit for ${cid}?\n\nNote: engine kill switches must be reset separately via /api/v1/ops/reset/{symbol}; this only clears the aggregate breaker.`)) {
       return
     }
     busy = true
@@ -40,108 +39,91 @@
     return () => clearInterval(id)
   })
 
-  function formatPnl(s) {
+  function fmtPnl(s) {
     const n = parseFloat(s || 0)
-    return n.toFixed(2)
+    if (!Number.isFinite(n)) return '—'
+    return (n > 0 ? '+' : '') + n.toFixed(2)
   }
-
   function pnlClass(s) {
     const n = parseFloat(s || 0)
-    if (n > 0) return 'pos'
-    if (n < 0) return 'neg'
+    if (n > 0.005)  return 'pos'
+    if (n < -0.005) return 'neg'
     return ''
   }
 </script>
 
-<div>
-  <h3>
-    Per-Client Loss Circuit
-    <span class="count">({rows.length})</span>
-  </h3>
-
-  {#if error}
-    <div class="error">error: {error}</div>
-  {/if}
-
-  {#if rows.length === 0 && !error}
-    <div class="empty">no clients registered</div>
-  {:else}
-    <table>
-      <thead>
-        <tr>
-          <th>Client</th>
-          <th class="num">Daily PnL</th>
-          <th class="num">Limit</th>
-          <th>Status</th>
-          <th></th>
+{#if error}
+  <div class="empty-state">
+    <span class="empty-state-icon" style="color: var(--neg)"><Icon name="alert" size={18} /></span>
+    <span class="empty-state-title">Failed to load clients</span>
+    <span class="empty-state-hint">{error}</span>
+  </div>
+{:else if rows.length === 0}
+  <div class="empty-state">
+    <span class="empty-state-icon"><Icon name="shield" size={18} /></span>
+    <span class="empty-state-title">No clients registered</span>
+    <span class="empty-state-hint">Per-client loss circuits appear when you add clients via <code>POST /api/admin/clients</code>.</span>
+  </div>
+{:else}
+  <table class="tbl">
+    <thead>
+      <tr>
+        <th>Client</th>
+        <th class="right">Daily PnL</th>
+        <th class="right">Limit</th>
+        <th>Status</th>
+        <th class="right"></th>
+      </tr>
+    </thead>
+    <tbody>
+      {#each rows as r (r.client_id)}
+        <tr class:tripped={r.tripped}>
+          <td class="cid">{r.client_id}</td>
+          <td class="num-cell right"><span class={pnlClass(r.daily_pnl)}>${fmtPnl(r.daily_pnl)}</span></td>
+          <td class="num-cell right">
+            {#if r.limit_usd}${r.limit_usd}{:else}—{/if}
+          </td>
+          <td>
+            {#if r.tripped}
+              <span class="chip chip-neg">Tripped</span>
+            {:else if !r.limit_usd}
+              <span class="chip">Unlimited</span>
+            {:else}
+              <span class="chip chip-pos">OK</span>
+            {/if}
+          </td>
+          <td class="right">
+            {#if r.tripped}
+              <button type="button" class="btn btn-sm btn-ghost" onclick={() => resetClient(r.client_id)} disabled={busy}>
+                <Icon name="check" size={12} />
+                <span>Reset</span>
+              </button>
+            {/if}
+          </td>
         </tr>
-      </thead>
-      <tbody>
-        {#each rows as r (r.client_id)}
-          <tr class:tripped={r.tripped}>
-            <td class="cid">{r.client_id}</td>
-            <td class="num {pnlClass(r.daily_pnl)}">{formatPnl(r.daily_pnl)}</td>
-            <td class="num">
-              {#if r.limit_usd}-{r.limit_usd}{:else}—{/if}
-            </td>
-            <td>
-              {#if r.tripped}
-                <span class="badge bad">TRIPPED</span>
-              {:else if !r.limit_usd}
-                <span class="badge dim">UNLIMITED</span>
-              {:else}
-                <span class="badge ok">OK</span>
-              {/if}
-            </td>
-            <td>
-              {#if r.tripped}
-                <button
-                  class="btn-reset"
-                  onclick={() => resetClient(r.client_id)}
-                  disabled={busy}
-                >reset</button>
-              {/if}
-            </td>
-          </tr>
-        {/each}
-      </tbody>
-    </table>
-  {/if}
-</div>
+      {/each}
+    </tbody>
+  </table>
+{/if}
 
 <style>
-  h3 {
-    font-size: 12px; color: #8b949e; margin-bottom: 12px;
-    text-transform: uppercase; letter-spacing: 0.5px;
-    display: flex; align-items: center; gap: 8px;
+  .cid {
+    font-family: var(--font-mono);
+    font-weight: 500;
+    color: var(--fg-primary);
   }
-  .count { font-size: 10px; color: #484f58; }
-  .error { color: #f85149; font-size: 11px; padding: 4px; }
-  .empty { color: #8b949e; font-size: 11px; padding: 8px 0; }
-  table { width: 100%; border-collapse: collapse; font-size: 11px; }
-  th {
-    text-align: left; color: #8b949e; font-weight: 500;
-    padding: 4px 6px; border-bottom: 1px solid #21262d;
-    font-size: 10px; text-transform: uppercase;
+  tr.tripped {
+    background: rgba(239, 68, 68, 0.06);
   }
-  th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  td { padding: 6px; border-bottom: 1px solid #1b1f27; }
-  tr.tripped { background: rgba(248, 81, 73, 0.08); }
-  td.cid { font-weight: 600; color: #e1e4e8; }
-  .pos { color: #3fb950; }
-  .neg { color: #f85149; }
-  .badge {
-    padding: 2px 6px; border-radius: 3px; font-size: 10px;
-    font-weight: 700; letter-spacing: 0.5px;
+  tr.tripped td.cid { color: var(--neg); }
+  .pos { color: var(--pos); }
+  .neg { color: var(--neg); }
+  code {
+    font-family: var(--font-mono);
+    font-size: var(--fs-2xs);
+    padding: 1px 4px;
+    background: var(--bg-chip);
+    border-radius: var(--r-sm);
+    color: var(--fg-secondary);
   }
-  .badge.ok { background: #238636; color: #fff; }
-  .badge.bad { background: #f85149; color: #fff; }
-  .badge.dim { background: #30363d; color: #8b949e; }
-  .btn-reset {
-    background: none; border: 1px solid #30363d; color: #8b949e;
-    padding: 2px 10px; border-radius: 3px; cursor: pointer;
-    font-family: inherit; font-size: 10px;
-  }
-  .btn-reset:hover { border-color: #3fb950; color: #3fb950; }
-  .btn-reset:disabled { opacity: 0.4; cursor: not-allowed; }
 </style>

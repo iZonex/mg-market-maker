@@ -85,6 +85,8 @@ impl BinanceFuturesConnector {
                 supports_fix: false,
                 max_order_rate: 300,
                 supports_funding_rate: true,
+                supports_margin_info: true,
+                supports_margin_mode: true,
             },
         }
     }
@@ -170,6 +172,10 @@ impl ExchangeConnector for BinanceFuturesConnector {
 
     fn capabilities(&self) -> &VenueCapabilities {
         &self.capabilities
+    }
+
+    fn classify_error(&self, err: &anyhow::Error) -> mm_exchange_core::VenueError {
+        crate::classify(err)
     }
 
     fn product(&self) -> VenueProduct {
@@ -607,6 +613,73 @@ impl ExchangeConnector for BinanceFuturesConnector {
         parse_binance_futures_fee_response(&resp)
             .ok_or_else(|| FeeTierError::Other(anyhow::anyhow!("malformed commissionRate body")))
     }
+
+    /// Account margin snapshot via `/fapi/v2/account` (Epic 40.4).
+    /// Returns `totalMarginBalance`, `totalMaintMargin`, plus
+    /// `positions[]` with `isolatedMargin` and `liquidationPrice`
+    /// for each open symbol. Margin ratio is computed client-side
+    /// as `totalMaintMargin / totalMarginBalance` since Binance's
+    /// account endpoint does not surface a single ratio field.
+    async fn account_margin_info(&self) -> Result<AccountMarginInfo, MarginError> {
+        let ts_param = format!("timestamp={}", chrono::Utc::now().timestamp_millis());
+        let resp = self
+            .signed_get("/fapi/v2/account", &ts_param)
+            .await
+            .map_err(MarginError::Other)?;
+        parse_binance_futures_account(&resp)
+            .ok_or_else(|| MarginError::Other(anyhow::anyhow!(
+                "malformed /fapi/v2/account response"
+            )))
+    }
+
+    /// Set per-symbol margin mode via
+    /// `POST /fapi/v1/marginType` (Epic 40.7). Binance treats
+    /// "already in this mode" as error `-4046` which we
+    /// normalise to `Ok(())` so a re-run of the startup hook
+    /// does not fail on a healthy account.
+    async fn set_margin_mode(
+        &self,
+        symbol: &str,
+        mode: MarginMode,
+    ) -> Result<(), MarginError> {
+        let kind = match mode {
+            MarginMode::Isolated => "ISOLATED",
+            MarginMode::Cross => "CROSSED",
+        };
+        let ts = chrono::Utc::now().timestamp_millis();
+        let params = format!("symbol={symbol}&marginType={kind}&timestamp={ts}");
+        match self.signed_post("/fapi/v1/marginType", &params).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                // -4046 = "No need to change margin type"
+                if msg.contains("-4046") || msg.contains("No need to change") {
+                    info!(symbol, mode = kind, "margin mode already set, skipping");
+                    Ok(())
+                } else {
+                    Err(MarginError::Other(e))
+                }
+            }
+        }
+    }
+
+    /// Set per-symbol leverage via
+    /// `POST /fapi/v1/leverage` (Epic 40.7). Binance silently
+    /// clamps to the symbol's bracket limit if we request more
+    /// than the tier allows — an under-quota value always
+    /// succeeds.
+    async fn set_leverage(
+        &self,
+        symbol: &str,
+        leverage: u32,
+    ) -> Result<(), MarginError> {
+        let ts = chrono::Utc::now().timestamp_millis();
+        let params = format!("symbol={symbol}&leverage={leverage}&timestamp={ts}");
+        self.signed_post("/fapi/v1/leverage", &params)
+            .await
+            .map(|_| ())
+            .map_err(MarginError::Other)
+    }
 }
 
 /// Parse a single `symbols[]` entry from `/fapi/v1/exchangeInfo`
@@ -712,6 +785,92 @@ pub(crate) fn parse_binance_futures_fee_response(resp: &Value) -> Option<FeeTier
         taker_fee,
         vip_tier: None,
         fetched_at: chrono::Utc::now(),
+    })
+}
+
+/// Parse `/fapi/v2/account` JSON into [`AccountMarginInfo`]
+/// (Epic 40.4). Binance publishes string-encoded decimals —
+/// every `.parse()` here defaults to `Decimal::ZERO` on a
+/// missing or malformed field so a single screwed-up position
+/// entry does not wipe out the whole snapshot. The guard
+/// will still escalate on the aggregate ratio even if one
+/// position parse failed.
+pub(crate) fn parse_binance_futures_account(resp: &Value) -> Option<AccountMarginInfo> {
+    let parse_dec = |v: Option<&Value>| -> Decimal {
+        v.and_then(|x| x.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(Decimal::ZERO)
+    };
+    let total_equity = parse_dec(resp.get("totalMarginBalance"));
+    let total_initial_margin = parse_dec(resp.get("totalInitialMargin"));
+    let total_maintenance_margin = parse_dec(resp.get("totalMaintMargin"));
+    let available_balance = parse_dec(resp.get("availableBalance"));
+    let margin_ratio = if total_equity > Decimal::ZERO {
+        total_maintenance_margin / total_equity
+    } else {
+        Decimal::ONE
+    };
+    let positions = resp
+        .get("positions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(parse_binance_futures_position)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(AccountMarginInfo {
+        total_equity,
+        total_initial_margin,
+        total_maintenance_margin,
+        available_balance,
+        margin_ratio,
+        positions,
+        reported_at_ms: chrono::Utc::now().timestamp_millis(),
+    })
+}
+
+/// Parse one `positions[]` entry from `/fapi/v2/account`.
+/// Zero-size entries are filtered — Binance returns a row
+/// for every listed symbol regardless of whether we hold a
+/// position, and including the zero rows would bloat the
+/// per-position map without carrying any margin info.
+fn parse_binance_futures_position(pos: &Value) -> Option<PositionMargin> {
+    let symbol = pos.get("symbol")?.as_str()?.to_string();
+    let parse_dec = |v: Option<&Value>| -> Decimal {
+        v.and_then(|x| x.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(Decimal::ZERO)
+    };
+    let position_amt = parse_dec(pos.get("positionAmt"));
+    if position_amt == Decimal::ZERO {
+        return None;
+    }
+    let side = if position_amt > Decimal::ZERO {
+        Side::Buy
+    } else {
+        Side::Sell
+    };
+    let entry_price = parse_dec(pos.get("entryPrice"));
+    let mark_price = parse_dec(pos.get("markPrice"));
+    let isolated_margin = pos
+        .get("isolatedMargin")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<Decimal>().ok())
+        .filter(|d| *d > Decimal::ZERO);
+    let liq_price = pos
+        .get("liquidationPrice")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<Decimal>().ok())
+        .filter(|d| *d > Decimal::ZERO);
+    Some(PositionMargin {
+        symbol,
+        side,
+        size: position_amt.abs(),
+        entry_price,
+        mark_price,
+        isolated_margin,
+        liq_price,
     })
 }
 
@@ -890,5 +1049,82 @@ mod tests {
             }
             FundingRateError::Other(_) => {}
         }
+    }
+
+    /// Epic 40.4 — pin the `/fapi/v2/account` wire shape so a
+    /// venue schema drift fails the test instead of silently
+    /// zeroing the guard's ratio (which would hide the account
+    /// from the kill switch until someone noticed).
+    #[test]
+    fn account_margin_parser_extracts_ratio_and_positions() {
+        let resp = serde_json::json!({
+            "totalMarginBalance": "10000.50",
+            "totalInitialMargin": "2000.00",
+            "totalMaintMargin": "500.00",
+            "availableBalance": "8000.00",
+            "positions": [
+                {
+                    "symbol": "BTCUSDT",
+                    "positionAmt": "0.050",
+                    "entryPrice": "50000.0",
+                    "markPrice": "50500.0",
+                    "isolatedMargin": "250.0",
+                    "liquidationPrice": "45000.0"
+                },
+                {
+                    "symbol": "DUMMY",
+                    "positionAmt": "0",
+                    "entryPrice": "0",
+                    "markPrice": "0",
+                    "isolatedMargin": "0",
+                    "liquidationPrice": "0"
+                },
+                {
+                    "symbol": "ETHUSDT",
+                    "positionAmt": "-1.5",
+                    "entryPrice": "3000",
+                    "markPrice": "2900",
+                    "isolatedMargin": "0",
+                    "liquidationPrice": "4500"
+                }
+            ]
+        });
+        let info = parse_binance_futures_account(&resp).unwrap();
+        assert_eq!(info.total_equity, dec!(10000.50));
+        assert_eq!(info.total_maintenance_margin, dec!(500.00));
+        // 500 / 10000.50 ≈ 0.0499975…
+        assert!(info.margin_ratio > dec!(0.049));
+        assert!(info.margin_ratio < dec!(0.051));
+        // DUMMY zero-size row filtered; BTCUSDT + ETHUSDT kept.
+        assert_eq!(info.positions.len(), 2);
+        let btc = info.positions.iter().find(|p| p.symbol == "BTCUSDT").unwrap();
+        assert_eq!(btc.side, Side::Buy);
+        assert_eq!(btc.size, dec!(0.050));
+        assert_eq!(btc.isolated_margin, Some(dec!(250.0)));
+        assert_eq!(btc.liq_price, Some(dec!(45000.0)));
+        let eth = info.positions.iter().find(|p| p.symbol == "ETHUSDT").unwrap();
+        assert_eq!(eth.side, Side::Sell);
+        assert_eq!(eth.size, dec!(1.5));
+        // Cross-margin position: no isolated allocation.
+        assert!(eth.isolated_margin.is_none());
+    }
+
+    /// Malformed `totalMarginBalance` → zero equity → the
+    /// parser saturates ratio at 1.0 so the guard's
+    /// `CancelAll` threshold is guaranteed to trip regardless
+    /// of the MM field. Better to over-escalate than to
+    /// silently pass through a near-zero ratio from a drifted
+    /// schema.
+    #[test]
+    fn account_margin_parser_zero_equity_forces_ratio_one() {
+        let resp = serde_json::json!({
+            "totalMarginBalance": "0",
+            "totalInitialMargin": "0",
+            "totalMaintMargin": "0",
+            "availableBalance": "0",
+            "positions": []
+        });
+        let info = parse_binance_futures_account(&resp).unwrap();
+        assert_eq!(info.margin_ratio, Decimal::ONE);
     }
 }

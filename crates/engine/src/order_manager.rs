@@ -2,12 +2,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
-use mm_common::types::{LiveOrder, OrderId, OrderType, Price, Qty, Quote, QuotePair, Side};
+use mm_common::types::{Fill, LiveOrder, OrderId, OrderType, Price, Qty, Quote, QuotePair, Side};
 use mm_common::types::{ProductSpec, TimeInForce};
 use mm_exchange_core::connector::{AmendOrder, ExchangeConnector, NewOrder};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 /// Epic E sub-component #1 — minimum batch size below which
 /// `execute_diff` stays on the per-order placement path. A
@@ -84,6 +85,16 @@ pub struct OrderManager {
     live_orders: HashMap<OrderId, LiveOrder>,
     /// Map from (side, price) to order ID for quick lookup.
     price_index: HashMap<(Side, Price), OrderId>,
+    /// When true, no real exchange calls are made — place/cancel/amend
+    /// short-circuit to locally-tracked simulated orders with fresh
+    /// UUIDs. The engine's full pipeline (quoting, diffing, PnL,
+    /// inventory, reconciliation) still runs end-to-end on the real
+    /// market feed; only order egress is stubbed.
+    ///
+    /// This is the real hard gate behind `MM_MODE=paper` — without
+    /// it, a paper-tagged run with live API keys would happily send
+    /// real orders to the venue.
+    paper_mode: bool,
 }
 
 impl OrderManager {
@@ -91,7 +102,24 @@ impl OrderManager {
         Self {
             live_orders: HashMap::new(),
             price_index: HashMap::new(),
+            paper_mode: false,
         }
+    }
+
+    /// Construct an `OrderManager` that refuses to touch the
+    /// connector for any order action — place, cancel, or amend.
+    /// Intended for the `MM_MODE=paper` code path.
+    pub fn new_paper() -> Self {
+        Self {
+            live_orders: HashMap::new(),
+            price_index: HashMap::new(),
+            paper_mode: true,
+        }
+    }
+
+    /// Is this OrderManager currently running in paper mode?
+    pub fn is_paper(&self) -> bool {
+        self.paper_mode
     }
 
     /// Number of live orders.
@@ -110,6 +138,29 @@ impl OrderManager {
             .values()
             .map(|o| o.price * (o.qty - o.filled_qty))
             .sum()
+    }
+
+    /// Snapshot the live-order book for the dashboard. Returns
+    /// one tuple per tracked order with the fields the UI
+    /// needs (`client_order_id`, `side`, `price`,
+    /// `remaining_qty`, `status`). Status is derived from the
+    /// `LiveOrder::status` enum so the frontend can distinguish
+    /// fully-live orders from partially-filled ones.
+    pub fn live_orders_snapshot(&self) -> Vec<(OrderId, Side, Price, Qty, &'static str)> {
+        self.live_orders
+            .values()
+            .map(|o| {
+                let status = match o.status {
+                    mm_common::types::OrderStatus::Open => "live",
+                    mm_common::types::OrderStatus::PartiallyFilled => "live",
+                    mm_common::types::OrderStatus::Filled => "filled",
+                    mm_common::types::OrderStatus::Cancelled => "cancelling",
+                    mm_common::types::OrderStatus::Rejected => "rejected",
+                };
+                let remaining = o.qty - o.filled_qty;
+                (o.order_id, o.side, o.price, remaining, status)
+            })
+            .collect()
     }
 
     /// Reconcile desired quotes with live orders, opportunistically
@@ -267,6 +318,16 @@ impl OrderManager {
         // Failures fall back to cancel + place by appending the entry
         // to the next-up buckets.
         for entry in std::mem::take(&mut plan.to_amend) {
+            if self.paper_mode {
+                debug!(
+                    order_id = %entry.order_id,
+                    old_price = %entry.old_price,
+                    new_price = %entry.new_price,
+                    "[PAPER] amended order (simulated)"
+                );
+                self.reprice_order(entry.order_id, entry.new_price);
+                continue;
+            }
             let request = AmendOrder {
                 order_id: entry.order_id,
                 symbol: symbol.to_string(),
@@ -371,6 +432,16 @@ impl OrderManager {
         if quotes.is_empty() {
             return Vec::new();
         }
+        // Paper mode: route every quote through the per-order path
+        // so the paper short-circuit inside `place_one_quote_outcome`
+        // applies without duplicating simulation logic here.
+        if self.paper_mode {
+            let mut outcomes = Vec::with_capacity(quotes.len());
+            for quote in quotes {
+                outcomes.push(self.place_one_quote_outcome(symbol, quote, connector).await);
+            }
+            return outcomes;
+        }
         let max_batch = connector.capabilities().max_batch_size.max(1);
         // Single-order or small slice → stay on per-order path.
         if quotes.len() < MIN_BATCH_SIZE || max_batch < MIN_BATCH_SIZE {
@@ -472,6 +543,27 @@ impl OrderManager {
         quote: &Quote,
         connector: &Arc<dyn ExchangeConnector>,
     ) -> BatchPlaceOutcome {
+        if self.paper_mode {
+            let order_id = Uuid::new_v4();
+            info!(
+                %order_id,
+                side = ?quote.side,
+                price = %quote.price,
+                qty = %quote.qty,
+                "[PAPER] placed order (simulated)"
+            );
+            self.track_order(LiveOrder {
+                order_id,
+                symbol: symbol.to_string(),
+                side: quote.side,
+                price: quote.price,
+                qty: quote.qty,
+                filled_qty: dec!(0),
+                status: mm_common::types::OrderStatus::Open,
+                created_at: chrono::Utc::now(),
+            });
+            return BatchPlaceOutcome::Placed { order_id };
+        }
         let order = NewOrder {
             symbol: symbol.to_string(),
             side: quote.side,
@@ -503,14 +595,19 @@ impl OrderManager {
                 BatchPlaceOutcome::Placed { order_id }
             }
             Err(e) => {
+                let classified = connector.classify_error(&e);
                 warn!(
                     side = ?quote.side,
                     price = %quote.price,
+                    venue = %connector.venue_id(),
+                    kind = %classified.kind,
+                    retryable = classified.kind.is_retryable(),
+                    alert = classified.kind.is_operator_alert(),
                     error = %e,
                     "failed to place order"
                 );
                 BatchPlaceOutcome::Failed {
-                    reason: e.to_string(),
+                    reason: classified.to_string(),
                 }
             }
         }
@@ -562,6 +659,15 @@ impl OrderManager {
         if order_ids.is_empty() {
             return Vec::new();
         }
+        // Paper mode: route through per-order path so the paper
+        // short-circuit in `cancel_one_outcome` applies uniformly.
+        if self.paper_mode {
+            let mut outcomes = Vec::with_capacity(order_ids.len());
+            for order_id in order_ids {
+                outcomes.push(self.cancel_one_outcome(symbol, *order_id, connector).await);
+            }
+            return outcomes;
+        }
         let max_batch = connector.capabilities().max_batch_size.max(1);
         if order_ids.len() < MIN_BATCH_SIZE || max_batch < MIN_BATCH_SIZE {
             let mut outcomes = Vec::with_capacity(order_ids.len());
@@ -612,6 +718,11 @@ impl OrderManager {
         order_id: OrderId,
         connector: &Arc<dyn ExchangeConnector>,
     ) -> BatchCancelOutcome {
+        if self.paper_mode {
+            debug!(%order_id, "[PAPER] cancelled order (simulated)");
+            self.remove_order(order_id);
+            return BatchCancelOutcome::Cancelled;
+        }
         match connector.cancel_order(symbol, order_id).await {
             Ok(_) => {
                 debug!(%order_id, "cancelled stale order");
@@ -619,10 +730,18 @@ impl OrderManager {
                 BatchCancelOutcome::Cancelled
             }
             Err(e) => {
-                warn!(%order_id, error = %e, "failed to cancel order");
+                let classified = connector.classify_error(&e);
+                warn!(
+                    %order_id,
+                    venue = %connector.venue_id(),
+                    kind = %classified.kind,
+                    retryable = classified.kind.is_retryable(),
+                    error = %e,
+                    "failed to cancel order"
+                );
                 self.remove_order(order_id);
                 BatchCancelOutcome::Failed {
-                    reason: e.to_string(),
+                    reason: classified.to_string(),
                 }
             }
         }
@@ -663,6 +782,27 @@ impl OrderManager {
         let price = product.round_price(quote.price);
         let qty = product.round_qty(quote.qty);
         if qty.is_zero() {
+            return Ok(());
+        }
+        if self.paper_mode {
+            let order_id = Uuid::new_v4();
+            info!(
+                %order_id,
+                side = ?quote.side,
+                %price,
+                %qty,
+                "[PAPER] placed unwind slice (simulated)"
+            );
+            self.track_order(LiveOrder {
+                order_id,
+                symbol: symbol.to_string(),
+                side: quote.side,
+                price,
+                qty,
+                filled_qty: dec!(0),
+                status: mm_common::types::OrderStatus::Open,
+                created_at: chrono::Utc::now(),
+            });
             return Ok(());
         }
         let order = NewOrder {
@@ -724,6 +864,13 @@ impl OrderManager {
     ) -> Result<()> {
         let ids: Vec<OrderId> = self.live_orders.keys().copied().collect();
         if ids.is_empty() {
+            return Ok(());
+        }
+        if self.paper_mode {
+            for id in &ids {
+                self.remove_order(*id);
+            }
+            info!(count = ids.len(), "[PAPER] cancelled all orders (simulated)");
             return Ok(());
         }
         let max_batch = connector.capabilities().max_batch_size.max(1);
@@ -855,6 +1002,68 @@ impl OrderManager {
             }
         }
     }
+
+    /// Paper-mode fill simulation driven by a public trade. Only
+    /// active when `paper_mode` is set — returns an empty vec
+    /// otherwise so the real path stays untouched.
+    ///
+    /// Model: a taker trade at `trade_price` with `taker_side`
+    /// fills every resting paper order whose price the trade
+    /// crossed on the opposite side:
+    /// - taker Buy (hit ask)  ⇒ fills every Sell order at price ≤ trade_price
+    /// - taker Sell (hit bid) ⇒ fills every Buy order at price ≥ trade_price
+    ///
+    /// The returned `Fill` records have `is_maker = true` — the
+    /// MM sat resting on the book — and the order is removed from
+    /// local tracking after fill. This is an aggressive model
+    /// (every crossing trade fills every eligible resting quote
+    /// fully) but it's the simplest first-order simulation that
+    /// lets PnL / inventory / SLA accumulate during a paper run.
+    /// Queue-position-aware simulation lives in `mm-backtester`;
+    /// here we just want "something fills" so the pipeline
+    /// exercises the real fill path.
+    pub fn paper_match_trade(&mut self, trade_price: Price, taker_side: Side) -> Vec<Fill> {
+        if !self.paper_mode {
+            return Vec::new();
+        }
+        let to_fill: Vec<OrderId> = self
+            .live_orders
+            .values()
+            .filter(|o| match (taker_side, o.side) {
+                (Side::Buy, Side::Sell) => o.price <= trade_price,
+                (Side::Sell, Side::Buy) => o.price >= trade_price,
+                _ => false,
+            })
+            .map(|o| o.order_id)
+            .collect();
+        let mut fills = Vec::with_capacity(to_fill.len());
+        for id in to_fill {
+            if let Some(order) = self.live_orders.remove(&id) {
+                self.price_index.remove(&(order.side, order.price));
+                fills.push(Fill {
+                    trade_id: rand_trade_id(),
+                    order_id: order.order_id,
+                    symbol: order.symbol.clone(),
+                    side: order.side,
+                    price: order.price,
+                    qty: order.qty - order.filled_qty,
+                    is_maker: true,
+                    timestamp: chrono::Utc::now(),
+                });
+            }
+        }
+        fills
+    }
+}
+
+/// Monotonically-unique synthetic trade id for paper fills.
+/// `u64` is big enough to never collide with real venue trade ids
+/// within a single run — the paper path does not need to stitch
+/// into venue-wide sequences.
+fn rand_trade_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 impl Default for OrderManager {
@@ -1402,5 +1611,140 @@ mod tests {
         assert!(res.is_ok());
         assert_eq!(as_mock(&conn).cancel_single_calls(), 0);
         assert_eq!(as_mock(&conn).cancel_batch_calls(), 0);
+    }
+
+    // ── Paper-mode guard (Epic 26) ────────────────────────────
+    //
+    // The hard invariant: an OrderManager built with `new_paper()`
+    // never calls any mutating method on the connector, no matter
+    // which public API the engine touches. These tests verify it
+    // end-to-end against the mock connector — a single real call
+    // would mean `MM_MODE=paper` is silently live-trading.
+
+    #[tokio::test]
+    async fn paper_mode_place_never_touches_connector() {
+        let mut mgr = OrderManager::new_paper();
+        let conn = mock_connector(20);
+        let desired = vec![pair_bid_ask(dec!(50000), dec!(50100), dec!(0.01))];
+        mgr.execute_diff("BTCUSDT", &desired, &product_btcusdt(), &conn, 5)
+            .await
+            .unwrap();
+        // Two quotes placed locally with simulated UUIDs.
+        assert_eq!(mgr.live_count(), 2);
+        // Zero connector calls.
+        let m = as_mock(&conn);
+        assert_eq!(m.place_single_calls(), 0);
+        assert_eq!(m.place_batch_calls(), 0);
+        assert_eq!(m.cancel_single_calls(), 0);
+        assert_eq!(m.cancel_batch_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn paper_mode_cancel_never_touches_connector() {
+        let mut mgr = OrderManager::new_paper();
+        mgr.track_order(live(Side::Buy, dec!(50000), dec!(0.01)));
+        mgr.track_order(live(Side::Sell, dec!(50100), dec!(0.01)));
+        let conn = mock_connector(20);
+        // Empty desired → every live order goes to `to_cancel`.
+        let desired: Vec<QuotePair> = vec![];
+        mgr.execute_diff("BTCUSDT", &desired, &product_btcusdt(), &conn, 5)
+            .await
+            .unwrap();
+        assert_eq!(mgr.live_count(), 0);
+        let m = as_mock(&conn);
+        assert_eq!(m.cancel_single_calls(), 0);
+        assert_eq!(m.cancel_batch_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn paper_mode_cancel_all_never_touches_connector() {
+        let mut mgr = OrderManager::new_paper();
+        mgr.track_order(live(Side::Buy, dec!(50000), dec!(0.01)));
+        mgr.track_order(live(Side::Sell, dec!(50100), dec!(0.01)));
+        let conn = mock_connector(20);
+        mgr.cancel_all(&conn, "BTCUSDT").await.unwrap();
+        assert_eq!(mgr.live_count(), 0);
+        let m = as_mock(&conn);
+        assert_eq!(m.cancel_single_calls(), 0);
+        assert_eq!(m.cancel_batch_calls(), 0);
+    }
+
+    #[test]
+    fn paper_match_trade_fills_crossing_sells() {
+        let mut mgr = OrderManager::new_paper();
+        mgr.track_order(live(Side::Sell, dec!(76_100), dec!(0.001)));
+        mgr.track_order(live(Side::Sell, dec!(76_050), dec!(0.001)));
+        mgr.track_order(live(Side::Buy, dec!(76_000), dec!(0.001)));
+        // Taker Buy at 76_150 crosses both Sell orders but NOT
+        // the Buy. Expect two fills, both maker, both on Sell.
+        let fills = mgr.paper_match_trade(dec!(76_150), Side::Buy);
+        assert_eq!(fills.len(), 2);
+        assert!(fills.iter().all(|f| matches!(f.side, Side::Sell)));
+        assert!(fills.iter().all(|f| f.is_maker));
+        // Our Buy survives the crossing-Buy (same side, no cross).
+        assert_eq!(mgr.live_count(), 1);
+    }
+
+    #[test]
+    fn paper_match_trade_fills_crossing_buys() {
+        let mut mgr = OrderManager::new_paper();
+        mgr.track_order(live(Side::Buy, dec!(76_000), dec!(0.001)));
+        mgr.track_order(live(Side::Buy, dec!(75_950), dec!(0.001)));
+        // Taker Sell at 76_000 matches the top Buy but the 75_950
+        // Buy is untouched (taker sold at 76_000, deeper bid sat
+        // below it and did not cross).
+        let fills = mgr.paper_match_trade(dec!(76_000), Side::Sell);
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].price, dec!(76_000));
+        assert_eq!(mgr.live_count(), 1);
+    }
+
+    #[test]
+    fn paper_match_trade_noop_in_live_mode() {
+        // The `paper_match_trade` must not produce any synthetic
+        // fills when paper_mode is off — the live path owns fill
+        // dispatch through the real `MarketEvent::Fill` stream.
+        let mut mgr = OrderManager::new();
+        mgr.track_order(live(Side::Sell, dec!(76_000), dec!(0.001)));
+        let fills = mgr.paper_match_trade(dec!(76_100), Side::Buy);
+        assert!(fills.is_empty());
+        assert_eq!(mgr.live_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn paper_mode_amend_never_touches_connector() {
+        let mut mgr = OrderManager::new_paper();
+        mgr.track_order(live(Side::Buy, dec!(50000.00), dec!(0.01)));
+        let conn = mock_connector(20);
+        // The default mock does NOT advertise supports_amend, so
+        // the engine's amend path is skipped and this becomes a
+        // cancel+place. Both still go through the paper gate and
+        // never touch the connector — which is the invariant we
+        // care about.
+        let desired = vec![QuotePair {
+            bid: Some(Quote {
+                side: Side::Buy,
+                price: dec!(50000.01),
+                qty: dec!(0.01),
+            }),
+            ask: None,
+        }];
+        mgr.execute_diff("BTCUSDT", &desired, &product_btcusdt(), &conn, 5)
+            .await
+            .unwrap();
+        // Exactly one order tracked at the new price.
+        assert_eq!(mgr.live_count(), 1);
+        let got = mgr
+            .live_orders
+            .values()
+            .find(|o| o.side == Side::Buy && o.price == dec!(50000.01))
+            .expect("order at new price present");
+        assert_eq!(got.qty, dec!(0.01));
+        // Zero connector calls for any mutation.
+        let m = as_mock(&conn);
+        assert_eq!(m.place_single_calls(), 0);
+        assert_eq!(m.place_batch_calls(), 0);
+        assert_eq!(m.cancel_single_calls(), 0);
+        assert_eq!(m.cancel_batch_calls(), 0);
     }
 }

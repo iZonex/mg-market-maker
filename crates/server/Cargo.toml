@@ -12,6 +12,7 @@ mm-exchange-bybit = { workspace = true }
 mm-exchange-hyperliquid = { workspace = true }
 mm-strategy = { workspace = true }
 mm-risk = { workspace = true }
+mm-sentiment = { workspace = true }
 mm-engine = { workspace = true }
 mm-dashboard = { workspace = true }
 mm-persistence = { workspace = true }
@@ -35,3 +36,30 @@ toml = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 prometheus = { workspace = true }
+chrono = { workspace = true }
+
+# OpenTelemetry OTLP tracing — opt-in via `--features otel`. Pulls
+# tonic + async runtime glue; keeping it optional holds the default
+# build footprint flat. When enabled and `OTEL_EXPORTER_OTLP_ENDPOINT`
+# is set, spans flow to the configured collector.
+opentelemetry = { version = "0.26", optional = true }
+opentelemetry_sdk = { version = "0.26", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.26", features = ["grpc-tonic"], optional = true }
+tracing-opentelemetry = { version = "0.27", optional = true }
+
+[features]
+default = []
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
+# Epic E stage-2 — io_uring transport (reserved name only).
+# Flipping this flag today does NOT swap the runtime; the
+# actual tokio_uring glue is deferred per
+# docs/research/io-uring-tradeoffs.md. The name is reserved
+# so future PRs touching `crates/exchange/*` transport layer
+# can gate their changes under `#[cfg(feature = "io-uring")]`
+# without coordinating across crates.
+io-uring = []

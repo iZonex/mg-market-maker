@@ -40,6 +40,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
 
+  otel-feature:
+    name: OTel Feature Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Build + clippy with the `otel` feature on mm-server so a
+      # regression that only surfaces with the opt-in OpenTelemetry
+      # deps (opentelemetry-otlp + tracing-opentelemetry) is caught
+      # on every PR — the default build skips these deps entirely.
+      - run: cargo build -p mm-server --features otel
+      - run: cargo clippy -p mm-server --features otel -- -D warnings
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -49,6 +65,23 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+
+  frontend:
+    name: Frontend Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install deps
+        working-directory: frontend
+        run: npm ci
+      - name: Build
+        working-directory: frontend
+        run: npm run build
 
   docker:
     name: Docker Build

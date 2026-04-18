@@ -1,0 +1,32 @@
+# MajorSpot template — BTC / ETH / SOL / BNB on a top-tier venue
+# with ≥ $1 B daily volume. Tight default spread, low γ, notional-
+# driven order size. Paper-smoke calibrated on Binance BTCUSDT
+# (Epic 25, see `btcusdt-binance-live.toml`).
+#
+# This is a PAIR-CLASS TEMPLATE, not a full config. The template
+# loader merges these sections into the caller's AppConfig; fields
+# not set here keep their venue-config / default values.
+
+[market_maker]
+gamma = "0.05"
+kappa = "20.0"
+sigma = "0.00003"          # per-second realised vol baseline
+time_horizon_secs = 300
+num_levels = 3
+refresh_interval_ms = 500
+min_spread_bps = "2"       # majors are tight; 2 bps above mid is typical
+max_distance_bps = "80"
+momentum_enabled = true
+momentum_window = 200
+market_resilience_enabled = true
+hma_enabled = true
+
+[risk]
+# Quote-currency-denominated ceilings; order_size stays in
+# the user config because it depends on capital.
+max_spread_bps = "50"
+stale_book_timeout_secs = 10
+
+[toxicity]
+vpin_threshold = "0.65"     # majors rarely toxic; trip earlier
+kyle_window = 100

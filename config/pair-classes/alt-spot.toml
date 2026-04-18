@@ -1,0 +1,26 @@
+# AltSpot template — mid-cap spot ($100 M – $1 B daily volume).
+# AVAX / LINK / MATIC / DOT / LTC / etc. Wider default spread than
+# majors, higher γ to compensate for thinner depth and more
+# adverse-selection risk.
+
+[market_maker]
+gamma = "0.15"
+kappa = "8.0"
+sigma = "0.0001"
+time_horizon_secs = 300
+num_levels = 3
+refresh_interval_ms = 500
+min_spread_bps = "8"
+max_distance_bps = "120"
+momentum_enabled = true
+momentum_window = 200
+market_resilience_enabled = true
+hma_enabled = true
+
+[risk]
+max_spread_bps = "150"
+stale_book_timeout_secs = 10
+
+[toxicity]
+vpin_threshold = "0.75"
+kyle_window = 100

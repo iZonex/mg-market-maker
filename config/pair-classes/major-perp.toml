@@ -1,0 +1,29 @@
+# MajorPerp template — BTC-PERP / ETH-PERP / SOL-PERP on a major
+# perp venue (Binance Futures / Bybit linear / HyperLiquid).
+#
+# Small σ uplift vs MajorSpot: perps track spot tightly but the
+# funding mechanism + hourly settlement means realised vol is a
+# touch higher in short windows. κ is slightly smaller because
+# perp taker arrivals are often less bursty than spot.
+
+[market_maker]
+gamma = "0.08"
+kappa = "15.0"
+sigma = "0.00004"
+time_horizon_secs = 300
+num_levels = 3
+refresh_interval_ms = 500
+min_spread_bps = "3"
+max_distance_bps = "80"
+momentum_enabled = true
+momentum_window = 200
+market_resilience_enabled = true
+hma_enabled = true
+
+[risk]
+max_spread_bps = "80"
+stale_book_timeout_secs = 10
+
+[toxicity]
+vpin_threshold = "0.70"
+kyle_window = 100

@@ -1815,4 +1815,240 @@ mod tests {
             v_later.abs()
         );
     }
+
+    // ── Property-based tests (Epic 19) ────────────────────────
+
+    use proptest::prelude::*;
+
+    prop_compose! {
+        fn qty_strat()(raw in 1i64..1_000_000i64) -> Decimal {
+            Decimal::new(raw, 2)
+        }
+    }
+
+    prop_compose! {
+        fn price_strat()(raw in 1i64..10_000_000i64) -> Decimal {
+            Decimal::new(raw, 2)
+        }
+    }
+
+    fn levels_strat(n: usize) -> impl Strategy<Value = Vec<PriceLevel>> {
+        proptest::collection::vec((price_strat(), qty_strat()), n..=n)
+            .prop_map(|v| v.into_iter().map(|(p, q)| PriceLevel { price: p, qty: q }).collect())
+    }
+
+    proptest! {
+        /// book_imbalance is always in [-1, +1] and zero when the
+        /// book is empty. Catches a division-by-zero regression or
+        /// a sign flip that overshoots the canonical range.
+        #[test]
+        fn book_imbalance_range_is_canonical(
+            bids in proptest::collection::vec((price_strat(), qty_strat()), 0..8),
+            asks in proptest::collection::vec((price_strat(), qty_strat()), 0..8),
+            k in 1usize..10,
+        ) {
+            let bids: Vec<_> = bids.into_iter()
+                .map(|(p, q)| PriceLevel { price: p, qty: q }).collect();
+            let asks: Vec<_> = asks.into_iter()
+                .map(|(p, q)| PriceLevel { price: p, qty: q }).collect();
+            let ib = book_imbalance(&bids, &asks, k);
+            prop_assert!(ib >= dec!(-1) && ib <= dec!(1),
+                "imbalance {} out of [-1, 1]", ib);
+        }
+
+        /// book_imbalance sign matches bid vs ask qty strictly.
+        #[test]
+        fn book_imbalance_sign_matches_heavier_side(
+            bids in levels_strat(3),
+            asks in levels_strat(3),
+        ) {
+            let bq: Decimal = bids.iter().take(3).map(|l| l.qty).sum();
+            let aq: Decimal = asks.iter().take(3).map(|l| l.qty).sum();
+            let ib = book_imbalance(&bids, &asks, 3);
+            if bq > aq {
+                prop_assert!(ib > dec!(0), "{} vs {} → ib {}", bq, aq, ib);
+            } else if aq > bq {
+                prop_assert!(ib < dec!(0), "{} vs {} → ib {}", bq, aq, ib);
+            } else {
+                prop_assert_eq!(ib, dec!(0));
+            }
+        }
+
+        /// book_imbalance_weighted stays bounded in [-1, +1].
+        #[test]
+        fn weighted_imbalance_is_bounded(
+            bids in proptest::collection::vec((price_strat(), qty_strat()), 0..8),
+            asks in proptest::collection::vec((price_strat(), qty_strat()), 0..8),
+            k in 1usize..10,
+        ) {
+            let bids: Vec<_> = bids.into_iter()
+                .map(|(p, q)| PriceLevel { price: p, qty: q }).collect();
+            let asks: Vec<_> = asks.into_iter()
+                .map(|(p, q)| PriceLevel { price: p, qty: q }).collect();
+            let ib = book_imbalance_weighted(&bids, &asks, k);
+            prop_assert!(ib >= dec!(-1) && ib <= dec!(1));
+        }
+
+        /// bba_imbalance stays bounded in [-1, +1].
+        #[test]
+        fn bba_imbalance_is_bounded(
+            bid_price in price_strat(),
+            bid_qty in qty_strat(),
+            ask_price in price_strat(),
+            ask_qty in qty_strat(),
+        ) {
+            let bids = vec![PriceLevel { price: bid_price, qty: bid_qty }];
+            let asks = vec![PriceLevel { price: ask_price, qty: ask_qty }];
+            let ib = bba_imbalance(&bids, &asks);
+            prop_assert!(ib >= dec!(-1) && ib <= dec!(1));
+        }
+
+        /// micro_price always sits between best_bid and best_ask
+        /// (inclusive) — by construction a weighted average of the
+        /// two prices cannot escape their interval.
+        #[test]
+        fn micro_price_bracketed_by_touch(
+            bid_price_raw in 1i64..100_000,
+            gap in 1i64..10_000,
+            bid_qty in qty_strat(),
+            ask_qty in qty_strat(),
+        ) {
+            let bid_price = Decimal::new(bid_price_raw, 2);
+            let ask_price = bid_price + Decimal::new(gap, 2);
+            let bids = vec![PriceLevel { price: bid_price, qty: bid_qty }];
+            let asks = vec![PriceLevel { price: ask_price, qty: ask_qty }];
+            let mp = micro_price(&bids, &asks).unwrap();
+            prop_assert!(mp >= bid_price && mp <= ask_price,
+                "mp {} not in [{}, {}]", mp, bid_price, ask_price);
+        }
+
+        /// micro_price_weighted with depth=1 matches plain
+        /// micro_price on a 1-level book.
+        #[test]
+        fn weighted_mp_depth1_matches_plain(
+            bid_price in price_strat(),
+            ask_price in price_strat(),
+            bid_qty in qty_strat(),
+            ask_qty in qty_strat(),
+        ) {
+            let bids = vec![PriceLevel { price: bid_price, qty: bid_qty }];
+            let asks = vec![PriceLevel { price: ask_price, qty: ask_qty }];
+            let plain = micro_price(&bids, &asks).unwrap();
+            let weighted = micro_price_weighted(&bids, &asks, 1).unwrap();
+            prop_assert_eq!(plain, weighted);
+        }
+
+        /// log_price_ratio is antisymmetric: swapping base and
+        /// follow negates the result (to within f64 round-trip
+        /// precision).
+        #[test]
+        fn log_price_ratio_is_antisymmetric(
+            a in price_strat(),
+            b in price_strat(),
+        ) {
+            let ab = log_price_ratio(a, b).unwrap();
+            let ba = log_price_ratio(b, a).unwrap();
+            let sum = ab + ba;
+            // Allow a small tolerance for f64 round-trip.
+            prop_assert!(sum.abs() < Decimal::new(1, 8),
+                "ab {} + ba {} = {} > 1e-8", ab, ba, sum);
+        }
+
+        /// log_price_ratio of equal prices is zero.
+        #[test]
+        fn log_price_ratio_of_equal_is_zero(p in price_strat()) {
+            let r = log_price_ratio(p, p).unwrap();
+            prop_assert_eq!(r, dec!(0));
+        }
+
+        /// market_impact: filled_qty never exceeds target, and
+        /// `partial` is set iff the book was actually too thin.
+        #[test]
+        fn market_impact_filled_and_partial_consistent(
+            levels in levels_strat(5),
+            target_raw in 1i64..100_000,
+        ) {
+            let target = Decimal::new(target_raw, 2);
+            let ref_price = levels[0].price;
+            let mi = market_impact(&levels, Side::Buy, target, ref_price).unwrap();
+            prop_assert!(mi.filled_qty <= target, "filled {} > target {}", mi.filled_qty, target);
+            let total_depth: Decimal = levels.iter().map(|l| l.qty).sum();
+            if target <= total_depth {
+                prop_assert!(!mi.partial, "full fill flagged partial");
+                prop_assert_eq!(mi.filled_qty, target);
+            } else {
+                prop_assert!(mi.partial, "partial fill not flagged");
+                prop_assert_eq!(mi.filled_qty, total_depth);
+            }
+        }
+
+        /// market_impact: vwap = notional / filled. An invariant
+        /// the impact_bps computation hinges on.
+        #[test]
+        fn market_impact_vwap_matches_notional_over_filled(
+            levels in levels_strat(5),
+            target_raw in 1i64..100_000,
+        ) {
+            let target = Decimal::new(target_raw, 2);
+            let ref_price = levels[0].price;
+            let mi = market_impact(&levels, Side::Buy, target, ref_price).unwrap();
+            prop_assert_eq!(mi.vwap, mi.notional / mi.filled_qty);
+        }
+
+        /// WindowedTradeFlow: after pushing only buys, value
+        /// converges to +1. After only sells, -1. Sanity check
+        /// for normalisation.
+        #[test]
+        fn windowed_pure_one_side_is_extreme(
+            qtys in proptest::collection::vec(1i64..10_000, 1..20),
+            buys in any::<bool>(),
+        ) {
+            let mut w = WindowedTradeFlow::new(30);
+            let side = if buys { Side::Buy } else { Side::Sell };
+            for q in &qtys {
+                w.on_trade(Decimal::new(*q, 2), side);
+            }
+            let v = w.value().unwrap();
+            if buys {
+                prop_assert_eq!(v, dec!(1));
+            } else {
+                prop_assert_eq!(v, dec!(-1));
+            }
+        }
+
+        /// WindowedTradeFlow value always in [-1, +1] across any
+        /// mix of trades.
+        #[test]
+        fn windowed_value_is_bounded(
+            ops in proptest::collection::vec((1i64..10_000, any::<bool>()), 1..40),
+        ) {
+            let mut w = WindowedTradeFlow::new(20);
+            for (q, is_buy) in &ops {
+                let side = if *is_buy { Side::Buy } else { Side::Sell };
+                w.on_trade(Decimal::new(*q, 2), side);
+            }
+            if let Some(v) = w.value() {
+                prop_assert!(v >= dec!(-1) && v <= dec!(1),
+                    "value {} out of [-1, 1]", v);
+            }
+        }
+
+        /// ob_imbalance_multi_depth: output in [-1, +1] for any
+        /// alpha ∈ (0, 1) and non-empty depths.
+        #[test]
+        fn multi_depth_is_bounded(
+            bids in proptest::collection::vec((price_strat(), qty_strat()), 0..6),
+            asks in proptest::collection::vec((price_strat(), qty_strat()), 0..6),
+            depths in proptest::collection::vec(1usize..6, 1..5),
+            alpha_raw in 1i64..99,
+        ) {
+            let bids: Vec<_> = bids.into_iter()
+                .map(|(p, q)| PriceLevel { price: p, qty: q }).collect();
+            let asks: Vec<_> = asks.into_iter()
+                .map(|(p, q)| PriceLevel { price: p, qty: q }).collect();
+            let alpha = Decimal::new(alpha_raw, 2); // 0.01..=0.99
+            let v = ob_imbalance_multi_depth(&bids, &asks, &depths, alpha);
+            prop_assert!(v >= dec!(-1) && v <= dec!(1));
+        }
+    }
 }

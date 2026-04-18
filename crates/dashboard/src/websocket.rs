@@ -12,7 +12,7 @@ use crate::auth::{AuthState, TokenClaims};
 use crate::state::DashboardState;
 
 /// WebSocket broadcast channel — engine pushes updates, all WS clients receive.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WsBroadcast {
     tx: broadcast::Sender<String>,
 }

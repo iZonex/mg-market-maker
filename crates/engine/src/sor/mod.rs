@@ -27,4 +27,5 @@
 pub mod cost;
 pub mod dispatch;
 pub mod router;
+pub mod trade_rate;
 pub mod venue_state;

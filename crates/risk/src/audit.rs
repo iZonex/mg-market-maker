@@ -31,6 +31,11 @@ struct AuditLogInner {
     /// on every write; the comparison is a single integer check,
     /// not a syscall, so the hot path overhead is negligible.
     current_date: NaiveDate,
+    /// Last event's SHA-256 (hex). Seeded from the last line of
+    /// the existing file at construction so a restart picks up
+    /// the chain without breaking it. Reset on daily rotation —
+    /// the archived file retains the closed chain.
+    last_hash: Option<String>,
 }
 
 /// An audit event — every action the MM takes.
@@ -55,6 +60,13 @@ pub struct AuditEvent {
     pub qty: Option<Qty>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Epic 36.3 — SHA-256 of the previous event's serialised
+    /// body (hex). Forms a tamper-evident hash chain across the
+    /// whole log: insertion, deletion, or modification of any
+    /// event breaks the chain at that point and every subsequent
+    /// record. `None` on the first event after rotation / init.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -188,6 +200,41 @@ pub enum AuditEventType {
     /// dispatch lands.
     RouteDecisionEmitted,
 
+    /// Epic F stage-3 — listing sniper placed a real entry
+    /// IOC after the quarantine window expired. `detail`
+    /// carries `venue=…, symbol=…, qty=…, price=…,
+    /// notional=…` so post-mortems can reconstruct the
+    /// decision without walking the order-manager fill log.
+    ListingEntered,
+
+    /// Epic F stage-3 — listing sniper REJECTED an entry
+    /// candidate. `detail` carries the rejection reason:
+    /// `quarantine`, `max_active`, `status`, `zero_qty`,
+    /// `no_book`, `place_err(...)`. Observer-mode runs
+    /// (`enter_on_discovery = false`) emit this with
+    /// `reason=disabled` exactly once per symbol so the
+    /// audit trail records the fact that the sniper saw
+    /// the listing but did not act.
+    ListingEntryRejected,
+
+    /// Epic B stage-2 — background pair-screener scan
+    /// result. `detail` carries `y=SYM, x=SYM, coint=bool,
+    /// adf=<stat>, crit=<stat>, beta=<val>, n=<samples>` so
+    /// ops can browse the audit trail and pick candidate
+    /// cointegrated pairs for a stat-arb driver without
+    /// re-running the test.
+    CointegrationScreened,
+
+    /// Epic A stage-2 #1 — inline dispatch tick actually
+    /// placed orders against the bundle. `detail` carries
+    /// target side + total target qty + total dispatched qty
+    /// plus per-leg `(venue, dispatched_qty, error?)`.
+    /// Emitted once per successful dispatch tick including
+    /// partial successes; errors are flagged in-line so
+    /// post-mortems correlate a failed leg to its audit row
+    /// without re-walking the log.
+    RouteDispatched,
+
     // Epic B — Cointegrated pairs stat-arb driver.
     /// `StatArbDriver` opened a position. `detail` carries
     /// direction + per-leg qty + entry z-score + spread.
@@ -277,14 +324,46 @@ pub enum AuditEventType {
     // Epic 5 — Compliance reporting.
     /// Scheduled report generated. `detail` carries report type + period.
     ReportGenerated,
+
+    // Epic 38 — Dashboard auth surveillance.
+    /// Dashboard login succeeded. `detail` carries `user_id=…,
+    /// role=…, ip=…`. Written for every accepted `/api/auth/login`
+    /// so credential-stuffing attempts leave a trail even if the
+    /// attacker eventually guesses a valid key.
+    LoginSucceeded,
+    /// Dashboard login failed — API key unknown. `detail` carries
+    /// the source IP plus a short prefix of the supplied key (for
+    /// correlation, never the full key) and the failure reason.
+    LoginFailed,
+    /// Dashboard logout requested. `detail` carries `user_id=…,
+    /// ip=…`. Tokens are stateless so the server-side effect is
+    /// advisory; the event exists to mark the operator's intent
+    /// for post-incident review.
+    LogoutSucceeded,
+
+    // Epic 40.3 — perp funding accrual.
+    /// A funding-settlement instant booked a `realised_delta`
+    /// into `PnlAttribution::funding_pnl_realised`. `detail`
+    /// carries `rate=…, mark=…, inventory=…, delta=…,
+    /// next_funding_time=…`. Emitted **only at settlement**
+    /// (not on the continuous MTM tick) so the audit log
+    /// records one row per period even at HL's 1-hour
+    /// cadence. MiCA reporting consumes this alongside
+    /// `OrderFilled` to reconstruct PnL.
+    FundingAccrued,
 }
 
 impl AuditLog {
-    /// Create a new audit log. Appends to existing file.
+    /// Create a new audit log. Appends to existing file. Seeds
+    /// the hash chain from the last line on disk so a restart
+    /// picks up where the previous process stopped — readers
+    /// that verify the chain see an unbroken sequence across
+    /// process boundaries.
     pub fn new(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let last_hash = seed_last_hash_from_file(path);
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -294,12 +373,17 @@ impl AuditLog {
                 writer: std::io::BufWriter::new(file),
                 base_path: path.to_path_buf(),
                 current_date: Utc::now().date_naive(),
+                last_hash,
             }),
             sequence: std::sync::atomic::AtomicU64::new(1),
         })
     }
 
-    /// Log an event.
+    /// Log an event. Chains the serialised form into a
+    /// tamper-evident SHA-256 sequence (Epic 36.3) and, for
+    /// regulatory-critical events, forces the OS to `fsync` the
+    /// record to disk before returning so power loss cannot
+    /// erase a filled order or a kill-switch escalation.
     pub fn log(&self, event: AuditEvent) {
         let seq = self
             .sequence
@@ -307,10 +391,6 @@ impl AuditLog {
         let mut event = event;
         event.seq = seq;
         event.timestamp = Utc::now();
-
-        let Ok(json) = serde_json::to_string(&event) else {
-            return;
-        };
 
         let Ok(mut state) = self.state.lock() else {
             error!("audit log mutex poisoned");
@@ -330,8 +410,30 @@ impl AuditLog {
             }
         }
 
+        // Chain-hash: stamp the prev_hash then serialise, then
+        // compute this event's hash for the next write.
+        event.prev_hash = state.last_hash.clone();
+        let Ok(json) = serde_json::to_string(&event) else {
+            return;
+        };
+        let this_hash = sha256_hex(json.as_bytes());
+        state.last_hash = Some(this_hash);
+
         if writeln!(state.writer, "{json}").is_err() {
             error!("failed to write audit log");
+        }
+
+        // Regulatory-critical events get fsync'd before return.
+        // The rest of the write path stays buffered because the
+        // tick_second() flush covers them within 30 s at worst.
+        if is_critical(&event.event_type) {
+            if let Err(e) = state.writer.flush() {
+                error!(error = %e, "audit flush failed on critical event");
+                return;
+            }
+            if let Err(e) = state.writer.get_ref().sync_data() {
+                error!(error = %e, "audit fsync failed on critical event");
+            }
         }
     }
 
@@ -370,6 +472,10 @@ impl AuditLog {
             .open(&state.base_path)?;
         state.writer = std::io::BufWriter::new(file);
         state.current_date = today;
+        // Fresh file = fresh chain. The archived file retains
+        // the closed chain; readers verify each day's file
+        // independently.
+        state.last_hash = None;
         Ok(())
     }
 
@@ -393,6 +499,8 @@ impl AuditLog {
             price: Some(price),
             qty: Some(qty),
             detail: None,
+
+            prev_hash: None,
         });
     }
 
@@ -421,6 +529,7 @@ impl AuditLog {
             } else {
                 "taker".to_string()
             }),
+            prev_hash: None,
         });
     }
 
@@ -437,6 +546,8 @@ impl AuditLog {
             price: None,
             qty: None,
             detail: None,
+
+            prev_hash: None,
         });
     }
 
@@ -467,6 +578,28 @@ impl AuditLog {
             price: None,
             qty: None,
             detail: Some(detail),
+
+            prev_hash: None,
+        });
+    }
+
+    /// Convenience: log a dashboard auth event. No symbol context
+    /// — auth is a cross-cutting concern, so `symbol` is left
+    /// empty. `detail` should carry `user_id=…, ip=…, …` as a
+    /// comma-separated k=v string so the audit trail is grep-able.
+    pub fn auth_event(&self, event_type: AuditEventType, detail: &str) {
+        self.log(AuditEvent {
+            seq: 0,
+            timestamp: Utc::now(),
+            event_type,
+            symbol: String::new(),
+            client_id: None,
+            order_id: None,
+            side: None,
+            price: None,
+            qty: None,
+            detail: Some(detail.to_string()),
+            prev_hash: None,
         });
     }
 
@@ -483,6 +616,7 @@ impl AuditLog {
             price: None,
             qty: None,
             detail: Some(detail.to_string()),
+            prev_hash: None,
         });
     }
 
@@ -608,4 +742,31 @@ fn archive_rotated_file(archived: &Path) {
             );
         }
     }
+}
+
+// ── Epic 36.3 helpers: hash-chain + critical-event fsync ──
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    hex::encode(h.finalize())
+}
+
+fn is_critical(ty: &AuditEventType) -> bool {
+    matches!(
+        ty,
+        AuditEventType::OrderFilled
+            | AuditEventType::KillSwitchEscalated
+            | AuditEventType::CircuitBreakerTripped
+    )
+}
+
+/// Read the last non-empty line of an existing audit file and
+/// return the SHA-256 of that line. Used at `AuditLog::new()` to
+/// seed the hash chain across process restarts.
+fn seed_last_hash_from_file(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let last = content.lines().rev().find(|l| !l.trim().is_empty())?;
+    Some(sha256_hex(last.as_bytes()))
 }

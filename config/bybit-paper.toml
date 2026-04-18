@@ -1,0 +1,95 @@
+# Bybit V5 spot paper-trading config — real feed, simulated egress.
+#
+# Bybit V5 REST + WS endpoints are hardcoded inside the connector
+# (see `crates/exchange/bybit/src/connector.rs:150-164`). The
+# `rest_url` / `ws_url` fields below are ignored for this venue;
+# they are filled in only so config deserialisation succeeds on a
+# shared `[exchange]` schema.
+#
+# Start by calibrating γ/κ/σ with `mm-record-live --venue bybit`
+# before treating these numbers as anything but placeholders.
+
+symbols = ["BTCUSDT"]
+mode = "paper"
+dashboard_port = 9090
+checkpoint_path = "data/checkpoint-bybit-paper.json"
+log_file = ""
+
+[exchange]
+# "bybit" | "bybit_testnet"
+exchange_type = "bybit"
+rest_url = "unused"
+ws_url = "unused"
+# api_key / api_secret come from MM_API_KEY / MM_API_SECRET env vars.
+# For public-only data you can leave both unset — spot orderbook,
+# trades, and product spec endpoints work keyless on Bybit V5.
+
+[market_maker]
+strategy = "avellaneda_stoikov"
+
+# Placeholder parameters — recalibrate against Bybit's own flow.
+# κ in particular differs between Binance and Bybit BTCUSDT; do
+# not copy the Binance-calibrated value.
+gamma = "0.1000"
+kappa = "15.0000"
+sigma = "0.00007"
+time_horizon_secs = 300
+
+num_levels = 3
+order_size = "0.0001"
+refresh_interval_ms = 500
+min_spread_bps = "3"
+max_distance_bps = "80"
+
+momentum_enabled = true
+momentum_window = 200
+market_resilience_enabled = true
+otr_enabled = true
+hma_enabled = true
+hma_window = 9
+
+# Bybit has its own private WS user-data stream (no listen-key
+# round-trip). Engine auto-wires it when user_stream_enabled = true
+# AND api_key / api_secret are set.
+user_stream_enabled = false
+inventory_drift_tolerance = "0.00001"
+inventory_drift_auto_correct = false
+
+[risk]
+max_inventory = "0.0001"
+max_exposure_quote = "10"
+max_drawdown_quote = "2"
+inventory_skew_factor = "1.0"
+max_spread_bps = "200"
+stale_book_timeout_secs = 10
+max_order_size = "0.0005"
+max_daily_volume_quote = "100"
+max_hourly_volume_quote = "30"
+
+[kill_switch]
+daily_loss_limit = "2"
+daily_loss_warning = "1"
+max_position_value = "10"
+max_message_rate = 50
+max_consecutive_errors = 10
+
+[sla]
+max_spread_bps = "100"
+min_depth_quote = "2000"
+min_uptime_pct = "95"
+two_sided_required = true
+max_requote_secs = 5
+min_order_rest_secs = 3
+
+[toxicity]
+vpin_bucket_size = "50000"
+vpin_num_buckets = 50
+vpin_threshold = "0.7"
+kyle_window = 100
+adverse_selection_lookback_ms = 3000
+autotune_enabled = true
+
+[listing_sniper]
+enabled = false
+scan_interval_secs = 300
+alert_on_discovery = true
