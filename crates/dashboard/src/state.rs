@@ -179,6 +179,12 @@ struct StateInner {
     /// the `Arc<AuditLog>` that `AuthState` and the engines also
     /// share, so all writers append into one file.
     audit_log: Option<std::sync::Arc<mm_risk::audit::AuditLog>>,
+    /// Epic Multi-Venue Level 2.A — cross-engine data bus. Every
+    /// engine publishes L1/L2/trades/funding/balance here; Level
+    /// 2.B parameterised source nodes in the strategy graph read
+    /// from this same bus. Cheap-to-clone (Arc internally) so the
+    /// dashboard state holds it directly, no Option indirection.
+    data_bus: crate::data_bus::DataBus,
     /// Latest per-symbol margin ratio (Epic 40.4). Published by
     /// the engine's `MarginGuard` poll each
     /// `refresh_interval_secs`. Surfaced on the dashboard so
@@ -776,6 +782,12 @@ impl DashboardState {
 
     pub fn audit_log(&self) -> Option<std::sync::Arc<mm_risk::audit::AuditLog>> {
         self.inner.read().unwrap().audit_log.clone()
+    }
+
+    /// Epic Multi-Venue 2.A — shared DataBus handle. Cheap
+    /// (Arc-internal) so engines clone their own copy at boot.
+    pub fn data_bus(&self) -> crate::data_bus::DataBus {
+        self.inner.read().unwrap().data_bus.clone()
     }
 
     pub fn set_strategy_graph_store(&self, store: std::sync::Arc<mm_strategy_graph::GraphStore>) {

@@ -722,7 +722,7 @@ pub enum ExchangeType {
 /// the per-product toxicity widen multiplier (Epic 40.8).
 ///
 /// Serialised as snake_case: `spot`, `linear_perp`, `inverse_perp`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProductType {
     #[default]
