@@ -559,6 +559,12 @@ pub struct MarketMakerEngine {
     /// Near-touch placement counter for `StrategicNonFillingDetector`.
     near_touch_placements: usize,
     near_touch_fills: usize,
+    /// Timestamp of the last reprice (refresh_quotes that placed
+    /// a fresh quote bundle). Feeds `LatencyExploitDetector`.
+    last_reprice_ts: Option<chrono::DateTime<chrono::Utc>>,
+    /// Timestamp of the most-recent public trade near our touch.
+    /// Feeds `CancelOnReactionDetector`.
+    last_nearby_trade_ts: Option<chrono::DateTime<chrono::Utc>>,
     /// Epic H — graph scope cached at `with_strategy_graph` /
     /// `swap_strategy_graph` so the per-tick source marshaller
     /// knows which asset to pull sentiment for without re-reading
@@ -943,6 +949,8 @@ impl MarketMakerEngine {
             imbalance_history: std::collections::VecDeque::with_capacity(200),
             near_touch_placements: 0,
             near_touch_fills: 0,
+            last_reprice_ts: None,
+            last_nearby_trade_ts: None,
             strategy_graph_scope: None,
             margin_guard: config.margin.as_ref().map(|m| {
                 MarginGuard::new(MarginGuardThresholds::from_config(m))
@@ -3956,6 +3964,15 @@ impl MarketMakerEngine {
                         "reconciliation: removing ghost orders (tracked locally but absent on venue)"
                     );
                     for id in &ghosts {
+                        // Epic R 1.2b — record cancel-to-nearby-trade
+                        // gap for CancelOnReaction scoring.
+                        let gap_ms = self
+                            .last_nearby_trade_ts
+                            .map(|ts| (chrono::Utc::now() - ts).num_milliseconds());
+                        self.cancel_reaction_deltas_ms.push_back(gap_ms);
+                        if self.cancel_reaction_deltas_ms.len() > 50 {
+                            self.cancel_reaction_deltas_ms.pop_front();
+                        }
                         self.order_manager.remove_order(*id);
                     }
                 }
@@ -4407,6 +4424,17 @@ impl MarketMakerEngine {
             }
             MarketEvent::Trade { venue, trade } => {
                 let trade_venue = *venue;
+                // Epic R 1.2b — timestamp the arrival of any
+                // public trade near our touch. The
+                // `CancelOnReactionDetector` reads this to score
+                // cancels that fire within ms of such a trade.
+                let mid = self.book_keeper.book.mid_price().unwrap_or(rust_decimal::Decimal::ZERO);
+                if mid > rust_decimal::Decimal::ZERO {
+                    let dist = (trade.price - mid).abs() / mid;
+                    if dist <= rust_decimal_macros::dec!(0.0010) {
+                        self.last_nearby_trade_ts = Some(chrono::Utc::now());
+                    }
+                }
                 // Multi-Venue 2.B.3 — public-trade tape to DataBus.
                 // `Trade.Tape` source nodes on any graph read this
                 // back by (venue, symbol, product). Aggressor side
@@ -4545,6 +4573,23 @@ impl MarketMakerEngine {
 
                 self.inventory_manager.on_fill(fill);
                 self.order_manager.on_fill(fill.order_id, fill.qty);
+                // Epic R 1.2b — LatencyExploit + near-touch fill
+                // feeds. Compute delta from the last reprice; cap
+                // the deque so it stays the "recent" window.
+                if let Some(ts) = self.last_reprice_ts {
+                    let delta_ms = (chrono::Utc::now() - ts).num_milliseconds();
+                    self.fill_reprice_deltas_ms.push_back(delta_ms);
+                    if self.fill_reprice_deltas_ms.len() > 50 {
+                        self.fill_reprice_deltas_ms.pop_front();
+                    }
+                }
+                let mid = self.book_keeper.book.mid_price().unwrap_or(rust_decimal::Decimal::ZERO);
+                if mid > rust_decimal::Decimal::ZERO {
+                    let dist = (fill.price - mid).abs() / mid;
+                    if dist <= rust_decimal_macros::dec!(0.0005) {
+                        self.near_touch_fills += 1;
+                    }
+                }
                 // Epic R — feed the surveillance tracker so
                 // detectors can reason about our fills. Cheap
                 // (mutex lock + one vec push), acceptable cost on
@@ -5496,6 +5541,10 @@ impl MarketMakerEngine {
             as_prob_ask,
         };
 
+        // Epic R 1.2b — mark this refresh as a reprice moment so
+        // LatencyExploit can measure fill-vs-reprice delta.
+        self.last_reprice_ts = Some(chrono::Utc::now());
+
         // Phase 4 — if the graph authored a quote bundle on the last
         // tick via `Out.Quotes`, use it instead of the hand-wired
         // strategy. Override is consumed (take) so the next tick
@@ -5522,6 +5571,30 @@ impl MarketMakerEngine {
                 strategy_quotes
             }
         };
+
+        // Epic R 1.2b — update OneSided tick ring + near-touch
+        // placement counter from the final quotes vector *before*
+        // inventory/balance filtering trims it. Ring stays capped
+        // at 100 entries.
+        {
+            let has_bid = quotes.iter().any(|p| p.bid.is_some());
+            let has_ask = quotes.iter().any(|p| p.ask.is_some());
+            let one_sided = has_bid ^ has_ask; // XOR — exactly one.
+            self.one_sided_tick_ring.push_back(one_sided);
+            if self.one_sided_tick_ring.len() > 100 {
+                self.one_sided_tick_ring.pop_front();
+            }
+            if mid > rust_decimal::Decimal::ZERO {
+                for p in &quotes {
+                    for q in [p.bid.as_ref(), p.ask.as_ref()].into_iter().flatten() {
+                        let dist = (q.price - mid).abs() / mid;
+                        if dist <= rust_decimal_macros::dec!(0.0005) {
+                            self.near_touch_placements += 1;
+                        }
+                    }
+                }
+            }
+        }
 
         // Inventory limits + urgency + dynamic sizing.
         self.inventory_manager
