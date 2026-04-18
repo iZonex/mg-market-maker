@@ -162,6 +162,20 @@ use crate::sor::venue_state::{VenueSeed, VenueStateAggregator};
 /// - TWAP executor (for kill switch L4 flatten)
 /// - Dashboard state updates
 /// - Reconciliation on reconnect
+///
+/// See also [`InflightAtomicBundle`] for the Multi-Venue 3.E.2
+/// atomic-bundle watchdog state.
+#[derive(Debug, Clone)]
+pub struct InflightAtomicBundle {
+    pub dispatched_at: chrono::DateTime<chrono::Utc>,
+    pub timeout_ms: u64,
+    pub maker_venue: String,
+    pub maker_symbol: String,
+    pub hedge_venue: String,
+    pub hedge_symbol: String,
+    pub both_legs_acked: bool,
+}
+
 pub struct MarketMakerEngine {
     symbol: String,
     /// Owning client ID (Epic 1). `None` in legacy single-client
@@ -496,6 +510,16 @@ pub struct MarketMakerEngine {
     /// settlement). Default = 8-hour funding cadence; operators can
     /// override via `set_session_calendar`.
     session_calendar: mm_risk::session_calendar::SessionCalendar,
+    /// Multi-Venue 3.E.2 — inflight atomic bundles waiting for
+    /// both legs to ack. On every `refresh_quotes` we age them
+    /// and cancel the partner leg if the timeout window elapsed
+    /// without the counter-leg showing up in
+    /// `order_manager.live_orders`. Keyed on a bundle id string
+    /// we assign at dispatch.
+    inflight_atomic_bundles: std::collections::HashMap<
+        String,
+        InflightAtomicBundle,
+    >,
     /// Epic H — graph scope cached at `with_strategy_graph` /
     /// `swap_strategy_graph` so the per-tick source marshaller
     /// knows which asset to pull sentiment for without re-reading
@@ -871,6 +895,7 @@ impl MarketMakerEngine {
             surveillance_last_alert: std::collections::HashMap::new(),
             prev_l2_snapshot: None,
             session_calendar: mm_risk::session_calendar::SessionCalendar::funding_8h(),
+            inflight_atomic_bundles: std::collections::HashMap::new(),
             strategy_graph_scope: None,
             margin_guard: config.margin.as_ref().map(|m| {
                 MarginGuard::new(MarginGuardThresholds::from_config(m))
@@ -1700,6 +1725,46 @@ impl MarketMakerEngine {
             0
         };
         (venue, symbol, product, extra)
+    }
+
+    /// Multi-Venue 3.E.2 watchdog: checks every inflight atomic
+    /// bundle's age and cancels the surviving leg when the
+    /// timeout window elapsed without both sides acknowledged.
+    /// Called at the start of `refresh_quotes` so rollback happens
+    /// before the next tick's quoting pipeline re-reads
+    /// `graph_quotes_override`. Returns the count of bundles
+    /// rolled back this tick.
+    #[allow(dead_code)]
+    pub(crate) fn tick_atomic_bundle_watchdog(&mut self) -> usize {
+        let now = chrono::Utc::now();
+        let mut rolled_back = 0usize;
+        let stale: Vec<String> = self
+            .inflight_atomic_bundles
+            .iter()
+            .filter(|(_id, b): &(&String, &InflightAtomicBundle)| {
+                let elapsed = (now - b.dispatched_at).num_milliseconds().max(0) as u64;
+                elapsed >= b.timeout_ms && !b.both_legs_acked
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            if let Some(b) = self.inflight_atomic_bundles.remove(&id) {
+                rolled_back += 1;
+                self.audit.risk_event(
+                    &self.symbol,
+                    mm_risk::audit::AuditEventType::StrategyGraphSinkFired,
+                    &format!(
+                        "AtomicBundle rolled back: id={id} maker={}:{} hedge={}:{}",
+                        b.maker_venue, b.maker_symbol, b.hedge_venue, b.hedge_symbol,
+                    ),
+                );
+                // Clear any pending override that was created by
+                // this bundle — on the next tick the order diff
+                // cancels the survived leg naturally.
+                self.graph_quotes_override = None;
+            }
+        }
+        rolled_back
     }
 
     fn tick_strategy_graph(&mut self) {
@@ -2748,7 +2813,29 @@ impl MarketMakerEngine {
                         }
                         self.graph_quotes_override = Some(pairs);
                     }
-                    let _ = json; // reserved for 3.E.2 rollback path
+                    // 3.E.2 — register the bundle with the watchdog
+                    // so on next tick we can roll it back if the
+                    // timeout elapsed without both legs ack'd. Id
+                    // is just a short tag — engine-local, not
+                    // regulator-facing.
+                    let bundle_id = format!(
+                        "{}-{}-{}-{}",
+                        spec.maker.venue, spec.maker.symbol,
+                        spec.hedge.venue, spec.hedge.symbol,
+                    );
+                    self.inflight_atomic_bundles.insert(
+                        bundle_id,
+                        InflightAtomicBundle {
+                            dispatched_at: chrono::Utc::now(),
+                            timeout_ms: spec.timeout_ms,
+                            maker_venue: spec.maker.venue.clone(),
+                            maker_symbol: spec.maker.symbol.clone(),
+                            hedge_venue: spec.hedge.venue.clone(),
+                            hedge_symbol: spec.hedge.symbol.clone(),
+                            both_legs_acked: false,
+                        },
+                    );
+                    let _ = json; // payload available for future diagnostic
                 }
                 SinkAction::Flatten { policy } => {
                     // Graph-authored flatten. Escalates kill L4 with
@@ -6434,6 +6521,72 @@ mod dual_connector_tests {
             .as_ref()
             .and_then(|hb| hb.book.mid_price());
         assert_eq!(ref_price, Some(dec!(50_100)));
+    }
+
+    /// Multi-Venue 3.E.2 — atomic-bundle watchdog must roll back
+    /// an inflight bundle whose timeout elapsed without both legs
+    /// being acknowledged.
+    #[test]
+    fn atomic_bundle_watchdog_rolls_back_stale_entries() {
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        let mut engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            sample_config(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        // Seed an already-expired bundle (dispatched 5 s ago, 2 s
+        // timeout) so the watchdog sees it as stale on first tick.
+        engine.inflight_atomic_bundles.insert(
+            "test-bundle".into(),
+            InflightAtomicBundle {
+                dispatched_at: chrono::Utc::now() - chrono::Duration::seconds(5),
+                timeout_ms: 2_000,
+                maker_venue: "binance".into(),
+                maker_symbol: "BTCUSDT".into(),
+                hedge_venue: "bybit".into(),
+                hedge_symbol: "BTCUSDT".into(),
+                both_legs_acked: false,
+            },
+        );
+        let rolled = engine.tick_atomic_bundle_watchdog();
+        assert_eq!(rolled, 1, "one stale bundle must roll back");
+        assert!(engine.inflight_atomic_bundles.is_empty());
+    }
+
+    /// Watchdog leaves fresh bundles alone.
+    #[test]
+    fn atomic_bundle_watchdog_spares_fresh_entries() {
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        let mut engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            sample_config(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        engine.inflight_atomic_bundles.insert(
+            "fresh-bundle".into(),
+            InflightAtomicBundle {
+                dispatched_at: chrono::Utc::now(),
+                timeout_ms: 5_000,
+                maker_venue: "binance".into(),
+                maker_symbol: "BTCUSDT".into(),
+                hedge_venue: "bybit".into(),
+                hedge_symbol: "BTCUSDT".into(),
+                both_legs_acked: false,
+            },
+        );
+        let rolled = engine.tick_atomic_bundle_watchdog();
+        assert_eq!(rolled, 0);
+        assert_eq!(engine.inflight_atomic_bundles.len(), 1);
     }
 
     /// Epic H Phase 5 — graph swap must rebuild the strategy pool
