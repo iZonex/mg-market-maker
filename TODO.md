@@ -1,6 +1,6 @@
 # MM — Open Work Tracker
 
-Last updated: 2026-04-19 (post-Sprint 21)
+Last updated: 2026-04-19 (post-Sprint 22)
 
 Tracking debt not yet closed. Closed items live in git history.
 Each row is a concrete deliverable; bigger initiatives are
@@ -1043,6 +1043,58 @@ Epic R run. All non-restricted.
 - [ ] **R10.2** Integration test coverage audit: we have ~1600
   unit tests, but how many integration / E2E? Sprint 14 showed
   this gap is what lets gate drift hide. Enumerate, fill gaps.
+
+## Sprint 22 — full-stack honesty audit (landed Apr 19)
+
+10 of 13 items closed in one session. 3 deferred with scoped
+follow-up notes; 2 stay operator-blocked.
+
+### Closed commits
+
+- 22A-1 stat_arb wiring (f6f939a)
+- 22A-2 var_guard CVaR tiers (301d7fa)
+- 22A-4 paper-mode hard-fail on empty keys (df7867f)
+- 22B-0 Strategy checkpoint hook (b3b869a)
+- 22B-1 GLFT calibration persist (df62ac1)
+- 22B-2 Adaptive bucket window persist (85e178e)
+- 22B-3 Autotune regime detector persist (c96fd3e)
+- 22B-4 + 22B-6 Momentum + learned microprice persist (376ce59)
+- 22B-5 PumpAndDump + Campaign FSM persist (ad45341)
+- 22C-1/3/4 prune xemm + dca + order_emulator + ReportsPanel
+  shape drift (9034b91)
+
+### Still open
+
+- [ ] **22A-3 exec algo selector** — TWAP / VWAP / POV /
+  Iceberg exist in `exec_algo.rs`. Swap requires adapting the
+  `next_slice(mid) -> Option<Quote>` API in `TwapExecutor` to
+  `tick(ExecContext) -> Vec<ExecAction>` from `ExecAlgorithm`,
+  plus 3 call sites in `market_maker.rs`. 2-3 hours; deferred
+  until SOR stage-2 lands (same work either way).
+- [ ] **22C-2 fill-model parity** — `backtester/simulator.rs`
+  uses queue-aware log probability; engine's
+  `paper_match_trade()` uses different logic. Unify: either
+  backtester calls `paper_match_trade`, or paper mode calls
+  the simulator's `FillModel`. Needs a call-site audit before
+  picking.
+- [ ] **22M-2 exhaustive audit sweep** — the four Sprint 22
+  audits covered ~30% of the system. Remaining scan:
+  individual risk modules (borrow / sla / otr / protections /
+  circuit_breaker / inventory_drift) for config-reachability,
+  remaining ~32 dashboard endpoints for shape drift,
+  `mm-indicators` for "library but unused", and — now that
+  22B-0 is landed — the **checkpoint write loop** which is
+  itself dead code (`main.rs:987` flushes only at shutdown and
+  `update_symbol` is never called at runtime). Adding that
+  loop is the capstone.
+
+### Operator-blocked
+
+- [ ] **22M-1 CI frontend build gap** — Frontend Build job
+  exists at `ci.yml:69-84` but `StrategyDeployHistory.svelte`
+  had build-breaking CSS since UI-5 landed. Operator to check
+  GitHub Actions UI whether CI has been running red or not
+  firing at all.
 
 ## Sprint 22 — full-stack honesty audit backlog (opened Apr 19)
 
