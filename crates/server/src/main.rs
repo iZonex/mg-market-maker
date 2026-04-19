@@ -1032,7 +1032,12 @@ async fn run_symbol(
             info!(symbol = %symbol, "using Grid strategy");
             Box::new(GridStrategy)
         }
-        StrategyType::Basis | StrategyType::FundingArb => {
+        StrategyType::Basis | StrategyType::FundingArb | StrategyType::StatArb => {
+            // 22A-1 — stat-arb's driver dispatches IOC legs of
+            // its own when the z-score fires; between signals we
+            // fall through to continuous BasisStrategy quoting
+            // on the primary (Y) leg. Same shape as FundingArb:
+            // one quoting strategy on primary, one driver on top.
             let shift = config.market_maker.basis_shift;
             let max_basis_bps = config
                 .hedge
@@ -1252,6 +1257,57 @@ async fn run_symbol(
         );
     }
 
+    // 22A-1 — stat_arb driver wiring. Mirror of the funding_arb
+    // block below. Uses `NullStatArbSink` for v1 — dashboard
+    // bridge is a follow-up task (it would publish per-pair
+    // z-score + event counters to a new UI panel). The driver
+    // still logs every event via its internal tracing, and the
+    // audit trail records dispatched legs when stage-2 entry /
+    // exit dispatch fires.
+    let stat_arb_wiring = if matches!(config.market_maker.strategy, StrategyType::StatArb) {
+        let cfg = config.stat_arb.clone().ok_or_else(|| {
+            anyhow::anyhow!("strategy=stat_arb requires [stat_arb] section in config")
+        })?;
+        if !cfg.enabled {
+            warn!("stat_arb.enabled=false — driver wired but signals disabled");
+        }
+        let hedge_conn = bundle
+            .hedge
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("strategy=stat_arb requires a hedge connector"))?;
+        let pair = mm_strategy::stat_arb::StatArbPair {
+            y_symbol: cfg.y_symbol.clone(),
+            x_symbol: cfg.x_symbol.clone(),
+            strategy_class: format!("stat_arb_{}_{}", cfg.y_symbol, cfg.x_symbol),
+        };
+        let sink: Arc<dyn mm_strategy::stat_arb::StatArbEventSink> =
+            Arc::new(mm_strategy::stat_arb::NullStatArbSink);
+        let driver_cfg = mm_strategy::stat_arb::StatArbDriverConfig {
+            tick_interval: std::time::Duration::from_secs(cfg.tick_interval_secs),
+            zscore: mm_strategy::stat_arb::ZScoreConfig {
+                window: cfg.zscore_window,
+                entry_threshold: cfg.zscore_entry,
+                exit_threshold: cfg.zscore_exit,
+            },
+            kalman_transition_var: cfg.kalman_transition_var,
+            kalman_observation_var: cfg.kalman_observation_var,
+            leg_notional_usd: cfg.leg_notional_usd,
+        };
+        let driver = mm_strategy::stat_arb::StatArbDriver::new(
+            bundle.primary.clone(),
+            hedge_conn,
+            pair,
+            driver_cfg,
+            sink,
+        );
+        Some((
+            driver,
+            std::time::Duration::from_secs(cfg.tick_interval_secs),
+        ))
+    } else {
+        None
+    };
+
     let funding_arb_wiring =
         if matches!(config.market_maker.strategy, StrategyType::FundingArb) {
             let cfg = config.funding_arb.clone().ok_or_else(|| {
@@ -1458,8 +1514,12 @@ async fn run_symbol(
         engine_builder = engine_builder.with_event_recorder(std::path::Path::new(path));
     }
 
-    let mut engine = match funding_arb_wiring {
+    let engine_builder = match funding_arb_wiring {
         Some((driver, tick)) => engine_builder.with_funding_arb_driver(driver, tick),
+        None => engine_builder,
+    };
+    let mut engine = match stat_arb_wiring {
+        Some((driver, tick)) => engine_builder.with_stat_arb_driver(driver, tick),
         None => engine_builder,
     };
 

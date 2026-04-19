@@ -244,6 +244,67 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
                 ));
             }
         }
+        StrategyType::StatArb => {
+            // 22A-1 — stat-arb needs the X-leg connector (hedge
+            // section) AND a [stat_arb] block with enabled=true
+            // for the driver to dispatch. Mirror of the
+            // FundingArb gate shape so operator mental model
+            // stays consistent across driver-style strategies.
+            if config.hedge.is_none() {
+                errors.push(
+                    "strategy=stat_arb requires a [hedge] section — the \
+                     driver uses the primary venue for the Y-leg and \
+                     the hedge connector for the X-leg of the \
+                     cointegrated pair"
+                        .to_string(),
+                );
+            }
+            match &config.stat_arb {
+                None => errors.push(
+                    "strategy=stat_arb requires a [stat_arb] section with \
+                     y_symbol, x_symbol, zscore_window, zscore_entry, \
+                     zscore_exit, and enabled"
+                        .to_string(),
+                ),
+                Some(sa) => {
+                    if !sa.enabled {
+                        warnings.push(
+                            "stat_arb.enabled=false — driver will tick but \
+                             never dispatch, effectively disabling the \
+                             cointegrated pair trade"
+                                .to_string(),
+                        );
+                    }
+                    if sa.y_symbol.trim().is_empty() {
+                        errors.push("stat_arb.y_symbol must be non-empty".to_string());
+                    }
+                    if sa.x_symbol.trim().is_empty() {
+                        errors.push("stat_arb.x_symbol must be non-empty".to_string());
+                    }
+                    if sa.zscore_window < 2 {
+                        errors.push(
+                            "stat_arb.zscore_window must be >= 2 — the \
+                             ZScoreSignal ctor asserts this invariant"
+                                .to_string(),
+                        );
+                    }
+                    if sa.zscore_exit >= sa.zscore_entry {
+                        errors.push(
+                            "stat_arb.zscore_exit must be strictly less than \
+                             zscore_entry, otherwise the signal never leaves \
+                             the hysteresis band"
+                                .to_string(),
+                        );
+                    }
+                    if sa.leg_notional_usd <= dec!(0) {
+                        errors.push("stat_arb.leg_notional_usd must be > 0".to_string());
+                    }
+                    if sa.tick_interval_secs == 0 {
+                        errors.push("stat_arb.tick_interval_secs must be > 0".to_string());
+                    }
+                }
+            }
+        }
         StrategyType::CrossExchange => {
             if config.hedge.is_none() {
                 errors.push(
@@ -491,7 +552,7 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mm_common::config::{AppConfig, FundingArbCfg, HedgeConfig, HedgePairConfig};
+    use mm_common::config::{AppConfig, FundingArbCfg, HedgeConfig, HedgePairConfig, StatArbCfg};
 
     fn base_config() -> AppConfig {
         // Tests exercise strategy/hedge/client logic on the
@@ -524,6 +585,21 @@ mod tests {
                 funding_interval_secs: Some(28_800),
                 basis_threshold_bps: dec!(20),
             },
+        }
+    }
+
+    fn valid_stat_arb() -> StatArbCfg {
+        StatArbCfg {
+            tick_interval_secs: 60,
+            y_symbol: "BTCUSDT".to_string(),
+            x_symbol: "ETHUSDT".to_string(),
+            zscore_window: 120,
+            zscore_entry: dec!(2),
+            zscore_exit: dec!(0.5),
+            kalman_transition_var: dec!(0.000001),
+            kalman_observation_var: dec!(0.001),
+            leg_notional_usd: dec!(1000),
+            enabled: true,
         }
     }
 
@@ -915,6 +991,67 @@ mod tests {
         cfg.exchange.product = mm_common::config::ProductType::Spot;
         cfg.margin = Some(mm_common::config::MarginConfig::default());
         validate_config(&cfg).unwrap();
+    }
+
+    /// 22A-1 — stat_arb without [stat_arb] section is rejected.
+    #[test]
+    fn stat_arb_without_section_is_rejected() {
+        let mut cfg = base_config();
+        cfg.market_maker.strategy = StrategyType::StatArb;
+        cfg.hedge = Some(valid_hedge());
+        cfg.stat_arb = None;
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("requires a [stat_arb] section"), "{err}");
+    }
+
+    /// 22A-1 — stat_arb without a hedge is rejected (hedge
+    /// connector drives the X-leg).
+    #[test]
+    fn stat_arb_without_hedge_is_rejected() {
+        let mut cfg = base_config();
+        cfg.market_maker.strategy = StrategyType::StatArb;
+        cfg.hedge = None;
+        cfg.stat_arb = Some(valid_stat_arb());
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("requires a [hedge] section"), "{err}");
+    }
+
+    /// 22A-1 — a valid stat_arb config accepts.
+    #[test]
+    fn stat_arb_valid_config_accepts() {
+        let mut cfg = base_config();
+        cfg.market_maker.strategy = StrategyType::StatArb;
+        cfg.hedge = Some(valid_hedge());
+        cfg.stat_arb = Some(valid_stat_arb());
+        validate_config(&cfg).unwrap();
+    }
+
+    /// 22A-1 — zscore_exit ≥ zscore_entry is rejected (ZScoreSignal
+    /// ctor would panic otherwise).
+    #[test]
+    fn stat_arb_zscore_exit_above_entry_is_rejected() {
+        let mut cfg = base_config();
+        cfg.market_maker.strategy = StrategyType::StatArb;
+        cfg.hedge = Some(valid_hedge());
+        let mut sa = valid_stat_arb();
+        sa.zscore_entry = dec!(1);
+        sa.zscore_exit = dec!(2); // wrong order
+        cfg.stat_arb = Some(sa);
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("zscore_exit"), "{err}");
+    }
+
+    /// 22A-1 — empty y/x symbol is rejected.
+    #[test]
+    fn stat_arb_empty_symbol_is_rejected() {
+        let mut cfg = base_config();
+        cfg.market_maker.strategy = StrategyType::StatArb;
+        cfg.hedge = Some(valid_hedge());
+        let mut sa = valid_stat_arb();
+        sa.y_symbol = String::new();
+        cfg.stat_arb = Some(sa);
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("y_symbol"), "{err}");
     }
 
     #[test]

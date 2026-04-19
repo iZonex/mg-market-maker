@@ -265,11 +265,18 @@ fn build_strategy(kind: StrategyType) -> Box<dyn Strategy> {
         StrategyType::AvellanedaStoikov => Box::new(AvellanedaStoikov),
         StrategyType::Glft => Box::new(GlftStrategy::new()),
         StrategyType::Grid => Box::new(GridStrategy),
-        StrategyType::Basis | StrategyType::FundingArb | StrategyType::CrossVenueBasis => {
+        StrategyType::Basis
+        | StrategyType::FundingArb
+        | StrategyType::CrossVenueBasis
+        | StrategyType::StatArb => {
             // Cross-product strategies need a hedge connector at
             // runtime — the backtester replays a single symbol so
             // we fall back to a permissive `BasisStrategy` with
-            // no staleness gate for offline tuning.
+            // no staleness gate for offline tuning. Stat-arb's
+            // real dispatch happens in `StatArbDriver` which is
+            // not part of the hyperopt loop; here we just need a
+            // quote-producing strategy so the backtester can
+            // measure baseline PnL.
             Box::new(BasisStrategy::new(dec!(0.5), dec!(50)))
         }
         StrategyType::CrossExchange => Box::new(BasisStrategy::new(dec!(0.5), dec!(50))),

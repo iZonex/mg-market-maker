@@ -67,6 +67,13 @@ pub struct AppConfig {
     #[serde(default)]
     pub funding_arb: Option<FundingArbCfg>,
 
+    /// Stat-arb driver config (22A-1). Required when
+    /// `StrategyType::StatArb` is selected; ignored otherwise.
+    /// The driver trades a cointegrated two-leg pair using
+    /// Engle-Granger + Kalman hedge ratio + z-score signal.
+    #[serde(default)]
+    pub stat_arb: Option<StatArbCfg>,
+
     /// Record live market data to JSONL for offline backtesting.
     /// When `true`, each engine writes BookSnapshot + Trade events
     /// to `data/recorded/{symbol}.jsonl`. Data accumulates across
@@ -605,6 +612,73 @@ fn default_max_basis() -> Decimal {
     dec!(50)
 }
 
+/// Stat-arb driver TOML config — mirrors `mm_strategy::stat_arb::StatArbDriverConfig`
+/// one-to-one so operators can tune the driver without touching
+/// Rust. Field shapes match the non-config struct so the
+/// translation in `main.rs` is a pure rename.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatArbCfg {
+    /// Driver tick interval in seconds. Default 60 s —
+    /// matches `StatArbDriverConfig::default`.
+    #[serde(default = "default_stat_arb_tick_secs")]
+    pub tick_interval_secs: u64,
+    /// Symbol of the dependent leg (the regression predicts its
+    /// mid). Required.
+    pub y_symbol: String,
+    /// Symbol of the independent leg (hedge-ratio β applies to
+    /// its mid). Required — usually different from the primary
+    /// engine symbol, routed to the hedge connector.
+    pub x_symbol: String,
+    /// Rolling z-score window size. Default 120 ticks (matches
+    /// `ZScoreConfig::default`).
+    #[serde(default = "default_stat_arb_window")]
+    pub zscore_window: usize,
+    /// z entry threshold. Default 2.0 — open when |z| > 2.
+    #[serde(default = "default_stat_arb_entry")]
+    pub zscore_entry: Decimal,
+    /// z exit threshold. Must be strictly less than
+    /// `zscore_entry`. Default 0.5.
+    #[serde(default = "default_stat_arb_exit")]
+    pub zscore_exit: Decimal,
+    /// Kalman transition variance Q. Default 1e-6.
+    #[serde(default = "default_stat_arb_q")]
+    pub kalman_transition_var: Decimal,
+    /// Kalman observation variance R. Default 1e-3.
+    #[serde(default = "default_stat_arb_r")]
+    pub kalman_observation_var: Decimal,
+    /// Notional USD to commit to the Y leg at entry. X leg is
+    /// sized as `β · y_qty` for book-neutral exposure.
+    /// Default 1000 USDT.
+    #[serde(default = "default_stat_arb_notional")]
+    pub leg_notional_usd: Decimal,
+    /// Enable the driver. Safety default is `false` so a stray
+    /// `[stat_arb]` block does not unexpectedly start trading.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+fn default_stat_arb_tick_secs() -> u64 {
+    60
+}
+fn default_stat_arb_window() -> usize {
+    120
+}
+fn default_stat_arb_entry() -> Decimal {
+    dec!(2)
+}
+fn default_stat_arb_exit() -> Decimal {
+    dec!(0.5)
+}
+fn default_stat_arb_q() -> Decimal {
+    dec!(0.000001)
+}
+fn default_stat_arb_r() -> Decimal {
+    dec!(0.001)
+}
+fn default_stat_arb_notional() -> Decimal {
+    dec!(1000)
+}
+
 /// Hedge-leg exchange + instrument pair config.
 ///
 /// The hedge exchange config mirrors `ExchangeConfig`; the
@@ -702,6 +776,13 @@ pub enum StrategyType {
     /// drag on the opportunity (e.g. Binance spot ↔ Bybit linear
     /// perp when the funding path is exhausted).
     CrossExchange,
+    /// Statistical arbitrage driver (22A-1). Runs a
+    /// `StatArbDriver` that tracks a cointegrated two-leg pair
+    /// via Engle-Granger + Kalman + z-score and dispatches
+    /// market-neutral round trips when the spread deviates.
+    /// Requires `AppConfig.hedge` (X-leg connector) and a
+    /// `[stat_arb]` section.
+    StatArb,
 }
 
 /// Which exchange to connect to.
@@ -2336,6 +2417,7 @@ impl Default for AppConfig {
             loans: std::collections::HashMap::new(),
             hedge: None,
             funding_arb: None,
+            stat_arb: None,
             record_market_data: false,
             paper_fill: None,
             rebalancer: None,
