@@ -863,6 +863,14 @@ fn parse_binance_futures_position(pos: &Value) -> Option<PositionMargin> {
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<Decimal>().ok())
         .filter(|d| *d > Decimal::ZERO);
+    // PERP-4 — Binance futures exposes `adlQuantile` on
+    // positionRisk (0–4). Absent on isolated positions that
+    // have not yet been through an ADL recalculation — parse
+    // as Option.
+    let adl_quantile = pos
+        .get("adlQuantile")
+        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .and_then(|n| u8::try_from(n).ok());
     Some(PositionMargin {
         symbol,
         side,
@@ -871,6 +879,7 @@ fn parse_binance_futures_position(pos: &Value) -> Option<PositionMargin> {
         mark_price,
         isolated_margin,
         liq_price,
+        adl_quantile,
     })
 }
 

@@ -273,6 +273,15 @@ pub struct MarketMakerEngine {
     /// Set when the book hasn't updated for stale_book_timeout_secs.
     /// Cleared when fresh data arrives.
     stale_book_paused: bool,
+    /// KILL-L5 — set after the kill switch first reaches
+    /// [`KillLevel::Disconnect`]. While set the run loop skips
+    /// every event / refresh / tick arm; only
+    /// `ConfigOverride::ManualKillSwitchReset` clears the flag
+    /// (via `kill_switch.reset()` dropping the level back to
+    /// Normal). The initial transition also fires a
+    /// `cancel_all` + audit entry so the venue shows an empty
+    /// book once we stop responding.
+    disconnected: bool,
     /// Set when the primary-vs-hedge mid divergence exceeded
     /// `max_cross_venue_divergence_pct` on the last tick. Used
     /// to suppress duplicate audit events on consecutive trips
@@ -776,6 +785,7 @@ impl MarketMakerEngine {
             },
             lifecycle_paused: false,
             stale_book_paused: false,
+            disconnected: false,
             cross_venue_divergence_tripped: false,
             per_client_circuit: None,
             per_client_trip_noted: false,
@@ -1001,7 +1011,13 @@ impl MarketMakerEngine {
             last_nearby_trade_ts: None,
             strategy_graph_scope: None,
             margin_guard: config.margin.as_ref().map(|m| {
+                // PERP-3 — pin the guard to this engine's
+                // symbol + configured margin mode so isolated
+                // positions get per-bucket ratios instead of
+                // the wallet-wide figure.
+                let (mode_cfg, _lev) = m.for_symbol(&symbol);
                 MarginGuard::new(MarginGuardThresholds::from_config(m))
+                    .with_symbol_mode(&symbol, mode_cfg)
             }),
             margin_poll_modulus: config
                 .margin
@@ -4286,6 +4302,70 @@ impl MarketMakerEngine {
         self.cycle_start = Instant::now();
 
         loop {
+            // KILL-L5 — handle the kill-switch → Disconnect
+            // transition once per loop tick, BEFORE the event
+            // select. On the rising edge we cancel all live
+            // orders + audit; on the falling edge (operator
+            // reset) we log resume. While disconnected the run
+            // loop skips every ws/refresh/tick arm and only
+            // drains shutdown + config-override so the
+            // operator's `ManualKillSwitchReset` still lands.
+            let current_level = self.kill_switch.level();
+            if current_level == KillLevel::Disconnect && !self.disconnected {
+                self.disconnected = true;
+                warn!(
+                    symbol = %self.symbol,
+                    "KILL SWITCH L5 Disconnect — tearing down: cancel-all + pause loop, manual reset required"
+                );
+                let _ = self
+                    .order_manager
+                    .cancel_all(&self.connectors.primary, &self.symbol)
+                    .await;
+                self.balance_cache.reset_reservations();
+                self.audit.risk_event(
+                    &self.symbol,
+                    AuditEventType::KillSwitchEscalated,
+                    "L5 disconnect: cancel-all fired, engine paused until manual reset",
+                );
+                self.record_incident(
+                    "critical",
+                    "Kill switch L5: engine disconnected — manual reset required",
+                );
+            } else if current_level != KillLevel::Disconnect && self.disconnected {
+                self.disconnected = false;
+                info!(
+                    symbol = %self.symbol,
+                    from = %KillLevel::Disconnect,
+                    to = %current_level,
+                    "KILL SWITCH L5 cleared — engine resuming"
+                );
+            }
+
+            if self.disconnected {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            self.shutdown().await;
+                            return Ok(());
+                        }
+                    }
+                    Some(ovr) = async {
+                        match self.config_override_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        self.apply_config_override(ovr);
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                        // Keep the loop responsive so the next
+                        // iteration re-checks `kill_switch.level()`
+                        // promptly after a reset.
+                    }
+                }
+                continue;
+            }
+
             tokio::select! {
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {

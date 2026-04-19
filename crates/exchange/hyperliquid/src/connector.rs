@@ -1169,6 +1169,9 @@ fn parse_hl_position_margin(entry: &Value) -> Option<PositionMargin> {
         mark_price,
         isolated_margin,
         liq_price,
+        // PERP-4 — HyperLiquid does not expose an ADL rank
+        // on `clearinghouseState`; leave `None`.
+        adl_quantile: None,
     })
 }
 

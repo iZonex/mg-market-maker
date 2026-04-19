@@ -31,7 +31,7 @@
 //! `kill_switch.update_margin_ratio(...)` so the monotonic
 //! escalation semantics stay in one place.
 
-use mm_common::config::MarginConfig;
+use mm_common::config::{MarginConfig, MarginModeCfg};
 use mm_exchange_core::connector::AccountMarginInfo;
 use rust_decimal::Decimal;
 
@@ -103,6 +103,11 @@ pub struct MarginGuardThresholds {
     pub stop_ratio: Decimal,
     pub cancel_ratio: Decimal,
     pub max_stale_secs: i64,
+    /// PERP-2 — fallback MM-as-fraction-of-notional used when
+    /// the venue snapshot has no open position to derive an
+    /// effective MMR from. Mirrors
+    /// `MarginConfig::default_maintenance_margin_rate`.
+    pub default_mmr: Decimal,
 }
 
 impl MarginGuardThresholds {
@@ -114,6 +119,7 @@ impl MarginGuardThresholds {
             stop_ratio: cfg.stop_ratio,
             cancel_ratio: cfg.cancel_ratio,
             max_stale_secs: cfg.max_stale_secs as i64,
+            default_mmr: cfg.default_maintenance_margin_rate,
         }
     }
 }
@@ -124,6 +130,15 @@ impl MarginGuardThresholds {
 #[derive(Debug, Clone)]
 pub struct MarginGuard {
     thresholds: MarginGuardThresholds,
+    /// PERP-3 — symbol the engine instance is quoting. Isolated
+    /// mode ratios are computed off *this* symbol's position
+    /// only; cross mode ignores it and uses the wallet-wide
+    /// figure.
+    symbol: String,
+    /// PERP-3 — venue-configured margin mode (isolated vs
+    /// cross). Decides whether the observed + projected ratios
+    /// look at per-position collateral or the whole wallet.
+    mode: MarginModeCfg,
     /// Last observed snapshot, or `None` before the first poll.
     last: Option<AccountMarginInfo>,
 }
@@ -132,8 +147,27 @@ impl MarginGuard {
     pub fn new(thresholds: MarginGuardThresholds) -> Self {
         Self {
             thresholds,
+            symbol: String::new(),
+            mode: MarginModeCfg::Cross,
             last: None,
         }
+    }
+
+    /// PERP-3 — pin this guard to a specific symbol + margin
+    /// mode. Isolated-mode guards compute the observed and
+    /// projected ratio off `(position_mm, isolated_margin)`
+    /// for `symbol`; cross-mode guards use the venue's
+    /// wallet-wide figure. Callers typically invoke this
+    /// immediately after `new()` with values resolved from
+    /// `MarginConfig::for_symbol(symbol)`.
+    pub fn with_symbol_mode(mut self, symbol: impl Into<String>, mode: MarginModeCfg) -> Self {
+        self.symbol = symbol.into();
+        self.mode = mode;
+        self
+    }
+
+    pub fn mode(&self) -> MarginModeCfg {
+        self.mode
     }
 
     pub fn thresholds(&self) -> &MarginGuardThresholds {
@@ -151,6 +185,60 @@ impl MarginGuard {
         self.last = Some(info);
     }
 
+    /// PERP-3 — the observed ratio this guard actually reasons
+    /// about. Cross-mode: the venue-reported wallet-wide
+    /// `margin_ratio` as before. Isolated-mode: the
+    /// per-position ratio for `self.symbol`, computed as
+    /// `(size × mark × effective_mmr) / isolated_margin`.
+    /// Falls back to the cross-mode ratio when the position is
+    /// missing or `isolated_margin` is `None` (pre-anchor
+    /// state, or the venue runs a cross-funded isolated bucket).
+    pub fn observed_ratio(&self) -> Option<Decimal> {
+        let info = self.last.as_ref()?;
+        if matches!(self.mode, MarginModeCfg::Cross) {
+            return Some(info.margin_ratio);
+        }
+        // Isolated path — find this engine's position.
+        let Some(pos) = info.positions.iter().find(|p| p.symbol == self.symbol) else {
+            return Some(info.margin_ratio);
+        };
+        let Some(iso) = pos.isolated_margin else {
+            return Some(info.margin_ratio);
+        };
+        if iso <= Decimal::ZERO {
+            return Some(Decimal::ONE);
+        }
+        let position_notional = pos.size.abs() * pos.mark_price;
+        let position_mm = position_notional * self.effective_mmr();
+        Some(position_mm / iso)
+    }
+
+    /// PERP-4 — highest ADL quantile on any of our open
+    /// positions. `0`–`4` on venues that publish it (Binance
+    /// `adlQuantile`, Bybit `adlRankIndicator`); `None` when
+    /// either no snapshot has arrived yet or no position
+    /// reports one (HyperLiquid for instance). Used to widen
+    /// spreads when we're close to the front of the venue's
+    /// auto-deleverage queue.
+    pub fn max_adl_quantile(&self) -> Option<u8> {
+        self.last
+            .as_ref()?
+            .positions
+            .iter()
+            .filter_map(|p| p.adl_quantile)
+            .max()
+    }
+
+    /// PERP-4 — `true` when any of our positions has an
+    /// elevated ADL rank (≥ 3, i.e. top-40% of the venue's
+    /// deleverage queue). The guard forces a `WidenSpreads`
+    /// decision while this is set — a venue-triggered ADL
+    /// would close the position at mark, so tightening
+    /// spreads in that state is the wrong bet.
+    pub fn adl_elevated(&self) -> bool {
+        self.max_adl_quantile().is_some_and(|q| q >= 3)
+    }
+
     /// What the guard would say *now*, given the last ingested
     /// snapshot and the wall-clock `now_ms`.
     pub fn decide(&self, now_ms: i64) -> MarginGuardDecision {
@@ -161,9 +249,52 @@ impl MarginGuard {
                 if age_secs > self.thresholds.max_stale_secs {
                     return MarginGuardDecision::Stale;
                 }
-                Self::bucket(info.margin_ratio, &self.thresholds)
+                let ratio = self.observed_ratio().unwrap_or(info.margin_ratio);
+                let bucket = Self::bucket(ratio, &self.thresholds);
+                // PERP-4 — ADL-rank override. Never DEMOTES a
+                // higher-severity decision (the ratio side has
+                // priority if we're already at StopNewOrders /
+                // CancelAll); only lifts Normal → WidenSpreads
+                // so the engine widens while the venue's
+                // deleverage queue has us near the front.
+                if self.adl_elevated() && matches!(bucket, MarginGuardDecision::Normal) {
+                    return MarginGuardDecision::WidenSpreads;
+                }
+                bucket
             }
         }
+    }
+
+    /// PERP-2 — effective maintenance-margin rate inferred from
+    /// the last venue snapshot:
+    ///
+    /// - Sum `size.abs() × mark_price` across every position.
+    /// - Divide `total_maintenance_margin` by that notional to
+    ///   get the venue's blended MMR for our current book.
+    /// - Clamp to `[default_mmr / 10, default_mmr × 10]` so a
+    ///   stale or pathological snapshot can't push the
+    ///   projection to absurd values.
+    ///
+    /// Falls back to `thresholds.default_mmr` when no position
+    /// is open (zero notional) or `last` is empty — the
+    /// configured default covers the cold-start path.
+    pub fn effective_mmr(&self) -> Decimal {
+        let default = self.thresholds.default_mmr;
+        let Some(info) = self.last.as_ref() else {
+            return default;
+        };
+        let total_notional: Decimal = info
+            .positions
+            .iter()
+            .map(|p| p.size.abs() * p.mark_price)
+            .sum();
+        if total_notional <= Decimal::ZERO {
+            return default;
+        }
+        let inferred = info.total_maintenance_margin / total_notional;
+        let floor = default / Decimal::from(10u32);
+        let ceil = default * Decimal::from(10u32);
+        inferred.max(floor).min(ceil)
     }
 
     /// Forecast the post-fill ratio if the engine adds
@@ -172,14 +303,13 @@ impl MarginGuard {
     /// cross `stop_ratio` even though the current snapshot is
     /// comfortably below it.
     ///
-    /// Approximation: holds total maintenance margin flat (fill
-    /// has not happened yet, so the venue hasn't booked any MM
-    /// for it) and reduces `total_equity` by the IM component
-    /// `notional_delta / leverage_est`. Since we don't always
-    /// know per-position leverage here, callers pass in the
-    /// effective leverage for the symbol. A conservative caller
-    /// passes `leverage = 1` (treat quote notional as raw IM),
-    /// which upper-bounds the projected ratio.
+    /// MM delta uses the venue-inferred effective MMR (see
+    /// [`Self::effective_mmr`]) instead of the previous
+    /// `notional/leverage` upper bound, which treated new IM
+    /// as if it were MM and over-rejected valid quotes by
+    /// 10-100×. Equity is still reduced by the IM reservation
+    /// `notional / leverage` because that is what the venue
+    /// actually locks from available balance on fill.
     ///
     /// Returns the projected ratio ∈ `[0, +∞)`. The engine
     /// compares it to `stop_ratio` itself (so the same code
@@ -191,22 +321,41 @@ impl MarginGuard {
         leverage: u32,
     ) -> Option<Decimal> {
         let info = self.last.as_ref()?;
+        let lev = Decimal::from(leverage.max(1));
+        let im_needed = notional_delta / lev;
+        let mm_delta = notional_delta * self.effective_mmr();
+
+        // PERP-3 — isolated mode projects against the
+        // position's own bucket. Opening exposure on the
+        // isolated symbol adds IM to the isolated collateral
+        // (the venue reserves from available balance into the
+        // position's bucket) AND lifts the position MM. Cross
+        // mode keeps the wallet-wide arithmetic.
+        if matches!(self.mode, MarginModeCfg::Isolated) {
+            if let Some(pos) = info.positions.iter().find(|p| p.symbol == self.symbol) {
+                if let Some(iso) = pos.isolated_margin {
+                    let position_mm_current =
+                        pos.size.abs() * pos.mark_price * self.effective_mmr();
+                    let projected_iso = iso + im_needed;
+                    if projected_iso <= Decimal::ZERO {
+                        return Some(Decimal::ONE);
+                    }
+                    return Some((position_mm_current + mm_delta) / projected_iso);
+                }
+            }
+        }
+
         if info.total_equity <= Decimal::ZERO {
             // Zero/negative equity already means we're at 1.0+ —
             // the guard would already have hit `CancelAll` via
             // `decide`. Return the saturating value.
             return Some(Decimal::ONE);
         }
-        let lev = Decimal::from(leverage.max(1));
-        let im_needed = notional_delta / lev;
         let projected_equity = info.total_equity - im_needed;
         if projected_equity <= Decimal::ZERO {
             return Some(Decimal::ONE);
         }
-        // Conservative: MM only grows (not shrinks) with added
-        // exposure; treat new IM as 1:1 MM for the projection so
-        // the guard errs toward refusing the quote.
-        let projected_mm = info.total_maintenance_margin + im_needed;
+        let projected_mm = info.total_maintenance_margin + mm_delta;
         Some(projected_mm / projected_equity)
     }
 
@@ -240,6 +389,7 @@ mod tests {
             stop_ratio: dec!(0.8),
             cancel_ratio: dec!(0.9),
             max_stale_secs: 30,
+            default_mmr: dec!(0.005),
         }
     }
 
@@ -399,5 +549,313 @@ mod tests {
     #[test]
     fn _keep_side_import() {
         let _ = Side::Buy;
+    }
+
+    // ── PERP-2 — effective MMR + richer projection ────────────
+
+    fn snapshot_with_positions(
+        total_mm: Decimal,
+        positions: Vec<(Decimal, Decimal)>, // (size, mark_price)
+        now_ms: i64,
+    ) -> AccountMarginInfo {
+        use mm_exchange_core::connector::PositionMargin;
+        AccountMarginInfo {
+            total_equity: dec!(10_000),
+            total_initial_margin: dec!(2_000),
+            total_maintenance_margin: total_mm,
+            available_balance: dec!(8_000),
+            margin_ratio: total_mm / dec!(10_000),
+            positions: positions
+                .into_iter()
+                .map(|(size, mark_price)| PositionMargin {
+                    symbol: "BTCUSDT".into(),
+                    side: Side::Buy,
+                    size,
+                    entry_price: mark_price,
+                    mark_price,
+                    isolated_margin: None,
+                    liq_price: None,
+                    adl_quantile: None,
+                })
+                .collect(),
+            reported_at_ms: now_ms,
+        }
+    }
+
+    #[test]
+    fn effective_mmr_defaults_without_positions() {
+        let g = MarginGuard::new(thresholds());
+        // No last snapshot — fall back to default MMR.
+        assert_eq!(g.effective_mmr(), dec!(0.005));
+    }
+
+    #[test]
+    fn effective_mmr_infers_from_venue_snapshot() {
+        let mut g = MarginGuard::new(thresholds());
+        // Position notional = 1 × 50_000 = 50_000; MM = 250 →
+        // inferred MMR = 0.005 exactly (matches the default but
+        // via the inferred path, not the fallback).
+        g.update(snapshot_with_positions(
+            dec!(250),
+            vec![(dec!(1), dec!(50_000))],
+            1_700_000_000_000,
+        ));
+        assert_eq!(g.effective_mmr(), dec!(0.005));
+
+        // A venue that runs tighter brackets (MM = 100 on same
+        // 50_000 notional → MMR = 0.002) — inferred value wins.
+        g.update(snapshot_with_positions(
+            dec!(100),
+            vec![(dec!(1), dec!(50_000))],
+            1_700_000_000_000,
+        ));
+        assert_eq!(g.effective_mmr(), dec!(0.002));
+    }
+
+    #[test]
+    fn effective_mmr_clamps_pathological_values() {
+        let mut g = MarginGuard::new(thresholds());
+        // Degenerate snapshot with MM 5000 on 50_000 notional
+        // (MMR = 0.1) — ten times the default. Guard clamps
+        // to default × 10 = 0.05.
+        g.update(snapshot_with_positions(
+            dec!(5_000),
+            vec![(dec!(1), dec!(50_000))],
+            1_700_000_000_000,
+        ));
+        assert_eq!(g.effective_mmr(), dec!(0.05));
+
+        // Same idea on the low side: MM 10 on 50_000 notional
+        // (MMR = 0.0002, 1/25 of default) clamps up to
+        // default / 10 = 0.0005.
+        g.update(snapshot_with_positions(
+            dec!(10),
+            vec![(dec!(1), dec!(50_000))],
+            1_700_000_000_000,
+        ));
+        assert_eq!(g.effective_mmr(), dec!(0.0005));
+    }
+
+    // ── PERP-3 — cross vs isolated margin mode ────────────────
+
+    fn isolated_snapshot(
+        symbol: &str,
+        size: Decimal,
+        mark: Decimal,
+        isolated_margin: Decimal,
+        now_ms: i64,
+    ) -> AccountMarginInfo {
+        use mm_exchange_core::connector::PositionMargin;
+        AccountMarginInfo {
+            total_equity: dec!(10_000),
+            total_initial_margin: dec!(2_000),
+            // Venue-reported wallet-wide MM — keep it BELOW
+            // the widen_ratio (0.5) so any isolated-vs-cross
+            // difference in tests comes from the guard's
+            // isolation logic, not the wallet figure.
+            total_maintenance_margin: dec!(1_000),
+            available_balance: dec!(8_000),
+            margin_ratio: dec!(0.1),
+            positions: vec![PositionMargin {
+                symbol: symbol.into(),
+                side: Side::Buy,
+                size,
+                entry_price: mark,
+                mark_price: mark,
+                isolated_margin: Some(isolated_margin),
+                liq_price: None,
+                adl_quantile: None,
+            }],
+            reported_at_ms: now_ms,
+        }
+    }
+
+    #[test]
+    fn isolated_mode_uses_per_position_ratio_not_wallet() {
+        let mut g = MarginGuard::new(thresholds())
+            .with_symbol_mode("BTCUSDT", MarginModeCfg::Isolated);
+        let now = 1_700_000_000_000;
+        // Position: 1 BTC × 50_000 = 50_000 notional. Isolated
+        // margin = 200. MMR default = 0.005 (no other position
+        // data to infer from) → position MM = 250. Ratio =
+        // 250 / 200 = 1.25. Wallet-wide ratio is 0.1 (from
+        // `margin_ratio` field on the snapshot) — if the guard
+        // used that it would return `Normal`. We expect
+        // `CancelAll` via the per-position path.
+        g.update(isolated_snapshot(
+            "BTCUSDT",
+            dec!(1),
+            dec!(50_000),
+            dec!(200),
+            now,
+        ));
+        let ratio = g.observed_ratio().unwrap();
+        assert!(ratio >= dec!(1.0), "isolated ratio should reflect position bucket, got {ratio}");
+        assert_eq!(g.decide(now), MarginGuardDecision::CancelAll);
+    }
+
+    #[test]
+    fn cross_mode_ignores_symbol_and_uses_wallet_ratio() {
+        let mut g = MarginGuard::new(thresholds())
+            .with_symbol_mode("BTCUSDT", MarginModeCfg::Cross);
+        let now = 1_700_000_000_000;
+        // Same snapshot as isolated test — but in Cross mode
+        // the guard uses `margin_ratio` = 0.1 → Normal, even
+        // though the per-position bucket is deeply underwater.
+        // This is the correct reading: under cross, the
+        // position draws collateral from the whole wallet.
+        g.update(isolated_snapshot(
+            "BTCUSDT",
+            dec!(1),
+            dec!(50_000),
+            dec!(200),
+            now,
+        ));
+        assert_eq!(g.observed_ratio(), Some(dec!(0.1)));
+        assert_eq!(g.decide(now), MarginGuardDecision::Normal);
+    }
+
+    #[test]
+    fn isolated_projected_ratio_uses_bucket_not_wallet() {
+        let mut g = MarginGuard::new(thresholds())
+            .with_symbol_mode("BTCUSDT", MarginModeCfg::Isolated);
+        let now = 1_700_000_000_000;
+        // Healthy bucket: 50_000 notional, 5_000 isolated
+        // margin. Using the fixture snapshot's total_mm of
+        // 1_000 and position notional 50_000, the inferred
+        // effective MMR is 0.02 (venue running a tighter
+        // bracket than the 0.005 default).
+        g.update(isolated_snapshot(
+            "BTCUSDT",
+            dec!(1),
+            dec!(50_000),
+            dec!(5_000),
+            now,
+        ));
+        assert_eq!(g.effective_mmr(), dec!(0.02));
+        // Add a new 10_000 notional at leverage 5. IM delta =
+        // 2_000 (reserved into the isolated bucket). MM delta
+        // = 10_000 × 0.02 = 200.
+        // position_mm_current = 50_000 × 0.02 = 1_000.
+        // projected_iso = 5_000 + 2_000 = 7_000
+        // projected_pos_mm = 1_000 + 200 = 1_200
+        // projected_ratio ≈ 0.1714
+        let r = g.projected_ratio(dec!(10_000), 5).unwrap();
+        let expected = dec!(1_200) / dec!(7_000);
+        assert_eq!(r, expected);
+        // Sanity: the wallet-wide cross projection would have
+        // given a very different answer — this test proves the
+        // isolated path is live.
+        assert!(r > dec!(0.1) && r < dec!(0.25));
+    }
+
+    // ── PERP-4 — ADL awareness ───────────────────────────────
+
+    fn snapshot_with_adl(adl: Option<u8>, ratio: Decimal, now_ms: i64) -> AccountMarginInfo {
+        use mm_exchange_core::connector::PositionMargin;
+        AccountMarginInfo {
+            total_equity: dec!(10_000),
+            total_initial_margin: dec!(2_000),
+            total_maintenance_margin: ratio * dec!(10_000),
+            available_balance: dec!(8_000),
+            margin_ratio: ratio,
+            positions: vec![PositionMargin {
+                symbol: "BTCUSDT".into(),
+                side: Side::Buy,
+                size: dec!(1),
+                entry_price: dec!(50_000),
+                mark_price: dec!(50_000),
+                isolated_margin: None,
+                liq_price: None,
+                adl_quantile: adl,
+            }],
+            reported_at_ms: now_ms,
+        }
+    }
+
+    #[test]
+    fn adl_none_on_empty_or_missing_snapshot() {
+        let g = MarginGuard::new(thresholds());
+        assert_eq!(g.max_adl_quantile(), None);
+        assert!(!g.adl_elevated());
+    }
+
+    #[test]
+    fn adl_low_rank_does_not_trigger() {
+        let mut g = MarginGuard::new(thresholds());
+        let now = 1_700_000_000_000;
+        g.update(snapshot_with_adl(Some(1), dec!(0.1), now));
+        assert_eq!(g.max_adl_quantile(), Some(1));
+        assert!(!g.adl_elevated());
+        // No ADL bump on a healthy ratio + low rank.
+        assert_eq!(g.decide(now), MarginGuardDecision::Normal);
+    }
+
+    #[test]
+    fn adl_elevated_lifts_normal_to_widen() {
+        let mut g = MarginGuard::new(thresholds());
+        let now = 1_700_000_000_000;
+        // Healthy wallet ratio (0.1 = Normal) but high ADL
+        // quantile (4 = next in line) → guard widens.
+        g.update(snapshot_with_adl(Some(4), dec!(0.1), now));
+        assert!(g.adl_elevated());
+        assert_eq!(g.decide(now), MarginGuardDecision::WidenSpreads);
+    }
+
+    #[test]
+    fn adl_does_not_demote_higher_severity() {
+        let mut g = MarginGuard::new(thresholds());
+        let now = 1_700_000_000_000;
+        // Cancel-worthy ratio (0.95) plus elevated ADL —
+        // must stay at CancelAll, not get demoted to
+        // WidenSpreads by the ADL override.
+        g.update(snapshot_with_adl(Some(4), dec!(0.95), now));
+        assert_eq!(g.decide(now), MarginGuardDecision::CancelAll);
+    }
+
+    #[test]
+    fn isolated_falls_back_to_cross_when_no_position_for_symbol() {
+        let mut g = MarginGuard::new(thresholds())
+            .with_symbol_mode("BTCUSDT", MarginModeCfg::Isolated);
+        let now = 1_700_000_000_000;
+        // Position is for ETHUSDT, not our engine's symbol.
+        g.update(isolated_snapshot(
+            "ETHUSDT",
+            dec!(1),
+            dec!(3_000),
+            dec!(100),
+            now,
+        ));
+        // Falls back to wallet ratio = 0.1.
+        assert_eq!(g.observed_ratio(), Some(dec!(0.1)));
+    }
+
+    #[test]
+    fn projected_ratio_honours_inferred_mmr_not_im_leverage() {
+        // Crucial PERP-2 assertion: the previous implementation
+        // treated new IM as 1:1 MM, inflating the projected
+        // MM delta by ~100× for a 2x-leverage quote. The new
+        // implementation multiplies notional by the inferred
+        // MMR (~0.005), which is what the venue will actually
+        // book.
+        let mut g = MarginGuard::new(thresholds());
+        g.update(snapshot_with_positions(
+            dec!(250),
+            vec![(dec!(1), dec!(50_000))], // inferred MMR = 0.005
+            1_700_000_000_000,
+        ));
+        // Add 2_000 notional at leverage 5 → IM locks 400 but
+        // MM only rises by 2_000 × 0.005 = 10.
+        let r = g.projected_ratio(dec!(2_000), 5).unwrap();
+        // projected_equity = 10_000 - 400 = 9_600
+        // projected_mm     = 250 + 10 = 260
+        // ratio ≈ 0.02708
+        let expected = dec!(260) / dec!(9_600);
+        assert_eq!(r, expected);
+        // Sanity: nowhere near the 2.0+ the old formula would
+        // have produced (250 + 400) / 9_600 = 0.0677 — the old
+        // output for this exact case. PERP-2 fixes the 2.5×
+        // over-rejection that the old formula created.
+        assert!(r < dec!(0.03));
     }
 }

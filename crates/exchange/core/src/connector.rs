@@ -297,6 +297,14 @@ pub struct PositionMargin {
     /// — venues publish the canonical value per their tiered MMR
     /// brackets which our engine does not model.
     pub liq_price: Option<rust_decimal::Decimal>,
+    /// PERP-4 — auto-deleveraging rank / quantile published by
+    /// the venue. `0` = safest (last to be ADL'd); `4` = next
+    /// in line when an ADL event fires. Binance publishes
+    /// `adlQuantile` on `/fapi/v2/positionRisk`; Bybit V5
+    /// reports `adlRankIndicator` on `/v5/position/list`
+    /// (same 0–4 scale). `None` on venues that don't expose
+    /// it or while waiting for the first snapshot.
+    pub adl_quantile: Option<u8>,
 }
 
 /// Margin mode selection for perp accounts (Epic 40.7).

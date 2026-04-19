@@ -1692,6 +1692,10 @@ fn default_max_stale_secs() -> u64 {
     30
 }
 
+fn default_mmr() -> Decimal {
+    dec!(0.005)
+}
+
 /// Margin guard configuration (Epic 40.4). Thresholds express
 /// `margin_ratio = totalMaintMargin / totalMarginBalance`; when
 /// the observed or projected ratio crosses a threshold the kill
@@ -1737,6 +1741,16 @@ pub struct MarginConfig {
     /// Default leverage applied where `per_symbol` is silent.
     #[serde(default = "default_leverage")]
     pub default_leverage: u32,
+    /// PERP-2 — fallback maintenance-margin rate (MM as a
+    /// fraction of notional) used for projected-ratio
+    /// calculations when the venue snapshot has no open
+    /// position to infer the effective rate from. Most
+    /// venues publish MMRs in `[0.004, 0.01]` for majors; we
+    /// default to `0.005` (0.5%) as a conservative middle
+    /// value. When positions are open the guard prefers the
+    /// inferred MMR over this constant.
+    #[serde(default = "default_mmr")]
+    pub default_maintenance_margin_rate: Decimal,
     /// Symbol-scoped overrides. Missing symbols fall back to
     /// `default_mode` + `default_leverage`.
     #[serde(default)]
@@ -1754,6 +1768,7 @@ impl Default for MarginConfig {
             max_stale_secs: default_max_stale_secs(),
             default_mode: MarginModeCfg::Isolated,
             default_leverage: default_leverage(),
+            default_maintenance_margin_rate: default_mmr(),
             per_symbol: Default::default(),
         }
     }

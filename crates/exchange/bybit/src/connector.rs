@@ -1011,6 +1011,17 @@ fn parse_bybit_position_margin(pos: &Value) -> Option<PositionMargin> {
         .filter(|s| !s.is_empty() && *s != "0")
         .and_then(|s| s.parse::<Decimal>().ok())
         .filter(|d| *d > Decimal::ZERO);
+    // PERP-4 — Bybit V5 exposes `adlRankIndicator` on
+    // /v5/position/list (0 = safest .. 4 = next-in-line for
+    // auto-deleverage). Absent or empty until the venue first
+    // recomputes on a position.
+    let adl_quantile = pos
+        .get("adlRankIndicator")
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .and_then(|n| u8::try_from(n).ok());
     Some(PositionMargin {
         symbol,
         side,
@@ -1019,6 +1030,7 @@ fn parse_bybit_position_margin(pos: &Value) -> Option<PositionMargin> {
         mark_price,
         isolated_margin,
         liq_price,
+        adl_quantile,
     })
 }
 

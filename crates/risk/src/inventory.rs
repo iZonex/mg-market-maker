@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use mm_common::config::RiskConfig;
 use mm_common::types::{Fill, Price, QuotePair, Side};
 use rust_decimal::prelude::Signed;
@@ -17,6 +18,16 @@ pub struct InventoryManager {
     total_sold: Decimal,
     /// Realized PnL in quote asset.
     realized_pnl: Decimal,
+    /// INV-2 — when the current "trade" opened. A trade = one
+    /// flat → non-flat → flat round-trip. `None` while flat.
+    /// Sign flips (long → short in a single fill) close the
+    /// previous trade and open a fresh one at the flip time.
+    trade_opened_at: Option<DateTime<Utc>>,
+    /// INV-2 — peak absolute inventory reached since the
+    /// current trade opened. Stays at the high-water mark even
+    /// after partial reduces so `trade_drawdown` returns the
+    /// true peak-to-trough delta.
+    trade_peak_abs: Decimal,
 }
 
 impl InventoryManager {
@@ -27,6 +38,8 @@ impl InventoryManager {
             total_bought: dec!(0),
             total_sold: dec!(0),
             realized_pnl: dec!(0),
+            trade_opened_at: None,
+            trade_peak_abs: dec!(0),
         }
     }
 
@@ -104,12 +117,81 @@ impl InventoryManager {
             Side::Sell => self.total_sold += fill.qty,
         }
 
+        // INV-2 — maintain per-trade timestamp + peak absolute
+        // inventory. Transitions:
+        // - flat → non-flat           → open a new trade
+        // - non-flat → flat           → close the current trade
+        // - sign flip in one fill     → close the old trade AND
+        //                                open a fresh one at the
+        //                                flip timestamp
+        // - growing the same side     → bump the peak
+        // - reducing without flipping → peak unchanged (so
+        //                                `trade_drawdown` stays
+        //                                peak-to-trough)
+        let old_sign = old_inventory.signum();
+        let new_sign = self.inventory.signum();
+        let now = fill.timestamp;
+        if old_sign != new_sign {
+            if self.inventory.is_zero() {
+                // Closed out.
+                self.trade_opened_at = None;
+                self.trade_peak_abs = dec!(0);
+            } else if old_sign.is_zero() {
+                // Opened a fresh trade from flat.
+                self.trade_opened_at = Some(now);
+                self.trade_peak_abs = self.inventory.abs();
+            } else {
+                // Sign-flipped in a single fill — close the old
+                // leg, open a new one at the same timestamp.
+                self.trade_opened_at = Some(now);
+                self.trade_peak_abs = self.inventory.abs();
+            }
+        } else {
+            // Same-sign update — bump the peak if we grew.
+            let curr_abs = self.inventory.abs();
+            if curr_abs > self.trade_peak_abs {
+                self.trade_peak_abs = curr_abs;
+            }
+        }
+
         info!(
             inventory = %self.inventory,
             avg_entry = %self.avg_entry_price,
             realized_pnl = %self.realized_pnl,
+            trade_peak_abs = %self.trade_peak_abs,
             "inventory updated"
         );
+    }
+
+    /// INV-2 — seconds since the current trade opened. `None`
+    /// while flat or before the first fill.
+    pub fn trade_holding_seconds(&self, now: DateTime<Utc>) -> Option<i64> {
+        self.trade_opened_at
+            .map(|opened| (now - opened).num_seconds().max(0))
+    }
+
+    /// INV-2 — peak absolute inventory reached since the
+    /// current trade opened. `0` while flat.
+    pub fn trade_peak_abs(&self) -> Decimal {
+        self.trade_peak_abs
+    }
+
+    /// INV-2 — peak-to-trough drawdown of absolute inventory
+    /// within the current trade. Non-negative:
+    /// `trade_peak_abs − |inventory|`. A long trade that hit
+    /// peak 0.8 BTC and is now 0.3 BTC reports `0.5`; flat and
+    /// newly-opened trades both report `0`.
+    pub fn trade_drawdown(&self) -> Decimal {
+        if self.trade_opened_at.is_none() {
+            return dec!(0);
+        }
+        (self.trade_peak_abs - self.inventory.abs()).max(dec!(0))
+    }
+
+    /// INV-2 — wall-clock timestamp the current trade opened.
+    /// `None` while flat.
+    pub fn trade_opened_at(&self) -> Option<DateTime<Utc>> {
+        self.trade_opened_at
     }
 
     /// Check if we're within inventory limits. Returns scaling factor [0, 1].
@@ -225,6 +307,95 @@ mod tests {
         assert_eq!(mgr.inventory(), dec!(0));
         // PnL = 0.01 * (51000 - 50000) = 10.
         assert_eq!(mgr.realized_pnl(), dec!(10));
+    }
+
+    // ── INV-2 — per-trade drawdown + holding time ─────────────
+
+    fn make_fill_at(side: Side, price: &str, qty: &str, ts: DateTime<Utc>) -> Fill {
+        Fill {
+            trade_id: 1,
+            order_id: Uuid::new_v4(),
+            symbol: "BTCUSDT".into(),
+            side,
+            price: price.parse().unwrap(),
+            qty: qty.parse().unwrap(),
+            is_maker: true,
+            timestamp: ts,
+        }
+    }
+
+    #[test]
+    fn trade_timer_opens_on_first_fill_and_closes_on_flat() {
+        let mut mgr = InventoryManager::new();
+        assert!(mgr.trade_opened_at().is_none());
+        let t0 = Utc::now();
+        mgr.on_fill(&make_fill_at(Side::Buy, "50000", "0.01", t0));
+        assert_eq!(mgr.trade_opened_at(), Some(t0));
+        assert_eq!(mgr.trade_peak_abs(), dec!(0.01));
+
+        // Close the trade.
+        mgr.on_fill(&make_fill_at(
+            Side::Sell,
+            "51000",
+            "0.01",
+            t0 + chrono::Duration::seconds(30),
+        ));
+        assert!(mgr.trade_opened_at().is_none());
+        assert_eq!(mgr.trade_peak_abs(), dec!(0));
+    }
+
+    #[test]
+    fn trade_peak_tracks_highest_abs_inventory_seen() {
+        let mut mgr = InventoryManager::new();
+        let t0 = Utc::now();
+        mgr.on_fill(&make_fill_at(Side::Buy, "50000", "0.2", t0));
+        mgr.on_fill(&make_fill_at(Side::Buy, "50100", "0.3", t0));
+        assert_eq!(mgr.trade_peak_abs(), dec!(0.5));
+        // Reduce but don't flatten — peak stays at 0.5.
+        mgr.on_fill(&make_fill_at(Side::Sell, "51000", "0.2", t0));
+        assert_eq!(mgr.trade_peak_abs(), dec!(0.5));
+        assert_eq!(mgr.inventory(), dec!(0.3));
+    }
+
+    #[test]
+    fn trade_drawdown_is_peak_minus_current_abs() {
+        let mut mgr = InventoryManager::new();
+        let t0 = Utc::now();
+        mgr.on_fill(&make_fill_at(Side::Buy, "50000", "0.5", t0));
+        assert_eq!(mgr.trade_drawdown(), dec!(0));
+        mgr.on_fill(&make_fill_at(Side::Sell, "51000", "0.2", t0));
+        // Peak was 0.5, current abs is 0.3 → drawdown 0.2.
+        assert_eq!(mgr.trade_drawdown(), dec!(0.2));
+    }
+
+    #[test]
+    fn sign_flip_resets_trade_state() {
+        let mut mgr = InventoryManager::new();
+        let t0 = Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(10);
+        // Open long.
+        mgr.on_fill(&make_fill_at(Side::Buy, "50000", "0.3", t0));
+        assert_eq!(mgr.trade_opened_at(), Some(t0));
+        assert_eq!(mgr.trade_peak_abs(), dec!(0.3));
+        // Flip short in one fill.
+        mgr.on_fill(&make_fill_at(Side::Sell, "51000", "0.5", t1));
+        // Fresh short trade opens at t1 with 0.2 abs inventory.
+        assert_eq!(mgr.inventory(), dec!(-0.2));
+        assert_eq!(mgr.trade_opened_at(), Some(t1));
+        assert_eq!(mgr.trade_peak_abs(), dec!(0.2));
+        assert_eq!(mgr.trade_drawdown(), dec!(0));
+    }
+
+    #[test]
+    fn holding_seconds_reads_wall_clock_delta() {
+        let mut mgr = InventoryManager::new();
+        let t0 = Utc::now();
+        mgr.on_fill(&make_fill_at(Side::Buy, "50000", "0.1", t0));
+        let now = t0 + chrono::Duration::seconds(42);
+        assert_eq!(mgr.trade_holding_seconds(now), Some(42));
+        // After closing, no timer.
+        mgr.on_fill(&make_fill_at(Side::Sell, "51000", "0.1", now));
+        assert_eq!(mgr.trade_holding_seconds(now), None);
     }
 
     #[test]

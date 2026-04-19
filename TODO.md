@@ -34,22 +34,34 @@ Legend:
   shape + meta; node count 102 → 103.
 
 ### Perpetual safety
-- [ ] **PERP-2** Use venue-reported `total_maintenance_margin`
-  for `projected_ratio` instead of the flat `IM ≈ notional /
-  leverage` approximation. A more accurate projection prevents
-  the engine from over-sizing on a tight book.
-- [ ] **PERP-3** Differentiate cross-margin vs isolated-margin
-  modes. Extend `MarginConfig.per_symbol` with `MarginMode`
-  enum; gate quote generation + reduce logic accordingly.
-- [ ] **PERP-4** Insurance fund / ADL awareness. Read venue
-  insurance balance + our ADL rank where exposed; widen on
-  elevated ADL rank because a venue-forced deleverage can
-  close our position at the mark.
+- [x] **PERP-2** `MarginGuard::effective_mmr` infers the
+  venue's blended MMR from `total_maintenance_margin` ÷
+  position notional (clamped to `[default/10, default×10]`).
+  `projected_ratio` now uses that inferred rate for the MM
+  delta instead of treating new IM as 1:1 MM. Over-rejection
+  of valid quotes drops ~10–100× on majors. Fallback MMR is
+  configurable via `MarginConfig::default_maintenance_margin_rate`.
+- [x] **PERP-3** `MarginGuard::with_symbol_mode` pins the guard
+  to the engine's symbol + `MarginModeCfg`. Isolated mode
+  returns the per-position ratio `(size × mark × MMR) /
+  isolated_margin` from `observed_ratio` and a bucket-local
+  `projected_ratio` that adds IM into the isolated collateral.
+  Cross mode keeps the wallet-wide figure.
+- [x] **PERP-4** `PositionMargin.adl_quantile` threaded
+  through Binance (`adlQuantile`) + Bybit
+  (`adlRankIndicator`); HyperLiquid leaves it `None`.
+  `MarginGuard::adl_elevated` (≥ 3) lifts a Normal decision to
+  `WidenSpreads` without demoting higher-severity bucket
+  readings.
 
 ### Inventory truth
-- [ ] **INV-2** Per-trade drawdown + holding-time on
-  `InventoryManager`. Track peak-to-trough inventory within a
-  single trade; track seconds-since-open.
+- [x] **INV-2** `InventoryManager` now tracks per-trade
+  `trade_opened_at` + `trade_peak_abs` (monotone high-water
+  mark within a trade) + `trade_drawdown()` (peak minus
+  current |inventory|). Sign-flips in one fill close the
+  previous trade and open a fresh one at the flip timestamp.
+  `trade_holding_seconds(now)` returns wall-clock delta since
+  the current trade opened.
 - [x] **INV-4** Dedicated portfolio aggregator struct.
   `CrossVenuePortfolio` in `crates/portfolio/src/cross_venue.rs`
   owns every engine's `(symbol, venue) → inventory + mark`
@@ -61,9 +73,13 @@ Legend:
   inventory so the UI shows live notional per venue.
 
 ### Kill-switch teardown
-- [ ] **KILL-L5** Real Disconnect teardown. Level 5 is
-  currently a state label; wire actual socket close, engine
-  pause, and manual-only reset.
+- [x] **KILL-L5** Engine run-loop now detects the transition
+  to `KillLevel::Disconnect`: fires `cancel_all` + audit +
+  critical incident, sets `disconnected = true`, and collapses
+  the main select to `shutdown / config_override / 1s sleep`
+  so only `ConfigOverride::ManualKillSwitchReset` clears the
+  flag. The falling edge (operator reset → Normal) logs a
+  resume line and returns the loop to the full event pipeline.
 
 ---
 
