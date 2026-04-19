@@ -1315,12 +1315,11 @@ impl MarketMakerEngine {
         // 22B-0 — feed the saved strategy state into the
         // `Strategy` impl. Stateless strategies (default
         // impl returns Ok(())) ignore it; stateful ones
-        // (GLFT / Adaptive / Autotune / LearnedMicroprice /
-        // PumpAndDump / Campaign / Momentum) rehydrate their
-        // rolling windows + fitted calibrations so the restart
-        // doesn't force a cold warmup. A deserialisation error
-        // logs at warn and the strategy keeps its defaults —
-        // a broken snapshot never blocks the boot.
+        // (GLFT / PumpAndDump / Campaign) rehydrate their
+        // rolling windows + FSMs so the restart doesn't force
+        // a cold warmup. A deserialisation error logs at warn
+        // and the strategy keeps its defaults — a broken
+        // snapshot never blocks the boot.
         if let Some(state) = &checkpoint.strategy_state {
             match self.strategy.restore_state(state) {
                 Ok(()) => tracing::info!(
@@ -1333,6 +1332,25 @@ impl MarketMakerEngine {
                     strategy = %self.strategy.name(),
                     error = %e,
                     "strategy restore_state failed — starting from defaults"
+                ),
+            }
+        }
+
+        // 22B-2 — engine-owned subsystems restore from
+        // `engine_state`. Each subsystem lives on the engine
+        // struct rather than on a `Strategy`, so it needs its
+        // own key. Missing keys are fine — the subsystem keeps
+        // its default state.
+        if let Some(v) = checkpoint.engine_state.get("adaptive") {
+            match self.adaptive_tuner.restore_state(v) {
+                Ok(()) => tracing::info!(
+                    symbol = %self.symbol,
+                    "adaptive tuner restored from checkpoint"
+                ),
+                Err(e) => tracing::warn!(
+                    symbol = %self.symbol,
+                    error = %e,
+                    "adaptive tuner restore_state failed — starting fresh"
                 ),
             }
         }
@@ -1359,9 +1377,8 @@ impl MarketMakerEngine {
     /// serialise the primary strategy's persistent state into
     /// the `SymbolCheckpoint.strategy_state` field. Returns
     /// `None` for stateless strategies (Avellaneda / Basis /
-    /// Grid / CrossExchange), `Some(json)` for GLFT, Adaptive,
-    /// Autotune, LearnedMicroprice, PumpAndDump, Campaign, and
-    /// Momentum after their 22B-1..6 landings.
+    /// Grid / CrossExchange), `Some(json)` for GLFT / PumpAndDump
+    /// / Campaign after their 22B-1/5 landings.
     ///
     /// **NOTE**: the per-tick checkpoint writer is not wired in
     /// this crate — the server's `CheckpointManager` at
@@ -1371,6 +1388,19 @@ impl MarketMakerEngine {
     /// the hook the future loop calls into.
     pub fn strategy_checkpoint_state(&self) -> Option<serde_json::Value> {
         self.strategy.checkpoint_state()
+    }
+
+    /// 22B-2 — collect engine-owned subsystem snapshots for
+    /// `SymbolCheckpoint.engine_state`. Each subsystem that
+    /// wants to survive a restart (AdaptiveTuner,
+    /// LearnedMicropriceModel, etc.) adds itself here. Returns
+    /// an empty map when every subsystem is disabled.
+    pub fn engine_checkpoint_state(&self) -> std::collections::HashMap<String, serde_json::Value> {
+        let mut map = std::collections::HashMap::new();
+        if let Some(v) = self.adaptive_tuner.snapshot_state() {
+            map.insert("adaptive".to_string(), v);
+        }
+        map
     }
 
     /// S2.1 — serialise the currently-inflight atomic bundle
@@ -10719,6 +10749,7 @@ mod dual_connector_tests {
             total_fills: 0,
             inflight_atomic_bundles: snapshot,
             strategy_state: None,
+            engine_state: std::collections::HashMap::new(),
         };
         let b = b.with_checkpoint_restore(&cp);
 
@@ -10761,6 +10792,7 @@ mod dual_connector_tests {
                 serde_json::json!({ "shape": "wrong" }),
             ],
             strategy_state: None,
+            engine_state: std::collections::HashMap::new(),
         };
         let engine = engine.with_checkpoint_restore(&cp);
         assert!(engine.inflight_atomic_bundles.is_empty());

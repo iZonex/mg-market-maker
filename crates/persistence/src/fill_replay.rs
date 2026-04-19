@@ -220,6 +220,7 @@ mod tests {
             total_fills: 3,
             inflight_atomic_bundles: Vec::new(),
             strategy_state: None,
+            engine_state: std::collections::HashMap::new(),
         };
         let replay = FillReplayResult {
             inventory: dec!(0.12),
@@ -244,6 +245,7 @@ mod tests {
             total_fills: 5,
             inflight_atomic_bundles: Vec::new(),
             strategy_state: None,
+            engine_state: std::collections::HashMap::new(),
         };
         let replay = FillReplayResult {
             inventory: dec!(0.5),
@@ -355,6 +357,7 @@ mod tests {
                 total_fills: fills,
                 inflight_atomic_bundles: Vec::new(),
                 strategy_state: None,
+                engine_state: std::collections::HashMap::new(),
             };
             let r = FillReplayResult {
                 inventory: inv,
@@ -383,6 +386,7 @@ mod tests {
                 total_fills: cp_fills + delta,
                 inflight_atomic_bundles: Vec::new(),
                 strategy_state: None,
+                engine_state: std::collections::HashMap::new(),
             };
             let r = FillReplayResult {
                 inventory: dec!(0),

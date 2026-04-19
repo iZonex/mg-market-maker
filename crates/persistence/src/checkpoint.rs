@@ -61,6 +61,17 @@ pub struct SymbolCheckpoint {
     /// legacy checkpoints keep loading.
     #[serde(default)]
     pub strategy_state: Option<serde_json::Value>,
+    /// 22B-2 — engine-owned per-subsystem state. Keyed by
+    /// subsystem name (`"adaptive"`, `"autotune"`,
+    /// `"learned_microprice"`, `"momentum"`). Values are
+    /// opaque JSON the subsystem round-trips through its own
+    /// `snapshot_state` / `restore_state` methods. Separate
+    /// from `strategy_state` because these components live
+    /// on the engine, not on any individual `Strategy` impl.
+    /// Missing keys are fine — each subsystem falls through to
+    /// its own defaults, same as a fresh boot.
+    #[serde(default)]
+    pub engine_state: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl Checkpoint {
@@ -369,6 +380,7 @@ mod tests {
             total_fills: 0,
             inflight_atomic_bundles: Vec::new(),
             strategy_state: Some(state.clone()),
+            engine_state: HashMap::new(),
         });
 
         let loaded = CheckpointManager::new_with_secret(&path, 10, secret);
@@ -411,6 +423,7 @@ mod tests {
             total_fills: 100,
             inflight_atomic_bundles: Vec::new(),
             strategy_state: None,
+            engine_state: std::collections::HashMap::new(),
         });
 
         let loaded = CheckpointManager::new_with_secret(&path, 10, secret);
@@ -437,6 +450,7 @@ mod tests {
             total_fills: 1,
             inflight_atomic_bundles: Vec::new(),
             strategy_state: None,
+            engine_state: std::collections::HashMap::new(),
         });
 
         // Tamper with the file — bump inventory directly in the
@@ -472,6 +486,7 @@ mod tests {
             total_fills: 1,
             inflight_atomic_bundles: Vec::new(),
             strategy_state: None,
+            engine_state: std::collections::HashMap::new(),
         });
 
         let loaded =
@@ -502,6 +517,7 @@ mod tests {
                         total_fills: 1,
                         inflight_atomic_bundles: Vec::new(),
                         strategy_state: None,
+                        engine_state: HashMap::new(),
                     },
                 );
                 m
@@ -560,6 +576,7 @@ mod tests {
                 total_fills,
                 inflight_atomic_bundles: Vec::new(),
                 strategy_state: None,
+                engine_state: HashMap::new(),
             }
         }
     }
@@ -722,6 +739,7 @@ mod tests {
                 total_fills: fills,
                 inflight_atomic_bundles: Vec::new(),
                 strategy_state: None,
+                engine_state: HashMap::new(),
             });
             prop_assert!(cp.validate().is_empty(),
                 "clean state flagged: {:?}", cp.validate());
@@ -745,6 +763,7 @@ mod tests {
                 total_fills: 0,
                 inflight_atomic_bundles: Vec::new(),
                 strategy_state: None,
+                engine_state: HashMap::new(),
             });
             prop_assert!(!cp.validate().is_empty(),
                 "negative entry price not flagged");
@@ -768,6 +787,7 @@ mod tests {
                 total_fills: 0,
                 inflight_atomic_bundles: Vec::new(),
                 strategy_state: None,
+                engine_state: HashMap::new(),
             });
             prop_assert!(!cp.validate().is_empty(),
                 "inventory without entry price not flagged");

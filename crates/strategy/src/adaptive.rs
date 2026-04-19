@@ -26,6 +26,7 @@
 
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -94,7 +95,7 @@ pub enum AdjustmentReason {
 
 /// One-minute bucket of per-symbol trading stats. Rolled up every
 /// `bucket_secs` by `maybe_rollover`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Bucket {
     fills: u32,
     volume_quote: Decimal,
@@ -347,6 +348,77 @@ impl AdaptiveTuner {
         }
         self.gamma_factor = clamped;
     }
+
+    /// 22B-2 — serialise the controller's persistent state so a
+    /// restart doesn't drop 1 hour of bucket history + the
+    /// learned γ multiplier. Skips `last_rollover: Instant` (not
+    /// serialisable; the next tick re-establishes the clock) and
+    /// `current` (partial in-progress bucket that will be
+    /// rewritten before the next rollover anyway). Returns `None`
+    /// when the controller is disabled — no point saving a
+    /// multiplier the engine ignores.
+    pub fn snapshot_state(&self) -> Option<serde_json::Value> {
+        if !self.enabled {
+            return None;
+        }
+        let buckets: Vec<&Bucket> = self.buckets.iter().collect();
+        Some(serde_json::json!({
+            "schema_version": 1,
+            "gamma_factor": self.gamma_factor.to_string(),
+            "gamma_target": self.gamma_target.to_string(),
+            "inv_vol_ewma": self.inv_vol_ewma.to_string(),
+            "prev_inventory": self.prev_inventory
+                .as_ref().map(|d| d.to_string()),
+            "buckets": buckets,
+        }))
+    }
+
+    /// 22B-2 — restore the controller from a prior snapshot.
+    /// Ignores the `enabled` flag — operators control opt-in
+    /// via config, not via the checkpoint. Truncates the bucket
+    /// history if it overshoots the current config's
+    /// `window_buckets` cap.
+    pub fn restore_state(&mut self, state: &serde_json::Value) -> Result<(), String> {
+        let schema = state.get("schema_version").and_then(|v| v.as_u64());
+        if schema != Some(1) {
+            return Err(format!(
+                "adaptive checkpoint has unsupported schema_version {schema:?}"
+            ));
+        }
+        let gamma_factor = state
+            .get("gamma_factor")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Decimal>().ok())
+            .ok_or_else(|| "adaptive: missing/invalid gamma_factor".to_string())?;
+        let gamma_target = state
+            .get("gamma_target")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Decimal>().ok())
+            .ok_or_else(|| "adaptive: missing/invalid gamma_target".to_string())?;
+        let inv_vol_ewma = state
+            .get("inv_vol_ewma")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Decimal>().ok())
+            .ok_or_else(|| "adaptive: missing/invalid inv_vol_ewma".to_string())?;
+        let prev_inventory = state
+            .get("prev_inventory")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Decimal>().ok());
+        let buckets_json = state
+            .get("buckets")
+            .ok_or_else(|| "adaptive: missing buckets".to_string())?;
+        let mut buckets: VecDeque<Bucket> = serde_json::from_value(buckets_json.clone())
+            .map_err(|e| format!("adaptive: bad buckets: {e}"))?;
+        while buckets.len() > self.cfg.window_buckets {
+            buckets.pop_front();
+        }
+        self.gamma_factor = gamma_factor;
+        self.gamma_target = gamma_target;
+        self.inv_vol_ewma = inv_vol_ewma;
+        self.prev_inventory = prev_inventory;
+        self.buckets = buckets;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -536,5 +608,62 @@ mod tests {
             t.tick(start + Duration::from_secs(i * 2));
         }
         assert_eq!(t.buckets.len(), 3);
+    }
+
+    /// 22B-2 — snapshot_state → restore_state round trip
+    /// preserves the learned multiplier + bucket history +
+    /// EWMA / prev_inventory state.
+    #[test]
+    fn snapshot_restore_round_trip() {
+        let mut src = AdaptiveTuner::new(fast_cfg());
+        src.enable(true);
+        let start = Instant::now();
+        src.tick(start);
+        for i in 1..=5 {
+            src.on_fill(dec!(100), dec!(1), dec!(5), dec!(1));
+            src.on_inventory(Decimal::from(i));
+            src.tick(start + Duration::from_secs(i as u64 * 2));
+        }
+        let snap = src.snapshot_state().expect("enabled snapshot");
+        let before_factor = src.gamma_factor;
+        let before_target = src.gamma_target;
+        let before_inv_ewma = src.inv_vol_ewma;
+        let before_buckets = src.buckets.len();
+
+        let mut dst = AdaptiveTuner::new(fast_cfg());
+        dst.enable(true);
+        dst.restore_state(&snap).unwrap();
+        assert_eq!(dst.gamma_factor, before_factor);
+        assert_eq!(dst.gamma_target, before_target);
+        assert_eq!(dst.inv_vol_ewma, before_inv_ewma);
+        assert_eq!(dst.buckets.len(), before_buckets);
+    }
+
+    /// 22B-2 — disabled tuner returns None from snapshot, so
+    /// a stray "enabled=false" run doesn't stamp a multiplier
+    /// into the checkpoint.
+    #[test]
+    fn disabled_tuner_returns_no_snapshot() {
+        let t = AdaptiveTuner::new(fast_cfg());
+        assert!(t.snapshot_state().is_none());
+    }
+
+    /// 22B-2 — mismatched schema_version returns Err without
+    /// mutating state.
+    #[test]
+    fn restore_rejects_wrong_schema() {
+        let mut t = AdaptiveTuner::new(fast_cfg());
+        t.enable(true);
+        let before = t.gamma_factor;
+        let bogus = serde_json::json!({
+            "schema_version": 42,
+            "gamma_factor": "2.0",
+            "gamma_target": "2.0",
+            "inv_vol_ewma": "0",
+            "prev_inventory": null,
+            "buckets": [],
+        });
+        assert!(t.restore_state(&bogus).is_err());
+        assert_eq!(t.gamma_factor, before);
     }
 }
