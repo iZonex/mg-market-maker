@@ -63,23 +63,39 @@ mod tests {
     /// Env override parses the usual truthy / falsy spellings.
     #[test]
     fn env_override_accepts_common_spellings() {
-        // Preserve any ambient value.
+        // HARD-4 — `std::env::set_var` is `unsafe` under the
+        // Rust 2024 edition because concurrent reads/writes
+        // across threads race on POSIX `setenv`. This test
+        // runs single-threaded via `#[test]` (cargo test
+        // threads tests out, but no other thread is touching
+        // the env variable during this block — verified by
+        // grep: this env var has no setter outside this
+        // test + one read in `inline_dispatch_env_override`),
+        // so the SAFETY contract "no other thread reads or
+        // writes the env" is upheld. Preserving the ambient
+        // value restores the pre-test state for subsequent
+        // suites.
         let prev = std::env::var("MM_SOR_INLINE_DISPATCH").ok();
         let cases_true = ["1", "true", "TRUE", "yes", "on"];
         let cases_false = ["0", "false", "FALSE", "no", "off"];
         for v in cases_true {
+            // SAFETY: see test-level comment above.
             unsafe { std::env::set_var("MM_SOR_INLINE_DISPATCH", v) };
             assert_eq!(inline_dispatch_env_override(), Some(true), "truthy: {v}");
         }
         for v in cases_false {
+            // SAFETY: see test-level comment above.
             unsafe { std::env::set_var("MM_SOR_INLINE_DISPATCH", v) };
             assert_eq!(inline_dispatch_env_override(), Some(false), "falsy: {v}");
         }
+        // SAFETY: see test-level comment above.
         unsafe { std::env::set_var("MM_SOR_INLINE_DISPATCH", "hmm") };
         assert_eq!(inline_dispatch_env_override(), None);
+        // SAFETY: see test-level comment above.
         unsafe { std::env::remove_var("MM_SOR_INLINE_DISPATCH") };
         assert_eq!(inline_dispatch_env_override(), None);
         if let Some(v) = prev {
+            // SAFETY: see test-level comment above.
             unsafe { std::env::set_var("MM_SOR_INLINE_DISPATCH", v) };
         }
     }

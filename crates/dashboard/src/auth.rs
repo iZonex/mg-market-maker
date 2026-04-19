@@ -519,9 +519,22 @@ mod tests {
         assert_eq!(claims.user_id, u.id);
         assert_eq!(claims.role, Role::Admin);
         // Tamper: flip a byte in the signature — must fail.
+        // HARD-6 — pick the substitute char so it can never
+        // equal whatever the token ended with. Base64url only
+        // uses `A-Za-z0-9_-`; swapping the last char with its
+        // case-inverted sibling (or a fixed non-equivalent
+        // character for digits/underscores) is always a
+        // distinct byte, so the tamper is never a no-op.
         let mut bad = tok.clone();
-        bad.pop();
-        bad.push('a');
+        let last = bad.pop().expect("token must not be empty");
+        let tampered = match last {
+            c if c.is_ascii_uppercase() => c.to_ascii_lowercase(),
+            c if c.is_ascii_lowercase() => c.to_ascii_uppercase(),
+            '0'..='9' => 'A',
+            _ => 'Z',
+        };
+        assert_ne!(tampered, last, "tamper must change the byte");
+        bad.push(tampered);
         assert!(auth.verify_token(&bad).is_none());
     }
 

@@ -557,14 +557,18 @@ mod tests {
                 let _ = std::fs::remove_file(&path);
                 return Ok(());
             }
-            let mut tampered = content.clone();
             let orig_ch = bytes[target_pos];
-            // Replace with a different ASCII byte. If XOR lands
-            // on a problematic non-ascii byte, skip silently.
+            // Replace with a different ASCII byte. HARD-4 —
+            // rebuild through `Vec<u8>` so we don't need the
+            // `String::as_bytes_mut` unsafe: tampering with a
+            // byte inside a UTF-8 string could invalidate the
+            // invariant, but we immediately re-decode under
+            // `String::from_utf8_lossy` so the test reads a
+            // legal string either way.
             let new_ch = if orig_ch == b'A' { b'Z' } else { b'A' };
-            unsafe {
-                tampered.as_bytes_mut()[target_pos] = new_ch;
-            }
+            let mut tampered_bytes = bytes.to_vec();
+            tampered_bytes[target_pos] = new_ch;
+            let tampered = String::from_utf8_lossy(&tampered_bytes).into_owned();
             if tampered == content {
                 let _ = std::fs::remove_file(&path);
                 return Ok(());

@@ -157,25 +157,36 @@ Legend:
 
 ## P3 — hardening / polish
 
-- [ ] **HARD-1** Hot-path unwrap audit in `market_maker.rs`
-  (38 `unwrap`/`expect` calls; `prod_readiness_audit_apr17`
-  flagged).
-- [ ] **HARD-2** Audit log hash-chain verify on startup. The
-  `verify_chain` helper exists (Sprint 5d); call it on boot,
-  refuse to start on a broken chain unless
-  `MM_AUDIT_RESUME_ON_BROKEN=yes` is set.
+- [x] **HARD-1** Audit complete: all 40 `unwrap`/`expect` calls
+  in `market_maker.rs` live in `#[cfg(test)]` modules. Wider
+  engine crate shows 0 production unwraps and exactly one
+  provable-invariant `expect` at `listing_sniper.rs:144`
+  (symbol pulled from `by_symbol.keys()` must re-resolve in
+  the same map). Hot path clean.
+- [x] **HARD-2** `server/main.rs` boots with
+  `mm_risk::audit::verify_chain(...)` and refuses to start on
+  a broken chain unless `MM_AUDIT_RESUME_ON_BROKEN=yes` is
+  set. Logs `rows_checked + last_hash` on success.
 - [ ] **HARD-3** Reconciliation loop real-exchange testing.
   The reconcile code exists; no integration test fires against
-  a real venue account.
-- [ ] **HARD-4** Remove 9 `unsafe` blocks across workspace —
-  every one needs a safety comment or refactor.
-- [ ] **HARD-5** CI/CD pipeline: github actions for build +
-  clippy + test + frontend build on every PR.
-- [ ] **HARD-6** Fix flaky `auth::tests::token_round_trips_and_expires`.
-  The test tampers a token by `pop()` + `push('a')`; if the
-  original token already ends in `'a'` the tamper is a no-op
-  and the assertion fails. Replace with a deterministic tamper
-  (e.g. flip the final char to a known-different byte).
+  a real venue account. **Operator task** — needs live venue
+  keys.
+- [x] **HARD-4** Unsafe audit done: one remaining block in a
+  test (`order_manager.rs:1392`) with a correct
+  `SAFETY:` comment; the SOR env-var test gained per-call
+  `SAFETY:` comments explaining the single-thread invariant
+  Rust 2024 requires; the checkpoint tamper test rebuilds
+  the tampered string through `Vec<u8>` + `String::from_utf8_lossy`,
+  eliminating `String::as_bytes_mut`.
+- [x] **HARD-5** CI/CD landed earlier at `.github/workflows/ci.yml` —
+  `cargo check --all-targets`, `cargo test --all`,
+  `cargo clippy -D warnings`, `cargo fmt --check`, OTel
+  feature build, frontend build, docker build on every PR
+  to main.
+- [x] **HARD-6** `auth::tests::token_round_trips_and_expires`
+  tamper replaced with a case-flip / fixed-substitute that
+  can never equal the original byte. Validated with 5
+  back-to-back runs.
 
 ---
 

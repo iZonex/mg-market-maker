@@ -231,12 +231,42 @@ async fn main() -> Result<()> {
     // Auth: create state and load users from config.
     let auth_secret =
         std::env::var("MM_AUTH_SECRET").unwrap_or_else(|_| "change-me-in-production".to_string());
+    // HARD-2 — verify the audit log hash-chain before we open
+    // the sink for append. A broken chain is a MiCA-grade
+    // incident: either tampering or a crash mid-write that
+    // left a torn row. Operator can bypass with
+    // `MM_AUDIT_RESUME_ON_BROKEN=yes` once they've triaged.
+    let audit_path = std::path::Path::new("data/audit.jsonl");
+    match mm_risk::audit::verify_chain(audit_path) {
+        Ok(report) => {
+            info!(
+                rows = report.rows_checked,
+                last_hash = ?report.last_hash,
+                "audit hash-chain verified on boot"
+            );
+        }
+        Err(e) => {
+            let resume =
+                std::env::var("MM_AUDIT_RESUME_ON_BROKEN").ok().as_deref() == Some("yes");
+            if resume {
+                error!(
+                    error = %e,
+                    "AUDIT CHAIN BROKEN — continuing under MM_AUDIT_RESUME_ON_BROKEN=yes"
+                );
+            } else {
+                error!(
+                    error = %e,
+                    "AUDIT CHAIN BROKEN — refusing to start (set MM_AUDIT_RESUME_ON_BROKEN=yes to override)"
+                );
+                anyhow::bail!("audit hash-chain verification failed: {e}");
+            }
+        }
+    }
     // Shared audit sink — attached to AuthState so login /
     // logout events land in the MiCA trail next to order + risk
     // rows (Epic 38).
     let shared_audit = Arc::new(
-        mm_risk::audit::AuditLog::new(std::path::Path::new("data/audit.jsonl"))
-            .expect("audit log for auth"),
+        mm_risk::audit::AuditLog::new(audit_path).expect("audit log for auth"),
     );
     let auth_state = AuthState::new(&auth_secret).with_audit(shared_audit.clone());
 
