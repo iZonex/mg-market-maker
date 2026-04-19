@@ -94,6 +94,7 @@ pub async fn start(
             get(per_leg_inventory_history),
         )
         .route("/api/v1/basis", get(basis_monitor))
+        .route("/api/v1/clients", get(list_clients_public))
         .route("/api/v1/sor/decisions/recent", get(sor_decisions_recent))
         .route("/api/v1/atomic-bundles/inflight", get(atomic_bundles_inflight))
         .route("/api/v1/rebalance/recommendations", get(rebalance_recommendations))
@@ -2245,6 +2246,34 @@ struct BasisLeg {
     /// Basis vs reference, in bps. `(mid - ref_mid) / ref_mid *
     /// 10_000`. Sign preserved — positive = premium.
     basis_bps: rust_decimal::Decimal,
+}
+
+/// 23-UX-12 — lightweight read-only client listing for the
+/// Overview page's client dropdown. Does NOT include
+/// registration fields, webhook URLs, or jurisdiction — the
+/// admin endpoint at /api/admin/clients owns those. Operators +
+/// viewers can see which clients map to which symbols so the
+/// dashboard scope selector works.
+#[derive(serde::Serialize)]
+struct ClientPublicRow {
+    id: String,
+    symbols: Vec<String>,
+}
+
+async fn list_clients_public(State(state): State<DashboardState>) -> Json<Vec<ClientPublicRow>> {
+    let ids = state.client_ids();
+    let rows: Vec<ClientPublicRow> = ids
+        .into_iter()
+        .map(|id| {
+            let syms = state
+                .get_client_symbols(&id)
+                .into_iter()
+                .map(|s| s.symbol)
+                .collect();
+            ClientPublicRow { id, symbols: syms }
+        })
+        .collect();
+    Json(rows)
 }
 
 async fn basis_monitor(State(state): State<DashboardState>) -> Json<Vec<BasisRow>> {

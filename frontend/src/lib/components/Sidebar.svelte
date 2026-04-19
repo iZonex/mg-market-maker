@@ -4,20 +4,51 @@
 
   let { route = $bindable('overview'), auth, connected = false, mode = 'paper' } = $props()
 
-  const items = [
-    { id: 'overview',    label: 'Overview',    icon: 'overview',    roles: ['admin','operator','viewer'] },
-    { id: 'orderbook',   label: 'Orderbook',   icon: 'orderbook',   roles: ['admin','operator','viewer'] },
-    { id: 'history',     label: 'History',     icon: 'history',     roles: ['admin','operator','viewer'] },
-    { id: 'calibration', label: 'Calibration', icon: 'calibration', roles: ['admin','operator'] },
-    { id: 'strategy',    label: 'Strategy',    icon: 'graph',       roles: ['admin','operator'] },
-    { id: 'compliance',  label: 'Compliance',  icon: 'compliance',  roles: ['admin','operator'] },
-    { id: 'surveillance', label: 'Surveillance', icon: 'compliance', roles: ['admin','operator'] },
-    { id: 'settings',    label: 'Settings',    icon: 'settings',    roles: ['admin','operator'] },
-    { id: 'users',       label: 'Users',       icon: 'users',       roles: ['admin'] },
-    { id: 'admin',       label: 'Admin',       icon: 'admin',       roles: ['admin'] },
+  // 23-UX-11 — four thematic groups. Flat list felt like admin
+  // debug tools; grouping maps operator intent (Live = watch,
+  // Operations = act, Configure = author, Admin = system).
+  const groups = [
+    {
+      label: 'Live',
+      items: [
+        { id: 'overview',    label: 'Overview',    icon: 'overview',    roles: ['admin','operator','viewer'] },
+        { id: 'orderbook',   label: 'Orderbook',   icon: 'orderbook',   roles: ['admin','operator','viewer'] },
+        { id: 'history',     label: 'History',     icon: 'history',     roles: ['admin','operator','viewer'] },
+      ],
+    },
+    {
+      label: 'Operations',
+      items: [
+        { id: 'compliance',   label: 'Compliance',   icon: 'compliance', roles: ['admin','operator'] },
+        { id: 'surveillance', label: 'Surveillance', icon: 'compliance', roles: ['admin','operator'] },
+      ],
+    },
+    {
+      label: 'Configure',
+      items: [
+        { id: 'calibration', label: 'Calibration', icon: 'calibration', roles: ['admin','operator'] },
+        { id: 'strategy',    label: 'Strategy',    icon: 'graph',       roles: ['admin','operator'] },
+        { id: 'settings',    label: 'Settings',    icon: 'settings',    roles: ['admin','operator'] },
+      ],
+    },
+    {
+      label: 'Admin',
+      items: [
+        { id: 'users', label: 'Users', icon: 'users', roles: ['admin'] },
+        { id: 'admin', label: 'Admin', icon: 'admin', roles: ['admin'] },
+      ],
+    },
   ]
 
-  const visible = $derived(items.filter(i => i.roles.includes(auth?.state?.role || 'viewer')))
+  const visibleGroups = $derived.by(() => {
+    const role = auth?.state?.role || 'viewer'
+    return groups
+      .map(g => ({
+        label: g.label,
+        items: g.items.filter(i => i.roles.includes(role)),
+      }))
+      .filter(g => g.items.length > 0)
+  })
 
   function go(id) { route = id }
 </script>
@@ -29,17 +60,22 @@
   </div>
 
   <nav class="nav">
-    {#each visible as item (item.id)}
-      <button
-        type="button"
-        class="nav-item"
-        class:active={route === item.id}
-        onclick={() => go(item.id)}
-        aria-label={item.label}
-      >
-        <span class="nav-icon"><Icon name={item.icon} size={18} /></span>
-        <span class="nav-label">{item.label}</span>
-      </button>
+    {#each visibleGroups as group (group.label)}
+      <div class="nav-group">
+        <div class="nav-group-head">{group.label}</div>
+        {#each group.items as item (item.id)}
+          <button
+            type="button"
+            class="nav-item"
+            class:active={route === item.id}
+            onclick={() => go(item.id)}
+            aria-label={item.label}
+          >
+            <span class="nav-icon"><Icon name={item.icon} size={18} /></span>
+            <span class="nav-label">{item.label}</span>
+          </button>
+        {/each}
+      </div>
     {/each}
   </nav>
 
@@ -100,9 +136,23 @@
   .nav {
     display: flex;
     flex-direction: column;
-    gap: var(--s-1);
+    gap: var(--s-3);
     flex: 1;
   }
+  /* 23-UX-11 grouped nav. Head labels only appear on hover-expand. */
+  .nav-group { display: flex; flex-direction: column; gap: var(--s-1); }
+  .nav-group-head {
+    padding: 0 var(--s-3);
+    font-size: var(--fs-2xs);
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-label);
+    color: var(--fg-faint);
+    font-weight: 600;
+    opacity: 0;
+    transition: opacity var(--dur-base) var(--ease-out);
+    height: 1.5em;
+  }
+  .sidebar:hover .nav-group-head { opacity: 1; }
   .nav-item {
     display: flex;
     align-items: center;

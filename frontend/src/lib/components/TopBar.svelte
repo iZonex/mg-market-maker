@@ -5,6 +5,8 @@
   // Sits above the main content area so the operator's context
   // (which symbol am I looking at, how fresh is the data, what
   // mode are we in) never scrolls off-screen.
+  import { createApiClient } from '../api.svelte.js'
+
   let {
     symbols = [],
     activeSymbol = '',
@@ -14,7 +16,46 @@
     auth,
     route = 'overview',
     symData = {},
+    // 23-UX-10 — max kill_level across every symbol the WS has
+    // published. Surfaces a global kill badge in the TopBar so
+    // operators see L2+ from any page, not just Admin.
+    maxKillLevel = 0,
+    onKillClick = () => {},
   } = $props()
+
+  // 23-UX-12 — client scope selector. Operators running multiple
+  // clients on one engine need to filter which client's legs
+  // they're watching. Empty string = "all clients".
+  const api = createApiClient(auth)
+  let clients = $state([])
+  let activeClient = $state('') // '' = all
+  let clientMenuOpen = $state(false)
+
+  async function refreshClients() {
+    try {
+      clients = await api.getJson('/api/v1/clients')
+    } catch (_) { clients = [] }
+  }
+  $effect(() => {
+    refreshClients()
+    const id = setInterval(refreshClients, 30_000)
+    return () => clearInterval(id)
+  })
+
+  function pickClient(id) {
+    activeClient = id
+    clientMenuOpen = false
+    // When a client is picked, jump to the first symbol owned
+    // by that client (if any) so the Overview refreshes to a
+    // matching context. "" (all) leaves the symbol alone.
+    if (id) {
+      const c = clients.find(c => c.id === id)
+      if (c && c.symbols.length > 0 && !c.symbols.includes(activeSymbol)) {
+        onSymbolChange?.(c.symbols[0])
+      }
+    }
+  }
+  const clientLabel = $derived(activeClient || 'all clients')
 
   const strategy = $derived(symData?.strategy || '—')
   const venue = $derived(symData?.venue || '—')
@@ -41,16 +82,31 @@
     admin: 'Admin',
   }[route] || 'Overview')
 
+  // 23-UX-10 — badge severity + label per kill level.
+  const killSev = $derived(
+    maxKillLevel === 0 ? 'ok'
+      : maxKillLevel === 1 ? 'warn'
+        : 'neg'
+  )
+  const killLabel = $derived({
+    0: 'NOMINAL',
+    1: 'WIDEN',
+    2: 'STOP',
+    3: 'CANCEL',
+    4: 'FLATTEN',
+    5: 'DISC',
+  }[maxKillLevel] || 'NOMINAL')
+
   let symbolMenuOpen = $state(false)
   let userMenuOpen = $state(false)
   function pickSymbol(s) {
     onSymbolChange?.(s)
     symbolMenuOpen = false
   }
-  function closeMenus() { symbolMenuOpen = false; userMenuOpen = false }
+  function closeMenus() { symbolMenuOpen = false; userMenuOpen = false; clientMenuOpen = false }
   function onGlobalClick(e) {
     // Close dropdowns when user clicks outside them.
-    if (!(e.target.closest('.symbol-picker') || e.target.closest('.user-menu-wrap'))) {
+    if (!(e.target.closest('.symbol-picker') || e.target.closest('.user-menu-wrap') || e.target.closest('.client-picker'))) {
       closeMenus()
     }
   }
@@ -78,6 +134,34 @@
   <div class="context">
     <span class="crumb-route">{routeLabel}</span>
     <span class="crumb-sep">/</span>
+    <!-- 23-UX-12 client selector, visible when any clients are
+         registered so single-client deployments don't see a
+         useless "all clients" dropdown. -->
+    {#if clients.length > 0}
+      <div class="client-picker">
+        <button class="btn btn-ghost btn-sm symbol-btn" onclick={() => (clientMenuOpen = !clientMenuOpen)} aria-haspopup="listbox" aria-expanded={clientMenuOpen} title="Client scope">
+          <span class="client-tag">client:</span>
+          <span class="client-name num">{clientLabel}</span>
+          <Icon name="chevronDown" size={14} />
+        </button>
+        {#if clientMenuOpen}
+          <div class="symbol-menu card-glass scroll">
+            <button class="sym-opt" class:active={activeClient === ''} onclick={() => pickClient('')}>
+              <span>all clients</span>
+              {#if activeClient === ''}<Icon name="check" size={12} />{/if}
+            </button>
+            {#each clients as c (c.id)}
+              <button class="sym-opt" class:active={c.id === activeClient} onclick={() => pickClient(c.id)}>
+                <span class="num">{c.id}</span>
+                <span class="muted small">{c.symbols.length}</span>
+              </button>
+            {/each}
+          </div>
+        {/if}
+      </div>
+      <span class="crumb-sep">/</span>
+    {/if}
+
     <div class="symbol-picker">
       <button class="btn btn-ghost btn-sm symbol-btn" onclick={() => (symbolMenuOpen = !symbolMenuOpen)} aria-haspopup="listbox" aria-expanded={symbolMenuOpen}>
         <span class="sym-ticker num">{activeSymbol || '—'}</span>
@@ -113,6 +197,20 @@
         {/if}
       </span>
     </div>
+
+    <!-- 23-UX-10 global kill-switch indicator. Visible on every
+         page, clicking jumps to Admin where Controls is mounted. -->
+    <button
+      type="button"
+      class="kill-badge kill-{killSev}"
+      class:kill-alarm={maxKillLevel >= 2}
+      onclick={onKillClick}
+      title={`Kill switch (max across symbols): L${maxKillLevel} — click to open Admin`}
+    >
+      <span class="kill-dot"></span>
+      <span class="kill-level">L{maxKillLevel}</span>
+      <span class="kill-label">{killLabel}</span>
+    </button>
 
     <div class="ctx-chips">
       <span class="chip chip-{modeSev}" title="Engine mode">{mode.toUpperCase()}</span>
@@ -206,6 +304,22 @@
   }
 
   .symbol-picker { position: relative; }
+  .client-picker { position: relative; }
+  .client-tag {
+    font-size: var(--fs-2xs);
+    color: var(--fg-muted);
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-label);
+    font-weight: 600;
+    margin-right: 4px;
+  }
+  .client-name {
+    font-weight: 600;
+    font-size: var(--fs-sm);
+    color: var(--fg-primary);
+  }
+  .muted { color: var(--fg-muted); }
+  .small { font-size: var(--fs-2xs); }
   .symbol-btn {
     padding: 0 var(--s-3);
   }
@@ -290,6 +404,44 @@
   .chip-key  { color: var(--fg-secondary); text-transform: uppercase; font-weight: 600; }
   .chip-val  { color: var(--fg-muted); text-transform: uppercase; }
   .chip-sep  { color: var(--fg-faint); }
+
+  /* 23-UX-10 kill-switch badge. */
+  .kill-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 24px;
+    padding: 0 var(--s-3);
+    border-radius: var(--r-pill);
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-chip);
+    color: var(--fg-muted);
+    font-family: var(--font-mono);
+    font-size: var(--fs-2xs);
+    font-weight: 700;
+    letter-spacing: var(--tracking-label);
+    cursor: pointer;
+    transition: background var(--dur-fast) var(--ease-out),
+                border-color var(--dur-fast) var(--ease-out);
+  }
+  .kill-badge:hover { border-color: var(--border-default); }
+  .kill-badge.kill-ok   { color: var(--pos);  background: var(--pos-bg);  border-color: rgba(34, 197, 94, 0.3); }
+  .kill-badge.kill-warn { color: var(--warn); background: var(--warn-bg); border-color: rgba(245, 158, 11, 0.3); }
+  .kill-badge.kill-neg  { color: var(--neg);  background: var(--neg-bg);  border-color: rgba(239, 68, 68, 0.35); }
+  .kill-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+  .kill-badge.kill-alarm .kill-dot {
+    animation: killPulse 0.7s ease-in-out infinite;
+  }
+  @keyframes killPulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50%      { opacity: 0.3; transform: scale(0.6); }
+  }
+  .kill-level { opacity: 0.85; }
+  .kill-label { font-weight: 600; }
   .freshness.fresh .freshness-dot {
     animation: pulseDot 1.8s ease-in-out infinite;
   }

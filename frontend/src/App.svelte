@@ -33,6 +33,19 @@
   const symData = $derived(ws.state.data[activeSymbol] || {})
   const rxMs = $derived(symData._rx_ms ?? null)
 
+  // 23-UX-10 — global kill-switch state for TopBar indicator.
+  // Takes the max kill_level across every symbol the WS has
+  // seen — if ANY leg is in cancel/flatten/disconnect we want
+  // that visible from every page, not buried on Admin.
+  const maxKillLevel = $derived.by(() => {
+    let max = 0
+    for (const s of Object.values(ws.state.data || {})) {
+      const lvl = parseInt(s?.kill_level ?? 0, 10)
+      if (Number.isFinite(lvl) && lvl > max) max = lvl
+    }
+    return max
+  })
+
   // Detect engine mode from the status payload if the backend
   // surfaces it; default to "paper" so the chip matches the
   // default run mode.
@@ -56,6 +69,8 @@
         {auth}
         {route}
         {symData}
+        {maxKillLevel}
+        onKillClick={() => (route = 'admin')}
       />
       {#if demo}
         <div class="demo-banner">
