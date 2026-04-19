@@ -207,6 +207,72 @@ impl RegimeDetector {
         }
         cov / var
     }
+
+    /// 22B-3 — snapshot the returns ring + current regime so a
+    /// restart doesn't drop the detection window (default 100
+    /// samples) and default the regime back to `Quiet`. Without
+    /// this, a 10-sample minimum is required before the detector
+    /// re-classifies anything — up to ~10 minutes of Quiet
+    /// mis-labelling before the window refills.
+    pub fn snapshot_state(&self) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "window": self.window,
+            "current_regime": regime_label(self.current_regime),
+            "returns": self.returns.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+        })
+    }
+
+    /// 22B-3 — restore the detector from a prior snapshot.
+    /// Silently truncates a returns buffer that exceeds the
+    /// current `window` cap so operators can shrink the detector
+    /// window without a restore failure.
+    pub fn restore_state(&mut self, state: &serde_json::Value) -> Result<(), String> {
+        let schema = state.get("schema_version").and_then(|v| v.as_u64());
+        if schema != Some(1) {
+            return Err(format!(
+                "autotune checkpoint has unsupported schema_version {schema:?}"
+            ));
+        }
+        let regime_str = state
+            .get("current_regime")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "autotune: missing current_regime".to_string())?;
+        let current_regime = parse_regime(regime_str)
+            .ok_or_else(|| format!("autotune: unknown regime '{regime_str}'"))?;
+        let mut returns: VecDeque<Decimal> = state
+            .get("returns")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "autotune: missing returns".to_string())?
+            .iter()
+            .filter_map(|v| v.as_str()?.parse::<Decimal>().ok())
+            .collect();
+        while returns.len() > self.window {
+            returns.pop_front();
+        }
+        self.returns = returns;
+        self.current_regime = current_regime;
+        Ok(())
+    }
+}
+
+fn regime_label(r: MarketRegime) -> &'static str {
+    match r {
+        MarketRegime::Quiet => "quiet",
+        MarketRegime::Trending => "trending",
+        MarketRegime::Volatile => "volatile",
+        MarketRegime::MeanReverting => "mean_reverting",
+    }
+}
+
+fn parse_regime(s: &str) -> Option<MarketRegime> {
+    match s {
+        "quiet" => Some(MarketRegime::Quiet),
+        "trending" => Some(MarketRegime::Trending),
+        "volatile" => Some(MarketRegime::Volatile),
+        "mean_reverting" => Some(MarketRegime::MeanReverting),
+        _ => None,
+    }
 }
 
 /// Heuristic and Hurst agree iff they point at the same
@@ -1160,5 +1226,50 @@ mod tests {
         t.set_lead_lag_mult(dec!(2));
         t.set_news_retreat_mult(dec!(3));
         assert_eq!(t.effective_spread_mult(), base * dec!(6));
+    }
+
+    /// 22B-3 — RegimeDetector snapshot/restore preserves the
+    /// returns window + current_regime across a process boundary.
+    #[test]
+    fn regime_detector_snapshot_restore_round_trip() {
+        let mut src = RegimeDetector::new(50);
+        // Feed volatile returns to push the detector off Quiet.
+        for i in 0..60 {
+            let r = if i % 2 == 0 { dec!(0.01) } else { dec!(-0.01) };
+            src.update(r);
+        }
+        let before_regime = src.regime();
+        let before_samples = src.returns.len();
+        let snap = src.snapshot_state();
+
+        let mut dst = RegimeDetector::new(50);
+        dst.restore_state(&snap).unwrap();
+        assert_eq!(dst.regime(), before_regime);
+        assert_eq!(dst.returns.len(), before_samples);
+    }
+
+    #[test]
+    fn regime_detector_restore_rejects_wrong_schema() {
+        let mut d = RegimeDetector::new(10);
+        let bogus = serde_json::json!({
+            "schema_version": 99,
+            "window": 10,
+            "current_regime": "quiet",
+            "returns": [],
+        });
+        assert!(d.restore_state(&bogus).is_err());
+    }
+
+    #[test]
+    fn regime_detector_restore_truncates_oversize_window() {
+        // Source has 200 samples; destination has a 50-sample cap.
+        let mut src = RegimeDetector::new(200);
+        for i in 0..200 {
+            src.update(Decimal::new(i as i64, 4));
+        }
+        let snap = src.snapshot_state();
+        let mut dst = RegimeDetector::new(50);
+        dst.restore_state(&snap).unwrap();
+        assert_eq!(dst.returns.len(), 50);
     }
 }

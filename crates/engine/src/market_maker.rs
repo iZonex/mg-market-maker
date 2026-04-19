@@ -1354,6 +1354,19 @@ impl MarketMakerEngine {
                 ),
             }
         }
+        if let Some(v) = checkpoint.engine_state.get("autotune") {
+            match self.auto_tuner.regime_detector.restore_state(v) {
+                Ok(()) => tracing::info!(
+                    symbol = %self.symbol,
+                    "autotune regime detector restored from checkpoint"
+                ),
+                Err(e) => tracing::warn!(
+                    symbol = %self.symbol,
+                    error = %e,
+                    "autotune restore_state failed — starting fresh"
+                ),
+            }
+        }
 
         self.audit.risk_event(
             &self.symbol,
@@ -1400,6 +1413,10 @@ impl MarketMakerEngine {
         if let Some(v) = self.adaptive_tuner.snapshot_state() {
             map.insert("adaptive".to_string(), v);
         }
+        map.insert(
+            "autotune".to_string(),
+            self.auto_tuner.regime_detector.snapshot_state(),
+        );
         map
     }
 
