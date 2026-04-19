@@ -12,6 +12,7 @@
   import FundingPanel from '../components/FundingPanel.svelte'
   import PerLegInventoryChart from '../components/PerLegInventoryChart.svelte'
   import PerLegPnl from '../components/PerLegPnl.svelte'
+  import BasisMonitor from '../components/BasisMonitor.svelte'
 
   let { ws, auth } = $props()
 
@@ -67,6 +68,13 @@
   <div class="row row-1">
     <Card title="Funding state" subtitle="per-leg rate + settlement countdown">
       {#snippet children()}<FundingPanel {auth} />{/snippet}
+    </Card>
+  </div>
+
+  <!-- Row 2.8: Basis monitor (full width) -->
+  <div class="row row-1">
+    <Card title="Basis monitor" subtitle="cross-venue / spot-vs-perp divergence">
+      {#snippet children()}<BasisMonitor {auth} />{/snippet}
     </Card>
   </div>
 

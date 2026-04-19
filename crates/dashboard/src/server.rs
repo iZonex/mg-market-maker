@@ -93,6 +93,7 @@ pub async fn start(
             "/api/v1/history/inventory/per_leg",
             get(per_leg_inventory_history),
         )
+        .route("/api/v1/basis", get(basis_monitor))
         .route("/api/v1/sor/decisions/recent", get(sor_decisions_recent))
         .route("/api/v1/atomic-bundles/inflight", get(atomic_bundles_inflight))
         .route("/api/v1/rebalance/recommendations", get(rebalance_recommendations))
@@ -2219,6 +2220,116 @@ async fn per_leg_inventory_history(
     axum::extract::Query(q): axum::extract::Query<PerLegHistoryQuery>,
 ) -> Json<Vec<crate::state::PerLegInventoryHistory>> {
     Json(state.per_leg_inventory_timeseries(q.base.as_deref()))
+}
+
+/// 23-UX-5 — cross-venue / spot-vs-perp basis snapshot. For
+/// every base asset with ≥ 2 L1 entries, compute each pairwise
+/// basis in bps against the reference (the cheapest spot leg
+/// if present, else the lowest-mid leg).
+#[derive(serde::Serialize)]
+struct BasisRow {
+    base_asset: String,
+    reference_venue: String,
+    reference_symbol: String,
+    reference_product: String,
+    reference_mid: rust_decimal::Decimal,
+    legs: Vec<BasisLeg>,
+}
+
+#[derive(serde::Serialize)]
+struct BasisLeg {
+    venue: String,
+    symbol: String,
+    product: String,
+    mid: rust_decimal::Decimal,
+    /// Basis vs reference, in bps. `(mid - ref_mid) / ref_mid *
+    /// 10_000`. Sign preserved — positive = premium.
+    basis_bps: rust_decimal::Decimal,
+}
+
+async fn basis_monitor(State(state): State<DashboardState>) -> Json<Vec<BasisRow>> {
+    use rust_decimal::Decimal;
+    let entries = state.data_bus().l1_entries();
+
+    // Group legs by inferred base asset.
+    let mut by_base: std::collections::HashMap<String, Vec<(crate::data_bus::StreamKey, Decimal)>> =
+        std::collections::HashMap::new();
+    for (key, snap) in entries {
+        let Some(mid) = snap.mid else { continue };
+        if mid <= Decimal::ZERO {
+            continue;
+        }
+        let base = mm_portfolio::infer_base_asset(&key.1);
+        // Prefix-trim common quote suffixes so BTCUSDT and
+        // BTCUSDC group together. infer_base_asset returns
+        // the whole symbol when no separator, so strip the
+        // trailing USDT/USDC/USD/BUSD if present.
+        let base_trimmed = trim_quote_suffix(&base);
+        by_base
+            .entry(base_trimmed.to_string())
+            .or_default()
+            .push((key, mid));
+    }
+
+    let mut out = Vec::new();
+    for (base, mut legs) in by_base {
+        if legs.len() < 2 {
+            continue;
+        }
+        // Pick reference: prefer spot (lowest product ordinal),
+        // then cheapest mid.
+        legs.sort_by(|a, b| {
+            let ord = product_ordinal(a.0 .2).cmp(&product_ordinal(b.0 .2));
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+            a.1.cmp(&b.1)
+        });
+        let (ref_key, ref_mid) = legs[0].clone();
+        let leg_rows: Vec<BasisLeg> = legs
+            .into_iter()
+            .map(|(k, mid)| {
+                let basis_bps = (mid - ref_mid) / ref_mid * Decimal::from(10_000);
+                BasisLeg {
+                    venue: k.0,
+                    symbol: k.1,
+                    product: format!("{:?}", k.2).to_lowercase(),
+                    mid,
+                    basis_bps,
+                }
+            })
+            .collect();
+        out.push(BasisRow {
+            base_asset: base,
+            reference_venue: ref_key.0,
+            reference_symbol: ref_key.1,
+            reference_product: format!("{:?}", ref_key.2).to_lowercase(),
+            reference_mid: ref_mid,
+            legs: leg_rows,
+        });
+    }
+    out.sort_by(|a, b| a.base_asset.cmp(&b.base_asset));
+    Json(out)
+}
+
+fn trim_quote_suffix(sym: &str) -> &str {
+    for q in ["USDT", "USDC", "USD", "BUSD", "DAI"] {
+        if let Some(stripped) = sym.strip_suffix(q) {
+            if !stripped.is_empty() {
+                return stripped;
+            }
+        }
+    }
+    sym
+}
+
+fn product_ordinal(p: mm_common::config::ProductType) -> u8 {
+    use mm_common::config::ProductType;
+    match p {
+        ProductType::Spot => 0,
+        ProductType::LinearPerp => 1,
+        ProductType::InversePerp => 2,
+    }
 }
 
 async fn venues_funding_state(

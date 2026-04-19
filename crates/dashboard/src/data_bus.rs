@@ -172,6 +172,17 @@ impl DataBus {
             .unwrap_or_default()
     }
 
+    /// 23-UX-5 — snapshot of every L1 book so the BasisMonitor
+    /// can compute spot-vs-perp basis + cross-venue mid
+    /// divergence without per-key lookups.
+    pub fn l1_entries(&self) -> Vec<(StreamKey, BookL1Snapshot)> {
+        self.books_l1
+            .read()
+            .ok()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default()
+    }
+
     pub fn get_balance(&self, venue: &str, asset: &str) -> Option<BalanceEntry> {
         self.balances
             .read()
