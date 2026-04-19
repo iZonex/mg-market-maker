@@ -36,6 +36,7 @@ static PENTEST_SPOOF_CLASSIC: &str = include_str!("../templates/pentest/spoof-cl
 static PENTEST_PUMP_AND_DUMP: &str = include_str!("../templates/pentest/pump-and-dump.json");
 static PENTEST_RAVE_CYCLE: &str = include_str!("../templates/pentest/rave-cycle.json");
 static PENTEST_RAVE_FULL_CAMPAIGN: &str = include_str!("../templates/pentest/rave-full-campaign.json");
+static PENTEST_LIQUIDATION_CASCADE: &str = include_str!("../templates/pentest/liquidation-cascade.json");
 static RUG_DETECTOR_COMPOSITE: &str = include_str!("../templates/rug-detector-composite.json");
 static FUNDING_AWARE_QUOTER: &str = include_str!("../templates/funding-aware-quoter.json");
 static LIQUIDITY_BURN_GUARD: &str = include_str!("../templates/liquidity-burn-guard.json");
@@ -140,6 +141,11 @@ const BUILTIN: &[BuiltinTemplate] = &[
         name: "pentest-rave-full-campaign",
         description: "⚠⚠⚠ PENTEST ONLY — FULL MULTI-PHASE RAVE CAMPAIGN. CampaignOrchestrator chains accumulate → leverage_long → liquidation_hunt → distribute → dump across the configured timeline. Surveillance.RugScore self-guard trips kill L4 on ≥ 0.5. Running this against any venue you don't own / aren't explicitly authorized to pentest is illegal under MiFID II / Dodd-Frank / MiCA and a ToS violation everywhere. Requires MM_RESTRICTED_ALLOW=1. OPERATOR MUST CONFIRM: (1) authorized pentest only, (2) own exchange or written authorization, (3) compliance review complete. THIS TOOL IS A PENTEST INSTRUMENT, NOT AN ATTACK KIT.",
         body: PENTEST_RAVE_FULL_CAMPAIGN,
+    },
+    BuiltinTemplate {
+        name: "pentest-liquidation-cascade",
+        description: "⚠⚠⚠ PENTEST ONLY — LIQUIDATION CASCADE TRIGGER. Combines Signal.LongShortRatio (crowd positioning) + Signal.LiquidationLevelEstimate (forward-looking cluster distance) → Strategy.CascadeHunter (gated crossing push). Surveillance.RugScore self-guard fires at 0.5. Reproduces the 2021-05 BTC flash-crash pattern (see docs/research/liquidation-cascades.md for the full public-investigation reference). Running this on any venue you don't own or aren't explicitly authorized to pentest is market manipulation under MAR Article 12 / CEA §9(a) / MiCA Article 92 and a ToS violation everywhere. Requires MM_RESTRICTED_ALLOW=1 + written venue-owner authorization + compliance review sign-off before deploy.",
+        body: PENTEST_LIQUIDATION_CASCADE,
     },
 ];
 

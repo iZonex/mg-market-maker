@@ -1433,6 +1433,89 @@ impl NodeKind for CampaignOrchestrator {
     }
 }
 
+/// ⚠ RESTRICTED — `Strategy.CascadeHunter` — gated liquidation-
+/// cascade trigger. Takes a `target_bps` input (from
+/// `Signal.LiquidationLevelEstimate` or
+/// `Surveillance.LiquidationHeatmap::nearest_above_bps`) and
+/// a `trigger` bool (typically a composite of
+/// `Signal.LongShortRatio > threshold` AND a size condition).
+/// Emits a single crossing order aimed at the target when the
+/// trigger is true.
+///
+/// Unlike `Strategy.LiquidationHunt` which hunts on every
+/// tick, this node is one-shot-per-tick and explicitly gated
+/// by a graph condition the operator controls — the idea is
+/// to couple attack timing to a visible crowd-side signal
+/// (e.g. "only hunt when longs are > 70 % of accounts AND
+/// heatmap shows a cluster within 200 bps"). Honest MM side:
+/// operators validate their own surveillance catches the
+/// full attack-defense loop with this node + RugScore +
+/// CascadeCompleted in one template.
+///
+/// Pentest only, restricted behind `MM_RESTRICTED_ALLOW=1`.
+#[derive(Debug, Default)]
+pub struct CascadeHunter;
+
+static CASCADE_HUNTER_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
+    vec![
+        Port::new("target_bps", PortType::Number),
+        Port::new("trigger", PortType::Bool),
+    ]
+});
+
+impl NodeKind for CascadeHunter {
+    fn kind(&self) -> &'static str {
+        "Strategy.CascadeHunter"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &CASCADE_HUNTER_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUOTES_OUT
+    }
+    fn restricted(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<ConfigField> {
+        vec![
+            ConfigField {
+                name: "push_size",
+                label: "⚠ Push size",
+                hint: Some("Per-fire cross qty when triggered. Pentest venue only."),
+                default: serde_json::json!("0.005"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+            ConfigField {
+                name: "side",
+                label: "⚠ Push side",
+                hint: Some("Which cluster to hunt — buy = pushes up into short-liq cluster; sell = pushes down into long-liq cluster."),
+                default: serde_json::json!("sell"),
+                widget: ConfigWidget::Enum {
+                    options: vec![
+                        ConfigEnumOption { value: "buy", label: "Buy (short-squeeze)" },
+                        ConfigEnumOption { value: "sell", label: "Sell (long-squeeze)" },
+                    ],
+                },
+            },
+            ConfigField {
+                name: "max_bps_overshoot",
+                label: "⚠ Max bps past cluster",
+                hint: Some("How far to overshoot the target_bps input to guarantee the cluster triggers."),
+                default: serde_json::json!("10"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: Some(200.0), step: Some(1.0) },
+            },
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

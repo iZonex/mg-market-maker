@@ -267,6 +267,26 @@ pub struct VenueCapabilities {
     pub supports_set_leverage: bool,
 }
 
+/// R7.1 — long/short account ratio on perp markets. Venues
+/// expose this to show aggregate positioning of their retail
+/// users. Pump-and-dump campaign authors consume it to tell
+/// when the crowd is one-sided enough to build a squeeze into.
+/// Consumers: the honest MM (widen when positioning is
+/// extreme, mean-revert is likely); the pentest operator
+/// (target cluster that corresponds to the majority side).
+#[derive(Debug, Clone)]
+pub struct LongShortRatio {
+    pub symbol: String,
+    /// Fraction of accounts that are net-long (0..=1).
+    pub long_pct: rust_decimal::Decimal,
+    /// Fraction of accounts that are net-short (0..=1).
+    pub short_pct: rust_decimal::Decimal,
+    /// `long_pct / short_pct`. `1.0` = balanced; `> 2.0` =
+    /// crowd one-sided long; `< 0.5` = crowd one-sided short.
+    pub ratio: rust_decimal::Decimal,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
 /// R6.3 — per-symbol open-interest snapshot. `oi_contracts` is
 /// the raw contract / coin count; `oi_usd` is the notional when
 /// the venue reports it. One of the two may be `None` —
@@ -628,6 +648,18 @@ pub trait ExchangeConnector: Send + Sync {
         &self,
         _symbol: &str,
     ) -> anyhow::Result<Option<OpenInterestInfo>> {
+        Ok(None)
+    }
+
+    /// R7.1 — long/short account ratio for `symbol`. Returns
+    /// `Ok(None)` when the venue exposes an endpoint but the
+    /// response was empty. Spot / custom override to return
+    /// `None` directly — L/S ratio is a perp positioning
+    /// concept.
+    async fn get_long_short_ratio(
+        &self,
+        _symbol: &str,
+    ) -> anyhow::Result<Option<LongShortRatio>> {
         Ok(None)
     }
 

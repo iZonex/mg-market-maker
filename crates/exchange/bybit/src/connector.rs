@@ -634,6 +634,62 @@ impl ExchangeConnector for BybitConnector {
         }))
     }
 
+    async fn get_long_short_ratio(
+        &self,
+        symbol: &str,
+    ) -> anyhow::Result<Option<mm_exchange_core::connector::LongShortRatio>> {
+        // R7.1 — Bybit V5 `/v5/market/account-ratio?category=
+        // linear&symbol=BTCUSDT&period=5min&limit=1`. Returns
+        // `{"result":{"list":[{"symbol":...,"buyRatio":"0.55",
+        //   "sellRatio":"0.45","timestamp":"1700000000000"}]}}`.
+        if !self.category.has_funding() {
+            return Ok(None);
+        }
+        let params = format!(
+            "category={}&symbol={symbol}&period=5min&limit=1",
+            self.category.as_str()
+        );
+        let url = format!("{}/v5/market/account-ratio?{params}", self.base_url);
+        let resp: Value = self.client.get(&url).send().await?.json().await?;
+        let list = resp
+            .get("result")
+            .and_then(|r| r.get("list"))
+            .and_then(|l| l.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let Some(row) = list.first() else {
+            return Ok(None);
+        };
+        let long_pct = row
+            .get("buyRatio")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Decimal>().ok())
+            .unwrap_or(Decimal::ZERO);
+        let short_pct = row
+            .get("sellRatio")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Decimal>().ok())
+            .unwrap_or(Decimal::ZERO);
+        let ratio = if short_pct.is_zero() {
+            Decimal::ZERO
+        } else {
+            long_pct / short_pct
+        };
+        let ts_ms = row
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        Ok(Some(mm_exchange_core::connector::LongShortRatio {
+            symbol: symbol.to_string(),
+            long_pct,
+            short_pct,
+            ratio,
+            timestamp: chrono::DateTime::from_timestamp_millis(ts_ms)
+                .unwrap_or_else(chrono::Utc::now),
+        }))
+    }
+
     async fn get_funding_rate(&self, symbol: &str) -> Result<FundingRate, FundingRateError> {
         if !self.category.has_funding() {
             return Err(FundingRateError::NotSupported);

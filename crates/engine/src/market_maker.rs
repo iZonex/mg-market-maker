@@ -438,6 +438,9 @@ pub struct MarketMakerEngine {
     /// venues; graph source falls back to the liquidation-feed
     /// proxy in that case.
     last_open_interest: Option<rust_decimal::Decimal>,
+    /// R7.1 — last polled long/short account ratio. Same
+    /// cadence + fallback story as `last_open_interest`.
+    last_long_short: Option<mm_exchange_core::connector::LongShortRatio>,
     /// Regulatory OTR counter: `(adds + 2·updates + cancels) /
     /// max(trades, 1) - 1`. Exported into the audit trail and
     /// Prometheus. Market-quality / spoofing proxy tracked for
@@ -938,6 +941,7 @@ impl MarketMakerEngine {
             },
             liquidation_heatmap: mm_risk::liquidation_heatmap::LiquidationHeatmap::new(),
             last_open_interest: None,
+            last_long_short: None,
             otr: OrderToTradeRatio::new(),
             tiered_otr: mm_risk::otr::TieredOtrTracker::new(),
             inventory_drift: InventoryDriftReconciler::new(
@@ -2408,6 +2412,41 @@ impl MarketMakerEngine {
                     };
                     Some(Box::new(
                         mm_strategy::exploits::NonFillStrategy::with_config(c),
+                    ))
+                }
+                // ⚠ R7.4 — CascadeHunter pentest wrapper.
+                // V1 reuses IgniteStrategy: crossing one-shot
+                // burst scaled by `push_size`. The graph's
+                // `trigger` input gates the node — when it
+                // reports false the surrounding evaluator
+                // Value::Missing propagation keeps the
+                // strategy idle.
+                "Strategy.CascadeHunter" => {
+                    let cfg = &n.config;
+                    let parse_dec = |k: &str, default: rust_decimal::Decimal| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(default)
+                    };
+                    let side = match cfg
+                        .get("side")
+                        .and_then(|v| v.as_str())
+                    {
+                        Some("buy") => mm_common::types::Side::Buy,
+                        _ => mm_common::types::Side::Sell,
+                    };
+                    let push_size = parse_dec("push_size", dec!(0.005));
+                    let overshoot = parse_dec("max_bps_overshoot", dec!(10));
+                    let hunt_cfg = mm_strategy::ignite::IgniteConfig {
+                        push_side: side,
+                        burst_size: push_size,
+                        cross_depth_bps: overshoot,
+                        burst_ticks: 1,
+                        rest_ticks: 5,
+                    };
+                    Some(Box::new(
+                        mm_strategy::ignite::IgniteStrategy::with_config(hunt_cfg),
                     ))
                 }
                 // ⚠ R4.3 — LiquidationHunt pentest wrapper.
@@ -4096,6 +4135,64 @@ impl MarketMakerEngine {
                         }
                     };
                     src.insert((*id, "value".into()), v);
+                }
+                // R7.1 — Signal.LongShortRatio. `Missing` on
+                // cold tracker / spot venues; graph source
+                // emits 3 numbers when data available.
+                "Signal.LongShortRatio" => {
+                    match self.last_long_short.as_ref() {
+                        Some(ls) => {
+                            src.insert((*id, "long_pct".into()), Value::Number(ls.long_pct));
+                            src.insert((*id, "short_pct".into()), Value::Number(ls.short_pct));
+                            src.insert((*id, "ratio".into()), Value::Number(ls.ratio));
+                        }
+                        None => {
+                            src.insert((*id, "long_pct".into()), Value::Missing);
+                            src.insert((*id, "short_pct".into()), Value::Missing);
+                            src.insert((*id, "ratio".into()), Value::Missing);
+                        }
+                    }
+                }
+                // R7.2 — Signal.LiquidationLevelEstimate. Pure
+                // math from config `avg_leverage` + mid.
+                // Leveraged long liquidates at `-10_000 / leverage`
+                // bps from entry (roughly). Assumes entry ≈ mid
+                // for V1 — a VWAP-based entry estimator is a
+                // later extension.
+                "Signal.LiquidationLevelEstimate" => {
+                    let cfg = graph.node_configs().get(id);
+                    let leverage = cfg
+                        .and_then(|c| c.get("avg_leverage"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(10)
+                        .max(1);
+                    // liquidation bps = 10_000 / leverage. Longs
+                    // go liq BELOW entry (negative), shorts ABOVE.
+                    let bps = rust_decimal::Decimal::from(10_000u64)
+                        / rust_decimal::Decimal::from(leverage);
+                    src.insert(
+                        (*id, "long_liq_bps".into()),
+                        Value::Number(-bps),
+                    );
+                    src.insert(
+                        (*id, "short_liq_bps".into()),
+                        Value::Number(bps),
+                    );
+                }
+                // R7.3 — Signal.CascadeCompleted. Reads the
+                // liquidation heatmap's total notional, compares
+                // to config threshold, emits Bool. Default
+                // threshold is 100k notional.
+                "Signal.CascadeCompleted" => {
+                    let cfg = graph.node_configs().get(id);
+                    let threshold: rust_decimal::Decimal = cfg
+                        .and_then(|c| c.get("threshold_notional"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or_else(|| rust_decimal_macros::dec!(100_000));
+                    let fired = self.liquidation_heatmap.total_notional() >= threshold
+                        && !threshold.is_zero();
+                    src.insert((*id, "value".into()), Value::Bool(fired));
                 }
                 // R2.11 — listing-age score.
                 "Surveillance.ListingAge" => {
@@ -7078,6 +7175,15 @@ impl MarketMakerEngine {
                 .await
             {
                 self.last_open_interest = oi.oi_usd.or(oi.oi_contracts);
+            }
+            // R7.1 — same cadence, long/short ratio.
+            if let Ok(Some(ls)) = self
+                .connectors
+                .primary
+                .get_long_short_ratio(&self.symbol)
+                .await
+            {
+                self.last_long_short = Some(ls);
             }
         }
     }

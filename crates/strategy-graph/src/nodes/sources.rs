@@ -1218,6 +1218,148 @@ impl NodeKind for OpenInterestSource {
     }
 }
 
+/// R7.1 — `Signal.LongShortRatio` — aggregate retail long vs
+/// short positioning on the running symbol. Three outputs:
+///   * `long_pct` — fraction of accounts net-long (0..=1)
+///   * `short_pct` — fraction net-short (0..=1)
+///   * `ratio` — long_pct / short_pct; 1.0 balanced
+///
+/// Honest MMs widen when positioning is extreme (reversion
+/// likely); pentest operators target the crowded side.
+/// Missing when the venue doesn't expose the endpoint.
+#[derive(Debug, Default)]
+pub struct LongShortRatioSource;
+
+static LONG_SHORT_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
+    vec![
+        Port::new("long_pct", PortType::Number),
+        Port::new("short_pct", PortType::Number),
+        Port::new("ratio", PortType::Number),
+    ]
+});
+
+impl NodeKind for LongShortRatioSource {
+    fn kind(&self) -> &'static str {
+        "Signal.LongShortRatio"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &LONG_SHORT_OUTPUTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing; 3])
+    }
+}
+
+/// R7.2 — `Signal.LiquidationLevelEstimate` — forward-looking
+/// distance (bps from mid) to the estimated average
+/// liquidation level, assuming a configured average leverage
+/// across open positions.
+///
+/// Config: `avg_leverage` (default 10). Pure math from current
+/// mid — no venue call. Outputs:
+///   * `long_liq_bps` — expected bps below mid where leveraged
+///     longs get liquidated
+///   * `short_liq_bps` — expected bps above mid where
+///     leveraged shorts get liquidated
+///
+/// Honest reading: these are ESTIMATES built on an assumption.
+/// Real liquidation distribution depends on the full entry
+/// price distribution, which venues don't expose. Treat
+/// outputs as order-of-magnitude hints — never tight triggers
+/// without corroboration from `Surveillance.LiquidationHeatmap`.
+#[derive(Debug, Default)]
+pub struct LiquidationLevelEstimateSource;
+
+static LIQ_LEVEL_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
+    vec![
+        Port::new("long_liq_bps", PortType::Number),
+        Port::new("short_liq_bps", PortType::Number),
+    ]
+});
+
+impl NodeKind for LiquidationLevelEstimateSource {
+    fn kind(&self) -> &'static str {
+        "Signal.LiquidationLevelEstimate"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &LIQ_LEVEL_OUTPUTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing; 2])
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![
+            ConfigField {
+                name: "avg_leverage",
+                label: "Assumed average leverage",
+                hint: Some("Rough average across observed positions. 10x = longs liquidate ~950 bps below entry."),
+                default: serde_json::json!(10),
+                widget: ConfigWidget::Integer { min: Some(1), max: Some(100) },
+            },
+        ]
+    }
+}
+
+/// R7.3 — `Signal.CascadeCompleted` — boolean that flips
+/// `true` when liquidation notional in the rolling window
+/// exceeds `threshold_notional`. Downstream strategy uses it
+/// as the exit trigger after an attack or the "stand down"
+/// signal for defensive gates.
+#[derive(Debug, Default)]
+pub struct CascadeCompletedSource;
+
+static CASCADE_OUTPUTS: Lazy<Vec<Port>> =
+    Lazy::new(|| vec![Port::new("value", PortType::Bool)]);
+
+impl NodeKind for CascadeCompletedSource {
+    fn kind(&self) -> &'static str {
+        "Signal.CascadeCompleted"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &CASCADE_OUTPUTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![
+            ConfigField {
+                name: "threshold_notional",
+                label: "Cascade-complete threshold (notional)",
+                hint: Some("Value above which rolling-window liquidation total flips `true`."),
+                default: serde_json::json!("100000"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(1000.0) },
+            },
+        ]
+    }
+}
+
 /// R2.11 — listing-age signal. Output `value` is a `[0, 1]`
 /// newness score that peaks at 1.0 for a fresh listing and
 /// decays linearly to 0 at the guard's `mature_days`. Useful

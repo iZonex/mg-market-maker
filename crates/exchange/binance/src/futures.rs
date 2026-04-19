@@ -220,6 +220,59 @@ impl ExchangeConnector for BinanceFuturesConnector {
         }))
     }
 
+    async fn get_long_short_ratio(
+        &self,
+        symbol: &str,
+    ) -> anyhow::Result<Option<mm_exchange_core::connector::LongShortRatio>> {
+        // R7.1 — `/futures/data/globalLongShortAccountRatio?
+        // symbol=BTCUSDT&period=5m&limit=1` returns a single
+        // snapshot: `[{"symbol":...,"longAccount":"0.55",
+        //   "shortAccount":"0.45","longShortRatio":"1.22",
+        //   "timestamp":1700000000000}]`.
+        self.rate_limiter.acquire(1).await;
+        let url = format!(
+            "{}/futures/data/globalLongShortAccountRatio?symbol={symbol}&period=5m&limit=1",
+            self.base_url
+        );
+        let body: Value = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .json()
+            .await?;
+        let Some(row) = body.as_array().and_then(|a| a.first()) else {
+            return Ok(None);
+        };
+        let long_pct = row
+            .get("longAccount")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Decimal>().ok())
+            .unwrap_or(Decimal::ZERO);
+        let short_pct = row
+            .get("shortAccount")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Decimal>().ok())
+            .unwrap_or(Decimal::ZERO);
+        let ratio = row
+            .get("longShortRatio")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Decimal>().ok())
+            .unwrap_or(Decimal::ZERO);
+        let ts_ms = row
+            .get("timestamp")
+            .and_then(|v| v.as_i64())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        Ok(Some(mm_exchange_core::connector::LongShortRatio {
+            symbol: symbol.to_string(),
+            long_pct,
+            short_pct,
+            ratio,
+            timestamp: chrono::DateTime::from_timestamp_millis(ts_ms)
+                .unwrap_or_else(chrono::Utc::now),
+        }))
+    }
+
     async fn get_funding_rate(&self, symbol: &str) -> Result<FundingRate, FundingRateError> {
         // `/fapi/v1/premiumIndex` returns current mark price,
         // funding rate, and next funding time for the symbol.

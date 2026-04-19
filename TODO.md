@@ -1,6 +1,6 @@
 # MM — Open Work Tracker
 
-Last updated: 2026-04-19 (post-Sprint 12)
+Last updated: 2026-04-19 (post-Sprint 13)
 
 Tracking debt not yet closed. Closed items live in git history.
 Each row is a concrete deliverable; bigger initiatives are
@@ -721,6 +721,50 @@ caveats.
   `last_open_interest` is unset. Engine polls OI on the
   funding-rate cadence so no new timer task — one `get_open_interest`
   call per funding refresh (≈ every 30 s on perp symbols).
+
+## Sprint 13 — liquidation cascade mechanics (landed Apr 19)
+
+⚠⚠⚠ Pentest-only sprint. Adds the full observable-data shape of
+the 2021-05 BTC flash-crash / RAVE / Alameda cascade plays, plus
+the offensive node that reproduces the attack for authorized
+exchange surveillance validation. Gated the same way as every
+other Epic R module: `restricted()=true` + `MM_RESTRICTED_ALLOW=1`
+env + loud `tracing::warn!` on every compile + mandatory
+operator read of `docs/guides/pentest.md` and
+`docs/research/liquidation-cascades.md`.
+
+- [x] **R7.1** `Signal.LongShortRatio` — new
+  `get_long_short_ratio` trait method on `ExchangeConnector`
+  + `LongShortRatio { long_pct, short_pct, ratio, ts }` type.
+  Binance impl hits `/futures/data/globalLongShortAccountRatio`;
+  Bybit impl hits `/v5/market/account-ratio`. Engine polls
+  on the funding-rate cadence (≈30 s on perps) and stores on
+  `last_long_short`; graph source exposes 3 Number outputs.
+- [x] **R7.2** `Signal.LiquidationLevelEstimate` — pure graph
+  source deriving `long_liq_bps` / `short_liq_bps` from
+  current mid + config `avg_leverage` (default 10). No venue
+  API; documented as order-of-magnitude estimate only.
+- [x] **R7.3** `Signal.CascadeCompleted` — Bool graph source
+  that flips `true` when in-window liquidation notional from
+  `LiquidationHeatmap` exceeds the configured
+  `threshold_notional`. Downstream exit / stand-down gate.
+- [x] **R7.4** `Strategy.CascadeHunter` (restricted) — one-shot
+  crossing push gated by `trigger` bool input + `target_bps`
+  Number input. V1 wraps IgniteStrategy — the graph drives
+  the trigger semantics, the strategy just emits the cross.
+- [x] **R7.5** `pentest-liquidation-cascade` bundled template
+  wires the full loop: `LiquidationLevelEstimate.long_liq_bps`
+  + `LongShortRatio.ratio ≥ 1.5 (Cast.ToBool)` →
+  `CascadeHunter` → `Out.Quotes`; `RugScore ≥ 0.5` →
+  `Out.KillEscalate(L4)` self-guard. Description carries the
+  triple-warning + MAR Art. 12 / CEA §9(a) / MiCA Art. 92
+  citations.
+- [x] **R7.6** `docs/research/liquidation-cascades.md` —
+  catalogue of public investigations (Kaiko 2021 BTC, Glassnode,
+  LUNA 2022, FTX/Alameda 2022 discovery, RAVE/SIREN/MYX 2026)
+  + attack-shape data table + defensive-use recommendations +
+  deferred research items.
+- [x] Catalog 121 → 125 kinds (+4 from R7).
 
 ## Graph system audit — Apr 19 follow-ups
 
