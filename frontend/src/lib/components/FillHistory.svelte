@@ -1,12 +1,11 @@
 <script>
+  // 23-UX-8 — shared formatters so fill timestamps / prices /
+  // quantities / fees match every other panel in the dashboard.
+  import { fmtTime, fmtPrice, fmtQty, fmtFixed } from '../format.js'
+
   let { data } = $props()
   const fills = $derived(data.state.fills || [])
   const visible = $derived(fills.slice(0, 20))
-
-  function fmtTime(t) {
-    try { return new Date(t || Date.now()).toLocaleTimeString() }
-    catch { return '—' }
-  }
 </script>
 
 {#if visible.length === 0}
@@ -37,14 +36,14 @@
       <tbody>
         {#each visible as fill}
           <tr>
-            <td class="time">{fmtTime(fill.timestamp)}</td>
+            <td class="time">{fmtTime(typeof fill.timestamp === 'number' ? fill.timestamp : new Date(fill.timestamp).getTime())}</td>
             <td class="venue">{fill.venue || '—'}</td>
             <td>
               <span class="side" data-side={fill.side?.toLowerCase()}>{fill.side?.toUpperCase()}</span>
             </td>
-            <td class="num right">{fill.price}</td>
-            <td class="num right">{fill.qty}</td>
-            <td class="num right">{fill.fee ?? '—'}</td>
+            <td class="num right">{fmtPrice(fill.price, 2)}</td>
+            <td class="num right">{fmtQty(fill.qty, 6)}</td>
+            <td class="num right">{fill.fee != null ? fmtFixed(fill.fee, 4) : '—'}</td>
             <td>
               <span class="role" class:maker={fill.is_maker} class:taker={!fill.is_maker}>
                 {fill.is_maker ? 'MAKER' : 'TAKER'}

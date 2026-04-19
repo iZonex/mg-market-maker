@@ -63,10 +63,16 @@
   const pairClass = $derived(data?.pair_class || null)
   const liveOrders = $derived(parseInt(data?.live_orders || 0, 10))
 
+  // 23-UX-8 — shared formatters. Locale-aware `en-US` thousands
+  // separators preserved by falling through to toLocaleString in
+  // the HeroKpis-specific prices + volume cases below.
+  import { fmtBps } from '../format.js'
   function fmt(n, d = 2) {
     if (!Number.isFinite(n)) return '—'
     return n.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })
   }
+  // Shadow local fmtSigned with the locale-formatted version
+  // HeroKpis needs for large PnL readings ($1,234.56 vs 1234.56).
   function fmtSigned(n, d = 2) {
     if (!Number.isFinite(n)) return '—'
     return (n > 0 ? '+' : '') + n.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })
@@ -97,7 +103,7 @@
   <div class="cell" title="Our quoted spread (best bid → best ask in bps). Falls back to venue spread when we have no live orders.">
     <span class="label">Spread · {spreadKind}</span>
     <div class="val-row">
-      <span class="val num">{spreadBps > 0 ? spreadBps.toFixed(2) : '—'}</span>
+      <span class="val num">{spreadBps > 0 ? fmtBps(spreadBps) : '—'}</span>
       <span class="unit">bps</span>
     </div>
   </div>

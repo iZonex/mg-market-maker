@@ -1,4 +1,7 @@
 <script>
+  // 23-UX-8 — shared price / qty formatters.
+  import { fmtPrice, fmtQty } from '../format.js'
+
   let { data } = $props()
   const s = $derived(data.state)
   const sym = $derived(s.activeSymbol || s.symbols[0] || '')
@@ -34,8 +37,8 @@
           <td>
             <span class="side" data-side={order.side?.toLowerCase()}>{order.side?.toUpperCase()}</span>
           </td>
-          <td class="num">{order.price}</td>
-          <td class="num right">{order.qty}</td>
+          <td class="num">{fmtPrice(order.price, 2)}</td>
+          <td class="num right">{fmtQty(order.qty, 6)}</td>
           <td><span class="status">{order.status}</span></td>
         </tr>
       {/each}

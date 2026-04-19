@@ -68,15 +68,9 @@
   }[killLevel] || '—')
   const killSeverity = $derived(killLevel === 0 ? 'ok' : killLevel === 1 ? 'warn' : 'neg')
 
-  function fmt(n, d = 4) {
-    const f = parseFloat(n || 0)
-    return Number.isFinite(f) ? f.toFixed(d) : '—'
-  }
-  function fmtSigned(n, d = 4) {
-    const f = parseFloat(n || 0)
-    if (!Number.isFinite(f)) return '—'
-    return (f > 0 ? '+' : '') + f.toFixed(d)
-  }
+  // 23-UX-8 — use shared formatters (frontend/src/lib/format.js)
+  // so every panel renders the same metric the same way.
+  import { fmtFixed, fmtPnl } from '../format.js'
 </script>
 
 <KillConfirmModal
@@ -111,21 +105,21 @@
   <div class="pnl-grid">
     <div class="pnl-cell">
       <span class="label">Spread</span>
-      <span class="pnl-val num pos">{fmtSigned(pnl.spread)}</span>
+      <span class="pnl-val num pos">{fmtPnl(pnl.spread)}</span>
     </div>
     <div class="pnl-cell">
       <span class="label">Inventory</span>
       <span class="pnl-val num" class:pos={parseFloat(pnl.inventory || 0) >= 0} class:neg={parseFloat(pnl.inventory || 0) < 0}>
-        {fmtSigned(pnl.inventory)}
+        {fmtPnl(pnl.inventory)}
       </span>
     </div>
     <div class="pnl-cell">
       <span class="label">Rebates</span>
-      <span class="pnl-val num pos">{fmt(pnl.rebates)}</span>
+      <span class="pnl-val num pos">{fmtFixed(pnl.rebates, 2)}</span>
     </div>
     <div class="pnl-cell">
       <span class="label">Fees</span>
-      <span class="pnl-val num neg">−{fmt(pnl.fees)}</span>
+      <span class="pnl-val num neg">−{fmtFixed(pnl.fees, 2)}</span>
     </div>
     <div class="pnl-cell">
       <span class="label">Trips</span>
@@ -133,7 +127,7 @@
     </div>
     <div class="pnl-cell">
       <span class="label">Volume</span>
-      <span class="pnl-val num">${fmt(pnl.volume, 2)}</span>
+      <span class="pnl-val num">${fmtFixed(pnl.volume, 2)}</span>
     </div>
   </div>
 

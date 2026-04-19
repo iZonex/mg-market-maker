@@ -11,10 +11,9 @@
   const adverse = $derived(parseFloat(d.adverse_bps || 0))
   const vol = $derived(parseFloat(d.volatility || 0))
 
-  function fmtSigned(n, dp = 6) {
-    if (!Number.isFinite(n)) return '—'
-    return (n > 0 ? '+' : '') + n.toFixed(dp)
-  }
+  // 23-UX-8 — shared formatters keep inventory / bps / pct readings
+  // identical to every other panel that shows the same metric.
+  import { fmtSigned, fmtBps, fmtPct, fmtFixed } from '../format.js'
 
   // Display helpers — Kyle lambda is shown as magnitude; sign
   // at low sample sizes is usually just noise, not alpha. VPIN
@@ -44,14 +43,14 @@
     },
     {
       label: 'Adverse',
-      value: `${adverse.toFixed(2)} bps`,
+      value: `${fmtBps(adverse)} bps`,
       valueStyle: 'num',
       hint: 'Post-fill price drift against our side, bps. >5 bps = getting picked off.',
       severity: adverse > 5 ? 'neg' : adverse > 2 ? 'warn' : 'ok',
     },
     {
       label: 'Volatility',
-      value: `${(vol * 100).toFixed(2)}%`,
+      value: fmtPct(vol * 100, 2),
       valueStyle: 'num',
       hint: 'Realised, annualised (EWMA on mid-returns).',
       severity: vol > 0.10 ? 'warn' : 'ok',
@@ -67,7 +66,7 @@
       <span class="inv-big num" class:pos={inv > 0} class:neg={inv < 0}>
         {fmtSigned(inv, 6)}
       </span>
-      <span class="inv-sub num">≈ ${Math.abs(invValue).toFixed(2)}</span>
+      <span class="inv-sub num">≈ ${fmtFixed(Math.abs(invValue), 2)}</span>
     </div>
 
     <div class="bar-track" aria-hidden="true">
