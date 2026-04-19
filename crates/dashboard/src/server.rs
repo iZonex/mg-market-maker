@@ -89,6 +89,7 @@ pub async fn start(
         .route("/api/v1/portfolio/cross_venue", get(portfolio_cross_venue))
         .route("/api/v1/venues/latency_p95", get(venues_latency_p95))
         .route("/api/v1/sor/decisions/recent", get(sor_decisions_recent))
+        .route("/api/v1/atomic-bundles/inflight", get(atomic_bundles_inflight))
         .merge(crate::client_api::client_routes())
         .merge(crate::client_portal::client_portal_routes())
         .route_layer(middleware::from_fn_with_state(
@@ -637,6 +638,23 @@ async fn sor_decisions_recent(
     let limit = q.limit.unwrap_or(50).min(256);
     Json(SorDecisionsResponse {
         decisions: state.sor_decisions_recent(limit),
+    })
+}
+
+/// S2.2 — inflight atomic bundle snapshot for the monitor
+/// panel. Returns every bundle currently tracked on the
+/// shared DashboardState ack map (originator + remote legs),
+/// paired up by bundle id.
+#[derive(serde::Serialize)]
+struct AtomicBundlesResponse {
+    bundles: Vec<crate::state::AtomicBundleSnapshot>,
+}
+
+async fn atomic_bundles_inflight(
+    State(state): State<DashboardState>,
+) -> Json<AtomicBundlesResponse> {
+    Json(AtomicBundlesResponse {
+        bundles: state.atomic_bundles_inflight(),
     })
 }
 
@@ -1666,6 +1684,15 @@ struct VenueStatusRow {
     /// True when kill level >= StopNewOrders — the engine is
     /// currently refusing to place new orders.
     quoting_halted: bool,
+    /// S2.4 — latest margin ratio (MM / equity) reported by
+    /// the venue. `null` on spot or pre-first-poll perp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    margin_ratio: Option<String>,
+    /// S2.4 — highest ADL quantile across this symbol's
+    /// positions (0..=4). `null` on venues that don't
+    /// publish ADL (HyperLiquid) or before the first snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adl_quantile: Option<u8>,
 }
 
 fn kill_label(level: u8) -> &'static str {
@@ -1684,16 +1711,22 @@ async fn venues_status(State(state): State<DashboardState>) -> Json<Vec<VenueSta
     let rows: Vec<VenueStatusRow> = state
         .get_all()
         .into_iter()
-        .map(|s| VenueStatusRow {
-            has_data: s.mid_price > rust_decimal::Decimal::ZERO,
-            mid_price: s.mid_price.to_string(),
-            kill_label: kill_label(s.kill_level),
-            kill_level: s.kill_level,
-            live_orders: s.live_orders as u32,
-            total_fills: s.total_fills,
-            sla_uptime_pct: s.sla_uptime_pct.to_string(),
-            quoting_halted: s.kill_level >= 2,
-            symbol: s.symbol,
+        .map(|s| {
+            let margin_ratio = state.margin_ratio(&s.symbol).map(|v| v.to_string());
+            let adl_quantile = state.adl_quantile(&s.symbol);
+            VenueStatusRow {
+                has_data: s.mid_price > rust_decimal::Decimal::ZERO,
+                mid_price: s.mid_price.to_string(),
+                kill_label: kill_label(s.kill_level),
+                kill_level: s.kill_level,
+                live_orders: s.live_orders as u32,
+                total_fills: s.total_fills,
+                sla_uptime_pct: s.sla_uptime_pct.to_string(),
+                quoting_halted: s.kill_level >= 2,
+                margin_ratio,
+                adl_quantile,
+                symbol: s.symbol,
+            }
         })
         .collect();
     Json(rows)

@@ -4,6 +4,7 @@
   import VenuesHealth from '../components/VenuesHealth.svelte'
   import AdminConfigPanels from '../components/AdminConfigPanels.svelte'
   import SorDecisions from '../components/SorDecisions.svelte'
+  import AtomicBundles from '../components/AtomicBundles.svelte'
   let { ws, auth } = $props()
 </script>
 
@@ -26,6 +27,9 @@
     </Card>
     <Card title="SOR routing" subtitle="winner + runner-up per decision" span={3}>
       {#snippet children()}<SorDecisions {auth} />{/snippet}
+    </Card>
+    <Card title="Atomic bundles" subtitle="inflight maker / hedge pairs" span={3}>
+      {#snippet children()}<AtomicBundles {auth} />{/snippet}
     </Card>
     <Card title="Config surfaces" subtitle="webhooks · alerts · loans · sentiment" span={3}>
       {#snippet children()}<AdminConfigPanels {auth} />{/snippet}

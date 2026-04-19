@@ -67,15 +67,25 @@
       if (!byV.has(v)) byV.set(v, [])
       byV.get(v).push(r)
     }
-    return Array.from(byV.entries()).map(([venue, items]) => ({
-      venue,
-      symbols: items.length,
-      max_kill: items.reduce((m, i) => Math.max(m, Number(i.kill_level || 0)), 0),
-      live_orders: items.reduce((s, i) => s + Number(i.live_orders || 0), 0),
-      min_uptime: items.reduce((m, i) => Math.min(m, Number(i.sla_uptime_pct || 100)), 100),
-      halted: items.some(i => i.quoting_halted),
-      venue_items: items,
-    })).sort((a, b) => a.venue.localeCompare(b.venue))
+    return Array.from(byV.entries()).map(([venue, items]) => {
+      const margins = items
+        .map(i => i.margin_ratio !== undefined ? Number(i.margin_ratio) : null)
+        .filter(m => m !== null && !isNaN(m))
+      const adls = items
+        .map(i => typeof i.adl_quantile === 'number' ? i.adl_quantile : null)
+        .filter(q => q !== null)
+      return {
+        venue,
+        symbols: items.length,
+        max_kill: items.reduce((m, i) => Math.max(m, Number(i.kill_level || 0)), 0),
+        live_orders: items.reduce((s, i) => s + Number(i.live_orders || 0), 0),
+        min_uptime: items.reduce((m, i) => Math.min(m, Number(i.sla_uptime_pct || 100)), 100),
+        halted: items.some(i => i.quoting_halted),
+        max_margin: margins.length ? Math.max(...margins) : null,
+        max_adl: adls.length ? Math.max(...adls) : null,
+        venue_items: items,
+      }
+    }).sort((a, b) => a.venue.localeCompare(b.venue))
   })
 
   function killColour(level) {
@@ -136,6 +146,22 @@
                 {:else}
                   —
                 {/if}
+              </span>
+            </div>
+            <div class="stat">
+              <span class="k">margin</span>
+              <span class="v mono" class:danger={v.max_margin !== null && v.max_margin >= 0.5}>
+                {#if v.max_margin !== null}
+                  {(v.max_margin * 100).toFixed(1)}%
+                {:else}
+                  —
+                {/if}
+              </span>
+            </div>
+            <div class="stat">
+              <span class="k">ADL rank</span>
+              <span class="v mono" class:danger={v.max_adl !== null && v.max_adl >= 3}>
+                {v.max_adl !== null ? v.max_adl : '—'}
               </span>
             </div>
           </div>
@@ -201,4 +227,5 @@
   .k { color: var(--fg-muted); letter-spacing: var(--tracking-label); text-transform: uppercase; font-size: 10px; }
   .v { color: var(--fg-primary); }
   .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .v.danger { color: var(--danger); font-weight: 700; }
 </style>

@@ -165,7 +165,7 @@ use crate::sor::venue_state::{VenueSeed, VenueStateAggregator};
 ///
 /// See also [`InflightAtomicBundle`] for the Multi-Venue 3.E.2
 /// atomic-bundle watchdog state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InflightAtomicBundle {
     pub dispatched_at: chrono::DateTime<chrono::Utc>,
     pub timeout_ms: u64,
@@ -1196,6 +1196,44 @@ impl MarketMakerEngine {
         self.inventory_manager
             .force_reset_inventory_to(checkpoint.inventory);
         self.pnl_tracker.attribution.spread_pnl = checkpoint.realized_pnl;
+
+        // S2.1 — restore any atomic bundles that were in
+        // flight when the previous process wrote the
+        // checkpoint. We deserialise each entry back into
+        // `InflightAtomicBundle` so the watchdog ticks on
+        // boot, force-cancels expired bundles, and the
+        // sweep merges in ack state from the shared
+        // DashboardState on the first live tick. Malformed
+        // entries are skipped with a warn — a corrupt legacy
+        // blob must not block a clean restart.
+        let mut restored = 0usize;
+        let mut malformed = 0usize;
+        for raw in &checkpoint.inflight_atomic_bundles {
+            match serde_json::from_value::<(String, InflightAtomicBundle)>(raw.clone()) {
+                Ok((id, bundle)) => {
+                    self.inflight_atomic_bundles.insert(id, bundle);
+                    restored += 1;
+                }
+                Err(e) => {
+                    malformed += 1;
+                    tracing::warn!(
+                        error = %e,
+                        "skipping malformed atomic bundle entry during checkpoint restore"
+                    );
+                }
+            }
+        }
+        if restored > 0 || malformed > 0 {
+            self.audit.risk_event(
+                &self.symbol,
+                mm_risk::audit::AuditEventType::CheckpointSaved,
+                &format!(
+                    "restored {} inflight atomic bundle(s); dropped {} malformed",
+                    restored, malformed
+                ),
+            );
+        }
+
         self.audit.risk_event(
             &self.symbol,
             mm_risk::audit::AuditEventType::CheckpointSaved,
@@ -1208,9 +1246,26 @@ impl MarketMakerEngine {
             symbol = %self.symbol,
             inventory = %checkpoint.inventory,
             pnl = %checkpoint.realized_pnl,
+            bundles_restored = restored,
             "engine state restored from checkpoint"
         );
         self
+    }
+
+    /// S2.1 — serialise the currently-inflight atomic bundle
+    /// map into the shape the checkpoint carries (`Vec<Value>`
+    /// of `(bundle_id, InflightAtomicBundle)` tuples). Called
+    /// whenever the engine writes its `SymbolCheckpoint` to
+    /// disk. Without this, a crash between `AtomicBundle`
+    /// dispatch and the first ack flip left the operator with
+    /// two one-sided legs and no record of the pair.
+    pub fn inflight_atomic_bundles_checkpoint(&self) -> Vec<serde_json::Value> {
+        self.inflight_atomic_bundles
+            .iter()
+            .filter_map(|(id, bundle)| {
+                serde_json::to_value((id, bundle)).ok()
+            })
+            .collect()
     }
 
     /// Attach a shared factor covariance estimator (Epic 3).
@@ -6142,6 +6197,8 @@ impl MarketMakerEngine {
                             timestamp: fill.timestamp,
                             symbol: self.symbol.clone(),
                             client_id: self.client_id.clone(),
+                            venue: format!("{:?}", self.config.exchange.exchange_type)
+                                .to_lowercase(),
                             side: format!("{:?}", fill.side),
                             price: fill.price,
                             qty: fill.qty,
@@ -6304,6 +6361,13 @@ impl MarketMakerEngine {
         if let Some(dash) = &self.dashboard {
             if let Some(info) = guard.last() {
                 dash.set_margin_ratio(&self.symbol, info.margin_ratio);
+            }
+            // S2.4 — surface the highest ADL quantile too so
+            // `/api/v1/venues/status` + VenuesHealth can render
+            // a red flag when any position on this venue is
+            // near the deleverage front.
+            if let Some(q) = guard.max_adl_quantile() {
+                dash.set_adl_quantile(&self.symbol, q);
             }
         }
         // PERP-1 — proactive reduce-only slice. On `Reduce`
@@ -9038,6 +9102,118 @@ mod dual_connector_tests {
             engine.strategy_node_configs.is_empty(),
             "nodes without knob overrides must NOT materialise a per-node config"
         );
+    }
+
+    // ── S2.1 — atomic bundle checkpoint round-trip ────────────
+
+    /// S2.1 — serialising the inflight map and restoring it
+    /// round-trips every field, so a crashed engine re-enters
+    /// the next tick with the watchdog + ack sweep already
+    /// primed.
+    #[test]
+    fn atomic_bundle_checkpoint_round_trips() {
+        use mm_common::types::Side;
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+
+        // Engine A: dispatches a pair and writes the
+        // checkpoint.
+        let mut a = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            sample_config(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        let now = chrono::Utc::now();
+        a.inflight_atomic_bundles.insert(
+            "bundle-a".into(),
+            InflightAtomicBundle {
+                dispatched_at: now,
+                timeout_ms: 60_000,
+                maker_venue: "binance".into(),
+                maker_symbol: "BTCUSDT".into(),
+                maker_side: Side::Buy,
+                maker_price: dec!(50_000),
+                maker_acked: false,
+                hedge_venue: "bybit".into(),
+                hedge_symbol: "BTC-USDT".into(),
+                hedge_side: Side::Sell,
+                hedge_price: dec!(50_100),
+                hedge_acked: true,
+            },
+        );
+        let snapshot = a.inflight_atomic_bundles_checkpoint();
+        assert_eq!(snapshot.len(), 1);
+
+        // Engine B: fresh, restores from the checkpoint blob.
+        let primary_b =
+            Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle_b = ConnectorBundle::single(primary_b);
+        let b = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            sample_config(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle_b,
+            None,
+            None,
+        );
+        let cp = mm_persistence::checkpoint::SymbolCheckpoint {
+            symbol: "BTCUSDT".into(),
+            inventory: dec!(0),
+            avg_entry_price: dec!(0),
+            open_order_ids: vec![],
+            realized_pnl: dec!(0),
+            total_volume: dec!(0),
+            total_fills: 0,
+            inflight_atomic_bundles: snapshot,
+        };
+        let b = b.with_checkpoint_restore(&cp);
+
+        assert_eq!(b.inflight_atomic_bundles.len(), 1);
+        let restored = b.inflight_atomic_bundles.get("bundle-a").unwrap();
+        assert_eq!(restored.maker_venue, "binance");
+        assert_eq!(restored.hedge_venue, "bybit");
+        assert_eq!(restored.maker_side, Side::Buy);
+        assert!(!restored.maker_acked);
+        assert!(restored.hedge_acked);
+        assert_eq!(restored.timeout_ms, 60_000);
+    }
+
+    /// S2.1 — a malformed blob inside the checkpoint doesn't
+    /// prevent the engine from starting; the entry is skipped
+    /// with a warn and the rest of the restore proceeds.
+    #[test]
+    fn atomic_bundle_checkpoint_skips_malformed_entries() {
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        let engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            sample_config(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        let cp = mm_persistence::checkpoint::SymbolCheckpoint {
+            symbol: "BTCUSDT".into(),
+            inventory: dec!(0),
+            avg_entry_price: dec!(0),
+            open_order_ids: vec![],
+            realized_pnl: dec!(0),
+            total_volume: dec!(0),
+            total_fills: 0,
+            inflight_atomic_bundles: vec![
+                serde_json::json!("not a tuple"),
+                serde_json::json!({ "shape": "wrong" }),
+            ],
+        };
+        let engine = engine.with_checkpoint_restore(&cp);
+        assert!(engine.inflight_atomic_bundles.is_empty());
     }
 
     // ── S1.2 — per-strategy capital budget gate tests ─────────

@@ -226,6 +226,10 @@ struct StateInner {
     /// operators can see the guard's view of how close the
     /// account is to a venue liquidation.
     per_symbol_margin_ratio: HashMap<String, Decimal>,
+    /// S2.4 — highest ADL quantile observed across any of
+    /// this symbol's positions (0..=4 per PERP-4). Missing
+    /// entry = spot engine or no venue-reported data yet.
+    per_symbol_adl_quantile: HashMap<String, u8>,
     /// Configurable alert rules.
     alert_rules: Vec<AlertRule>,
     /// Loan agreements (Epic 2). Keyed by loan ID.
@@ -329,6 +333,27 @@ pub enum BundleLegRole {
 
 #[derive(Debug, Clone)]
 pub struct AtomicBundleLeg {
+    pub venue: String,
+    pub symbol: String,
+    pub side: mm_common::types::Side,
+    pub price: Decimal,
+    pub acked: bool,
+}
+
+/// S2.2 — snapshot row for `/api/v1/atomic-bundles/inflight`
+/// paired by bundle id. Either leg may be `None` if only one
+/// side has been registered (originator mid-dispatch, or
+/// ack-map race on read). The panel renders the missing side
+/// as "—".
+#[derive(Debug, Clone, Serialize)]
+pub struct AtomicBundleSnapshot {
+    pub bundle_id: String,
+    pub maker: Option<AtomicBundleLegSnapshot>,
+    pub hedge: Option<AtomicBundleLegSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AtomicBundleLegSnapshot {
     pub venue: String,
     pub symbol: String,
     pub side: mm_common::types::Side,
@@ -440,6 +465,15 @@ pub struct FillRecord {
     /// Owning client ID (Epic 1). `None` in legacy mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    /// S2.3 — venue tag the fill hit, in lowercase
+    /// (`"binance"`, `"bybit"`, `"hyperliquid"`). Populated
+    /// from `exchange_type.to_lowercase()` at fill ingest so
+    /// per-venue PnL breakdowns can be computed client-side
+    /// without crossing-index against a separate engine map.
+    /// `#[serde(default)]` keeps old checkpoints + WS payloads
+    /// deserialisable as empty string.
+    #[serde(default)]
+    pub venue: String,
     pub side: String,
     pub price: Decimal,
     pub qty: Decimal,
@@ -1115,6 +1149,39 @@ impl DashboardState {
             .retain(|k, _| k.bundle_id != bundle_id);
     }
 
+    /// S2.2 — full snapshot of every inflight atomic bundle
+    /// for the monitor panel. One entry per bundle id with
+    /// both legs' venue/symbol/side/price/ack paired up.
+    /// Bundles where the originator already cleared the
+    /// shared map (success + graduation, or rollback) don't
+    /// appear here.
+    pub fn atomic_bundles_inflight(&self) -> Vec<AtomicBundleSnapshot> {
+        use std::collections::BTreeMap;
+        let g = self.inner.read().unwrap();
+        let mut by_id: BTreeMap<String, AtomicBundleSnapshot> = BTreeMap::new();
+        for (key, leg) in &g.atomic_bundle_legs {
+            let entry = by_id
+                .entry(key.bundle_id.clone())
+                .or_insert_with(|| AtomicBundleSnapshot {
+                    bundle_id: key.bundle_id.clone(),
+                    maker: None,
+                    hedge: None,
+                });
+            let rendered = AtomicBundleLegSnapshot {
+                venue: leg.venue.clone(),
+                symbol: leg.symbol.clone(),
+                side: leg.side,
+                price: leg.price,
+                acked: leg.acked,
+            };
+            match key.role {
+                BundleLegRole::Maker => entry.maker = Some(rendered),
+                BundleLegRole::Hedge => entry.hedge = Some(rendered),
+            }
+        }
+        by_id.into_values().collect()
+    }
+
     /// S1.3 — append a freshly-produced SOR routing decision
     /// to the ring buffer. Capped at `MAX_SOR_DECISIONS`
     /// (oldest entry dropped on overflow).
@@ -1174,6 +1241,27 @@ impl DashboardState {
             .read()
             .unwrap()
             .per_symbol_margin_ratio
+            .get(symbol)
+            .copied()
+    }
+
+    /// S2.4 — publish the highest ADL quantile observed
+    /// across any of `symbol`'s positions. Engine's
+    /// `MarginGuard::max_adl_quantile` drives this on every
+    /// poll.
+    pub fn set_adl_quantile(&self, symbol: &str, quantile: u8) {
+        self.inner
+            .write()
+            .unwrap()
+            .per_symbol_adl_quantile
+            .insert(symbol.to_string(), quantile);
+    }
+
+    pub fn adl_quantile(&self, symbol: &str) -> Option<u8> {
+        self.inner
+            .read()
+            .unwrap()
+            .per_symbol_adl_quantile
             .get(symbol)
             .copied()
     }
@@ -2196,6 +2284,7 @@ mod tests {
             timestamp: Utc::now(),
             symbol: "BTCUSDT".into(),
             client_id: Some("alice".into()),
+            venue: "binance".into(),
             side: "buy".into(),
             price: dec!(50000),
             qty: dec!(0.01),

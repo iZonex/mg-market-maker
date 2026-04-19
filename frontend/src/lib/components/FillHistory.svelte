@@ -26,9 +26,11 @@
       <thead>
         <tr>
           <th>Time</th>
+          <th>Venue</th>
           <th>Side</th>
           <th class="right">Price</th>
           <th class="right">Qty</th>
+          <th class="right">Fee</th>
           <th>Role</th>
         </tr>
       </thead>
@@ -36,11 +38,13 @@
         {#each visible as fill}
           <tr>
             <td class="time">{fmtTime(fill.timestamp)}</td>
+            <td class="venue">{fill.venue || '—'}</td>
             <td>
               <span class="side" data-side={fill.side?.toLowerCase()}>{fill.side?.toUpperCase()}</span>
             </td>
             <td class="num right">{fill.price}</td>
             <td class="num right">{fill.qty}</td>
+            <td class="num right">{fill.fee ?? '—'}</td>
             <td>
               <span class="role" class:maker={fill.is_maker} class:taker={!fill.is_maker}>
                 {fill.is_maker ? 'MAKER' : 'TAKER'}
@@ -118,4 +122,11 @@
   }
   .role.maker { background: var(--info-bg); color: var(--info); }
   .role.taker { background: var(--bg-chip); color: var(--fg-muted); }
+  .venue {
+    font-family: var(--font-mono);
+    font-size: var(--fs-2xs);
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-label);
+    color: var(--fg-secondary);
+  }
 </style>

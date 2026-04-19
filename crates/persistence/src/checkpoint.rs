@@ -40,6 +40,18 @@ pub struct SymbolCheckpoint {
     pub total_volume: Decimal,
     /// Total fills count.
     pub total_fills: u64,
+    /// S2.1 — atomic bundles that were in flight when the
+    /// checkpoint was written. Serialised as opaque JSON so
+    /// `mm-persistence` stays engine-type-free; the
+    /// `mm-engine` side (re)parses into its
+    /// `InflightAtomicBundle` struct on load. On restart the
+    /// engine walks this list, force-cancels every expired
+    /// bundle's legs via the real connectors, and re-enters
+    /// the quoting loop. Without this a crash mid-dispatch
+    /// left operators with a spot order placed + perp hedge
+    /// pending and no record of the pair.
+    #[serde(default)]
+    pub inflight_atomic_bundles: Vec<serde_json::Value>,
 }
 
 impl Checkpoint {
@@ -339,6 +351,7 @@ mod tests {
             realized_pnl: dec!(42.5),
             total_volume: dec!(10000),
             total_fills: 100,
+            inflight_atomic_bundles: Vec::new(),
         });
 
         let loaded = CheckpointManager::new_with_secret(&path, 10, secret);
@@ -363,6 +376,7 @@ mod tests {
             realized_pnl: dec!(0),
             total_volume: dec!(50000),
             total_fills: 1,
+            inflight_atomic_bundles: Vec::new(),
         });
 
         // Tamper with the file — bump inventory directly in the
@@ -396,6 +410,7 @@ mod tests {
             realized_pnl: dec!(0),
             total_volume: dec!(25000),
             total_fills: 1,
+            inflight_atomic_bundles: Vec::new(),
         });
 
         let loaded =
@@ -424,6 +439,7 @@ mod tests {
                         realized_pnl: dec!(0),
                         total_volume: dec!(600),
                         total_fills: 1,
+                        inflight_atomic_bundles: Vec::new(),
                     },
                 );
                 m
@@ -480,6 +496,7 @@ mod tests {
                 realized_pnl,
                 total_volume,
                 total_fills,
+                inflight_atomic_bundles: Vec::new(),
             }
         }
     }
@@ -640,6 +657,7 @@ mod tests {
                 realized_pnl: dec!(0),
                 total_volume: Decimal::new(vol_cents, 2),
                 total_fills: fills,
+                inflight_atomic_bundles: Vec::new(),
             });
             prop_assert!(cp.validate().is_empty(),
                 "clean state flagged: {:?}", cp.validate());
@@ -661,6 +679,7 @@ mod tests {
                 realized_pnl: dec!(0),
                 total_volume: dec!(0),
                 total_fills: 0,
+                inflight_atomic_bundles: Vec::new(),
             });
             prop_assert!(!cp.validate().is_empty(),
                 "negative entry price not flagged");
@@ -682,6 +701,7 @@ mod tests {
                 realized_pnl: dec!(0),
                 total_volume: dec!(0),
                 total_fills: 0,
+                inflight_atomic_bundles: Vec::new(),
             });
             prop_assert!(!cp.validate().is_empty(),
                 "inventory without entry price not flagged");

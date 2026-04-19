@@ -239,6 +239,36 @@ client sees the system.
   decision with winner + considered legs, side colour,
   partial-fill tag. 4-second refresh.
 
+## Sprint 2 — crash safety + observability basics (landed Apr 19)
+
+- [x] **S2.1** Atomic bundle checkpoint recovery.
+  `InflightAtomicBundle` gained `#[derive(Serialize, Deserialize)]`
+  and a new `inflight_atomic_bundles: Vec<serde_json::Value>`
+  field on `SymbolCheckpoint` (serde-default for backward
+  compat). Engine's `with_checkpoint_restore` restores the
+  in-flight map on boot; the next `refresh_quotes` tick's
+  watchdog cancels any expired bundle and the shared
+  DashboardState ack map picks up mid-dispatch state. Two
+  engine tests pin the round-trip and malformed-entry
+  tolerance.
+- [x] **S2.2** `DashboardState::atomic_bundles_inflight` +
+  `GET /api/v1/atomic-bundles/inflight` + `AtomicBundles.svelte`
+  panel on AdminPage. Maker / hedge legs paired by bundle_id
+  with ack indicators; missing-side rows render "—" so a
+  mid-dispatch state is visible instead of hidden.
+- [x] **S2.3** `FillRecord` gained a `venue` field (lowercase
+  exchange_type tag). Engine populates on fill ingest; the
+  existing WS fill broadcaster carries it through; FillHistory
+  table gains a Venue column + a Fee column while we're there.
+  Old serialised fills deserialise as `""` via `#[serde(default)]`.
+- [x] **S2.4** `DashboardState::set_adl_quantile` /
+  `adl_quantile()` + `per_symbol_adl_quantile` map. Engine's
+  margin-guard poll publishes `max_adl_quantile()` alongside
+  the existing `margin_ratio`. `venues_status` endpoint now
+  carries both per row (Option-skipped); VenuesHealth panel
+  aggregates the max across a venue's symbols and red-flags
+  margin ≥ 50% or ADL rank ≥ 3.
+
 ## Graph system audit — Apr 19 follow-ups
 
 Surfaced during the post-batch audit at
