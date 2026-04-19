@@ -973,6 +973,63 @@ async fn main() -> Result<()> {
         info!("portfolio risk monitor started (30s interval)");
     }
 
+    // 22W-2 — portfolio-wide VaR guard. Samples total realised
+    // PnL every 30 s, feeds the rolling delta into a parametric
+    // Gaussian VaR, broadcasts the size multiplier to every
+    // engine via ConfigOverride::PortfolioVarMult. Complements
+    // the per-strategy var_guard (which runs inside each engine).
+    if let Some(ref pv_cfg) = config.portfolio_var {
+        let pv_portfolio = portfolio.clone();
+        let pv_dashboard = dashboard_state.clone();
+        let mut pv_shutdown = shutdown_tx.subscribe();
+        let pv_config = mm_risk::portfolio_var::PortfolioVarConfig {
+            var_limit_95: pv_cfg.var_limit_95,
+            var_limit_99: pv_cfg.var_limit_99,
+            max_samples: pv_cfg.max_samples,
+            min_samples: pv_cfg.min_samples,
+        };
+        let mut pv_guard = mm_risk::portfolio_var::PortfolioVarGuard::new(pv_config);
+        let mut pv_last_total: rust_decimal::Decimal = rust_decimal::Decimal::ZERO;
+        let mut pv_last_throttle: rust_decimal::Decimal = rust_decimal::Decimal::ONE;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Ok(port) = pv_portfolio.lock() {
+                            let snap = port.snapshot();
+                            let current_total = snap.total_realised_pnl;
+                            let delta = current_total - pv_last_total;
+                            pv_last_total = current_total;
+                            pv_guard.record_sample(delta);
+                            let throttle = pv_guard.throttle();
+                            if throttle != pv_last_throttle {
+                                pv_dashboard.broadcast_config_override(
+                                    mm_dashboard::state::ConfigOverride::PortfolioVarMult(throttle),
+                                );
+                                if throttle < rust_decimal::Decimal::ONE {
+                                    warn!(
+                                        throttle = %throttle,
+                                        samples = pv_guard.sample_count(),
+                                        "portfolio VaR throttle applied"
+                                    );
+                                } else {
+                                    info!(
+                                        samples = pv_guard.sample_count(),
+                                        "portfolio VaR throttle cleared"
+                                    );
+                                }
+                                pv_last_throttle = throttle;
+                            }
+                        }
+                    }
+                    _ = pv_shutdown.changed() => break,
+                }
+            }
+        });
+        info!("portfolio VaR guard started (30s interval)");
+    }
+
     // Wait for Ctrl+C.
     tokio::signal::ctrl_c().await?;
     info!("shutdown signal received — cancelling all orders");

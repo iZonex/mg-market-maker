@@ -84,6 +84,16 @@ pub struct AppConfig {
     #[serde(default)]
     pub protections: Option<ProtectionsCfg>,
 
+    /// Portfolio-wide VaR guard (22W-2). Complements the
+    /// per-strategy `var_guard_*` with a book-wide PnL-delta
+    /// rolling window and parametric Gaussian VaR at 95 %+99 %.
+    /// Breach of `var_limit_95`/`99` broadcasts a size multiplier
+    /// (0.5/0.0) to every engine via
+    /// `ConfigOverride::PortfolioVarMult`. `None` disables the
+    /// portfolio-level guard; per-strategy var_guard still runs.
+    #[serde(default)]
+    pub portfolio_var: Option<PortfolioVarCfg>,
+
     /// Record live market data to JSONL for offline backtesting.
     /// When `true`, each engine writes BookSnapshot + Trade events
     /// to `data/recorded/{symbol}.jsonl`. Data accumulates across
@@ -743,6 +753,40 @@ pub struct LowProfitPairsCfg {
     pub min_pnl_quote: Decimal,
     pub lockout_secs: u64,
     pub min_trades: usize,
+}
+
+/// Portfolio-wide VaR guard config (22W-2). Mirrors
+/// `mm_risk::portfolio_var::PortfolioVarConfig` 1:1; server
+/// converts directly. Sampling cadence is fixed at 30 s in
+/// `main.rs` — same as `portfolio_risk`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortfolioVarCfg {
+    #[serde(default)]
+    pub var_limit_95: Option<Decimal>,
+    #[serde(default)]
+    pub var_limit_99: Option<Decimal>,
+    #[serde(default = "default_portfolio_var_max_samples")]
+    pub max_samples: usize,
+    #[serde(default = "default_portfolio_var_min_samples")]
+    pub min_samples: usize,
+}
+
+fn default_portfolio_var_max_samples() -> usize {
+    1440
+}
+fn default_portfolio_var_min_samples() -> usize {
+    30
+}
+
+impl Default for PortfolioVarCfg {
+    fn default() -> Self {
+        Self {
+            var_limit_95: None,
+            var_limit_99: None,
+            max_samples: default_portfolio_var_max_samples(),
+            min_samples: default_portfolio_var_min_samples(),
+        }
+    }
 }
 
 /// Hedge-leg exchange + instrument pair config.
@@ -2485,6 +2529,7 @@ impl Default for AppConfig {
             funding_arb: None,
             stat_arb: None,
             protections: None,
+            portfolio_var: None,
             record_market_data: false,
             paper_fill: None,
             rebalancer: None,

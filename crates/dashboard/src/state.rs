@@ -50,6 +50,12 @@ pub enum ConfigOverride {
     /// effective spread, composable with existing kill switch
     /// and market resilience multipliers.
     PortfolioRiskMult(Decimal),
+    /// 22W-2 — portfolio-wide VaR throttle. Complements the
+    /// per-strategy var_guard with a book-wide PnL VaR gauge.
+    /// Values: 1.0 normal, 0.5 VaR_95 breach, 0.0 VaR_99
+    /// breach. The engine multiplies its size-multiplier
+    /// stack by this value (composes via min()).
+    PortfolioVarMult(Decimal),
     /// Manually escalate the kill switch to a specific level.
     /// `level` maps onto `mm_risk::KillLevel` (1..=5); `reason`
     /// is recorded to the audit trail. Emitted by the dashboard

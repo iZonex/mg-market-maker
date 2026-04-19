@@ -389,6 +389,23 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
         }
     }
 
+    // --- Portfolio VaR (22W-2) ---
+    if let Some(p) = &config.portfolio_var {
+        if p.min_samples == 0 {
+            errors.push("portfolio_var.min_samples must be > 0".to_string());
+        }
+        if p.max_samples < p.min_samples {
+            errors.push("portfolio_var.max_samples must be >= min_samples".to_string());
+        }
+        if p.var_limit_95.is_none() && p.var_limit_99.is_none() {
+            warnings.push(
+                "[portfolio_var] is configured but both var_limit_95 + var_limit_99 \
+                 are unset — guard will sample but never throttle"
+                    .to_string(),
+            );
+        }
+    }
+
     // --- VaR guard ---
     if mm.var_guard_enabled {
         if mm.var_guard_limit_95.is_none() && mm.var_guard_limit_99.is_none() {

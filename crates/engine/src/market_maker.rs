@@ -377,6 +377,11 @@ pub struct MarketMakerEngine {
     /// Portfolio-level risk spread multiplier (Epic 3). Applied
     /// as an additional factor in `refresh_quotes`.
     portfolio_risk_mult: Decimal,
+    /// 22W-2 — portfolio-wide VaR size multiplier. 1.0 normal,
+    /// 0.5 VaR_95 breach, 0.0 VaR_99 breach. Composes into
+    /// `ks_size` via `min()` alongside kill_switch.size_multiplier
+    /// and the per-strategy var_guard throttle.
+    portfolio_var_mult: Decimal,
     /// Second `OrderManager` for the hedge leg, built lazily when
     /// `connectors.hedge` is present. Kept strictly separate
     /// from the primary `order_manager` so per-leg diffing,
@@ -923,6 +928,7 @@ impl MarketMakerEngine {
             var_guard_last_throttle: None,
             var_guard_last_total_pnl: dec!(0),
             portfolio_risk_mult: dec!(1),
+            portfolio_var_mult: dec!(1),
             ab_split: None,
             event_recorder: None,
             hedge_order_manager,
@@ -8062,7 +8068,7 @@ impl MarketMakerEngine {
             .as_ref()
             .map(|vg| vg.effective_throttle(&strategy_class))
             .unwrap_or(Decimal::ONE);
-        let ks_size = ks_base_size.min(var_throttle);
+        let ks_size = ks_base_size.min(var_throttle).min(self.portfolio_var_mult);
 
         // Fire a transition audit event when the VaR throttle
         // flips. Stable-state ticks do not spam the trail.
@@ -8954,6 +8960,10 @@ impl MarketMakerEngine {
             ConfigOverride::PortfolioRiskMult(v) => {
                 info!(symbol = %self.symbol, mult = %v, "hot-reload: portfolio risk spread multiplier");
                 self.portfolio_risk_mult = v;
+            }
+            ConfigOverride::PortfolioVarMult(v) => {
+                info!(symbol = %self.symbol, mult = %v, "hot-reload: portfolio VaR size multiplier");
+                self.portfolio_var_mult = v;
             }
             ConfigOverride::ManualKillSwitch { level, reason } => {
                 let kl = match level {
