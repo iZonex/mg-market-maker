@@ -76,6 +76,20 @@ impl NodeKind for ToxicityWiden {
     fn output_ports(&self) -> &[Port] {
         &TOXICITY_WIDEN_OUTPUTS
     }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![ConfigField {
+            name: "scale",
+            label: "Widening scale",
+            hint: Some("mult = 1 + scale·vpin — default 2.0 so vpin=0.5 → 2×"),
+            default: serde_json::json!("2.0"),
+            widget: ConfigWidget::Number {
+                min: Some(0.0),
+                max: Some(10.0),
+                step: Some(0.1),
+            },
+        }]
+    }
     fn evaluate(
         &self,
         _ctx: &EvalCtx,
@@ -170,6 +184,33 @@ impl NodeKind for InventoryUrgency {
     fn output_ports(&self) -> &[Port] {
         &INVENTORY_URGENCY_OUTPUTS
     }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![
+            ConfigField {
+                name: "cap",
+                label: "Inventory cap",
+                hint: Some("Absolute base-asset position treated as `urgency = 1`"),
+                default: serde_json::json!("1"),
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.01),
+                },
+            },
+            ConfigField {
+                name: "exponent",
+                label: "Curve exponent",
+                hint: Some("> 1 steepens the ramp toward cap — default 2 (quadratic)"),
+                default: serde_json::json!("2"),
+                widget: ConfigWidget::Number {
+                    min: Some(0.1),
+                    max: Some(10.0),
+                    step: Some(0.1),
+                },
+            },
+        ]
+    }
     fn evaluate(
         &self,
         _ctx: &EvalCtx,
@@ -261,6 +302,20 @@ impl NodeKind for CircuitBreaker {
     }
     fn output_ports(&self) -> &[Port] {
         &CIRCUIT_OUTPUTS
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![ConfigField {
+            name: "wide_bps",
+            label: "Max spread (bps)",
+            hint: Some("Spread above this trips `tripped=true` — fail-closed on missing input"),
+            default: serde_json::json!("500"),
+            widget: ConfigWidget::Number {
+                min: Some(0.0),
+                max: None,
+                step: Some(1.0),
+            },
+        }]
     }
     fn evaluate(
         &self,

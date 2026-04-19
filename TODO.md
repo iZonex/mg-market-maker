@@ -212,21 +212,33 @@ Surfaced during the post-batch audit at
 `docs/research/graph-system-audit-apr19.md`. Each entry names
 a concrete extension point.
 
-- [ ] **GR-3** Per-node `Strategy.*` config override (γ / κ /
-  σ / size / num_levels). Catalog already accepts per-node
-  config; engine doesn't read it. Requires a per-node
-  strategy-instance pool keyed on NodeId. Scope: medium
-  (~100-200 LoC).
-- [ ] **GR-4** `config_schema()` on `Risk.ToxicityWiden`,
-  `Risk.InventoryUrgency`, `Risk.CircuitBreaker`. Mechanical —
-  same shape as the Exec schemas landed this pass.
-- [ ] **GR-5** Sentiment source asset resolution on non-symbol
-  scopes. Either add a `asset` config field or document that
-  sentiment requires a Symbol-scoped graph.
-- [ ] **GR-6** Catalog-vs-engine source-coverage test. Walk
-  every `kinds()` entry; refuse to CI-pass if a source kind
-  has no match arm in `tick_strategy_graph`. Blocks the
-  "added to catalog, forgot to wire" regression.
+- [x] **GR-3** `strategy_node_configs: HashMap<NodeId,
+  MarketMakerConfig>` built in lockstep with `strategy_pool`
+  on every graph swap. Parses `gamma`/`kappa`/`sigma`/
+  `order_size`/`num_levels`/`min_spread_bps`/`max_distance_bps`
+  off each `Strategy.*` node's graph config, clones the
+  engine baseline, applies overrides. The per-node tick loop
+  builds a `StrategyContext` whose `config` field points at
+  the override so two `Strategy.Avellaneda`s with different
+  γ genuinely produce different quotes.
+- [x] **GR-4** `config_schema()` on `Risk.ToxicityWiden`
+  (`scale`), `Risk.InventoryUrgency` (`cap`, `exponent`),
+  `Risk.CircuitBreaker` (`wide_bps`). Same `Number { min,
+  max, step }` widget pattern as the Exec schemas.
+- [x] **GR-5** `Sentiment.Rate` / `Sentiment.Score` accept an
+  optional `asset` config override. Engine checks the field
+  first; when set, looks up the tick regardless of graph
+  scope. Empty / missing keeps the legacy Symbol-scope-only
+  resolution. Schema gains the `asset` text field so the UI
+  surfaces it without a catalog drift.
+- [x] **GR-6** `graph_catalog_coverage` test module on the
+  engine: walks every `kinds()` entry, skips nodes with
+  inputs (graph-internal), skips a hand-curated EXEMPT list
+  of pool-backed / sink kinds, and asserts every remaining
+  kind appears as a `"Kind" =>` (or `|`-joined) arm in
+  `tick_strategy_graph`. Caught Risk.* false positives +
+  Sentiment compound-match on first run; both fixed in the
+  same commit.
 
 ## P3 — hardening / polish
 

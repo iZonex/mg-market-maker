@@ -544,6 +544,21 @@ pub struct MarketMakerEngine {
         mm_strategy_graph::NodeId,
         Box<dyn mm_strategy::r#trait::Strategy>,
     >,
+    /// GR-3 — per-node MarketMakerConfig overrides. Two
+    /// `Strategy.Avellaneda` nodes in one graph with
+    /// `{gamma: 0.5}` vs `{gamma: 2.0}` produced identical
+    /// quotes before this map landed because both shared the
+    /// engine's single config. The tick loop now reads each
+    /// node's override and passes a `StrategyContext` whose
+    /// `config` field points at it. Built by
+    /// `build_strategy_node_configs` in lockstep with
+    /// `strategy_pool` on every graph swap. Missing entries
+    /// fall through to `self.config.market_maker` — legacy
+    /// graphs with no overrides keep their current behaviour.
+    strategy_node_configs: std::collections::HashMap<
+        mm_strategy_graph::NodeId,
+        mm_common::config::MarketMakerConfig,
+    >,
     /// Last tick's `compute_quotes()` output per-pool-instance,
     /// keyed by the node id. Refreshed at the end of
     /// `refresh_quotes` once the StrategyContext is built — the
@@ -995,6 +1010,7 @@ impl MarketMakerEngine {
             graph_quotes_override: None,
             last_strategy_quotes: None,
             strategy_pool: std::collections::HashMap::new(),
+            strategy_node_configs: std::collections::HashMap::new(),
             last_strategy_quotes_per_node: std::collections::HashMap::new(),
             surveillance_tracker: mm_risk::surveillance::new_shared_tracker(),
             surveillance_last_alert: std::collections::HashMap::new(),
@@ -1631,6 +1647,87 @@ impl MarketMakerEngine {
     /// (falls back to the strategy's `Default`) — the deploy
     /// validator already caught catalog-level issues; we just want
     /// the pool to keep running on configs it can't parse.
+    /// GR-3 — parse every `Strategy.*` node's graph config for
+    /// MM-knob overrides (γ / κ / σ / order_size / num_levels
+    /// / min_spread_bps / max_distance_bps) and bake a clone of
+    /// the engine's baseline `MarketMakerConfig` with those
+    /// fields replaced. Returns one owned config per override
+    /// node. Missing / unparseable config falls through — the
+    /// tick loop uses `self.config.market_maker` for any node
+    /// absent from this map.
+    fn build_strategy_node_configs(
+        graph: &mm_strategy_graph::Graph,
+        baseline: &mm_common::config::MarketMakerConfig,
+    ) -> std::collections::HashMap<
+        mm_strategy_graph::NodeId,
+        mm_common::config::MarketMakerConfig,
+    > {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+
+        let mut out = std::collections::HashMap::new();
+        for n in &graph.nodes {
+            if !n.kind.starts_with("Strategy.") {
+                continue;
+            }
+            let cfg = &n.config;
+            let dec = |k: &str| -> Option<Decimal> {
+                cfg.get(k)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Decimal::from_str(s).ok())
+            };
+            let usz = |k: &str| -> Option<usize> {
+                cfg.get(k)
+                    .and_then(|v| v.as_u64())
+                    .and_then(|n| usize::try_from(n).ok())
+            };
+
+            let gamma = dec("gamma");
+            let kappa = dec("kappa");
+            let sigma = dec("sigma");
+            let order_size = dec("order_size");
+            let num_levels = usz("num_levels");
+            let min_spread_bps = dec("min_spread_bps");
+            let max_distance_bps = dec("max_distance_bps");
+
+            let has_override = gamma.is_some()
+                || kappa.is_some()
+                || sigma.is_some()
+                || order_size.is_some()
+                || num_levels.is_some()
+                || min_spread_bps.is_some()
+                || max_distance_bps.is_some();
+            if !has_override {
+                continue;
+            }
+
+            let mut c = baseline.clone();
+            if let Some(v) = gamma {
+                c.gamma = v;
+            }
+            if let Some(v) = kappa {
+                c.kappa = v;
+            }
+            if let Some(v) = sigma {
+                c.sigma = v;
+            }
+            if let Some(v) = order_size {
+                c.order_size = v;
+            }
+            if let Some(v) = num_levels {
+                c.num_levels = v.max(1);
+            }
+            if let Some(v) = min_spread_bps {
+                c.min_spread_bps = v;
+            }
+            if let Some(v) = max_distance_bps {
+                c.max_distance_bps = v;
+            }
+            out.insert(n.id, c);
+        }
+        out
+    }
+
     fn build_strategy_pool(
         graph: &mm_strategy_graph::Graph,
     ) -> std::collections::HashMap<
@@ -2013,6 +2110,8 @@ impl MarketMakerEngine {
         self.strategy_graph_hash = Some(graph.content_hash());
         self.strategy_graph_scope = Some(graph.scope.clone());
         self.strategy_pool = Self::build_strategy_pool(graph);
+        self.strategy_node_configs =
+            Self::build_strategy_node_configs(graph, &self.config.market_maker);
         self.last_strategy_quotes_per_node.clear();
         // Drop any pending `Out.Quotes` override from the previous
         // graph — without this, the first tick after a swap would
@@ -2051,6 +2150,8 @@ impl MarketMakerEngine {
         self.strategy_graph_hash = Some(graph.content_hash());
         self.strategy_graph_scope = Some(graph.scope.clone());
         self.strategy_pool = Self::build_strategy_pool(graph);
+        self.strategy_node_configs =
+            Self::build_strategy_node_configs(graph, &self.config.market_maker);
         self.last_strategy_quotes_per_node.clear();
         // Drop any pending `Out.Quotes` override from the previous
         // graph — without this, the first tick after a swap would
@@ -2732,7 +2833,27 @@ impl MarketMakerEngine {
                     src.insert((*id, "class".into()), Value::PairClass(label));
                 }
                 "Sentiment.Rate" | "Sentiment.Score" => {
-                    let tick = sentiment_tick.as_ref();
+                    // GR-5 — per-node `asset` override. Resolves
+                    // a tick regardless of graph scope when the
+                    // node config names a base asset (e.g.
+                    // `asset: "BTC"`); otherwise falls back to
+                    // the scope-derived `sentiment_tick`.
+                    let cfg = graph.node_configs().get(id);
+                    let override_asset = cfg
+                        .and_then(|c| c.get("asset"))
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    let tick_owned;
+                    let tick = if let Some(asset) = override_asset {
+                        tick_owned = self
+                            .dashboard
+                            .as_ref()
+                            .and_then(|d| d.sentiment_tick_for(asset));
+                        tick_owned.as_ref()
+                    } else {
+                        sentiment_tick.as_ref()
+                    };
                     let v = match (kind.as_str(), tick) {
                         ("Sentiment.Rate", Some(t)) => Value::Number(t.mentions_rate),
                         ("Sentiment.Score", Some(t)) => {
@@ -6875,15 +6996,26 @@ impl MarketMakerEngine {
                 // nodes — they read it out of `last_strategy_quotes`
                 // via the source marshaller.
                 self.last_strategy_quotes = Some(strategy_quotes.clone());
-                // Phase 5 — also refresh every pool-instance so the
-                // node-level config (different γ across two
-                // `Strategy.Avellaneda`s for example) actually takes
-                // effect. Same ctx, different knobs.
+                // Phase 5 / GR-3 — refresh every pool-instance with
+                // a per-node `StrategyContext` whose `config` field
+                // points at the override materialised in
+                // `strategy_node_configs` (or the engine's baseline
+                // when the node declared no knob overrides). Two
+                // `Strategy.Avellaneda` nodes with different γ now
+                // actually produce different quotes.
                 let mut per_node = std::collections::HashMap::with_capacity(
                     self.strategy_pool.len(),
                 );
                 for (node_id, strat) in &self.strategy_pool {
-                    per_node.insert(*node_id, strat.compute_quotes(&ctx));
+                    let node_ctx = match self.strategy_node_configs.get(node_id) {
+                        Some(override_cfg) => {
+                            let mut c = ctx.clone();
+                            c.config = override_cfg;
+                            c
+                        }
+                        None => ctx.clone(),
+                    };
+                    per_node.insert(*node_id, strat.compute_quotes(&node_ctx));
                 }
                 self.last_strategy_quotes_per_node = per_node;
                 strategy_quotes
@@ -8615,6 +8747,164 @@ mod dual_connector_tests {
         assert!(
             engine.graph_quotes_override.is_none(),
             "pending Out.Quotes override from graph A dropped on swap"
+        );
+    }
+
+    /// GR-3 — two `Strategy.Avellaneda` nodes with different γ
+    /// / order_size overrides get different
+    /// `MarketMakerConfig` baselines materialised so their
+    /// `compute_quotes` calls see distinct knobs.
+    #[test]
+    fn per_node_strategy_config_overrides_are_materialised() {
+        use mm_strategy_graph::{Edge, Graph, GraphNode, NodeId, PortRef, Scope};
+
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        let mut engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            sample_config(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+
+        let aggressive = NodeId::new();
+        let conservative = NodeId::new();
+        let quotes_sink = NodeId::new();
+        let cst = NodeId::new();
+        let mult_sink = NodeId::new();
+        let mut g = Graph::empty("per-node-config", Scope::Symbol("BTCUSDT".into()));
+        g.nodes.push(GraphNode {
+            id: aggressive,
+            kind: "Strategy.Avellaneda".into(),
+            config: serde_json::json!({ "gamma": "5.0", "order_size": "0.2" }),
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(GraphNode {
+            id: conservative,
+            kind: "Strategy.Avellaneda".into(),
+            config: serde_json::json!({ "gamma": "0.1" }),
+            pos: (0.0, 0.0),
+        });
+        // Round out the graph so the validator accepts it
+        // (every graph needs an Out.SpreadMult sink; Quotes
+        // sink consumes one of the Strategy's outputs so the
+        // strategy node doesn't dangle).
+        g.nodes.push(GraphNode {
+            id: quotes_sink,
+            kind: "Out.Quotes".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(GraphNode {
+            id: cst,
+            kind: "Math.Const".into(),
+            config: serde_json::json!({ "value": "1" }),
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(GraphNode {
+            id: mult_sink,
+            kind: "Out.SpreadMult".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        g.edges.push(Edge {
+            from: PortRef { node: aggressive, port: "quotes".into() },
+            to: PortRef { node: quotes_sink, port: "quotes".into() },
+        });
+        g.edges.push(Edge {
+            from: PortRef { node: cst, port: "value".into() },
+            to: PortRef { node: mult_sink, port: "mult".into() },
+        });
+
+        engine.swap_strategy_graph(&g).expect("graph compiles");
+
+        assert_eq!(
+            engine.strategy_node_configs.len(),
+            2,
+            "both override nodes should have materialised configs"
+        );
+        let aggr_cfg = engine
+            .strategy_node_configs
+            .get(&aggressive)
+            .expect("aggressive override present");
+        let cons_cfg = engine
+            .strategy_node_configs
+            .get(&conservative)
+            .expect("conservative override present");
+        assert_eq!(aggr_cfg.gamma, dec!(5.0));
+        assert_eq!(aggr_cfg.order_size, dec!(0.2));
+        assert_eq!(cons_cfg.gamma, dec!(0.1));
+        // Baseline fields the node did NOT override stay at the
+        // engine's config (sample_config uses the defaults).
+        assert_eq!(cons_cfg.order_size, engine.config.market_maker.order_size);
+        assert_eq!(aggr_cfg.kappa, engine.config.market_maker.kappa);
+    }
+
+    /// GR-3 — a Strategy.* node with no knob override must NOT
+    /// appear in `strategy_node_configs`; the tick loop falls
+    /// back to the engine's baseline config, preserving legacy
+    /// graph behaviour.
+    #[test]
+    fn per_node_strategy_config_absent_for_unconfigured_nodes() {
+        use mm_strategy_graph::{Edge, Graph, GraphNode, NodeId, PortRef, Scope};
+
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        let mut engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            sample_config(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+
+        let strat = NodeId::new();
+        let quotes_sink = NodeId::new();
+        let cst = NodeId::new();
+        let mult_sink = NodeId::new();
+        let mut g = Graph::empty("no-overrides", Scope::Symbol("BTCUSDT".into()));
+        g.nodes.push(GraphNode {
+            id: strat,
+            kind: "Strategy.Avellaneda".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(GraphNode {
+            id: quotes_sink,
+            kind: "Out.Quotes".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(GraphNode {
+            id: cst,
+            kind: "Math.Const".into(),
+            config: serde_json::json!({ "value": "1" }),
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(GraphNode {
+            id: mult_sink,
+            kind: "Out.SpreadMult".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        g.edges.push(Edge {
+            from: PortRef { node: strat, port: "quotes".into() },
+            to: PortRef { node: quotes_sink, port: "quotes".into() },
+        });
+        g.edges.push(Edge {
+            from: PortRef { node: cst, port: "value".into() },
+            to: PortRef { node: mult_sink, port: "mult".into() },
+        });
+
+        engine.swap_strategy_graph(&g).expect("graph compiles");
+        assert!(
+            engine.strategy_node_configs.is_empty(),
+            "nodes without knob overrides must NOT materialise a per-node config"
         );
     }
 
@@ -11608,6 +11898,151 @@ mod graph_source_sanity_tests {
         assert!(
             mult > dec!(1),
             "profitable-long flatten PnL should propagate to SpreadMult, got {mult}"
+        );
+    }
+}
+
+// -------------------------------------------------------------
+// GR-6 — catalog-vs-engine coverage lint. Walks every catalog
+// `kinds()` entry and asserts that every kind which the engine
+// is responsible for materialising has a matching arm in this
+// file. Blocks the "added to catalog, forgot to wire" regression
+// the Apr-19 graph audit flagged.
+// -------------------------------------------------------------
+
+#[cfg(test)]
+mod graph_catalog_coverage {
+    /// Kinds that are **intentionally** not matched by a
+    /// `"Kind" =>` arm in `tick_strategy_graph`. Each entry
+    /// needs a one-line rationale so a future reader knows
+    /// whether the skip is valid.
+    const EXEMPT: &[(&str, &str)] = &[
+        // ── Pure graph-internal nodes: evaluate from inputs,
+        //    no engine state required. No arm by design.
+        ("Math.Add", "math op — evaluated by graph"),
+        ("Math.Mul", "math op — evaluated by graph"),
+        ("Math.Const", "constant — evaluated by graph"),
+        ("Stats.EWMA", "stateless EWMA — evaluated by graph"),
+        ("Cast.ToBool", "bool cast — evaluated by graph"),
+        ("Cast.StrategyEq", "tag cmp — evaluated by graph"),
+        ("Cast.PairClassEq", "tag cmp — evaluated by graph"),
+        ("Logic.And", "boolean AND — evaluated by graph"),
+        ("Logic.Mux", "switch — evaluated by graph"),
+        ("Logic.StringMux", "string switch — evaluated by graph"),
+        ("Indicator.SMA", "stateful — evaluated by graph from `x` input"),
+        ("Indicator.EMA", "stateful — evaluated by graph from `x` input"),
+        ("Indicator.HMA", "stateful — evaluated by graph from `x` input"),
+        ("Indicator.RSI", "stateful — evaluated by graph from `x` input"),
+        ("Indicator.ATR", "stateful — evaluated by graph from high/low/close"),
+        ("Indicator.Bollinger", "stateful — evaluated by graph from `x` input"),
+        ("Exec.TwapConfig", "policy emitter — evaluated by graph"),
+        ("Exec.VwapConfig", "policy emitter — evaluated by graph"),
+        ("Exec.PovConfig", "policy emitter — evaluated by graph"),
+        ("Exec.IcebergConfig", "policy emitter — evaluated by graph"),
+        ("Quote.Grid", "quote combinator — evaluated by graph"),
+        ("Quote.Mux", "quote switch — evaluated by graph"),
+        ("Plan.Accumulate", "plan FSM — evaluated by graph"),
+        ("Strategy.QueueAware", "scaler — evaluated by graph from its inputs"),
+        // ── Strategy.* source nodes use a separate
+        //    per-node pool + wildcard overlay (see the pool
+        //    construction at ~1640 and the Strategy.*
+        //    lookup at ~3466). Not a by-name match arm in
+        //    `tick_strategy_graph`, but they ARE engine-wired.
+        ("Strategy.Avellaneda", "strategy pool wildcard lookup"),
+        ("Strategy.GLFT", "strategy pool wildcard lookup"),
+        ("Strategy.Grid", "strategy pool wildcard lookup"),
+        ("Strategy.Basis", "strategy pool wildcard lookup"),
+        ("Strategy.CrossExchange", "strategy pool wildcard lookup"),
+        ("Strategy.BasisArb", "strategy pool wildcard lookup"),
+        // Pentest strategies — same pool-backed pattern.
+        ("Strategy.Spoof", "pentest — pool-backed"),
+        ("Strategy.Wash", "pentest — pool-backed"),
+        ("Strategy.Ignite", "pentest — pool-backed"),
+        ("Strategy.Mark", "pentest — pool-backed"),
+        ("Strategy.Layer", "pentest — pool-backed"),
+        ("Strategy.Stuff", "pentest — pool-backed"),
+        ("Strategy.CrossMarket", "pentest — pool-backed"),
+        ("Strategy.LatencyHunt", "pentest — pool-backed"),
+        ("Strategy.RebateFarm", "pentest — pool-backed"),
+        ("Strategy.Imbalance", "pentest — pool-backed"),
+        ("Strategy.ReactCancel", "pentest — pool-backed"),
+        ("Strategy.OneSided", "pentest — pool-backed"),
+        ("Strategy.InvPush", "pentest — pool-backed"),
+        ("Strategy.NonFill", "pentest — pool-backed"),
+        // ── Sinks: fire via `SinkAction` harvest in evaluator,
+        //    not the source overlay loop.
+        ("Out.SpreadMult", "sink — SinkAction::SpreadMult"),
+        ("Out.SizeMult", "sink — SinkAction::SizeMult"),
+        ("Out.KillEscalate", "sink — SinkAction::KillEscalate"),
+        ("Out.Flatten", "sink — SinkAction::Flatten"),
+        ("Out.Quotes", "sink — SinkAction::Quotes"),
+        ("Out.VenueQuotes", "sink — SinkAction::VenueQuotes"),
+        ("Out.AtomicBundle", "sink — SinkAction::AtomicBundle"),
+    ];
+
+    #[test]
+    fn every_catalog_kind_is_wired_or_explicitly_exempt() {
+        let engine_src: &str = include_str!("market_maker.rs");
+        let exempt: std::collections::HashSet<&str> =
+            EXEMPT.iter().map(|(k, _)| *k).collect();
+
+        let mut missing: Vec<String> = Vec::new();
+        for (kind, shape) in mm_strategy_graph::catalog::kinds() {
+            if exempt.contains(kind) {
+                continue;
+            }
+            // Nodes that declare input ports compute their
+            // output from those inputs via `evaluate()` — the
+            // engine doesn't need a source-overlay arm for
+            // them (Risk.ToxicityWiden / Risk.InventoryUrgency
+            // / Risk.CircuitBreaker are the canonical case).
+            if !shape.inputs.is_empty() {
+                continue;
+            }
+            // Source overlay patterns the engine uses:
+            //   `"Kind" =>`                (solo arm)
+            //   `"Kind" | "OtherKind" =>`  (compound arm, left)
+            //   `| "Kind" =>`              (compound arm, right)
+            //   `| "Kind" |`               (compound arm, middle)
+            // Any of them counts as "wired".
+            let solo = format!("\"{kind}\" =>");
+            let left = format!("\"{kind}\" |");
+            let right = format!("| \"{kind}\" =>");
+            let mid = format!("| \"{kind}\" |");
+            let wired = engine_src.contains(&solo)
+                || engine_src.contains(&left)
+                || engine_src.contains(&right)
+                || engine_src.contains(&mid);
+            if !wired {
+                missing.push(kind.to_string());
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "catalog kinds with no engine arm (and no exemption): {missing:?}. \
+             Either add a match arm in `tick_strategy_graph` or document the \
+             skip in `graph_catalog_coverage::EXEMPT` with a one-line reason."
+        );
+    }
+
+    /// Companion guard — any EXEMPT entry that doesn't
+    /// match a current catalog kind is probably a rename
+    /// drift. Fail so the next audit notices.
+    #[test]
+    fn every_exempt_kind_still_exists_in_catalog() {
+        let live: std::collections::HashSet<&str> = mm_strategy_graph::catalog::kinds()
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
+        let stale: Vec<&&str> = EXEMPT
+            .iter()
+            .map(|(k, _)| k)
+            .filter(|k| !live.contains(*k))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "EXEMPT entries whose catalog kind no longer exists: {stale:?}"
         );
     }
 }

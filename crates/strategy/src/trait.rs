@@ -50,6 +50,7 @@ impl FillObservation {
 }
 
 /// Context passed to the strategy on each tick.
+#[derive(Clone)]
 pub struct StrategyContext<'a> {
     pub book: &'a LocalOrderBook,
     pub product: &'a ProductSpec,

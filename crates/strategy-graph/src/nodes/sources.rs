@@ -477,8 +477,88 @@ single_scalar_source!(BorrowRateApr, "Borrow.RateApr", "value");
 single_scalar_source!(BorrowMaxAvailable, "Borrow.MaxAvailable", "value");
 single_scalar_source!(BorrowCarryBps, "Borrow.CarryBps", "value");
 
-single_scalar_source!(SentimentRate, "Sentiment.Rate", "value");
-single_scalar_source!(SentimentScore, "Sentiment.Score", "value");
+// GR-5 — Sentiment.Rate / Sentiment.Score accept an optional
+// `asset` config override so non-Symbol-scoped graphs can
+// still resolve a tick. Without the override the engine uses
+// the graph's symbol scope (Symbol("BTCUSDT") → "BTC");
+// Global / AssetClass / Client graphs stay at `Missing`
+// unless the config names an explicit asset.
+
+#[derive(Debug, Default)]
+pub struct SentimentRate;
+
+impl NodeKind for SentimentRate {
+    fn kind(&self) -> &'static str {
+        "Sentiment.Rate"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        static PORTS: Lazy<Vec<Port>> =
+            Lazy::new(|| vec![Port::new("value", PortType::Number)]);
+        &PORTS
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![ConfigField {
+            name: "asset",
+            label: "Asset override",
+            hint: Some(
+                "Leave empty to resolve from graph scope; set to a base asset \
+                 (e.g. BTC) when the graph isn't Symbol-scoped",
+            ),
+            default: serde_json::json!(""),
+            widget: ConfigWidget::Text,
+        }]
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct SentimentScore;
+
+impl NodeKind for SentimentScore {
+    fn kind(&self) -> &'static str {
+        "Sentiment.Score"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        static PORTS: Lazy<Vec<Port>> =
+            Lazy::new(|| vec![Port::new("value", PortType::Number)]);
+        &PORTS
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![ConfigField {
+            name: "asset",
+            label: "Asset override",
+            hint: Some(
+                "Leave empty to resolve from graph scope; set to a base asset \
+                 (e.g. BTC) when the graph isn't Symbol-scoped",
+            ),
+            default: serde_json::json!(""),
+            widget: ConfigWidget::Text,
+        }]
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
 single_scalar_source!(VolatilityRealised, "Volatility.Realised", "value");
 single_scalar_source!(ToxicityVpin, "Toxicity.VPIN", "value");
 single_scalar_source!(MomentumOfiZ, "Momentum.OFIZ", "value");
