@@ -105,10 +105,10 @@
     for (let i = 0; i < n; i++) {
       const left = la[i] ?? ''
       const right = lb[i] ?? ''
-      let tag = '='
-      if (left && !right) tag = '-'
-      else if (!left && right) tag = '+'
-      else if (left !== right) tag = '~'
+      let tag = 'eq'
+      if (left && !right) tag = 'del'
+      else if (!left && right) tag = 'add'
+      else if (left !== right) tag = 'chg'
       rows.push({ tag, left, right })
     }
     return rows
@@ -302,10 +302,10 @@
     background: var(--bg-raised);
     white-space: pre;
   }
-  .diff-row.diff-= .diff-cell { opacity: 0.6; }
-  .diff-row.diff-+ .diff-cell:last-child { background: rgba(52, 211, 153, 0.18); }
-  .diff-row.diff-- .diff-cell:first-child { background: rgba(248, 113, 113, 0.2); }
-  .diff-row.diff-~ .diff-cell { background: rgba(251, 191, 36, 0.15); }
+  .diff-row.diff-eq .diff-cell { opacity: 0.6; }
+  .diff-row.diff-add .diff-cell:last-child { background: rgba(52, 211, 153, 0.18); }
+  .diff-row.diff-del .diff-cell:first-child { background: rgba(248, 113, 113, 0.2); }
+  .diff-row.diff-chg .diff-cell { background: rgba(251, 191, 36, 0.15); }
   .diff-one {
     max-height: 60vh; overflow: auto;
     padding: var(--s-2);

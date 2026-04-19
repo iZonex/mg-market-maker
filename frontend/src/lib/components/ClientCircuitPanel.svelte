@@ -62,7 +62,7 @@
   <div class="empty-state">
     <span class="empty-state-icon"><Icon name="shield" size={18} /></span>
     <span class="empty-state-title">No clients registered</span>
-    <span class="empty-state-hint">Per-client loss circuits appear when you add clients via <code>POST /api/admin/clients</code>.</span>
+    <span class="empty-state-hint">Per-client loss circuits appear once a client is registered. Use the <strong>Client onboarding</strong> panel on the Admin page.</span>
   </div>
 {:else}
   <table class="tbl">

@@ -1,6 +1,6 @@
 # MM — Open Work Tracker
 
-Last updated: 2026-04-19 (post-Sprint 20)
+Last updated: 2026-04-19 (post-Sprint 21)
 
 Tracking debt not yet closed. Closed items live in git history.
 Each row is a concrete deliverable; bigger initiatives are
@@ -999,19 +999,47 @@ Verification:
   asserts `SinkAction::VenueQuotes(non_empty)` fires on the
   tick.
 
-## Sprint 21 — honest MM side closeout (planned)
+## Sprint 21 — honest MM side closeout (landed Apr 19)
 
 Long-deferred MM-side quality work that's been sitting behind the
 Epic R run. All non-restricted.
 
-- [ ] **R10.1** Client onboarding UX polish — dashboard flow for
-  new client registration needs end-to-end smoke.
-- [ ] **PAPER-2** Two-venue paper smoke runbook exercise (operator
-  task, runbook at `docs/guides/paper-smoke-two-venue.md`).
-- [ ] **OBS-1** OTel DSN + Sentry sanity — both exist, neither
-  tested against a live endpoint (operator task).
-- [ ] **HARD-3** Reconciliation loop real-exchange test — exists
-  in code, needs live venue keys (operator task).
+- [x] **R10.1** `ClientOnboardingPanel.svelte` mounted on
+  AdminPage above the config surfaces card. Form fields: id,
+  name, symbols CSV, webhook URLs one-per-line, jurisdiction
+  dropdown (global / US / EU / UK / JP / SG). 403 jurisdiction
+  gate surfaces a user-readable "US clients cannot register on
+  a perp engine" message; 409 surfaces "client id already
+  exists — choose a different id". Success banner warns the
+  operator that new-symbol engines need a server restart to
+  spawn (the backend module doc says so, so the UI says so).
+  `ClientCircuitPanel`'s empty-state hint updated away from
+  the curl pointer. No backend change — all four endpoints
+  already existed at `/api/admin/clients`.
+- [x] **Bonus** — fixed pre-existing build-breaking CSS in
+  `StrategyDeployHistory.svelte`. Tags `=` / `+` / `-` / `~`
+  aren't valid CSS identifiers; `.diff-=` / `.diff-+` /
+  `.diff--` selectors made `npm run build` fail in every run
+  since UI-5 landed. Tags renamed to `eq` / `add` / `del` /
+  `chg` in both the diff function and the CSS. Dashboard now
+  builds cleanly.
+- [x] **Operator runbooks** for the three operator-blocked
+  items: `docs/guides/paper-smoke-two-venue.md` (PAPER-2, was
+  already there from Sprint 13), `docs/guides/obs-sanity.md`
+  (OBS-1 — Sentry DSN + OTLP gRPC two-part check), and
+  `docs/guides/reconciliation-live-test.md` (HARD-3 — three
+  scenarios: agreement, induced order drift, induced position
+  drift). Each has explicit pass criteria checkboxes so the
+  operator can't handwave a half-pass. Until the operator runs
+  them, these three TODO items stay open as blocked-on-hardware:
+- [ ] **PAPER-2** Two-venue paper smoke runbook exercise
+  (operator task, runbook at `docs/guides/paper-smoke-two-venue.md`).
+- [ ] **OBS-1** OTel DSN + Sentry sanity — runbook at
+  `docs/guides/obs-sanity.md`. Needs live Sentry DSN + OTLP
+  collector.
+- [ ] **HARD-3** Reconciliation loop real-exchange test —
+  runbook at `docs/guides/reconciliation-live-test.md`. Needs
+  testnet venue keys.
 - [ ] **R10.2** Integration test coverage audit: we have ~1600
   unit tests, but how many integration / E2E? Sprint 14 showed
   this gap is what lets gate drift hide. Enumerate, fill gaps.

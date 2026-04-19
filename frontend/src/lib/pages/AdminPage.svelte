@@ -3,6 +3,7 @@
   import Controls from '../components/Controls.svelte'
   import VenuesHealth from '../components/VenuesHealth.svelte'
   import AdminConfigPanels from '../components/AdminConfigPanels.svelte'
+  import ClientOnboardingPanel from '../components/ClientOnboardingPanel.svelte'
   import SorDecisions from '../components/SorDecisions.svelte'
   import AtomicBundles from '../components/AtomicBundles.svelte'
   import RebalanceRecommendations from '../components/RebalanceRecommendations.svelte'
@@ -54,6 +55,9 @@
     </Card>
     <Card title="On-chain surveillance" subtitle="holder concentration + CEX inflow" span={3}>
       {#snippet children()}<OnchainScores {auth} />{/snippet}
+    </Card>
+    <Card title="Client onboarding" subtitle="register + jurisdiction gate" span={3}>
+      {#snippet children()}<ClientOnboardingPanel {auth} />{/snippet}
     </Card>
     <Card title="Config surfaces" subtitle="webhooks · alerts · loans · sentiment" span={3}>
       {#snippet children()}<AdminConfigPanels {auth} />{/snippet}
