@@ -469,10 +469,12 @@ pub struct MarketMakerEngine {
     /// site shape as `funding_arb_driver`: the engine's select
     /// loop polls it on `stat_arb_tick`, routes every event
     /// through `handle_stat_arb_event`, and leaves the driver
-    /// owning the Kalman / z-score state. Stage-1 is
-    /// advisory-only — the driver does NOT dispatch leg orders
-    /// yet. Events land in the audit trail so operators can
-    /// replay what the driver would have done.
+    /// owning the Kalman / z-score state. Stage-2 (MV-4) wires
+    /// `try_dispatch_legs_for_{entry,exit}` before the event
+    /// reaches `handle_stat_arb_event`; a partially-failed
+    /// dispatch (one leg placed, the other rejected) escalates
+    /// the kill switch to `StopNewOrders` and drops the driver
+    /// so an operator must explicitly restart after triage.
     stat_arb_driver: Option<StatArbDriver>,
     stat_arb_tick: std::time::Duration,
 
@@ -2199,7 +2201,6 @@ impl MarketMakerEngine {
         Arc::clone(&self.decision_ledger)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn sweep_atomic_bundle_acks(&mut self) {
         let self_venue = format!("{:?}", self.config.exchange.exchange_type)
             .to_lowercase();
@@ -2207,8 +2208,36 @@ impl MarketMakerEngine {
         // Price tolerance: half a tick lets venue-side rounding
         // still match.
         let tol = self.product.tick_size / rust_decimal_macros::dec!(2);
+
+        // MV-2 — phase 1: publish any of our OWN live orders
+        // that match pending bundle legs registered on the
+        // shared DashboardState. Every engine runs this phase
+        // so the ack flag flips regardless of who originated
+        // the bundle.
+        if let Some(dash) = self.dashboard.as_ref() {
+            for (_oid, side, price, _qty, _status) in &live {
+                let matches =
+                    dash.pending_bundle_leg_matches(&self_venue, &self.symbol, *side, *price, tol);
+                for (bundle_id, role) in matches {
+                    dash.ack_atomic_bundle_leg(&bundle_id, role);
+                }
+            }
+        }
+
+        // Phase 2: merge the dashboard's view into this engine's
+        // locally-tracked bundles. Self-venue legs still get
+        // flipped by the live-orders match below (dashboard
+        // already reflects that); cross-venue legs now lift off
+        // `false` because a sibling engine's phase-1 publish
+        // updated the shared state. Either path is acceptable —
+        // we OR them so a dashboard-less test deployment still
+        // works.
         for b in self.inflight_atomic_bundles.values_mut() {
-            let matches = |venue: &str, symbol: &str, side: mm_common::types::Side, price: rust_decimal::Decimal| -> bool {
+            let local_match = |venue: &str,
+                               symbol: &str,
+                               side: mm_common::types::Side,
+                               price: rust_decimal::Decimal|
+             -> bool {
                 if venue != self_venue || symbol != self.symbol {
                     return false;
                 }
@@ -2216,20 +2245,39 @@ impl MarketMakerEngine {
                     *live_side == side && (*live_price - price).abs() <= tol
                 })
             };
-            if !b.maker_acked && matches(&b.maker_venue, &b.maker_symbol, b.maker_side, b.maker_price) {
+            if !b.maker_acked && local_match(&b.maker_venue, &b.maker_symbol, b.maker_side, b.maker_price) {
                 b.maker_acked = true;
             }
-            if !b.hedge_acked && matches(&b.hedge_venue, &b.hedge_symbol, b.hedge_side, b.hedge_price) {
+            if !b.hedge_acked && local_match(&b.hedge_venue, &b.hedge_symbol, b.hedge_side, b.hedge_price) {
                 b.hedge_acked = true;
             }
         }
+        if let Some(dash) = self.dashboard.as_ref() {
+            for (id, b) in self.inflight_atomic_bundles.iter_mut() {
+                let (maker, hedge) = dash.atomic_bundle_ack_state(id);
+                b.maker_acked = b.maker_acked || maker;
+                b.hedge_acked = b.hedge_acked || hedge;
+            }
+        }
+
         // Fully-acked bundles graduate out of the inflight table —
         // the watchdog doesn't need to watch them any more. Count
         // the graduations so Prometheus can report a success ratio
         // against the watchdog's rollback counter.
         let before = self.inflight_atomic_bundles.len();
+        let completed_ids: Vec<String> = self
+            .inflight_atomic_bundles
+            .iter()
+            .filter(|(_, b)| b.both_legs_acked())
+            .map(|(id, _)| id.clone())
+            .collect();
         self.inflight_atomic_bundles
             .retain(|_, b| !b.both_legs_acked());
+        if let Some(dash) = self.dashboard.as_ref() {
+            for id in &completed_ids {
+                dash.clear_atomic_bundle(id);
+            }
+        }
         let completed = before - self.inflight_atomic_bundles.len();
         if completed > 0 {
             mm_dashboard::metrics::ATOMIC_BUNDLES_COMPLETED_TOTAL
@@ -2248,7 +2296,6 @@ impl MarketMakerEngine {
     /// before the next tick's quoting pipeline re-reads
     /// `graph_quotes_override`. Returns the count of bundles
     /// rolled back this tick.
-    #[allow(dead_code)]
     pub(crate) fn tick_atomic_bundle_watchdog(&mut self) -> usize {
         let now = chrono::Utc::now();
         let mut rolled_back = 0usize;
@@ -2275,6 +2322,13 @@ impl MarketMakerEngine {
                 mm_dashboard::metrics::ATOMIC_BUNDLES_ROLLED_BACK_TOTAL
                     .with_label_values(&[&self.symbol])
                     .inc();
+                // MV-2 — tidy the cross-engine ack map so a
+                // future bundle with the same fingerprint
+                // doesn't inherit a stale ack flag from this
+                // retired one.
+                if let Some(dash) = self.dashboard.as_ref() {
+                    dash.clear_atomic_bundle(&id);
+                }
                 // Clear any pending override that was created by
                 // this bundle — on the next tick the order diff
                 // cancels the survived leg naturally.
@@ -3779,6 +3833,31 @@ impl MarketMakerEngine {
                         QuoteSide::Buy => Side::Buy,
                         QuoteSide::Sell => Side::Sell,
                     };
+                    let maker_side = to_side(spec.maker.side);
+                    let hedge_side = to_side(spec.hedge.side);
+                    // MV-2 — register both legs on the shared
+                    // DashboardState so any engine whose
+                    // live-orders map grows a match can flip the
+                    // ack flag, regardless of which engine
+                    // originated the dispatch.
+                    if let Some(dash) = self.dashboard.as_ref() {
+                        dash.register_atomic_bundle_leg(
+                            &bundle_id,
+                            mm_dashboard::state::BundleLegRole::Maker,
+                            &spec.maker.venue,
+                            &spec.maker.symbol,
+                            maker_side,
+                            spec.maker.price,
+                        );
+                        dash.register_atomic_bundle_leg(
+                            &bundle_id,
+                            mm_dashboard::state::BundleLegRole::Hedge,
+                            &spec.hedge.venue,
+                            &spec.hedge.symbol,
+                            hedge_side,
+                            spec.hedge.price,
+                        );
+                    }
                     self.inflight_atomic_bundles.insert(
                         bundle_id,
                         InflightAtomicBundle {
@@ -3786,12 +3865,12 @@ impl MarketMakerEngine {
                             timeout_ms: spec.timeout_ms,
                             maker_venue: spec.maker.venue.clone(),
                             maker_symbol: spec.maker.symbol.clone(),
-                            maker_side: to_side(spec.maker.side),
+                            maker_side,
                             maker_price: spec.maker.price,
                             maker_acked: false,
                             hedge_venue: spec.hedge.venue.clone(),
                             hedge_symbol: spec.hedge.symbol.clone(),
-                            hedge_side: to_side(spec.hedge.side),
+                            hedge_side,
                             hedge_price: spec.hedge.price,
                             hedge_acked: false,
                         },
@@ -4601,6 +4680,21 @@ impl MarketMakerEngine {
         event: StatArbEvent,
         dispatch_report: Option<mm_strategy::stat_arb::LegDispatchReport>,
     ) {
+        // MV-4 — classify the dispatch outcome. A partial
+        // failure leaves us with one leg live on one venue and
+        // nothing hedging it on the other — that's the naked
+        // exposure the stat-arb driver was meant to avoid, so
+        // we escalate to `StopNewOrders` and drop the driver so
+        // no further auto-dispatches fire until an operator
+        // intervenes.
+        let partial_failure = dispatch_report.as_ref().is_some_and(|r| {
+            let y_ok = r.y.as_ref().is_some_and(|l| l.error.is_none());
+            let x_ok = r.x.as_ref().is_some_and(|l| l.error.is_none());
+            let y_err = r.y.as_ref().is_some_and(|l| l.error.is_some());
+            let x_err = r.x.as_ref().is_some_and(|l| l.error.is_some());
+            (y_ok && x_err) || (x_ok && y_err)
+        });
+
         match event {
             StatArbEvent::Entered {
                 direction,
@@ -4656,6 +4750,29 @@ impl MarketMakerEngine {
             | StatArbEvent::Warmup { .. }
             | StatArbEvent::Hold { .. }
             | StatArbEvent::InputUnavailable { .. } => {}
+        }
+
+        if partial_failure {
+            let detail = format_leg_report(dispatch_report.as_ref());
+            warn!(
+                symbol = %self.symbol,
+                dispatch = %detail,
+                "stat_arb partial dispatch failure — naked leg risk, escalating kill switch"
+            );
+            self.audit.risk_event(
+                &self.symbol,
+                AuditEventType::PairBreak,
+                &format!("stat_arb partial dispatch: {detail}"),
+            );
+            self.record_incident(
+                "critical",
+                &format!("stat_arb naked-leg exposure on partial dispatch: {detail}"),
+            );
+            self.kill_switch.manual_trigger(
+                mm_risk::kill_switch::KillLevel::StopNewOrders,
+                "stat_arb partial dispatch — naked leg risk",
+            );
+            self.stat_arb_driver = None;
         }
     }
 
@@ -5264,8 +5381,10 @@ impl MarketMakerEngine {
                 };
                 self.book_keeper.on_event(&event);
                 let elapsed_ms = _bk_start.elapsed().as_secs_f64() * 1000.0;
+                let venue_tag = format!("{:?}", self.config.exchange.exchange_type)
+                    .to_lowercase();
                 mm_dashboard::metrics::BOOK_UPDATE_LATENCY_MS
-                    .with_label_values(&[&self.symbol, _bk_kind])
+                    .with_label_values(&[&self.symbol, &venue_tag, _bk_kind])
                     .observe(elapsed_ms);
                 // BOOK-1 — feed the book delta / snapshot into
                 // the queue-position tracker so per-order fill
@@ -6045,6 +6164,16 @@ impl MarketMakerEngine {
     #[instrument(skip(self), fields(symbol = %self.symbol, tick = self.tick_count))]
     async fn refresh_quotes(&mut self) -> Result<()> {
         self.tick_count += 1;
+
+        // MV-2 — run the atomic-bundle ack sweep + rollback
+        // watchdog BEFORE the quote pipeline so (a) ack state
+        // merged this tick influences any graph evaluator that
+        // reads it downstream, and (b) timed-out bundles clear
+        // their `graph_quotes_override` entry before the next
+        // order diff fires. Cheap when no bundle is inflight
+        // (`values_mut()` over an empty map).
+        self.sweep_atomic_bundle_acks();
+        let _rolled = self.tick_atomic_bundle_watchdog();
 
         // Per-client loss circuit (Epic 6). When the aggregate
         // daily PnL across this client's symbols has breached
@@ -8248,6 +8377,95 @@ mod dual_connector_tests {
         );
     }
 
+    /// MV-2 — cross-venue ack loop. The originator's hedge leg
+    /// lives on a different venue; the sibling engine running
+    /// on that venue marks the leg via the shared DashboardState
+    /// and the originator's sweep picks it up. Without the
+    /// shared ack map this bundle would stay `hedge_acked=false`
+    /// forever and get rolled back on timeout.
+    #[test]
+    fn atomic_bundle_ack_sweep_honours_cross_venue_dashboard_signal() {
+        use mm_common::types::{LiveOrder, OrderStatus, Side};
+        use mm_dashboard::state::{BundleLegRole, DashboardState};
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        let dash = DashboardState::new();
+        let mut engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            sample_config(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            Some(dash.clone()),
+            None,
+        );
+        let self_venue = "custom"; // engine's default exchange_type tag.
+        let now = chrono::Utc::now();
+        // Only the maker leg lives locally; hedge is on bybit.
+        engine.order_manager.track_order(LiveOrder {
+            order_id: uuid::Uuid::new_v4(),
+            symbol: "BTCUSDT".into(),
+            side: Side::Buy,
+            price: dec!(100),
+            qty: dec!(1),
+            filled_qty: dec!(0),
+            status: OrderStatus::Open,
+            created_at: now,
+        });
+        let bundle_id = "cross-bundle".to_string();
+        engine.inflight_atomic_bundles.insert(
+            bundle_id.clone(),
+            InflightAtomicBundle {
+                dispatched_at: now,
+                timeout_ms: 60_000,
+                maker_venue: self_venue.into(),
+                maker_symbol: "BTCUSDT".into(),
+                maker_side: Side::Buy,
+                maker_price: dec!(100),
+                maker_acked: false,
+                hedge_venue: "bybit".into(),
+                hedge_symbol: "BTC-USDT".into(),
+                hedge_side: Side::Sell,
+                hedge_price: dec!(101),
+                hedge_acked: false,
+            },
+        );
+        // Register both legs on the shared DashboardState as
+        // the originator would on AtomicBundle sink dispatch.
+        dash.register_atomic_bundle_leg(
+            &bundle_id,
+            BundleLegRole::Maker,
+            self_venue,
+            "BTCUSDT",
+            Side::Buy,
+            dec!(100),
+        );
+        dash.register_atomic_bundle_leg(
+            &bundle_id,
+            BundleLegRole::Hedge,
+            "bybit",
+            "BTC-USDT",
+            Side::Sell,
+            dec!(101),
+        );
+        // Sibling engine's phase-1 publish: the bybit engine
+        // observed its hedge leg live on its live-orders map
+        // and called `ack_atomic_bundle_leg`.
+        dash.ack_atomic_bundle_leg(&bundle_id, BundleLegRole::Hedge);
+
+        // Originator's sweep must pick up the hedge ack via
+        // DashboardState AND flip its own maker ack via the
+        // local live-orders match.
+        engine.sweep_atomic_bundle_acks();
+        assert!(
+            engine.inflight_atomic_bundles.is_empty(),
+            "cross-venue bundle should graduate once DashboardState carries the remote ack"
+        );
+        // Dashboard entry should also have been cleared.
+        let (m, h) = dash.atomic_bundle_ack_state(&bundle_id);
+        assert!(!m && !h, "completed bundle's dashboard entry must be cleared");
+    }
+
     /// Watchdog leaves fresh bundles alone.
     #[test]
     fn atomic_bundle_watchdog_spares_fresh_entries() {
@@ -9848,6 +10066,117 @@ mod stat_arb_integration {
         // Stage-1 advisory-only: no kill-switch escalation
         // regardless of the event sequence.
         assert_eq!(engine.kill_switch.level(), starting);
+    }
+
+    /// MV-4 — a partial dispatch (one leg filled, the other
+    /// errored) escalates kill switch to StopNewOrders and
+    /// drops the stat-arb driver. This is the naked-leg
+    /// safety we were missing while the driver was labelled
+    /// "advisory only".
+    #[tokio::test]
+    async fn partial_dispatch_failure_escalates_and_drops_driver() {
+        use mm_strategy::stat_arb::{LegDispatchReport, LegOutcome};
+
+        let mut engine = single_engine();
+        let y = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let x = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let driver = StatArbDriver::new(
+            y,
+            x,
+            stat_arb_pair(),
+            small_stat_arb_config(),
+            Arc::new(NullStatArbSink),
+        );
+        engine.stat_arb_driver = Some(driver);
+        let starting = engine.kill_switch.level();
+        assert!(engine.stat_arb_driver.is_some());
+
+        let partial = LegDispatchReport {
+            y: Some(LegOutcome {
+                symbol: "Y".into(),
+                side: mm_common::types::Side::Sell,
+                target_qty: dec!(5),
+                dispatched_qty: dec!(5),
+                error: None,
+            }),
+            x: Some(LegOutcome {
+                symbol: "X".into(),
+                side: mm_common::types::Side::Buy,
+                target_qty: dec!(10),
+                dispatched_qty: dec!(0),
+                error: Some("place_order: venue rate limited".into()),
+            }),
+        };
+        engine.handle_stat_arb_event(
+            StatArbEvent::Entered {
+                direction: SpreadDirection::SellY,
+                y_qty: dec!(5),
+                x_qty: dec!(10),
+                z: dec!(2.5),
+                spread: dec!(1.5),
+            },
+            Some(partial),
+        );
+
+        assert_ne!(engine.kill_switch.level(), starting);
+        assert_eq!(
+            engine.kill_switch.level(),
+            mm_risk::kill_switch::KillLevel::StopNewOrders
+        );
+        assert!(
+            engine.stat_arb_driver.is_none(),
+            "driver must drop after naked-leg incident"
+        );
+    }
+
+    /// MV-4 — full success (both legs placed) must NOT
+    /// escalate and must leave the driver in place.
+    #[tokio::test]
+    async fn full_dispatch_success_does_not_escalate() {
+        use mm_strategy::stat_arb::{LegDispatchReport, LegOutcome};
+
+        let mut engine = single_engine();
+        let y = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let x = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let driver = StatArbDriver::new(
+            y,
+            x,
+            stat_arb_pair(),
+            small_stat_arb_config(),
+            Arc::new(NullStatArbSink),
+        );
+        engine.stat_arb_driver = Some(driver);
+        let starting = engine.kill_switch.level();
+
+        let both_ok = LegDispatchReport {
+            y: Some(LegOutcome {
+                symbol: "Y".into(),
+                side: mm_common::types::Side::Sell,
+                target_qty: dec!(5),
+                dispatched_qty: dec!(5),
+                error: None,
+            }),
+            x: Some(LegOutcome {
+                symbol: "X".into(),
+                side: mm_common::types::Side::Buy,
+                target_qty: dec!(10),
+                dispatched_qty: dec!(10),
+                error: None,
+            }),
+        };
+        engine.handle_stat_arb_event(
+            StatArbEvent::Entered {
+                direction: SpreadDirection::SellY,
+                y_qty: dec!(5),
+                x_qty: dec!(10),
+                z: dec!(2.5),
+                spread: dec!(1.5),
+            },
+            Some(both_ok),
+        );
+
+        assert_eq!(engine.kill_switch.level(), starting);
+        assert!(engine.stat_arb_driver.is_some());
     }
 }
 

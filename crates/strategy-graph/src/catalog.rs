@@ -171,6 +171,7 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Decision.RealizedCostBps" => Some(Box::new(sources::DecisionRealizedCostBps)),
         "Portfolio.CrossVenueNetDelta" => Some(Box::new(sources::PortfolioCrossVenueNetDelta)),
         "Book.FillProbability" => Some(Box::new(sources::BookFillProbability)),
+        "Strategy.QueueAware" => Some(Box::new(strategies::QueueAware)),
         "Borrow.RateApr" => Some(Box::new(sources::BorrowRateApr)),
         "Borrow.MaxAvailable" => Some(Box::new(sources::BorrowMaxAvailable)),
         "Borrow.CarryBps" => Some(Box::new(sources::BorrowCarryBps)),
@@ -316,6 +317,7 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Decision.RealizedCostBps" => NodeMeta { label: "Decision cost avg", summary: "Rolling avg realized cost bps across the last N resolved decisions", group: "Sources" },
         "Portfolio.CrossVenueNetDelta" => NodeMeta { label: "Cross-venue net delta", summary: "Sum of signed inventory across every connected venue for a base asset", group: "Sources" },
         "Book.FillProbability"    => NodeMeta { label: "Fill probability",   summary: "Queue-position-aware 60s fill probability for our frontmost own order on a side", group: "Sources" },
+        "Strategy.QueueAware"     => NodeMeta { label: "Queue-aware scaler", summary: "Scales incoming quote qtys by a Book.FillProbability multiplier — composes with any Strategy.*", group: "Strategies" },
         "Borrow.RateApr"          => NodeMeta { label: "Borrow APR",         summary: "Spot venue borrow rate (annualised fraction) — Missing on perp", group: "Sources" },
         "Borrow.MaxAvailable"     => NodeMeta { label: "Max borrowable",     summary: "Base-asset cap the borrow manager will allow — Missing on perp", group: "Sources" },
         "Borrow.CarryBps"         => NodeMeta { label: "Expected carry bps", summary: "APR converted to bps over operator-tuned holding window", group: "Sources" },
@@ -443,6 +445,7 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Decision.RealizedCostBps",
         "Portfolio.CrossVenueNetDelta",
         "Book.FillProbability",
+        "Strategy.QueueAware",
         "Borrow.RateApr",
         "Borrow.MaxAvailable",
         "Borrow.CarryBps",
@@ -540,9 +543,9 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_103_nodes_after_book_fill_probability() {
-        // 102 after SPOT-1 borrow trio + 1 (BOOK-2: Book.FillProbability). = 103.
-        assert_eq!(kinds().len(), 103, "catalog drift");
+    fn catalog_has_104_nodes_after_strat2_queue_aware() {
+        // 103 after BOOK-2 + 1 (STRAT-2: Strategy.QueueAware). = 104.
+        assert_eq!(kinds().len(), 104, "catalog drift");
     }
 
     /// GR-1 — every indicator with a `period` config field must

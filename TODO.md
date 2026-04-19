@@ -111,17 +111,20 @@ Legend:
   frontend-absent: webhooks, alerts, loans, sentiment
   overrides (see `prod_readiness_audit_apr17` memory for the
   full list).
-- [ ] **UI-8** Per-venue book-update latency p95 on
-  VenuesHealth. Read `mm_book_update_latency_ms` histogram
-  via either a new aggregator endpoint or a direct Prometheus
-  query from the server.
+- [x] **UI-8** `VenuesHealth.svelte` polls both
+  `/api/v1/venues/status` and `/api/v1/venues/latency_p95` in
+  parallel, rendering a `book p95` stat row per venue.
+  Latency poll failures fall through to "—" so the health
+  panel stays alive when the metrics endpoint is down.
 
 ### Observability
 - [ ] **OBS-1** OTel traces with request/tick spans. Sentry
   error reporting already present on `server.rs` init but
-  untested against a real DSN.
-- [ ] **OBS-2** Per-venue latency Prometheus view: aggregator
-  endpoint for the frontend.
+  untested against a real DSN. **Needs live DSN** — operator.
+- [x] **OBS-2** `mm_book_update_latency_ms` histogram gained a
+  `venue` label; `GET /api/v1/venues/latency_p95` scrapes the
+  histogram buckets and returns one row per venue with a
+  bucket-approximated p95 in milliseconds.
 
 ---
 
@@ -132,21 +135,34 @@ Legend:
   degenerate dispatcher that ignores remote legs with a real
   cross-engine dispatch via `ExternalVenueQuotes` channel.
   Comment marker at `engine/src/market_maker.rs:3195`.
-- [ ] **MV-2** `Out.AtomicBundle` cross-venue ack watch (3.E.2).
-  Today cross-venue legs stay `acked=false` forever. Add a
-  distributed ack loop so the watchdog rollback actually
-  flips on a failed leg.
+- [x] **MV-2** Shared `AtomicBundleLeg` table on `DashboardState`
+  carries per-leg ack flags across engines. Originator
+  registers maker+hedge on dispatch; every engine's sweep
+  publishes matches off its own live-orders snapshot. Sweep +
+  watchdog wired into `refresh_quotes()` so rollback + merge
+  fire each tick. Local + cross-venue ack round-trip covered
+  by `atomic_bundle_ack_sweep_honours_cross_venue_dashboard_signal`.
 - [ ] **MV-3** Fee-aware SOR routing.
-- [ ] **MV-4** `StatArbDriver` auto-dispatch (currently
-  advisory-only per `engine/src/market_maker.rs:453`).
+- [x] **MV-4** Stale "advisory-only" docstring replaced.
+  `handle_stat_arb_event` now detects a partial dispatch
+  (one leg placed, the other rejected), escalates the kill
+  switch to `StopNewOrders`, drops the driver, and records a
+  `PairBreak` audit + critical incident — the naked-leg
+  safety the comment claimed we needed. Two new unit tests
+  (`partial_dispatch_failure_escalates_and_drops_driver`
+  + `full_dispatch_success_does_not_escalate`).
 
 ### Strategies + sources
 - [ ] **STRAT-1** Stateful feature extractors behind Strategy
   trait. Reuse the MM-2 `on_fill` / `on_tick` hooks for
   regret memory / Q-table / bandit strategies.
-- [ ] **STRAT-2** Composite `Strategy.Queue-aware` — takes a
-  `Book.FillProbability` input, skews size + level by the
-  probability estimate.
+- [x] **STRAT-2** New `Strategy.QueueAware` node in
+  `strategy-graph/src/nodes/strategies.rs` — inputs
+  `(quotes: Quotes, probability: Number)`, output `quotes`.
+  Multiplier `0.3 + 0.7 · p` with the `0.3` floor guaranteeing
+  no full flatten on a stalled probability feed. Registered in
+  catalog (103 → 104 nodes) with palette meta + 5 unit tests
+  covering the multiplier curve.
 
 ### Graph polish
 - [x] **GR-1** `period_config_field(default)` helper in

@@ -87,6 +87,7 @@ pub async fn start(
         .route("/api/v1/plans/active", get(active_plans))
         .route("/api/v1/otr/tiered", get(otr_tiered))
         .route("/api/v1/portfolio/cross_venue", get(portfolio_cross_venue))
+        .route("/api/v1/venues/latency_p95", get(venues_latency_p95))
         .merge(crate::client_api::client_routes())
         .merge(crate::client_portal::client_portal_routes())
         .route_layer(middleware::from_fn_with_state(
@@ -523,6 +524,95 @@ async fn portfolio_cross_venue(
         })
         .collect();
     Json(CrossVenuePortfolioResponse { assets })
+}
+
+/// OBS-2 — per-venue p95 book-update latency derived from the
+/// `mm_book_update_latency_ms` histogram. Reads Prometheus
+/// histogram buckets, aggregates across symbols for each venue,
+/// and returns one row per venue with an approximated p95 using
+/// the histogram's native bucket boundaries (no external
+/// quantile estimator).
+#[derive(serde::Serialize)]
+struct VenueLatencyRow {
+    venue: String,
+    /// Approximated p95 in milliseconds. `null` when the venue
+    /// has no samples yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p95_ms: Option<f64>,
+    sample_count: u64,
+}
+
+#[derive(serde::Serialize)]
+struct VenueLatencyResponse {
+    venues: Vec<VenueLatencyRow>,
+}
+
+async fn venues_latency_p95() -> Json<VenueLatencyResponse> {
+    use prometheus::proto::MetricType;
+    // bucket upper bound → cumulative count per venue.
+    let mut per_venue: std::collections::BTreeMap<String, Vec<(f64, u64)>> =
+        std::collections::BTreeMap::new();
+    let mut total_counts: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    let families = prometheus::gather();
+    for fam in &families {
+        if fam.get_name() != "mm_book_update_latency_ms"
+            || fam.get_field_type() != MetricType::HISTOGRAM
+        {
+            continue;
+        }
+        for m in fam.get_metric() {
+            let venue = m
+                .get_label()
+                .iter()
+                .find(|lbl| lbl.get_name() == "venue")
+                .map(|lbl| lbl.get_value().to_string());
+            let Some(venue) = venue else { continue };
+            let h = m.get_histogram();
+            let buckets = per_venue.entry(venue.clone()).or_default();
+            // Histograms share bucket boundaries across all
+            // metrics, so we accumulate cumulative_count
+            // per boundary.
+            for b in h.get_bucket() {
+                let ub = b.get_upper_bound();
+                let count = b.get_cumulative_count();
+                if let Some(existing) = buckets.iter_mut().find(|(boundary, _)| {
+                    (boundary - ub).abs() < f64::EPSILON
+                }) {
+                    existing.1 += count;
+                } else {
+                    buckets.push((ub, count));
+                }
+            }
+            *total_counts.entry(venue).or_insert(0) += h.get_sample_count();
+        }
+    }
+
+    let venues: Vec<VenueLatencyRow> = per_venue
+        .into_iter()
+        .map(|(venue, mut buckets)| {
+            // Sort by upper bound ascending for a monotone cdf.
+            buckets.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let total = total_counts.get(&venue).copied().unwrap_or(0);
+            let p95_ms = if total == 0 {
+                None
+            } else {
+                let target = ((total as f64) * 0.95).ceil() as u64;
+                // First bucket whose cumulative count ≥ target
+                // is the p95 upper-bound approximation.
+                buckets
+                    .iter()
+                    .find(|(_, cum)| *cum >= target)
+                    .map(|(ub, _)| *ub)
+            };
+            VenueLatencyRow {
+                venue,
+                p95_ms,
+                sample_count: total,
+            }
+        })
+        .collect();
+    Json(VenueLatencyResponse { venues })
 }
 
 async fn otr_tiered() -> Json<TieredOtrResponse> {

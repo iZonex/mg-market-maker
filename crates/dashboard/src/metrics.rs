@@ -554,10 +554,14 @@ pub static DECISION_VS_EXPECTED_BPS: Lazy<prometheus::HistogramVec> = Lazy::new(
 /// Catches a slowing book-update path before stale quotes cost
 /// us money.
 pub static BOOK_UPDATE_LATENCY_MS: Lazy<prometheus::HistogramVec> = Lazy::new(|| {
+    // OBS-2 — added `venue` label so operators can pivot the
+    // p95 by exchange instead of by symbol. Cardinality grows
+    // by a small constant (3–5 venues per deployment) which
+    // Prometheus handles without trouble.
     prometheus::register_histogram_vec!(
         "mm_book_update_latency_ms",
         "Engine-side processing latency: WS event arrival → book state applied",
-        &["symbol", "kind"],
+        &["symbol", "venue", "kind"],
         vec![0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 1000.0]
     )
     .unwrap()

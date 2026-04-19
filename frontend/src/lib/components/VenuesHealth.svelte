@@ -19,14 +19,28 @@
   const REFRESH_MS = 3_000
 
   let rows = $state([])
+  // UI-8 — map venue → p95_ms polled alongside the venues
+  // status payload. Falls back to null so the existing UI
+  // never blocks on the new endpoint being unreachable.
+  let latencyP95 = $state({})
   let error = $state(null)
   let lastFetch = $state(null)
   let loading = $state(true)
 
   async function refresh() {
     try {
-      const data = await api.getJson('/api/v1/venues/status')
-      rows = Array.isArray(data) ? data : []
+      const [statusData, latencyData] = await Promise.all([
+        api.getJson('/api/v1/venues/status'),
+        api.getJson('/api/v1/venues/latency_p95').catch(() => null),
+      ])
+      rows = Array.isArray(statusData) ? statusData : []
+      const next = {}
+      for (const row of latencyData?.venues ?? []) {
+        if (typeof row?.p95_ms === 'number') {
+          next[row.venue] = row.p95_ms
+        }
+      }
+      latencyP95 = next
       error = null
       lastFetch = new Date()
       loading = false
@@ -113,6 +127,16 @@
             <div class="stat">
               <span class="k">min SLA</span>
               <span class="v mono">{v.min_uptime.toFixed(2)}%</span>
+            </div>
+            <div class="stat">
+              <span class="k">book p95</span>
+              <span class="v mono">
+                {#if typeof latencyP95[v.venue] === 'number'}
+                  {latencyP95[v.venue].toFixed(1)} ms
+                {:else}
+                  —
+                {/if}
+              </span>
             </div>
           </div>
         </div>

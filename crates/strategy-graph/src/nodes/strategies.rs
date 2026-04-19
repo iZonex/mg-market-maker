@@ -74,6 +74,76 @@ strategy_node!(Grid, "Strategy.Grid");
 strategy_node!(Basis, "Strategy.Basis");
 strategy_node!(CrossExchange, "Strategy.CrossExchange");
 
+// ─── STRAT-2 — queue-aware size scaler ────────────────────────
+
+/// `Strategy.QueueAware` — composable quote-size modulator that
+/// takes a `Quotes` bundle and a `Book.FillProbability` scalar,
+/// then scales every quote's `qty` by a probability-derived
+/// multiplier. Pipe any `Strategy.*` source through this node
+/// upstream of `Out.Quotes` to get a queue-position-aware
+/// variant of that strategy without touching its internals.
+///
+/// Multiplier shape: `mult = floor + (1 - floor) · p` where
+/// `floor = 0.3` (never flatten completely so a stalled feed
+/// can't drop size to zero) and `p ∈ [0, 1]`. A `Missing` or
+/// `Bool(false)` probability falls through with `mult = floor`,
+/// the conservative default.
+#[derive(Debug, Default)]
+pub struct QueueAware;
+
+static QUEUE_AWARE_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
+    vec![
+        Port::new("quotes", PortType::Quotes),
+        Port::new("probability", PortType::Number),
+    ]
+});
+
+static QUEUE_AWARE_OUTPUTS: Lazy<Vec<Port>> =
+    Lazy::new(|| vec![Port::new("quotes", PortType::Quotes)]);
+
+impl NodeKind for QueueAware {
+    fn kind(&self) -> &'static str {
+        "Strategy.QueueAware"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &QUEUE_AWARE_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUEUE_AWARE_OUTPUTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        use rust_decimal::prelude::FromPrimitive;
+        let Some(quotes) = inputs.first().and_then(Value::as_quotes) else {
+            return Ok(vec![Value::Missing]);
+        };
+        let p_raw = inputs.get(1).and_then(Value::as_number);
+        // Clamp probability to `[0, 1]`. Missing / out-of-range
+        // falls through to `0.0` so the floor multiplier does
+        // the work — conservative, matches the rest of the
+        // graph's fail-closed posture.
+        let p = p_raw
+            .map(|v| v.max(rust_decimal::Decimal::ZERO).min(rust_decimal::Decimal::ONE))
+            .unwrap_or(rust_decimal::Decimal::ZERO);
+        let floor = rust_decimal::Decimal::from_f64(0.3).unwrap_or(rust_decimal::Decimal::ZERO);
+        let mult = floor + (rust_decimal::Decimal::ONE - floor) * p;
+
+        let scaled: Vec<crate::types::GraphQuote> = quotes
+            .iter()
+            .map(|q| crate::types::GraphQuote {
+                side: q.side,
+                price: q.price,
+                qty: (q.qty * mult).max(rust_decimal::Decimal::ZERO),
+            })
+            .collect();
+        Ok(vec![Value::Quotes(scaled)])
+    }
+}
+
 // ─── Epic R — exploit strategies (pentest-only) ──────────────
 //
 // These deliberately reproduce manipulative patterns for internal
@@ -1048,6 +1118,115 @@ mod tests {
         let mut state = NodeState::default();
         let out = Avellaneda
             .evaluate(&EvalCtx::default(), &[], &mut state)
+            .unwrap();
+        assert!(matches!(out[0], Value::Missing));
+    }
+
+    // ─── STRAT-2 — Strategy.QueueAware scaling ────────────────
+
+    fn gq(side: crate::types::QuoteSide, qty: rust_decimal::Decimal) -> crate::types::GraphQuote {
+        crate::types::GraphQuote {
+            side,
+            price: rust_decimal::Decimal::ONE,
+            qty,
+        }
+    }
+
+    #[test]
+    fn queue_aware_passes_full_qty_at_probability_one() {
+        use rust_decimal_macros::dec;
+        let mut state = NodeState::default();
+        let quotes = vec![gq(crate::types::QuoteSide::Buy, dec!(10))];
+        let out = QueueAware
+            .evaluate(
+                &EvalCtx::default(),
+                &[Value::Quotes(quotes), Value::Number(dec!(1))],
+                &mut state,
+            )
+            .unwrap();
+        match &out[0] {
+            Value::Quotes(qs) => assert_eq!(qs[0].qty, dec!(10)),
+            other => panic!("expected Quotes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn queue_aware_floors_at_0_3_when_probability_zero() {
+        use rust_decimal::prelude::FromPrimitive;
+        use rust_decimal_macros::dec;
+        let mut state = NodeState::default();
+        let quotes = vec![gq(crate::types::QuoteSide::Buy, dec!(10))];
+        let out = QueueAware
+            .evaluate(
+                &EvalCtx::default(),
+                &[Value::Quotes(quotes), Value::Number(dec!(0))],
+                &mut state,
+            )
+            .unwrap();
+        match &out[0] {
+            Value::Quotes(qs) => {
+                let expected = dec!(10) * rust_decimal::Decimal::from_f64(0.3).unwrap();
+                assert_eq!(qs[0].qty, expected);
+            }
+            other => panic!("expected Quotes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn queue_aware_scales_linearly_between_floor_and_full() {
+        use rust_decimal::prelude::FromPrimitive;
+        use rust_decimal_macros::dec;
+        let mut state = NodeState::default();
+        let quotes = vec![gq(crate::types::QuoteSide::Sell, dec!(10))];
+        let out = QueueAware
+            .evaluate(
+                &EvalCtx::default(),
+                &[Value::Quotes(quotes), Value::Number(dec!(0.5))],
+                &mut state,
+            )
+            .unwrap();
+        match &out[0] {
+            Value::Quotes(qs) => {
+                // mult = 0.3 + 0.7 * 0.5 = 0.65 → qty = 6.5
+                let expected = dec!(10) * rust_decimal::Decimal::from_f64(0.65).unwrap();
+                assert_eq!(qs[0].qty, expected);
+            }
+            other => panic!("expected Quotes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn queue_aware_missing_probability_falls_through_to_floor() {
+        use rust_decimal::prelude::FromPrimitive;
+        use rust_decimal_macros::dec;
+        let mut state = NodeState::default();
+        let quotes = vec![gq(crate::types::QuoteSide::Buy, dec!(10))];
+        let out = QueueAware
+            .evaluate(
+                &EvalCtx::default(),
+                &[Value::Quotes(quotes), Value::Missing],
+                &mut state,
+            )
+            .unwrap();
+        match &out[0] {
+            Value::Quotes(qs) => {
+                let expected = dec!(10) * rust_decimal::Decimal::from_f64(0.3).unwrap();
+                assert_eq!(qs[0].qty, expected);
+            }
+            other => panic!("expected Quotes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn queue_aware_missing_quotes_input_returns_missing() {
+        use rust_decimal_macros::dec;
+        let mut state = NodeState::default();
+        let out = QueueAware
+            .evaluate(
+                &EvalCtx::default(),
+                &[Value::Missing, Value::Number(dec!(1))],
+                &mut state,
+            )
             .unwrap();
         assert!(matches!(out[0], Value::Missing));
     }

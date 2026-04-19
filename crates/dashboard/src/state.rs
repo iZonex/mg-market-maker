@@ -264,6 +264,40 @@ struct StateInner {
     /// emit a typed push message so the frontend panel doesn't
     /// need to poll. Left as `None` in headless / test builds.
     ws_broadcast: Option<std::sync::Arc<crate::websocket::WsBroadcast>>,
+    /// MV-2 — cross-engine atomic-bundle ack tracker. The
+    /// originator registers each bundle's two legs here on
+    /// dispatch; every engine publishes into the ack map as
+    /// soon as its own live-orders snapshot contains a match.
+    /// Cheap to clone (`(bundle_id, venue, symbol)` keys;
+    /// booleans as values) and scoped to the lifetime of the
+    /// bundle — originator clears on rollback / success.
+    atomic_bundle_legs: HashMap<AtomicBundleLegKey, AtomicBundleLeg>,
+}
+
+/// MV-2 — dispatch-time fingerprint of a single leg in an
+/// atomic bundle. Every engine's sweep compares its own
+/// live-orders snapshot against the set of currently-pending
+/// legs so acks propagate across venues via the shared
+/// dashboard state instead of a bespoke signalling channel.
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub struct AtomicBundleLegKey {
+    pub bundle_id: String,
+    pub role: BundleLegRole,
+}
+
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+pub enum BundleLegRole {
+    Maker,
+    Hedge,
+}
+
+#[derive(Debug, Clone)]
+pub struct AtomicBundleLeg {
+    pub venue: String,
+    pub symbol: String,
+    pub side: mm_common::types::Side,
+    pub price: Decimal,
+    pub acked: bool,
 }
 
 const MAX_DAILY_REPORTS: usize = 90;
@@ -937,6 +971,111 @@ impl DashboardState {
     /// rendering.
     pub fn cross_venue_by_asset(&self) -> Vec<AssetAggregate> {
         self.inner.read().unwrap().cross_venue.by_asset()
+    }
+
+    /// MV-2 — register a single atomic-bundle leg on dispatch.
+    /// Originator calls this once per leg (maker + hedge). Every
+    /// engine's sweep reads back via
+    /// [`Self::pending_bundle_leg_matches`] to flip acks as soon
+    /// as the leg appears on its local live-orders map.
+    pub fn register_atomic_bundle_leg(
+        &self,
+        bundle_id: &str,
+        role: BundleLegRole,
+        venue: &str,
+        symbol: &str,
+        side: mm_common::types::Side,
+        price: Decimal,
+    ) {
+        self.inner.write().unwrap().atomic_bundle_legs.insert(
+            AtomicBundleLegKey {
+                bundle_id: bundle_id.to_string(),
+                role,
+            },
+            AtomicBundleLeg {
+                venue: venue.to_string(),
+                symbol: symbol.to_string(),
+                side,
+                price,
+                acked: false,
+            },
+        );
+    }
+
+    /// MV-2 — every engine calls this during its ack sweep with
+    /// the `(venue, symbol, side, price)` of each of its OWN live
+    /// maker orders. Returns the `(bundle_id, role)` pairs that
+    /// match the input so the caller can mark the ack below.
+    /// `tick_size_tolerance` mirrors the half-tick rounding
+    /// slack the engine's own matcher already applies.
+    pub fn pending_bundle_leg_matches(
+        &self,
+        venue: &str,
+        symbol: &str,
+        side: mm_common::types::Side,
+        price: Decimal,
+        tick_size_tolerance: Decimal,
+    ) -> Vec<(String, BundleLegRole)> {
+        let g = self.inner.read().unwrap();
+        g.atomic_bundle_legs
+            .iter()
+            .filter(|(_, leg)| {
+                leg.venue == venue
+                    && leg.symbol == symbol
+                    && leg.side == side
+                    && (leg.price - price).abs() <= tick_size_tolerance
+                    && !leg.acked
+            })
+            .map(|(key, _)| (key.bundle_id.clone(), key.role))
+            .collect()
+    }
+
+    /// MV-2 — flip an ack flag. Safe to call from any engine;
+    /// idempotent (repeat calls for a leg already acked are
+    /// no-ops).
+    pub fn ack_atomic_bundle_leg(&self, bundle_id: &str, role: BundleLegRole) {
+        let mut g = self.inner.write().unwrap();
+        if let Some(leg) = g.atomic_bundle_legs.get_mut(&AtomicBundleLegKey {
+            bundle_id: bundle_id.to_string(),
+            role,
+        }) {
+            leg.acked = true;
+        }
+    }
+
+    /// MV-2 — originator reads both legs' current ack state.
+    /// Returns `(maker_acked, hedge_acked)` — either can be
+    /// `false` if the corresponding leg has not landed on a
+    /// venue yet.
+    pub fn atomic_bundle_ack_state(&self, bundle_id: &str) -> (bool, bool) {
+        let g = self.inner.read().unwrap();
+        let maker = g
+            .atomic_bundle_legs
+            .get(&AtomicBundleLegKey {
+                bundle_id: bundle_id.to_string(),
+                role: BundleLegRole::Maker,
+            })
+            .map(|l| l.acked)
+            .unwrap_or(false);
+        let hedge = g
+            .atomic_bundle_legs
+            .get(&AtomicBundleLegKey {
+                bundle_id: bundle_id.to_string(),
+                role: BundleLegRole::Hedge,
+            })
+            .map(|l| l.acked)
+            .unwrap_or(false);
+        (maker, hedge)
+    }
+
+    /// MV-2 — originator removes both legs when the bundle
+    /// finishes (success or rollback). Leaving entries around
+    /// would match against future live orders and cause
+    /// spurious "acks" for retired bundles.
+    pub fn clear_atomic_bundle(&self, bundle_id: &str) {
+        let mut g = self.inner.write().unwrap();
+        g.atomic_bundle_legs
+            .retain(|k, _| k.bundle_id != bundle_id);
     }
 
     /// UI-1 — publish active plans for a symbol. Empty vec
