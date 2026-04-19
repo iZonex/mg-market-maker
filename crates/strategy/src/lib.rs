@@ -23,6 +23,7 @@ pub mod learned_microprice;
 pub mod market_resilience;
 pub mod momentum;
 pub mod paired_unwind;
+pub mod pump_and_dump;
 pub mod spoof;
 pub mod stat_arb;
 pub mod wash;

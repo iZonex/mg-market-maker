@@ -1069,6 +1069,45 @@ fn cross_venue_config_fields(
 /// ratio, median order lifetime, and biggest-open-vs-avg-trade size.
 /// Pair with `Cast.ToBool(>=0.8)` + `Out.KillEscalate` to stand
 /// down when the detector flags us.
+/// R2.7 — CEX-side manipulation detector graph source.
+/// Outputs four numbers matching the
+/// `ManipulationScoreAggregator` snapshot shape: the combined
+/// score plus the three sub-components so operators can pipe
+/// either the aggregated signal into `Strategy.QueueAware` /
+/// kill-switch gates, or a specific sub-component when that's
+/// the only signal they trust.
+#[derive(Debug, Default)]
+pub struct ManipulationScore;
+
+static MANIPULATION_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
+    vec![
+        Port::new("value", PortType::Number),
+        Port::new("pump_dump", PortType::Number),
+        Port::new("wash", PortType::Number),
+        Port::new("thin_book", PortType::Number),
+    ]
+});
+
+impl NodeKind for ManipulationScore {
+    fn kind(&self) -> &'static str {
+        "Surveillance.ManipulationScore"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &MANIPULATION_OUTPUTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing; 4])
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SpoofingScore;
 

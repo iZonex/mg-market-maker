@@ -414,6 +414,11 @@ pub struct MarketMakerEngine {
     /// has stressed the book. Feeds into
     /// `AutoTuner::set_market_resilience` per tick.
     market_resilience: MarketResilienceCalculator,
+    /// R2.5 — CEX-side manipulation detector bundle. Fed on
+    /// every public trade + book refresh; the aggregated
+    /// snapshot is published to the dashboard and piped into
+    /// `Surveillance.ManipulationScore` for graph consumers.
+    manipulation: mm_risk::manipulation::ManipulationScoreAggregator,
     /// Regulatory OTR counter: `(adds + 2·updates + cancels) /
     /// max(trades, 1) - 1`. Exported into the audit trail and
     /// Prometheus. Market-quality / spoofing proxy tracked for
@@ -904,6 +909,7 @@ impl MarketMakerEngine {
             kyle_lambda: KyleLambda::new(config.toxicity.kyle_window),
             adverse_selection: AdverseSelectionTracker::new(200),
             market_resilience: MarketResilienceCalculator::new(MrConfig::default()),
+            manipulation: mm_risk::manipulation::ManipulationScoreAggregator::new(),
             otr: OrderToTradeRatio::new(),
             tiered_otr: mm_risk::otr::TieredOtrTracker::new(),
             inventory_drift: InventoryDriftReconciler::new(
@@ -2323,6 +2329,45 @@ impl MarketMakerEngine {
                     };
                     Some(Box::new(
                         mm_strategy::exploits::NonFillStrategy::with_config(c),
+                    ))
+                }
+                "Strategy.PumpAndDump" => {
+                    let cfg = &n.config;
+                    let parse_dec = |k: &str, default: rust_decimal::Decimal| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(default)
+                    };
+                    let parse_u64 = |k: &str, default: u64| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(default)
+                    };
+                    let parse_u32 = |k: &str, default: u32| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32)
+                            .unwrap_or(default)
+                    };
+                    let c = mm_strategy::pump_and_dump::PumpAndDumpConfig {
+                        accumulate_ticks: parse_u64("accumulate_ticks", 20),
+                        accumulate_size: parse_dec("accumulate_size", dec!(0.002)),
+                        accumulate_offset_bps: parse_dec("accumulate_offset_bps", dec!(5)),
+                        pump_ticks: parse_u64("pump_ticks", 10),
+                        pump_size: parse_dec("pump_size", dec!(0.002)),
+                        pump_depth_bps: parse_dec("pump_depth_bps", dec!(50)),
+                        distribute_ticks: parse_u64("distribute_ticks", 20),
+                        distribute_size: parse_dec("distribute_size", dec!(0.001)),
+                        distribute_offset_bps: parse_dec("distribute_offset_bps", dec!(20)),
+                        distribute_rungs: parse_u32("distribute_rungs", 4),
+                        distribute_step_bps: parse_dec("distribute_step_bps", dec!(15)),
+                        dump_ticks: parse_u64("dump_ticks", 10),
+                        dump_size: parse_dec("dump_size", dec!(0.002)),
+                        dump_depth_bps: parse_dec("dump_depth_bps", dec!(60)),
+                    };
+                    Some(Box::new(
+                        mm_strategy::pump_and_dump::PumpAndDumpStrategy::with_config(c),
                     ))
                 }
                 _ => None,
@@ -3751,6 +3796,20 @@ impl MarketMakerEngine {
                     if out.score >= rust_decimal_macros::dec!(0.8) {
                         pending_alerts.push((kind.clone(), *id, out));
                     }
+                }
+                // R2.7 — CEX-side manipulation detector source.
+                // The engine keeps the aggregator's sub-scores
+                // fresh via `on_trade` in the market-event loop +
+                // `on_book` on every tick; the overlay just copies
+                // the current snapshot into the evaluator's
+                // source_inputs so every downstream consumer sees
+                // the same tuple.
+                "Surveillance.ManipulationScore" => {
+                    let snap = self.manipulation.snapshot();
+                    src.insert((*id, "value".into()), Value::Number(snap.combined));
+                    src.insert((*id, "pump_dump".into()), Value::Number(snap.pump_dump));
+                    src.insert((*id, "wash".into()), Value::Number(snap.wash));
+                    src.insert((*id, "thin_book".into()), Value::Number(snap.thin_book));
                 }
                 "Surveillance.SpoofingScore" |
                 "Surveillance.LayeringScore" |
@@ -6066,6 +6125,12 @@ impl MarketMakerEngine {
             }
             MarketEvent::Trade { venue, trade } => {
                 let trade_venue = *venue;
+                // R2.5 — feed public trades into the manipulation
+                // detector bundle (pump-dump velocity + wash
+                // prints + thin-book volume tail). Cheap per-trade
+                // bookkeeping; snapshot is published each tick
+                // later in `refresh_quotes`.
+                self.manipulation.on_trade(trade);
                 // BOOK-1 — route the trade to every tracker
                 // sitting at the same price level and bump the
                 // per-symbol trade-rate EWMA. Cheap (two map
@@ -8377,6 +8442,23 @@ impl MarketMakerEngine {
                         .strategy_graph_deployed_at_ms
                         .unwrap_or(0),
                     node_count: self.strategy_graph_node_count.unwrap_or(0),
+                }
+            }),
+            // R2.6 — CEX-side manipulation snapshot. Refreshed
+            // on-book before the publish via `on_book`, so each
+            // tick carries the latest (pump, wash, thin-book,
+            // combined) tuple.
+            manipulation_score: Some({
+                self.manipulation.on_book(
+                    &self.book_keeper.book,
+                    chrono::Utc::now(),
+                );
+                let snap = self.manipulation.snapshot();
+                mm_dashboard::state::ManipulationScoreSnapshot {
+                    pump_dump: snap.pump_dump,
+                    wash: snap.wash,
+                    thin_book: snap.thin_book,
+                    combined: snap.combined,
                 }
             }),
         });

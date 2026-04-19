@@ -97,6 +97,7 @@ pub async fn start(
         .route("/api/v1/adverse-selection", get(adverse_selection_snapshot))
         .route("/api/v1/calibration/status", get(calibration_status))
         .route("/api/v1/active-graphs", get(active_graphs_snapshot))
+        .route("/api/v1/manipulation/scores", get(manipulation_scores))
         .merge(crate::client_api::client_routes())
         .merge(crate::client_portal::client_portal_routes())
         .route_layer(middleware::from_fn_with_state(
@@ -959,6 +960,46 @@ struct ActiveGraphRow {
 #[derive(Debug, serde::Serialize)]
 struct ActiveGraphsResponse {
     rows: Vec<ActiveGraphRow>,
+}
+
+/// R2.6 — per-symbol CEX-side manipulation detector snapshot.
+/// Shape matches `ManipulationScoreSnapshot` (four sub-scores +
+/// combined). Symbols without a snapshot are skipped.
+#[derive(Debug, serde::Serialize)]
+struct ManipulationScoreRow {
+    symbol: String,
+    pump_dump: rust_decimal::Decimal,
+    wash: rust_decimal::Decimal,
+    thin_book: rust_decimal::Decimal,
+    combined: rust_decimal::Decimal,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ManipulationScoresResponse {
+    rows: Vec<ManipulationScoreRow>,
+}
+
+async fn manipulation_scores(
+    State(state): State<DashboardState>,
+) -> Json<ManipulationScoresResponse> {
+    let mut rows: Vec<ManipulationScoreRow> = state
+        .get_all()
+        .into_iter()
+        .filter_map(|s| {
+            let m = s.manipulation_score?;
+            Some(ManipulationScoreRow {
+                symbol: s.symbol,
+                pump_dump: m.pump_dump,
+                wash: m.wash,
+                thin_book: m.thin_book,
+                combined: m.combined,
+            })
+        })
+        .collect();
+    // Highest combined first — operators care about the worst
+    // offenders, not alphabetical order.
+    rows.sort_by(|a, b| b.combined.cmp(&a.combined));
+    Json(ManipulationScoresResponse { rows })
 }
 
 async fn active_graphs_snapshot(

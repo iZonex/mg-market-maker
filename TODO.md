@@ -1,6 +1,6 @@
 # MM — Open Work Tracker
 
-Last updated: 2026-04-19 (post-Sprint 6)
+Last updated: 2026-04-19 (post-Sprint 7)
 
 Tracking debt not yet closed. Closed items live in git history.
 Each row is a concrete deliverable; bigger initiatives are
@@ -436,6 +436,70 @@ client sees the system.
   Server boot opens `data/transfers.jsonl`, registers every
   bundle connector by `VenueId::Display` lowercase. Operator
   identity taken from the JWT `TokenClaims::user_id` for audit.
+
+## Sprint 7 — Epic R2 Phase 1: market-manipulation tooling (landed Apr 19)
+
+Detector + exploit pair that implements the RAVE-style pump-
+and-dump cycle on both halves: our MM sees the public pattern
+on a symbol (detect), and — under the same `MM_RESTRICTED_ALLOW=1`
+gate as the existing pentest suite — can reproduce the cycle on
+a controlled venue for surveillance validation (exploit). Key
+use case: "пенетрейсим нашу биржу" — the user will attack their
+own exchange with this tooling, verify the detection + risk
+controls fire, then harden the venue.
+
+- [x] **R2.1** `PumpDumpDetector` at `crates/risk/src/manipulation.rs`.
+  Price velocity (% change across a rolling window, bps) crossed
+  with volume surge (second-half / first-half notional ratio)
+  → product [0, 1]. Self-warming: first-half vs second-half
+  baseline means no separate seed step.
+- [x] **R2.2** `WashPrintDetector`. Classic wash signature: N
+  size-matched opposite-side public prints in a short window at
+  prices clustered near one level. Pair-matched so
+  buy-buy-sell-sell counts as 2, not 4.
+- [x] **R2.3** `ThinBookGuard`. Book depth within ±2% of mid vs
+  trailing 60-second notional. Score saturates at 1.0 when the
+  ratio drops below `min_ratio` (default 0.1 — book can't absorb
+  10% of recent volume).
+- [x] **R2.4** `ManipulationScoreAggregator`. Weighted combiner
+  (default 0.5 / 0.3 / 0.2 on pump-dump / wash / thin-book) with
+  a single `snapshot()` returning the four-field view the
+  dashboard + graph source both consume.
+- [x] **R2.5** Engine wire-in. `MarketMakerEngine.manipulation`
+  field; every `MarketEvent::Trade` feeds `on_trade`, every tick's
+  `refresh_quotes` calls `on_book` + publishes
+  `SymbolState.manipulation_score`.
+- [x] **R2.6** Dashboard publish + panel.
+  `ManipulationScoreSnapshot` on `SymbolState`, endpoint
+  `/api/v1/manipulation/scores` (sorted by combined DESC),
+  `ManipulationScores.svelte` on AdminPage highlighting symbols
+  with `combined ≥ 0.5` in red.
+- [x] **R2.7** Graph source `Surveillance.ManipulationScore` with
+  four Number outputs (value, pump_dump, wash, thin_book).
+  Engine overlay at `tick_strategy_graph` copies the current
+  snapshot into `source_inputs`. Catalog count bumped 109 → 111.
+- [x] **R2.8** `PumpAndDumpStrategy` at
+  `crates/strategy/src/pump_and_dump.rs`. Four-phase FSM:
+  Accumulate (passive bids) → Pump (cross-through buys) →
+  Distribute (laddered asks above mid) → Dump (cross-through
+  sells). Tick-driven phase advance; cycle wraps so smoke runs
+  can span multiple cycles. Restricted under `MM_RESTRICTED_ALLOW`.
+- [x] **R2.9** Graph node `Strategy.PumpAndDump` (restricted,
+  same gate as Spoof/Wash/…) with full config schema for each
+  phase's ticks + sizes + depths. Engine `build_strategy_pool`
+  match arm parses config and instantiates `PumpAndDumpStrategy`.
+- [x] **R2.10** Bundled `pentest-pump-and-dump` template. Pairs
+  `Strategy.PumpAndDump` + `Out.Quotes` with
+  `Surveillance.ManipulationScore` → `Cast.ToBool(≥0.6)` →
+  `Out.KillEscalate(level=4)`. Proves the detector fires against
+  the exploit on the same graph: operator deploys it on a test
+  venue, watches the ManipulationScore panel trip the kill
+  switch when the attack phase hits.
+
+Phase 2 deferred (on-chain holder-concentration tracker, CEX
+deposit flow monitor, market-cap vs liquidation ratio guard) —
+those need a new chain indexer / external API integration, out
+of scope for a CEX-data-only sprint.
 
 ## Graph system audit — Apr 19 follow-ups
 

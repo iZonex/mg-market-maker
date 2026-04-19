@@ -751,6 +751,25 @@ pub struct SymbolState {
     /// becomes visible within one refresh cycle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_graph: Option<ActiveGraphSnapshot>,
+    /// R2.6 — CEX-side manipulation detector bundle snapshot.
+    /// `None` before the first tick; thereafter carries the
+    /// four-field view (pump-dump, wash, thin-book, combined)
+    /// that drives the AdminPage panel and the
+    /// `Surveillance.ManipulationScore` graph source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manipulation_score: Option<ManipulationScoreSnapshot>,
+}
+
+/// R2.6 — per-symbol manipulation detector snapshot. Mirror of
+/// `mm_risk::manipulation::ManipulationScoreSnapshot` so
+/// `mm-dashboard` stays independent of `mm-risk`'s internal
+/// types (the engine does the conversion).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ManipulationScoreSnapshot {
+    pub pump_dump: Decimal,
+    pub wash: Decimal,
+    pub thin_book: Decimal,
+    pub combined: Decimal,
 }
 
 /// S6.1 — per-symbol active-graph descriptor. Fields mirror the
@@ -2559,6 +2578,7 @@ mod tests {
             adaptive_state: None,
             open_orders: vec![],
             active_graph: None,
+            manipulation_score: None,
         }
     }
 

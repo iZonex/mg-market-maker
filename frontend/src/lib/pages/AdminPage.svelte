@@ -9,6 +9,7 @@
   import FundingArbPairs from '../components/FundingArbPairs.svelte'
   import AdverseSelection from '../components/AdverseSelection.svelte'
   import CalibrationStatus from '../components/CalibrationStatus.svelte'
+  import ManipulationScores from '../components/ManipulationScores.svelte'
   let { ws, auth } = $props()
 </script>
 
@@ -46,6 +47,9 @@
     </Card>
     <Card title="Live calibration" subtitle="GLFT a / k retune status" span={3}>
       {#snippet children()}<CalibrationStatus {auth} />{/snippet}
+    </Card>
+    <Card title="Manipulation detector" subtitle="CEX-side pump / wash / thin-book" span={3}>
+      {#snippet children()}<ManipulationScores {auth} />{/snippet}
     </Card>
     <Card title="Config surfaces" subtitle="webhooks · alerts · loans · sentiment" span={3}>
       {#snippet children()}<AdminConfigPanels {auth} />{/snippet}

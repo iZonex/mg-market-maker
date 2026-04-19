@@ -11,6 +11,7 @@ pub mod inventory;
 pub mod inventory_drift;
 pub mod kill_switch;
 pub mod lead_lag_guard;
+pub mod manipulation;
 pub mod loan_utilization;
 pub mod margin_guard;
 pub mod market_impact;

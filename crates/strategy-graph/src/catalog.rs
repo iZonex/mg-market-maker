@@ -141,11 +141,14 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Strategy.OneSided" => Some(Box::new(strategies::OneSided)),
         "Strategy.InvPush" => Some(Box::new(strategies::InvPush)),
         "Strategy.NonFill" => Some(Box::new(strategies::NonFill)),
+        // R2.9 — pump-and-dump orchestrator (pentest-only)
+        "Strategy.PumpAndDump" => Some(Box::new(strategies::PumpAndDump)),
         // MM-3 — execution plan DSL
         "Plan.Accumulate" => {
             plan::Accumulate::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
         }
         // Epic R — surveillance detectors (engine overlays per tick)
+        "Surveillance.ManipulationScore" => Some(Box::new(sources::ManipulationScore)),
         "Surveillance.SpoofingScore" => Some(Box::new(sources::SpoofingScore)),
         "Surveillance.LayeringScore" => Some(Box::new(sources::LayeringScore)),
         "Surveillance.QuoteStuffingScore" => Some(Box::new(sources::QuoteStuffingScore)),
@@ -294,11 +297,13 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Strategy.OneSided"    => NodeMeta { label: "One-sided (pentest)", summary: "⚠ RESTRICTED — post on one side only without inventory reason", group: "Exploit" },
         "Strategy.InvPush"     => NodeMeta { label: "Inv push (pentest)",  summary: "⚠ RESTRICTED — drive price in unwinding direction to dump inventory", group: "Exploit" },
         "Strategy.NonFill"     => NodeMeta { label: "Non-filling (pentest)", summary: "⚠ RESTRICTED — orders placed near-touch but pulled before fill", group: "Exploit" },
+        "Strategy.PumpAndDump" => NodeMeta { label: "Pump & Dump (pentest)", summary: "⚠ RESTRICTED — 4-phase FSM: accumulate → pump → distribute → dump. Reproduces the RAVE-style cycle for exchange-side surveillance validation.", group: "Exploit" },
 
         // MM-3 — execution plan DSL
         "Plan.Accumulate"      => NodeMeta { label: "Plan: Accumulate", summary: "Time-sliced accumulate / distribute with abort-price guard", group: "Plans" },
 
         // Epic R — surveillance detectors (safe, defaults-on)
+        "Surveillance.ManipulationScore" => NodeMeta { label: "Manipulation score", summary: "CEX-side pump-dump + wash + thin-book aggregated manipulation score [0..1] — the RAVE rug-pull detector", group: "Surveillance" },
         "Surveillance.SpoofingScore" => NodeMeta { label: "Spoofing score", summary: "Likelihood our own flow looks like spoofing [0..1] + cancel_ratio + lifetime", group: "Surveillance" },
         "Surveillance.LayeringScore" => NodeMeta { label: "Layering score", summary: "Multi-order structured pressure + synchronous cancels [0..1]", group: "Surveillance" },
         "Surveillance.QuoteStuffingScore" => NodeMeta { label: "Quote stuffing score", summary: "High orders/sec + high cancel ratio + near-zero fill rate [0..1]", group: "Surveillance" },
@@ -447,6 +452,7 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Strategy.OneSided",
         "Strategy.InvPush",
         "Strategy.NonFill",
+        "Strategy.PumpAndDump",
         "Plan.Accumulate",
         "Surveillance.ForeignTwap",
         "Cost.Sweep",
@@ -466,6 +472,7 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Borrow.RateApr",
         "Borrow.MaxAvailable",
         "Borrow.CarryBps",
+        "Surveillance.ManipulationScore",
         "Surveillance.SpoofingScore",
         "Surveillance.LayeringScore",
         "Surveillance.QuoteStuffingScore",
@@ -560,10 +567,10 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_109_nodes_after_s4_3_composable_inventory() {
-        // 107 after S4.1 + 2 (S4.3: Signal.FillDepth,
-        // Math.InventorySkew). = 109.
-        assert_eq!(kinds().len(), 109, "catalog drift");
+    fn catalog_has_111_nodes_after_r2_manipulation_score() {
+        // 109 after S4.3 + 1 (R2.9: Strategy.PumpAndDump)
+        // + 1 (R2.7: Surveillance.ManipulationScore) = 111.
+        assert_eq!(kinds().len(), 111, "catalog drift");
     }
 
     /// GR-1 — every indicator with a `period` config field must

@@ -1092,6 +1092,95 @@ impl NodeKind for Spoof {
     }
 }
 
+/// `Strategy.PumpAndDump` — pentest four-phase exploit
+/// orchestrator. See `mm_strategy::pump_and_dump` for the phase
+/// FSM and each phase's quote shape.
+#[derive(Debug, Default)]
+pub struct PumpAndDump;
+
+impl NodeKind for PumpAndDump {
+    fn kind(&self) -> &'static str {
+        "Strategy.PumpAndDump"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &[]
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUOTES_OUT
+    }
+    fn restricted(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<ConfigField> {
+        vec![
+            ConfigField {
+                name: "accumulate_ticks",
+                label: "Accumulate ticks",
+                hint: Some("How long to quietly build inventory before the pump."),
+                default: serde_json::json!(20),
+                widget: ConfigWidget::Integer { min: Some(0), max: Some(10_000) },
+            },
+            ConfigField {
+                name: "accumulate_size",
+                label: "Accumulate size",
+                hint: Some("Per-tick passive bid qty during accumulate."),
+                default: serde_json::json!("0.002"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+            ConfigField {
+                name: "pump_ticks",
+                label: "Pump ticks",
+                hint: Some("How long to aggressively push price up."),
+                default: serde_json::json!(10),
+                widget: ConfigWidget::Integer { min: Some(0), max: Some(10_000) },
+            },
+            ConfigField {
+                name: "pump_depth_bps",
+                label: "Pump depth (bps)",
+                hint: Some("How far across the ask the crossing buy goes."),
+                default: serde_json::json!("50"),
+                widget: ConfigWidget::Number { min: Some(1.0), max: Some(1000.0), step: Some(1.0) },
+            },
+            ConfigField {
+                name: "distribute_ticks",
+                label: "Distribute ticks",
+                hint: Some("How long to sell into FOMO via an ask ladder."),
+                default: serde_json::json!(20),
+                widget: ConfigWidget::Integer { min: Some(0), max: Some(10_000) },
+            },
+            ConfigField {
+                name: "distribute_rungs",
+                label: "Distribute rungs",
+                hint: Some("Simultaneous ask ladder rungs above mid."),
+                default: serde_json::json!(4),
+                widget: ConfigWidget::Integer { min: Some(1), max: Some(50) },
+            },
+            ConfigField {
+                name: "dump_ticks",
+                label: "Dump ticks",
+                hint: Some("Aggressive cross-through sell tail at the end."),
+                default: serde_json::json!(10),
+                widget: ConfigWidget::Integer { min: Some(0), max: Some(10_000) },
+            },
+            ConfigField {
+                name: "dump_depth_bps",
+                label: "Dump depth (bps)",
+                hint: Some("How far across the bid the crossing sell goes."),
+                default: serde_json::json!("60"),
+                widget: ConfigWidget::Number { min: Some(1.0), max: Some(1000.0), step: Some(1.0) },
+            },
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
