@@ -88,6 +88,7 @@ pub async fn start(
         .route("/api/v1/otr/tiered", get(otr_tiered))
         .route("/api/v1/portfolio/cross_venue", get(portfolio_cross_venue))
         .route("/api/v1/venues/latency_p95", get(venues_latency_p95))
+        .route("/api/v1/venues/funding_state", get(venues_funding_state))
         .route("/api/v1/sor/decisions/recent", get(sor_decisions_recent))
         .route("/api/v1/atomic-bundles/inflight", get(atomic_bundles_inflight))
         .route("/api/v1/rebalance/recommendations", get(rebalance_recommendations))
@@ -2187,6 +2188,36 @@ fn kill_label(level: u8) -> &'static str {
         5 => "DISCONNECT",
         _ => "UNKNOWN",
     }
+}
+
+/// 23-UX-4 — one snapshot row per (venue, symbol, product)
+/// with a funding-rate entry on the data bus. The frontend's
+/// funding-countdown panel renders these so operators see the
+/// next 8h settlement approaching per perp leg + current rate.
+#[derive(serde::Serialize)]
+struct FundingStateRow {
+    venue: String,
+    symbol: String,
+    product: String,
+    rate: Option<rust_decimal::Decimal>,
+    next_funding_ts: Option<i64>,
+}
+
+async fn venues_funding_state(
+    State(state): State<DashboardState>,
+) -> Json<Vec<FundingStateRow>> {
+    let entries = state.data_bus().funding_entries();
+    let rows: Vec<FundingStateRow> = entries
+        .into_iter()
+        .map(|(key, f)| FundingStateRow {
+            venue: key.0,
+            symbol: key.1,
+            product: format!("{:?}", key.2).to_lowercase(),
+            rate: f.rate,
+            next_funding_ts: f.next_funding_ts.map(|ts| ts.timestamp_millis()),
+        })
+        .collect();
+    Json(rows)
 }
 
 async fn venues_status(State(state): State<DashboardState>) -> Json<Vec<VenueStatusRow>> {

@@ -9,6 +9,7 @@
   import InventoryPanel from '../components/InventoryPanel.svelte'
   import InventoryChart from '../components/InventoryChart.svelte'
   import CrossVenuePortfolio from '../components/CrossVenuePortfolio.svelte'
+  import FundingPanel from '../components/FundingPanel.svelte'
 
   let { ws, auth } = $props()
 
@@ -43,6 +44,13 @@
   <div class="row row-1">
     <Card title="Cross-venue portfolio" subtitle="net delta per base asset">
       {#snippet children()}<CrossVenuePortfolio {auth} />{/snippet}
+    </Card>
+  </div>
+
+  <!-- Row 2.75: Funding state per perp leg (full width) -->
+  <div class="row row-1">
+    <Card title="Funding state" subtitle="per-leg rate + settlement countdown">
+      {#snippet children()}<FundingPanel {auth} />{/snippet}
     </Card>
   </div>
 

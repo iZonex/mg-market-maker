@@ -160,6 +160,18 @@ impl DataBus {
         self.funding.read().ok().and_then(|m| m.get(key).cloned())
     }
 
+    /// 23-UX-4 — snapshot of every (venue, symbol, product) that
+    /// has a funding-rate entry. Used by
+    /// `/api/v1/venues/funding_state` to render the countdown
+    /// panel on Overview without a per-leg polling loop.
+    pub fn funding_entries(&self) -> Vec<(StreamKey, FundingRate)> {
+        self.funding
+            .read()
+            .ok()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default()
+    }
+
     pub fn get_balance(&self, venue: &str, asset: &str) -> Option<BalanceEntry> {
         self.balances
             .read()
@@ -268,5 +280,32 @@ mod tests {
         let got = bus.get_balance("binance", "USDT").unwrap();
         assert_eq!(got.available, dec!(900));
         assert!(bus.get_balance("bybit", "USDT").is_none());
+    }
+
+    /// 23-UX-4 — funding_entries snapshot exposes every (venue,
+    /// symbol, product) with a funding-rate entry so the
+    /// frontend panel can render one row per perp leg.
+    #[test]
+    fn funding_entries_returns_all_published() {
+        let bus = DataBus::new();
+        bus.publish_funding(
+            key("binance", "BTCUSDT", ProductType::LinearPerp),
+            FundingRate {
+                rate: Some(dec!(0.0001)),
+                next_funding_ts: Some(Utc::now()),
+            },
+        );
+        bus.publish_funding(
+            key("bybit", "ETHUSDT", ProductType::LinearPerp),
+            FundingRate {
+                rate: Some(dec!(-0.0002)),
+                next_funding_ts: Some(Utc::now()),
+            },
+        );
+        let entries = bus.funding_entries();
+        assert_eq!(entries.len(), 2);
+        let venues: Vec<&String> = entries.iter().map(|(k, _)| &k.0).collect();
+        assert!(venues.iter().any(|v| v == &"binance"));
+        assert!(venues.iter().any(|v| v == &"bybit"));
     }
 }
