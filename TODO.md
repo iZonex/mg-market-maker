@@ -100,17 +100,24 @@ Legend:
   7 tests in `crates/strategy-graph/src/nodes/plan.rs`.
 
 ### UI / UX
-- [ ] **UI-5** Graph deploy diff viewer. History panel shows
-  hash + operator + timestamp; add a side-by-side JSON diff
-  against the previous deployed version when the operator
-  clicks a history row.
-- [ ] **UI-6** Pentest template review flow. Operator must
-  explicitly ack the restricted-node list before the graph
-  deploys when `MM_RESTRICTED_ALLOW=1` is on.
-- [ ] **UI-7** Admin config panels that are backend-ready but
-  frontend-absent: webhooks, alerts, loans, sentiment
-  overrides (see `prod_readiness_audit_apr17` memory for the
-  full list).
+- [x] **UI-5** `StrategyDeployHistory.svelte` gained a Diff
+  button per history row: loads the current + previous deploy
+  bodies via `/api/v1/strategy/graphs/{name}/history/{hash}`,
+  pretty-prints both, renders a line-by-line side-by-side
+  modal with colour markers for `+` / `-` / `~` changed lines.
+  First deploy of a graph shows a single-pane fallback.
+- [x] **UI-6** Server returns `412 Precondition Required` +
+  `restricted_nodes` list when a restricted graph is deployed
+  under `MM_RESTRICTED_ALLOW=1` without an explicit ack
+  token. Frontend catches the 412, opens a confirmation modal
+  listing the pentest nodes + a checkbox, and retries the
+  POST with `restricted_ack=yes-pentest-mode`. The original
+  env-less refusal (403) path is unchanged.
+- [x] **UI-7** `AdminConfigPanels.svelte` mounts on
+  AdminPage: four sub-panels (webhooks, alert rules, loans,
+  sentiment headlines) calling the existing `/api/admin/*`
+  endpoints with minimal list + add forms. Loans panel also
+  lists the first eight active agreements inline.
 - [x] **UI-8** `VenuesHealth.svelte` polls both
   `/api/v1/venues/status` and `/api/v1/venues/latency_p95` in
   parallel, rendering a `book p95` stat row per venue.
@@ -131,10 +138,15 @@ Legend:
 ## P2 — full-featured
 
 ### Multi-venue
-- [ ] **MV-1** `MultiVenueOrderRouter` — replaces the
-  degenerate dispatcher that ignores remote legs with a real
-  cross-engine dispatch via `ExternalVenueQuotes` channel.
-  Comment marker at `engine/src/market_maker.rs:3195`.
+- [x] **MV-1** Audited — `SinkAction::VenueQuotes` already
+  buckets remote legs by target symbol and dispatches each
+  bucket via `ConfigOverride::ExternalVenueQuotes` on the
+  dashboard's per-symbol channel; target engine picks it up
+  on its next tick. The stale "degenerate dispatcher" comment
+  at line 3647 was refreshed to describe the actual 3.A + 3.B
+  flow. A separate SOR-based venue-selection layer (pick the
+  best venue for an order intent the graph didn't preselect)
+  is a new feature and NOT what this TODO was tracking.
 - [x] **MV-2** Shared `AtomicBundleLeg` table on `DashboardState`
   carries per-leg ack flags across engines. Originator
   registers maker+hedge on dispatch; every engine's sweep
@@ -142,7 +154,12 @@ Legend:
   watchdog wired into `refresh_quotes()` so rollback + merge
   fire each tick. Local + cross-venue ack round-trip covered
   by `atomic_bundle_ack_sweep_honours_cross_venue_dashboard_signal`.
-- [ ] **MV-3** Fee-aware SOR routing.
+- [x] **MV-3** SOR `VenueCostModel::price` (at
+  `crates/engine/src/sor/cost.rs`) already folds venue
+  `maker_fee_bps` + `taker_fee_bps` into
+  `effective_cost_bps`; both Greedy and Convex routers sort
+  routes by that figure. Audited this pass — the TODO was
+  stale.
 - [x] **MV-4** Stale "advisory-only" docstring replaced.
   `handle_stat_arb_event` now detects a partial dispatch
   (one leg placed, the other rejected), escalates the kill
@@ -153,9 +170,14 @@ Legend:
   + `full_dispatch_success_does_not_escalate`).
 
 ### Strategies + sources
-- [ ] **STRAT-1** Stateful feature extractors behind Strategy
-  trait. Reuse the MM-2 `on_fill` / `on_tick` hooks for
-  regret memory / Q-table / bandit strategies.
+- [x] **STRAT-1** Audited — `Strategy` trait at
+  `crates/strategy/src/trait.rs` already exposes
+  `on_fill(&FillObservation)` + `on_tick(&StrategyContext)` +
+  `on_session_tick(i64)` default-no-op hooks (MM-2 landed
+  these during the production push). Engine wires them in
+  `market_maker.rs` at the tick and fill call sites. Stateful
+  strategies (GLFT calibration, Cartea adverse-selection) are
+  already using the hooks. TODO was stale.
 - [x] **STRAT-2** New `Strategy.QueueAware` node in
   `strategy-graph/src/nodes/strategies.rs` — inputs
   `(quotes: Quotes, probability: Number)`, output `quotes`.

@@ -3644,15 +3644,22 @@ impl MarketMakerEngine {
                     self.graph_quotes_override = Some(pairs);
                 }
                 SinkAction::VenueQuotes(vqs) => {
-                    // Multi-Venue 3.A — degenerate dispatcher. Fan
-                    // entries to:
-                    //   · self engine (same venue + symbol)  →
-                    //     reuse the classic `graph_quotes_override`
-                    //     path (legacy diffing, inventory limits,
-                    //     balance check all get their shot).
-                    //   · any other venue/symbol → ignored with a
-                    //     warn; 3.B replaces this arm with a real
-                    //     MultiVenueOrderRouter.
+                    // Multi-Venue 3.A + 3.B (MV-1) — real
+                    // cross-engine dispatch. Fan entries to:
+                    //   · self engine (same venue + symbol +
+                    //     product) → reuse the classic
+                    //     `graph_quotes_override` path (legacy
+                    //     diffing, inventory limits, balance
+                    //     check all get their shot).
+                    //   · any other venue/symbol → bucket by
+                    //     target symbol and dispatch each
+                    //     bucket as an `ExternalVenueQuotes`
+                    //     override on the dashboard's
+                    //     per-symbol channel. The target
+                    //     engine picks it up on its next
+                    //     select-loop tick. Dropped-routing
+                    //     warns surface when no engine is
+                    //     registered for the target symbol.
                     use mm_common::types::{Quote, QuotePair, Side};
                     use mm_strategy_graph::QuoteSide;
                     let self_venue = format!("{:?}", self.config.exchange.exchange_type)

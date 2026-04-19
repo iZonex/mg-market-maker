@@ -50,6 +50,12 @@
   // accidental hash match). Cleared after a successful deploy.
   let rollbackFrom = $state(null)
   let previewBusy = $state(false)
+  // UI-6 — set when the backend returns 412 with a
+  // restricted-nodes list. Frontend opens a confirmation
+  // modal; operator ticks the box + clicks Acknowledge &
+  // Deploy, which re-issues the request with
+  // restricted_ack=yes-pentest-mode.
+  let restrictedAck = $state(null)
 
   // Custom / user-authored templates, loaded from disk via
   // /api/v1/strategy/custom_templates. Shown in the same dropdown
@@ -422,23 +428,59 @@
     }
   }
 
-  async function deploy() {
+  async function deploy(ackToken = null) {
     deployBusy = true
     deployStatus = ''
     try {
       const body = toBackendGraph()
-      const path = rollbackFrom
-        ? `/api/admin/strategy/graph?rollback_from=${encodeURIComponent(rollbackFrom)}`
+      const params = []
+      if (rollbackFrom) params.push(`rollback_from=${encodeURIComponent(rollbackFrom)}`)
+      if (ackToken) params.push(`restricted_ack=${encodeURIComponent(ackToken)}`)
+      const path = params.length
+        ? `/api/admin/strategy/graph?${params.join('&')}`
         : '/api/admin/strategy/graph'
-      const r = await api.postJson(path, body)
+      const resp = await api.authedFetch(path, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+      if (resp.status === 412) {
+        // UI-6 — restricted deploy awaiting operator ack. Open
+        // the modal; resubmit only if the operator confirms.
+        const payload = await resp.json().catch(() => ({}))
+        restrictedAck = {
+          nodes: payload?.restricted_nodes ?? [],
+          acknowledged: false,
+          busy: false,
+          error: '',
+        }
+        deployStatus = 'restricted deploy — operator ack required'
+        return
+      }
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => '')
+        throw new Error(`${resp.status} ${text}`)
+      }
+      const r = await resp.json().catch(() => ({}))
       deployStatus = rollbackFrom
         ? `rolled back · hash ${r.hash?.slice(0, 12)}… · ${r.recipients} engines`
         : `deployed · hash ${r.hash?.slice(0, 12)}… · ${r.recipients} engines`
       rollbackFrom = null
+      restrictedAck = null
     } catch (e) {
       deployStatus = `deploy failed: ${e}`
     } finally {
       deployBusy = false
+    }
+  }
+
+  async function confirmRestrictedDeploy() {
+    if (!restrictedAck?.acknowledged) return
+    restrictedAck = { ...restrictedAck, busy: true, error: '' }
+    await deploy('yes-pentest-mode')
+    if (restrictedAck) {
+      // deploy() cleared it on success; if we're here, leave
+      // the modal open so the operator can read the error.
+      restrictedAck = { ...restrictedAck, busy: false, error: deployStatus }
     }
   }
 
@@ -756,6 +798,56 @@
   <div class="plans-footer">
     <ActivePlans {auth} />
   </div>
+
+  {#if restrictedAck}
+    <div class="ack-backdrop">
+      <div class="ack-card">
+        <div class="ack-title">⚠ Restricted deploy</div>
+        <div class="ack-body">
+          <p class="ack-lead">
+            This graph references {restrictedAck.nodes.length} pentest-only
+            node{restrictedAck.nodes.length === 1 ? '' : 's'}. Deployment
+            places market-manipulating patterns on the engine pool; make
+            sure the run is authorised before continuing.
+          </p>
+          <ul class="ack-nodes">
+            {#each restrictedAck.nodes as n (n)}
+              <li><code>{n}</code></li>
+            {/each}
+          </ul>
+          <label class="ack-check">
+            <input
+              type="checkbox"
+              bind:checked={restrictedAck.acknowledged}
+              disabled={restrictedAck.busy}
+            />
+            <span>I acknowledge the restricted node list above and authorise this deploy.</span>
+          </label>
+          {#if restrictedAck.error}
+            <div class="ack-error">{restrictedAck.error}</div>
+          {/if}
+        </div>
+        <div class="ack-actions">
+          <button
+            type="button"
+            class="btn ghost"
+            onclick={() => { restrictedAck = null }}
+            disabled={restrictedAck.busy}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            class="btn"
+            onclick={confirmRestrictedDeploy}
+            disabled={!restrictedAck.acknowledged || restrictedAck.busy}
+          >
+            {restrictedAck.busy ? 'Deploying…' : 'Acknowledge & Deploy'}
+          </button>
+        </div>
+      </div>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -847,6 +939,48 @@
   /* Hide a top-bar field without removing it from the flex layout
    * so the bar keeps its width on scope toggles. */
   .field-hidden { visibility: hidden; pointer-events: none; }
+
+  /* UI-6 — restricted-deploy ack modal. Full-screen backdrop +
+   * centred card over the editor. Checkbox-gated Deploy button
+   * so the operator can't tab-enter their way into a pentest
+   * deploy. */
+  .ack-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0, 0, 0, 0.65);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 20;
+  }
+  .ack-card {
+    width: min(520px, 92vw);
+    background: var(--bg-raised);
+    border: 1px solid var(--danger);
+    border-radius: var(--r-md);
+    display: flex; flex-direction: column;
+    gap: var(--s-3);
+    padding: var(--s-4);
+  }
+  .ack-title {
+    font-size: var(--fs-md);
+    font-weight: 600;
+    color: var(--danger);
+    letter-spacing: var(--tracking-tight);
+  }
+  .ack-body { display: flex; flex-direction: column; gap: var(--s-3); font-size: var(--fs-sm); }
+  .ack-lead { color: var(--fg-primary); }
+  .ack-nodes {
+    list-style: disc;
+    padding-left: var(--s-4);
+    color: var(--fg-secondary);
+    font-family: var(--font-mono); font-size: var(--fs-xs);
+  }
+  .ack-check {
+    display: flex; align-items: center; gap: var(--s-2);
+    color: var(--fg-primary); font-size: var(--fs-xs);
+  }
+  .ack-error { color: var(--danger); font-size: var(--fs-xs); }
+  .ack-actions {
+    display: flex; justify-content: flex-end; gap: var(--s-2);
+  }
 
   /* Validation strip — sits between the top bar and the canvas,
    * always present (even when empty) so the bar's height doesn't

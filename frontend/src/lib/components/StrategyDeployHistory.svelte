@@ -16,6 +16,13 @@
   let open = $state(false)
   let error = $state('')
   let listed = $state([])
+  // UI-5 — when the operator clicks Diff on a history row
+  // we fetch both that deploy's graph body and the previous
+  // deploy of the SAME name and render a side-by-side view.
+  // `null` means no diff is open.
+  let diff = $state(null)
+  let diffError = $state('')
+  let diffLoading = $state(false)
 
   async function refresh() {
     try {
@@ -33,6 +40,78 @@
     if (!t) return '—'
     const d = new Date(t)
     return d.toLocaleString()
+  }
+
+  // UI-5 — prior deploy for the same `name` strictly older
+  // than `current`. Returns the DeployRecord or null if this
+  // is the first deploy of that name.
+  function priorFor(current) {
+    let newest = null
+    for (const rec of entries) {
+      if (rec.name !== current.name) continue
+      if (rec.hash === current.hash && rec.deployed_at === current.deployed_at) continue
+      if (new Date(rec.deployed_at) >= new Date(current.deployed_at)) continue
+      if (!newest || new Date(rec.deployed_at) > new Date(newest.deployed_at)) {
+        newest = rec
+      }
+    }
+    return newest
+  }
+
+  async function openDiff(current) {
+    diff = null
+    diffError = ''
+    diffLoading = true
+    try {
+      const currentBody = await api.getJson(
+        `/api/v1/strategy/graphs/${encodeURIComponent(current.name)}/history/${encodeURIComponent(current.hash)}`,
+      )
+      const prior = priorFor(current)
+      let priorBody = null
+      if (prior) {
+        priorBody = await api.getJson(
+          `/api/v1/strategy/graphs/${encodeURIComponent(prior.name)}/history/${encodeURIComponent(prior.hash)}`,
+        )
+      }
+      diff = {
+        current,
+        prior,
+        currentJson: JSON.stringify(currentBody, null, 2),
+        priorJson: priorBody === null ? '' : JSON.stringify(priorBody, null, 2),
+      }
+    } catch (e) {
+      diffError = String(e)
+    } finally {
+      diffLoading = false
+    }
+  }
+
+  function closeDiff() {
+    diff = null
+    diffError = ''
+  }
+
+  // Simple per-line diff markers: `=` identical, `+` added,
+  // `-` removed, `~` changed. Zipped by index so output stays
+  // aligned with the side-by-side layout the operator reads
+  // left-to-right. Not a true LCS diff — good enough for a
+  // quick visual scan and keeps the frontend free of a diff
+  // library dependency.
+  function diffMarkers(a, b) {
+    const la = a.split('\n')
+    const lb = b.split('\n')
+    const n = Math.max(la.length, lb.length)
+    const rows = []
+    for (let i = 0; i < n; i++) {
+      const left = la[i] ?? ''
+      const right = lb[i] ?? ''
+      let tag = '='
+      if (left && !right) tag = '-'
+      else if (!left && right) tag = '+'
+      else if (left !== right) tag = '~'
+      rows.push({ tag, left, right })
+    }
+    return rows
   }
 </script>
 
@@ -75,7 +154,15 @@
                     <td class="num">{rec.hash.slice(0, 12)}…</td>
                     <td>{rec.operator}</td>
                     <td><code class="small">{rec.scope}</code></td>
-                    <td>
+                    <td class="actions">
+                      <button
+                        type="button"
+                        class="rb-btn"
+                        onclick={() => openDiff(rec)}
+                        title="Side-by-side diff against the previous deploy of this graph"
+                      >
+                        Diff
+                      </button>
                       <button type="button" class="rb-btn" onclick={() => onRollback?.(rec.name, rec.hash)} title="Load this version and redeploy">
                         Rollback
                       </button>
@@ -87,6 +174,50 @@
           {/if}
         </div>
       {/if}
+    </div>
+  {/if}
+
+  {#if diffLoading}
+    <div class="diff-backdrop">
+      <div class="diff-card"><div class="diff-title">loading diff…</div></div>
+    </div>
+  {:else if diff}
+    <div class="diff-backdrop" onclick={closeDiff}>
+      <div class="diff-card" onclick={(e) => e.stopPropagation()}>
+        <div class="diff-head">
+          <div class="diff-title">
+            <code>{diff.current.name}</code>
+            <span class="muted">·</span>
+            <span class="small">diff</span>
+          </div>
+          <button type="button" class="rb-btn" onclick={closeDiff}>Close</button>
+        </div>
+        {#if diffError}
+          <div class="error">{diffError}</div>
+        {:else if !diff.prior}
+          <div class="muted small">First deploy of this graph — nothing to diff against.</div>
+          <pre class="diff-one">{diff.currentJson}</pre>
+        {:else}
+          <div class="diff-meta">
+            <div class="diff-col muted small">
+              prev · {diff.prior.hash.slice(0, 12)}…
+              <span class="muted">· {fmtTs(diff.prior.deployed_at)}</span>
+            </div>
+            <div class="diff-col muted small">
+              this · {diff.current.hash.slice(0, 12)}…
+              <span class="muted">· {fmtTs(diff.current.deployed_at)}</span>
+            </div>
+          </div>
+          <div class="diff-rows">
+            {#each diffMarkers(diff.priorJson, diff.currentJson) as row}
+              <div class="diff-row diff-{row.tag}">
+                <div class="diff-cell"><code>{row.left}</code></div>
+                <div class="diff-cell"><code>{row.right}</code></div>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </div>
     </div>
   {/if}
 </div>
@@ -130,4 +261,57 @@
     font-size: var(--fs-2xs); cursor: pointer;
   }
   .rb-btn:hover { border-color: var(--warn); color: var(--warn); }
+  .actions { display: flex; gap: var(--s-2); }
+
+  .diff-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 10;
+  }
+  .diff-card {
+    background: var(--bg-raised);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--r-md);
+    width: min(1100px, 92vw);
+    max-height: 82vh;
+    display: flex; flex-direction: column;
+    padding: var(--s-3);
+    gap: var(--s-2);
+  }
+  .diff-head {
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .diff-title { display: flex; align-items: center; gap: var(--s-2); font-size: var(--fs-xs); }
+  .diff-meta { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-2); }
+  .diff-col { font-family: var(--font-mono); font-size: var(--fs-2xs); }
+  .diff-rows {
+    display: flex; flex-direction: column;
+    max-height: 60vh; overflow: auto;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--r-sm);
+    background: var(--bg-chip);
+  }
+  .diff-row {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 1px; background: var(--border-subtle);
+    font-family: var(--font-mono); font-size: var(--fs-2xs);
+  }
+  .diff-cell {
+    padding: 2px var(--s-2);
+    background: var(--bg-raised);
+    white-space: pre;
+  }
+  .diff-row.diff-= .diff-cell { opacity: 0.6; }
+  .diff-row.diff-+ .diff-cell:last-child { background: rgba(52, 211, 153, 0.18); }
+  .diff-row.diff-- .diff-cell:first-child { background: rgba(248, 113, 113, 0.2); }
+  .diff-row.diff-~ .diff-cell { background: rgba(251, 191, 36, 0.15); }
+  .diff-one {
+    max-height: 60vh; overflow: auto;
+    padding: var(--s-2);
+    background: var(--bg-chip);
+    border-radius: var(--r-sm);
+    font-family: var(--font-mono); font-size: var(--fs-2xs);
+  }
+  .small { font-size: var(--fs-2xs); color: var(--fg-muted); }
 </style>

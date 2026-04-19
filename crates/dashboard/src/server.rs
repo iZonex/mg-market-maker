@@ -1263,6 +1263,16 @@ async fn admin_sentiment_headline(
 struct DeployQuery {
     #[serde(default)]
     rollback_from: Option<String>,
+    /// UI-6 — operator acknowledgement of a restricted-node
+    /// deploy. When the env gate is ON (`MM_RESTRICTED_ALLOW`)
+    /// AND the graph references pentest kinds, the deploy must
+    /// carry `restricted_ack=yes-pentest-mode` so a routine
+    /// deploy can't silently promote a pentest template into
+    /// the engine. Without the ack we return `412 Precondition
+    /// Required` with the offender list and the operator UI
+    /// opens a confirmation modal.
+    #[serde(default)]
+    restricted_ack: Option<String>,
 }
 
 /// Sprint 5b — derive the set of venue names a graph may
@@ -1361,30 +1371,53 @@ async fn admin_deploy_strategy_graph(
     let allow_restricted = std::env::var("MM_RESTRICTED_ALLOW")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    if !allow_restricted {
-        let offenders: Vec<String> = graph
-            .nodes
-            .iter()
-            .filter(|n| {
-                mm_strategy_graph::catalog::shape(&n.kind)
-                    .map(|s| s.restricted)
-                    .unwrap_or(false)
-            })
-            .map(|n| n.kind.clone())
-            .collect();
-        if !offenders.is_empty() {
-            let reason = format!(
-                "restricted nodes without MM_RESTRICTED_ALLOW: {}",
-                offenders.join(",")
-            );
+    let offenders: Vec<String> = graph
+        .nodes
+        .iter()
+        .filter(|n| {
+            mm_strategy_graph::catalog::shape(&n.kind)
+                .map(|s| s.restricted)
+                .unwrap_or(false)
+        })
+        .map(|n| n.kind.clone())
+        .collect();
+    if !allow_restricted && !offenders.is_empty() {
+        let reason = format!(
+            "restricted nodes without MM_RESTRICTED_ALLOW: {}",
+            offenders.join(",")
+        );
+        if let Some(audit) = state.audit_log() {
+            audit.strategy_graph_deploy_rejected(&graph.name, &reason, &operator);
+        }
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "error": "restricted",
+                "detail": reason,
+            })),
+        )
+            .into_response();
+    }
+    // UI-6 — even with the env gate ON, operator must ack each
+    // restricted deploy. Returns `412 Precondition Required`
+    // with the offender list so the UI knows to open the ack
+    // modal and retry with the explicit token.
+    if allow_restricted && !offenders.is_empty() {
+        let acked = q.restricted_ack.as_deref() == Some("yes-pentest-mode");
+        if !acked {
             if let Some(audit) = state.audit_log() {
-                audit.strategy_graph_deploy_rejected(&graph.name, &reason, &operator);
+                audit.strategy_graph_deploy_rejected(
+                    &graph.name,
+                    &format!("restricted deploy awaiting operator ack: {}", offenders.join(",")),
+                    &operator,
+                );
             }
             return (
-                StatusCode::FORBIDDEN,
+                StatusCode::PRECONDITION_REQUIRED,
                 axum::Json(serde_json::json!({
-                    "error": "restricted",
-                    "detail": reason,
+                    "error": "restricted_ack_required",
+                    "detail": "operator must explicitly acknowledge the restricted nodes before deploy",
+                    "restricted_nodes": offenders,
                 })),
             )
                 .into_response();
