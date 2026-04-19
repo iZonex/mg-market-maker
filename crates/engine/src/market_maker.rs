@@ -9467,6 +9467,172 @@ mod dual_connector_tests {
         }
     }
 
+    /// Sprint 18 R12.2 — `refresh_funding_rate` fully populates
+    /// both `last_open_interest` and `last_long_short` when the
+    /// connector's perp-product overrides return values. Pins
+    /// the Sprint 12 R6.4 + Sprint 13 R7.1 data-flow that the
+    /// Sprint 15 matrix flagged as ❌ None.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_funding_rate_populates_oi_and_ls_ratio() {
+        use mm_exchange_core::connector::{LongShortRatio, OpenInterestInfo};
+        let mock = Arc::new(MockConnector::new(
+            VenueId::Binance,
+            VenueProduct::LinearPerp,
+        ));
+        mock.set_oi(OpenInterestInfo {
+            symbol: "BTCUSDT".into(),
+            oi_contracts: Some(dec!(12345.67)),
+            oi_usd: Some(dec!(500_000_000)),
+            timestamp: chrono::Utc::now(),
+        });
+        mock.set_ls_ratio(LongShortRatio {
+            symbol: "BTCUSDT".into(),
+            long_pct: dec!(0.7),
+            short_pct: dec!(0.3),
+            ratio: dec!(2.33),
+            timestamp: chrono::Utc::now(),
+        });
+        let bundle = ConnectorBundle::single(mock);
+        let mut engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            sample_config(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        assert!(engine.last_open_interest.is_none(), "pre-poll baseline");
+        assert!(engine.last_long_short.is_none(), "pre-poll baseline");
+        engine.refresh_funding_rate().await;
+        assert_eq!(
+            engine.last_open_interest,
+            Some(dec!(500_000_000)),
+            "OI USD preferred over contracts when both set"
+        );
+        let ls = engine
+            .last_long_short
+            .as_ref()
+            .expect("L/S ratio populated");
+        assert_eq!(ls.ratio, dec!(2.33));
+        assert_eq!(ls.long_pct, dec!(0.7));
+    }
+
+    /// Sprint 18 R12.2 — a spot connector's refresh is a no-op
+    /// for OI + L/S (both stay None). `refresh_funding_rate` is
+    /// still called by the engine loop; it must fail-open on
+    /// `supports_funding_rate = false` so spot engines don't
+    /// spam warnings.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_funding_rate_spot_leaves_state_none() {
+        let mock = Arc::new(MockConnector::new(
+            VenueId::Binance,
+            VenueProduct::Spot,
+        ));
+        let bundle = ConnectorBundle::single(mock);
+        let mut engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            sample_config(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        engine.refresh_funding_rate().await;
+        assert!(engine.last_open_interest.is_none());
+        assert!(engine.last_long_short.is_none());
+    }
+
+    /// Sprint 18 R12.3 — `spawn_leverage_setup` hits the
+    /// connector's `set_leverage` when the graph carries a
+    /// `Strategy.LeverageBuilder` node and capabilities allow.
+    /// Runs under the restricted gate (set by the test body).
+    /// Default multi-thread runtime so `tokio::spawn` executes
+    /// concurrently with the async test body.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_leverage_setup_calls_connector_on_leverage_node() {
+        // SAFETY: single-threaded current_thread runtime; no
+        // parallel observer of MM_ALLOW_RESTRICTED during the
+        // block. Every restricted-gate test in this crate
+        // takes the same contract.
+        unsafe {
+            std::env::set_var("MM_ALLOW_RESTRICTED", "yes-pentest-mode");
+        }
+        let mock = Arc::new(MockConnector::new(
+            VenueId::Binance,
+            VenueProduct::LinearPerp,
+        ));
+        let conn_for_assert = mock.clone();
+        // Hand-assemble a minimal graph with Strategy.LeverageBuilder.
+        let mut g = mm_strategy_graph::Graph::empty(
+            "lev-setup-test",
+            mm_strategy_graph::Scope::Symbol("BTCUSDT".to_string()),
+        );
+        let lev_id = mm_strategy_graph::NodeId::new();
+        g.nodes.push(mm_strategy_graph::GraphNode {
+            id: lev_id,
+            kind: "Strategy.LeverageBuilder".into(),
+            config: serde_json::json!({ "leverage": 20 }),
+            pos: (0.0, 0.0),
+        });
+        // Graph compiles as a standalone test (no sink needed
+        // since we only exercise spawn_leverage_setup, not the
+        // full validator path).
+        let conn_trait: Arc<
+            dyn mm_exchange_core::connector::ExchangeConnector,
+        > = mock;
+        MarketMakerEngine::spawn_leverage_setup(&g, &conn_trait, "BTCUSDT");
+        // spawn_leverage_setup uses tokio::spawn — yield a few
+        // times so the spawned task runs.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let history = conn_for_assert.leverage_call_history();
+        assert_eq!(history.len(), 1, "expected one set_leverage call");
+        assert_eq!(history[0], ("BTCUSDT".to_string(), 20));
+        // SAFETY: same justification.
+        unsafe {
+            std::env::remove_var("MM_ALLOW_RESTRICTED");
+        }
+    }
+
+    /// Sprint 18 R12.3 — spot connector (no leverage cap)
+    /// short-circuits before hitting `set_leverage`. Pins the
+    /// fail-open gate path for venues that don't support it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_leverage_setup_skips_spot_connector() {
+        let mock = Arc::new(MockConnector::new(
+            VenueId::Binance,
+            VenueProduct::Spot,
+        ));
+        let conn_for_assert = mock.clone();
+        let mut g = mm_strategy_graph::Graph::empty(
+            "lev-setup-spot",
+            mm_strategy_graph::Scope::Symbol("BTCUSDT".to_string()),
+        );
+        g.nodes.push(mm_strategy_graph::GraphNode {
+            id: mm_strategy_graph::NodeId::new(),
+            kind: "Strategy.LeverageBuilder".into(),
+            config: serde_json::json!({ "leverage": 10 }),
+            pos: (0.0, 0.0),
+        });
+        let conn_trait: Arc<
+            dyn mm_exchange_core::connector::ExchangeConnector,
+        > = mock;
+        MarketMakerEngine::spawn_leverage_setup(&g, &conn_trait, "BTCUSDT");
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let history = conn_for_assert.leverage_call_history();
+        assert!(
+            history.is_empty(),
+            "spot capability should block set_leverage entirely; got {history:?}"
+        );
+    }
+
     #[test]
     fn single_bundle_has_no_hedge_book() {
         let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));

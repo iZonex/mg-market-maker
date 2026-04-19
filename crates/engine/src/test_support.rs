@@ -57,6 +57,14 @@ pub struct MockConnector {
     /// to simulate a surviving order after cancel_all push ids
     /// here via [`MockConnector::set_open_orders`].
     open_orders: Mutex<Vec<LiveOrder>>,
+    /// Sprint 18 R12.1 — REST-poll override hooks. Mirror the
+    /// `crates/exchange/core/tests/mock_connector_contracts.rs`
+    /// Sprint 17 fixture so engine-level tests can drive the
+    /// same semantics without duplicating trait impls.
+    oi_override: Mutex<Option<mm_exchange_core::connector::OpenInterestInfo>>,
+    ls_override: Mutex<Option<mm_exchange_core::connector::LongShortRatio>>,
+    leverage_calls: Mutex<Vec<(String, u32)>>,
+    leverage_succeeds: Mutex<bool>,
 }
 
 impl MockConnector {
@@ -71,11 +79,14 @@ impl MockConnector {
                 supports_fix: false,
                 max_order_rate: 100,
                 supports_funding_rate: product.has_funding(),
-                supports_margin_info: false,
-                supports_margin_mode: false,
-            supports_liquidation_feed: false,
-            supports_set_leverage: false,
-                        },
+                supports_margin_info: product.has_funding(),
+                supports_margin_mode: product.has_funding(),
+                // Sprint 18 — honest perp-vs-spot semantics so
+                // spawn_leverage_setup + liquidation-feed gated
+                // paths find the right capability on perp mocks.
+                supports_liquidation_feed: product.has_funding(),
+                supports_set_leverage: product.has_funding(),
+            },
             wallet: product.default_wallet(),
             events_tx: Mutex::new(None),
             orderbook: Mutex::new((vec![], vec![])),
@@ -89,7 +100,44 @@ impl MockConnector {
             fail_next_batch_cancel: Mutex::new(false),
             list_symbols_response: Mutex::new(None),
             open_orders: Mutex::new(Vec::new()),
+            oi_override: Mutex::new(None),
+            ls_override: Mutex::new(None),
+            leverage_calls: Mutex::new(Vec::new()),
+            leverage_succeeds: Mutex::new(true),
         }
+    }
+
+    /// Sprint 18 R12.1 — override the mock's
+    /// `get_open_interest` return value so `refresh_funding_rate`
+    /// tests can assert `last_open_interest` populated.
+    pub fn set_oi(&self, value: mm_exchange_core::connector::OpenInterestInfo) {
+        *self.oi_override.lock().unwrap() = Some(value);
+    }
+
+    /// Sprint 18 R12.1 — override `get_long_short_ratio`.
+    pub fn set_ls_ratio(&self, value: mm_exchange_core::connector::LongShortRatio) {
+        *self.ls_override.lock().unwrap() = Some(value);
+    }
+
+    /// Sprint 18 R12.1 — flip set_leverage to return
+    /// `NotSupported` on next call. Used by the
+    /// `spawn_leverage_setup` fallback path tests.
+    pub fn fail_leverage(&self) {
+        *self.leverage_succeeds.lock().unwrap() = false;
+    }
+
+    /// Sprint 18 R12.1 — read the recorded `set_leverage`
+    /// call history. Each entry is `(symbol, leverage)` as
+    /// passed by the caller.
+    pub fn leverage_call_history(&self) -> Vec<(String, u32)> {
+        self.leverage_calls.lock().unwrap().clone()
+    }
+
+    /// Sprint 18 — update the capability flags post-construction.
+    /// Useful when a test needs to pretend a spot venue supports
+    /// something it normally wouldn't (or vice-versa).
+    pub fn set_caps(&mut self, caps: VenueCapabilities) {
+        self.caps = caps;
     }
 
     /// Set the venue's open-order set seen by
@@ -288,6 +336,41 @@ impl ExchangeConnector for MockConnector {
     }
     async fn health_check(&self) -> anyhow::Result<bool> {
         Ok(true)
+    }
+
+    // Sprint 18 R12.1 — REST-poll overrides. Each mirrors the
+    // semantics of the cross-crate
+    // `crates/exchange/core/tests/mock_connector_contracts.rs`
+    // fixture: override set → return value, unset → trait
+    // default (`Ok(None)` / `Err(NotSupported)`).
+    async fn get_open_interest(
+        &self,
+        _symbol: &str,
+    ) -> anyhow::Result<Option<mm_exchange_core::connector::OpenInterestInfo>> {
+        Ok(self.oi_override.lock().unwrap().clone())
+    }
+
+    async fn get_long_short_ratio(
+        &self,
+        _symbol: &str,
+    ) -> anyhow::Result<Option<mm_exchange_core::connector::LongShortRatio>> {
+        Ok(self.ls_override.lock().unwrap().clone())
+    }
+
+    async fn set_leverage(
+        &self,
+        symbol: &str,
+        leverage: u32,
+    ) -> Result<(), mm_exchange_core::connector::MarginError> {
+        self.leverage_calls
+            .lock()
+            .unwrap()
+            .push((symbol.to_string(), leverage));
+        if *self.leverage_succeeds.lock().unwrap() {
+            Ok(())
+        } else {
+            Err(mm_exchange_core::connector::MarginError::NotSupported)
+        }
     }
 
     /// Epic F listing sniper (stage-2): honour the programmed

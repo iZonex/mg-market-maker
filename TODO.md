@@ -1,6 +1,6 @@
 # MM — Open Work Tracker
 
-Last updated: 2026-04-19 (post-Sprint 17)
+Last updated: 2026-04-19 (post-Sprint 18)
 
 Tracking debt not yet closed. Closed items live in git history.
 Each row is a concrete deliverable; bigger initiatives are
@@ -884,6 +884,34 @@ sprint. Ships reusable fixture + 8 contract tests in one file.
 
 Renumbered: "deferred research" (old Sprint 17) now Sprint 19;
 "honest MM side" (old Sprint 18) now Sprint 20.
+
+## Sprint 18 — engine tick integration with MockConnector (landed Apr 19)
+
+Completes R10.2c from the Sprint 15 coverage matrix. MockConnector
+(Sprint 17 fixture) now drives the real `MarketMakerEngine`
+through `refresh_funding_rate` + `spawn_leverage_setup`. Catches
+the exact bug class Sprint 14 found manually — where a feature
+compiles + deploys but doesn't actually flow data through the
+engine.
+
+- [x] **R12.1** Extended `crates/engine/src/test_support.rs::MockConnector`
+  with `get_open_interest` / `get_long_short_ratio` /
+  `set_leverage` hooks. Capability defaults honest per product
+  (perp → full perp support, spot → all perp caps false).
+- [x] **R12.2** Two `refresh_funding_rate` engine tick tests:
+  perp mock populates `last_open_interest` + `last_long_short`
+  end-to-end; spot mock leaves both `None` (fail-open).
+- [x] **R12.3** Two `spawn_leverage_setup` tests under
+  `MM_ALLOW_RESTRICTED=yes-pentest-mode`: perp graph with
+  `Strategy.LeverageBuilder` node fires exactly one
+  `set_leverage` call recorded with `(BTCUSDT, 20)`; spot
+  connector short-circuits on capability gate so `set_leverage`
+  is never called.
+- [x] Found + fixed silent bug: engine `MockConnector`
+  previously advertised `supports_liquidation_feed=false` +
+  `supports_set_leverage=false` even for perp products —
+  would have masked real capability-gated paths in future
+  tests. Now matches the Sprint 17 cross-crate fixture pattern.
 
 ## Renumbered — old Sprint 17 "deferred research" → now Sprint 19
 ## Renumbered — old Sprint 18 "honest MM side" → now Sprint 20

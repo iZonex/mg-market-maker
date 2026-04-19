@@ -68,8 +68,8 @@
 | Liquidation WS → `LiquidationHeatmap` → `Surveillance.LiquidationHeatmap` graph source | Connector parsers | Graph consumers | 🟡 Unit (parsers + heatmap each tested) |
 | `MarketEvent::Fill` → `InventoryManager` → drift reconciler | Engine | Risk + dashboard | 🟡 Unit |
 | Strategy pool tick → `last_strategy_quotes_per_node` → graph overlay → `Out.Quotes` | `build_strategy_pool` | Sink | ✅ E2E (Sprint 14 R8.2 for Strategy.* source nodes) |
-| Funding-rate refresh → `get_funding_rate` → `get_open_interest` → `get_long_short_ratio` | Connector REST | Engine state | 🟡 Unit (Sprint 17 R11.4 — MockConnector contracts) |
-| `swap_strategy_graph` → `spawn_leverage_setup` → `set_leverage` | Dashboard config-override | Connector | ❌ None |
+| Funding-rate refresh → `get_funding_rate` → `get_open_interest` → `get_long_short_ratio` | Connector REST | Engine state | ✅ E2E (Sprint 18 R12.2 — engine tick + mock connector) |
+| `swap_strategy_graph` → `spawn_leverage_setup` → `set_leverage` | Dashboard config-override | Connector | ✅ E2E (Sprint 18 R12.3 — graph node + mock call history) |
 | Config override → `refresh_quotes` → new strategy live | `register_config_channel` | Engine loop | 🟡 Unit |
 | Kill-switch L4 → `TwapExecutor` flatten | `kill_switch` | `OrderManager` | 🟡 Unit |
 
@@ -118,11 +118,9 @@ Three clusters of weakness:
   Pins default `Ok(None)` for `get_open_interest` +
   `get_long_short_ratio` on spot; override path for perps;
   `set_leverage` call recording + failure injection.
-- [ ] **R10.2c** Engine tick integration: spin MockConnector +
-  drive 10 s of fake WS events → verify SymbolState publish.
-  The MockConnector fixture now exists (Sprint 17) —
-  remaining work is the engine-side harness. Added to
-  Sprint 18 backlog.
+- [x] **R10.2c** Engine tick integration (Sprint 18 R12.2 +
+  R12.3 — `refresh_funding_rate` + `spawn_leverage_setup`
+  both proven end-to-end against mock connector)
 - [ ] **R10.2e** Wire CI to run integration tests in addition
   to unit tests — currently `--lib` + `--tests` runs
   everything locally but we haven't verified the CI workflow
