@@ -89,6 +89,10 @@ pub async fn start(
         .route("/api/v1/portfolio/cross_venue", get(portfolio_cross_venue))
         .route("/api/v1/venues/latency_p95", get(venues_latency_p95))
         .route("/api/v1/venues/funding_state", get(venues_funding_state))
+        .route(
+            "/api/v1/history/inventory/per_leg",
+            get(per_leg_inventory_history),
+        )
         .route("/api/v1/sor/decisions/recent", get(sor_decisions_recent))
         .route("/api/v1/atomic-bundles/inflight", get(atomic_bundles_inflight))
         .route("/api/v1/rebalance/recommendations", get(rebalance_recommendations))
@@ -2201,6 +2205,20 @@ struct FundingStateRow {
     product: String,
     rate: Option<rust_decimal::Decimal>,
     next_funding_ts: Option<i64>,
+}
+
+/// 23-UX-2 — per-leg inventory time-series endpoint. Optional
+/// `?base=BTC` filters to legs whose inferred base asset matches.
+#[derive(serde::Deserialize)]
+struct PerLegHistoryQuery {
+    base: Option<String>,
+}
+
+async fn per_leg_inventory_history(
+    State(state): State<DashboardState>,
+    axum::extract::Query(q): axum::extract::Query<PerLegHistoryQuery>,
+) -> Json<Vec<crate::state::PerLegInventoryHistory>> {
+    Json(state.per_leg_inventory_timeseries(q.base.as_deref()))
 }
 
 async fn venues_funding_state(

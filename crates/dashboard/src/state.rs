@@ -166,6 +166,14 @@ struct StateInner {
     spread_timeseries: HashMap<String, std::collections::VecDeque<(i64, Decimal)>>,
     /// UX-2 — inventory (base asset) rolling history.
     inventory_timeseries: HashMap<String, std::collections::VecDeque<(i64, Decimal)>>,
+    /// 23-UX-2 — per-leg inventory time-series keyed by
+    /// `(venue, symbol)`. Populated alongside
+    /// `inventory_timeseries` whenever `publish_inventory` is
+    /// called. Lets the frontend draw a stacked-area chart
+    /// showing how inventory is distributed across venues +
+    /// products over time, not just the aggregate.
+    per_leg_inventory_timeseries:
+        HashMap<(String, String), std::collections::VecDeque<(i64, Decimal)>>,
     /// Process start time for uptime calculation.
     started_at: DateTime<Utc>,
     /// Engine product (Epic 40.10) — `Some` once the server has
@@ -565,6 +573,18 @@ pub struct PnlTimePoint {
 pub struct SeriesPoint {
     pub timestamp_ms: i64,
     pub value: Decimal,
+}
+
+/// 23-UX-2 — one leg's inventory history for the per-leg
+/// stacked-area chart. `venue + symbol` identifies the leg
+/// uniquely; `base_asset` is inferred from symbol so the
+/// frontend can filter / group across quote-currency variants.
+#[derive(Debug, Clone, Serialize)]
+pub struct PerLegInventoryHistory {
+    pub venue: String,
+    pub symbol: String,
+    pub base_asset: String,
+    pub points: Vec<SeriesPoint>,
 }
 
 /// Stored daily report for historical queries.
@@ -1250,11 +1270,67 @@ impl DashboardState {
         inv: Decimal,
         mark: Option<Decimal>,
     ) {
-        self.inner
-            .write()
-            .unwrap()
-            .cross_venue
-            .publish(symbol, venue, inv, mark);
+        let mut inner = self.inner.write().unwrap();
+        inner.cross_venue.publish(symbol, venue, inv, mark);
+        // 23-UX-2 — also push into per-leg time-series so the
+        // PerLegInventoryChart can render "Binance spot vs
+        // Bybit spot vs Binance perp" over time. Same
+        // 1s-gap / 14400-cap rules as `push_pnl_sample`.
+        let key = (venue.to_string(), symbol.to_string());
+        let ts_ms = chrono::Utc::now().timestamp_millis();
+        let series = inner.per_leg_inventory_timeseries.entry(key).or_default();
+        let should_push = series
+            .back()
+            .map(|(last_ts, _)| ts_ms - *last_ts >= MIN_TIMESERIES_GAP_MS)
+            .unwrap_or(true);
+        if should_push {
+            series.push_back((ts_ms, inv));
+            while series.len() > MAX_PNL_TIMESERIES {
+                series.pop_front();
+            }
+        }
+    }
+
+    /// 23-UX-2 — flat per-leg inventory time-series for
+    /// frontend charting. Returns one row per leg with its
+    /// full history — the frontend does the stacking. `base`
+    /// filter uses `infer_base_asset` to match legs across
+    /// quote-variants (BTCUSDT + BTCUSDC both land under
+    /// `"BTC"`).
+    pub fn per_leg_inventory_timeseries(
+        &self,
+        base_filter: Option<&str>,
+    ) -> Vec<PerLegInventoryHistory> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .per_leg_inventory_timeseries
+            .iter()
+            .filter(|((_, symbol), _)| {
+                // `infer_base_asset("BTCUSDT") == "BTCUSDT"` by
+                // design (fallback keeps the full symbol when
+                // no separator / digit is found). So we match
+                // by prefix instead of equality to group both
+                // BTCUSDT and BTCUSDC under "BTC".
+                base_filter
+                    .map(|b| {
+                        let inferred = mm_portfolio::infer_base_asset(symbol);
+                        inferred == b || inferred.starts_with(b)
+                    })
+                    .unwrap_or(true)
+            })
+            .map(|((venue, symbol), series)| PerLegInventoryHistory {
+                venue: venue.clone(),
+                symbol: symbol.clone(),
+                base_asset: mm_portfolio::infer_base_asset(symbol),
+                points: series
+                    .iter()
+                    .map(|(ts, inv)| SeriesPoint {
+                        timestamp_ms: *ts,
+                        value: *inv,
+                    })
+                    .collect(),
+            })
+            .collect()
     }
 
     /// INV-4 — net delta in `base_asset` units, summed across
@@ -3361,6 +3437,39 @@ mod tests {
         }
         let ts = ds.get_spread_timeseries("BTCUSDT");
         assert_eq!(ts.len(), 14_400);
+    }
+
+    /// 23-UX-2 — per-leg history is populated as a side effect
+    /// of publish_inventory. Each leg gets its own ring buffer
+    /// keyed by (venue, symbol).
+    #[test]
+    fn per_leg_inventory_history_populates_on_publish() {
+        let ds = DashboardState::new();
+        ds.publish_inventory("BTCUSDT", "binance", dec!(0.5), Some(dec!(50_000)));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        ds.publish_inventory("BTCUSDT", "binance", dec!(0.6), Some(dec!(50_000)));
+        ds.publish_inventory("BTCUSDT", "bybit", dec!(-0.2), Some(dec!(50_000)));
+        let legs = ds.per_leg_inventory_timeseries(None);
+        assert_eq!(legs.len(), 2);
+        let binance = legs.iter().find(|l| l.venue == "binance").unwrap();
+        // infer_base_asset("BTCUSDT") returns "BTCUSDT" — no
+        // separator to split on. Base filter uses prefix match.
+        assert!(binance.base_asset.starts_with("BTC"));
+        assert_eq!(binance.points.len(), 2);
+        assert_eq!(binance.points[0].value, dec!(0.5));
+        assert_eq!(binance.points[1].value, dec!(0.6));
+    }
+
+    /// 23-UX-2 — base filter matches across quote variants.
+    #[test]
+    fn per_leg_inventory_base_filter_groups_btcusdt_btcusdc() {
+        let ds = DashboardState::new();
+        ds.publish_inventory("BTCUSDT", "binance", dec!(0.5), Some(dec!(50_000)));
+        ds.publish_inventory("BTCUSDC", "bybit", dec!(0.3), Some(dec!(50_000)));
+        ds.publish_inventory("ETHUSDT", "binance", dec!(1.0), Some(dec!(3000)));
+        let btc = ds.per_leg_inventory_timeseries(Some("BTC"));
+        assert_eq!(btc.len(), 2);
+        assert!(btc.iter().all(|l| l.base_asset.starts_with("BTC")));
     }
 
     #[test]
