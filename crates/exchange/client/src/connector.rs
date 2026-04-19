@@ -31,6 +31,8 @@ impl CustomConnector {
                 supports_funding_rate: false,
                 supports_margin_info: false,
                 supports_margin_mode: false,
+            supports_liquidation_feed: false,
+            supports_set_leverage: false,
                         },
         }
     }

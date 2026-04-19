@@ -87,6 +87,13 @@ impl BinanceFuturesConnector {
                 supports_funding_rate: true,
                 supports_margin_info: true,
                 supports_margin_mode: true,
+                // R5.5 — Binance USDⓈ-M `!forceOrder@arr`
+                // all-market liquidation stream; single WS
+                // topic, no per-symbol fan-out.
+                supports_liquidation_feed: true,
+                // `/fapi/v1/leverage` accepts per-symbol leverage
+                // up to the venue's risk-limit cap.
+                supports_set_leverage: true,
             },
         }
     }
@@ -233,13 +240,20 @@ impl ExchangeConnector for BinanceFuturesConnector {
         let (tx, rx) = mpsc::unbounded_channel();
 
         // Depth20 + trade per symbol, combined stream.
-        let streams: Vec<String> = symbols
+        // R5.1 — also subscribe to `!forceOrder@arr` once
+        // globally so the engine's LiquidationHeatmap starts
+        // receiving real Binance USDⓈ-M liquidation events.
+        // Single topic (all-market); the parser tags each event
+        // with its own symbol so multi-symbol engines all see
+        // the same stream.
+        let mut streams: Vec<String> = symbols
             .iter()
             .flat_map(|s| {
                 let lower = s.to_lowercase();
                 vec![format!("{lower}@depth20@100ms"), format!("{lower}@trade")]
             })
             .collect();
+        streams.push("!forceOrder@arr".to_string());
         let stream_param = streams.join("/");
         // Combined-stream endpoint pattern:
         //   wss://fstream.binance.com/stream?streams=<s1>/<s2>/…

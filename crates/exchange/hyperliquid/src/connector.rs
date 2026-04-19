@@ -150,6 +150,13 @@ impl HyperLiquidConnector {
                 // spot has no margin concept.
                 supports_margin_info: !is_spot,
                 supports_margin_mode: !is_spot,
+                // R5.5 — HL perp publishes forced-liquidation
+                // events on the `liquidations` channel. Spot
+                // has no liquidations.
+                supports_liquidation_feed: !is_spot,
+                // HL `updateLeverage` action sets per-asset
+                // leverage on perps. Spot has no leverage knob.
+                supports_set_leverage: !is_spot,
             },
             asset_map: Arc::new(RwLock::new(HashMap::new())),
             asset_index_to_name: Arc::new(RwLock::new(HashMap::new())),
@@ -480,6 +487,11 @@ impl ExchangeConnector for HyperLiquidConnector {
                         let (mut write, mut read) = ws.split();
 
                         // Public market data: l2Book + trades per coin.
+                        // R5.1 — on perp (is_spot == false) also
+                        // subscribe to `liquidations` per coin so
+                        // the engine's LiquidationHeatmap
+                        // receives real HL forced-liquidation
+                        // events. Spot has none.
                         for coin in &coins {
                             let sub_book = json!({
                                 "method": "subscribe",
@@ -502,6 +514,22 @@ impl ExchangeConnector for HyperLiquidConnector {
                                 .is_err()
                             {
                                 break;
+                            }
+                            if !is_spot {
+                                let sub_liq = json!({
+                                    "method": "subscribe",
+                                    "subscription": {
+                                        "type": "liquidations",
+                                        "coin": coin
+                                    }
+                                });
+                                if write
+                                    .send(Message::Text(sub_liq.to_string()))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
                             }
                         }
 
@@ -1341,6 +1369,45 @@ pub(crate) fn parse_hl_event(v: &Value, is_spot: bool) -> Vec<MarketEvent> {
                             taker_side: side,
                             timestamp,
                         },
+                    })
+                })
+                .collect()
+        }
+        "liquidations" => {
+            // R5.1 — HL perp liquidation channel. Shape per
+            // docs: `{"channel":"liquidations","data":[{
+            //   "coin":"BTC","side":"A","sz":"0.1","px":"30000",
+            //   "time":1700000000000}, ...]}`.
+            // Side: "A" = liquidated long (market taker sell),
+            //       "B" = liquidated short (market taker buy).
+            if is_spot {
+                return Vec::new();
+            }
+            let Some(arr) = data.and_then(|d| d.as_array()) else {
+                return Vec::new();
+            };
+            arr.iter()
+                .filter_map(|t| {
+                    let symbol = t.get("coin")?.as_str()?.to_string();
+                    let price: Decimal = t.get("px")?.as_str()?.parse().ok()?;
+                    let qty: Decimal = t.get("sz")?.as_str()?.parse().ok()?;
+                    // HL "side" on liquidations semantics per docs:
+                    // "A" = long liquidated → taker side = Sell.
+                    let side = match t.get("side")?.as_str()? {
+                        "A" => Side::Sell,
+                        "B" => Side::Buy,
+                        _ => return None,
+                    };
+                    let time_ms = t.get("time").and_then(|v| v.as_i64()).unwrap_or_else(|| {
+                        chrono::Utc::now().timestamp_millis()
+                    });
+                    Some(MarketEvent::Liquidation {
+                        venue,
+                        symbol,
+                        side,
+                        qty,
+                        price,
+                        timestamp_ms: time_ms,
                     })
                 })
                 .collect()

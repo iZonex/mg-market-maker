@@ -187,6 +187,11 @@ impl BybitConnector {
                 // flags stay honest per category.
                 supports_margin_info: category.has_funding(),
                 supports_margin_mode: category.has_funding(),
+                // R5.5 — Bybit V5 `liquidation.{symbol}` WS
+                // topic on linear + inverse perps only.
+                supports_liquidation_feed: category.has_funding(),
+                // `/v5/position/set-leverage` — perp only.
+                supports_set_leverage: category.has_funding(),
             },
             wallet: category.wallet_type(),
             category,
@@ -356,9 +361,26 @@ impl ExchangeConnector for BybitConnector {
             BybitCategory::Spot => 50,
             BybitCategory::Linear | BybitCategory::Inverse => 50,
         };
+        // R5.1 — also subscribe to `liquidation.{symbol}` on
+        // perp categories so the engine's LiquidationHeatmap
+        // receives real Bybit forced-liquidation events. Spot
+        // has no liquidations, so skip the topic there.
+        let include_liquidations = matches!(
+            self.category,
+            BybitCategory::Linear | BybitCategory::Inverse
+        );
         let topics: Vec<String> = symbols
             .iter()
-            .flat_map(|s| vec![format!("orderbook.{depth}.{s}"), format!("publicTrade.{s}")])
+            .flat_map(|s| {
+                let mut v = vec![
+                    format!("orderbook.{depth}.{s}"),
+                    format!("publicTrade.{s}"),
+                ];
+                if include_liquidations {
+                    v.push(format!("liquidation.{s}"));
+                }
+                v
+            })
             .collect();
 
         tokio::spawn(async move {
@@ -1252,6 +1274,40 @@ fn parse_bybit_event(v: &Value) -> Option<MarketEvent> {
                 taker_side,
                 timestamp: chrono::Utc::now(),
             },
+        })
+    } else if topic.starts_with("liquidation.") {
+        // R5.1 — Bybit V5 liquidation topic shape:
+        // `{"topic":"liquidation.BTCUSDT","data":{"symbol":"BTCUSDT",
+        //   "side":"Buy","size":"0.001","price":"30000",
+        //   "updatedTime":1700000000000}}`
+        // `side` here is the side of the LIQUIDATED position —
+        // a liquidated long means the clearinghouse market-sold
+        // to close it (taker side = Sell).
+        let d = if data.is_array() {
+            data.as_array()?.first()?.clone()
+        } else {
+            data.clone()
+        };
+        let symbol = d.get("symbol").and_then(|s| s.as_str())?.to_string();
+        let liquidated_side = d.get("side").and_then(|s| s.as_str())?;
+        // Liquidated LONG → maker was forced to sell → taker side is Sell.
+        let side = if liquidated_side.eq_ignore_ascii_case("Buy") {
+            Side::Sell
+        } else {
+            Side::Buy
+        };
+        let qty: Decimal = d.get("size").and_then(|q| q.as_str())?.parse().ok()?;
+        let price: Decimal = d.get("price").and_then(|p| p.as_str())?.parse().ok()?;
+        let ts_ms = d.get("updatedTime").and_then(|t| t.as_i64()).unwrap_or_else(|| {
+            chrono::Utc::now().timestamp_millis()
+        });
+        Some(MarketEvent::Liquidation {
+            venue: VenueId::Bybit,
+            symbol,
+            side,
+            qty,
+            price,
+            timestamp_ms: ts_ms,
         })
     } else {
         None

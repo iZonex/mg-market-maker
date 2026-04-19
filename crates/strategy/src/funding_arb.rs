@@ -392,6 +392,8 @@ mod tests {
                     supports_funding_rate: product.has_funding(),
                     supports_margin_info: false,
                 supports_margin_mode: false,
+            supports_liquidation_feed: false,
+            supports_set_leverage: false,
                             },
                 behaviours: Mutex::new(vec![]),
                 placed: Mutex::new(vec![]),

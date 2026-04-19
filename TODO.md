@@ -1,6 +1,6 @@
 # MM — Open Work Tracker
 
-Last updated: 2026-04-19 (post-Sprint 10)
+Last updated: 2026-04-19 (post-Sprint 11)
 
 Tracking debt not yet closed. Closed items live in git history.
 Each row is a concrete deliverable; bigger initiatives are
@@ -652,6 +652,38 @@ gates operator use; loud `tracing::warn!` on every restricted graph compile.
   three operator-confirmation conditions + full exploit /
   detector / template cross-reference table.
 - [x] Catalog 116 → 121 kinds (+5 from R4).
+
+## Sprint 11 — cross-venue data parity (landed Apr 19)
+
+Honest data-parity pass. Makes sure every surveillance + pentest
+feature actually has the right data feeds from every perp venue,
+regardless of which one the operator picks as their customer.
+
+- [x] **R5.1** Forced-liquidation WS subscribers on every perp
+  venue: Binance USDⓈ-M `!forceOrder@arr`, Bybit V5
+  `liquidation.{symbol}` on linear + inverse, HyperLiquid
+  `liquidations` per coin. All three emit the canonical
+  `MarketEvent::Liquidation` variant; engine's
+  `LiquidationHeatmap` populates on every arrival.
+- [x] **R5.2** Audited — `ExchangeConnector::set_leverage`
+  already exists from Epic 40.7 + Binance/Bybit/HL impls.
+  `Strategy.LeverageBuilder` stage-2 plumbing (call it on
+  phase entry) is the next-sprint item — not a trait gap.
+- [x] **R5.5** `VenueCapabilities::supports_liquidation_feed`
+  + `supports_set_leverage` flags. Binance futures = both
+  true; Bybit linear/inverse = both true; HL perp = both
+  true; every spot / custom / coinbase-prime = false.
+- [x] **Cross-venue parity doc** — `docs/guides/pentest.md`
+  gained the honest capability matrix (L1/L2, trades,
+  liquidations, OI, funding, set_leverage, margin info,
+  transfers, withdraw) per venue × product. Everything that's
+  wired + everything that's deferred is in the table.
+
+Sprint 12 picks up: `Strategy.CampaignOrchestrator` real FSM
+(advisory-only in this build), real `get_open_interest()` REST
+calls (currently proxied via liquidation total), and
+`Strategy.BasketPush` + `Strategy.IndexPush` for the remaining
+RAVE-pattern pentest vectors.
 
 ## Graph system audit — Apr 19 follow-ups
 

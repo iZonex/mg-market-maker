@@ -250,6 +250,21 @@ pub struct VenueCapabilities {
     /// `/v5/account/set-margin-mode`, HL `updateLeverage`). Spot
     /// connectors set this to `false`.
     pub supports_margin_mode: bool,
+    /// R5.5 — venue publishes a forced-liquidation WS stream
+    /// the connector subscribes to (Binance `!forceOrder@arr`,
+    /// Bybit `liquidation`). Engine's `LiquidationHeatmap`
+    /// only populates when this is `true` on at least one
+    /// connector. Spot venues and test connectors set this to
+    /// `false` — surveillance consumers get `Missing` and
+    /// fail-open gracefully.
+    pub supports_liquidation_feed: bool,
+    /// R5.5 — venue accepts `set_leverage(symbol, leverage)`
+    /// as a pre-trade account-level mutation. Required for
+    /// `Strategy.LeverageBuilder` to actually configure
+    /// account leverage; without it the strategy falls back
+    /// to whatever leverage the account is already set to and
+    /// logs a warning.
+    pub supports_set_leverage: bool,
 }
 
 /// Account-level margin snapshot (Epic 40.4). One per venue; the

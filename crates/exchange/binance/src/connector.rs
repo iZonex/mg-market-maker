@@ -78,6 +78,8 @@ impl BinanceConnector {
                 supports_funding_rate: false, // spot has no funding
                 supports_margin_info: false,  // spot — margin is N/A
                 supports_margin_mode: false,
+            supports_liquidation_feed: false,
+            supports_set_leverage: false,
             },
             ws_trader: None,
             withdraw_whitelist: None,
@@ -744,6 +746,31 @@ pub(crate) fn parse_binance_event(stream: &str, data: &Value) -> Option<MarketEv
                 taker_side,
                 timestamp: chrono::Utc::now(),
             },
+        })
+    } else if stream == "!forceOrder@arr" || stream.ends_with("@forceOrder") {
+        // R5.1 — Binance USDⓈ-M forced-liquidation event.
+        // Shape: `{"e":"forceOrder","o":{"s":"BTCUSDT","S":"BUY",
+        // "q":"0.001","p":"30000",...}}`.
+        let o = data.get("o")?;
+        let symbol = o.get("s").and_then(|s| s.as_str())?.to_string();
+        let side_s = o.get("S").and_then(|s| s.as_str())?;
+        let side = if side_s.eq_ignore_ascii_case("SELL") {
+            Side::Sell
+        } else {
+            Side::Buy
+        };
+        let qty: Decimal = o.get("q").and_then(|q| q.as_str())?.parse().ok()?;
+        let price: Decimal = o.get("p").and_then(|p| p.as_str())?.parse().ok()?;
+        let ts_ms = o.get("T").and_then(|t| t.as_i64()).unwrap_or_else(|| {
+            chrono::Utc::now().timestamp_millis()
+        });
+        Some(MarketEvent::Liquidation {
+            venue: VenueId::Binance,
+            symbol,
+            side,
+            qty,
+            price,
+            timestamp_ms: ts_ms,
         })
     } else {
         None
