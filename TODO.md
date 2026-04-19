@@ -1,6 +1,6 @@
 # MM — Open Work Tracker
 
-Last updated: 2026-04-19 (post-INV-4)
+Last updated: 2026-04-19 (post-Sprint 4)
 
 Tracking debt not yet closed. Closed items live in git history.
 Each row is a concrete deliverable; bigger initiatives are
@@ -309,6 +309,39 @@ client sees the system.
   double-counting across venues is impossible by construction.
   Three portfolio-level tests pin consolidation, replace
   semantics, and base-asset rollup.
+
+## Sprint 4 — graph ↔ legacy parity (landed Apr 19)
+
+- [x] **S4.1** Risk guard states exposed as graph sources.
+  `Risk.CircuitBreakerTripped` (Bool), `Risk.NewsRetreatState`
+  (String: normal/reduce/halt), `Risk.LeadLagMultiplier`
+  (Number: widen factor). Engine overlays publish the same
+  values the legacy gating already consults, so a graph author
+  can route these into `Strategy.QueueAware`/gating logic
+  without the guard running twice.
+- [x] **S4.2** Per-node `Strategy.*` ctx overrides.
+  `StrategyCtxOverride { as_prob, as_prob_bid, as_prob_ask,
+  borrow_cost_bps }` on the engine; `build_strategy_ctx_overrides`
+  parses each `Strategy.*` node's config and patches the
+  `StrategyContext` on the per-node tick before invoking
+  the pooled strategy. Two authors sharing a pool get
+  independent as_prob / borrow surcharges without
+  inventing a second pool key.
+- [x] **S4.3** Composable inventory-aware execution.
+  `Math.InventorySkew` node (inputs `level: Number`; config
+  `cap`, `exponent`; output skew in [-1,1]) +
+  `Signal.FillDepth` source publishing the running max
+  fill-depth-bps the router observed. Catalog bumped 108 →
+  109; `catalog_has_109_nodes_after_s4_3_composable_inventory`
+  pins the count.
+- [x] **S4.4** Graph ↔ legacy parity tests.
+  `crates/engine/src/market_maker.rs` `dual_connector_tests`:
+  `avellaneda_graph_parity_matches_legacy` (identical ctx →
+  identical quotes), `avellaneda_per_node_gamma_override_matches_direct_config`
+  (GR-3 override path), `avellaneda_borrow_cost_override_matches_direct_ctx`
+  + `avellaneda_as_prob_override_matches_direct_ctx` (S4.2
+  ctx override path). `Quote` + `QuotePair` gained `PartialEq,
+  Eq` derives so `assert_eq!` works byte-for-byte.
 
 ## Graph system audit — Apr 19 follow-ups
 

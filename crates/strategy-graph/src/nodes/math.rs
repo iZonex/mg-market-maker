@@ -396,3 +396,132 @@ impl NodeKind for ToBool {
         Ok(vec![Value::Bool(out)])
     }
 }
+
+// S4.3 — composable inventory skew.
+//
+// `|level| / cap` clamped to `[0, 1]`, raised to `exponent`,
+// then signed by `level`. Output is a skew score in `[-1, 1]`
+// that downstream nodes can multiply into a size/price term
+// (long = +; short = −; flat = 0). Matches the hand-wired
+// formula the grid strategy and advanced inventory manager use
+// but exposes it as a graph-composable node so operators can
+// dial it into any strategy pipeline without writing Rust.
+
+/// `Math.InventorySkew` — see module comment above.
+#[derive(Debug)]
+pub struct InventorySkew {
+    cap: Decimal,
+    exponent: Decimal,
+}
+
+impl Default for InventorySkew {
+    fn default() -> Self {
+        Self {
+            cap: Decimal::ONE,
+            exponent: Decimal::from(2u8),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct InventorySkewCfg {
+    #[serde(default)]
+    cap: Option<String>,
+    #[serde(default)]
+    exponent: Option<String>,
+}
+
+impl InventorySkew {
+    pub fn from_config(cfg: &Json) -> Option<Self> {
+        if cfg.is_null() {
+            return Some(Self::default());
+        }
+        let parsed: InventorySkewCfg = serde_json::from_value(cfg.clone()).ok()?;
+        let cap = match parsed.cap {
+            None => Decimal::ONE,
+            Some(s) => {
+                let v = Decimal::from_str(&s).ok()?;
+                if v <= Decimal::ZERO {
+                    return None;
+                }
+                v
+            }
+        };
+        let exponent = match parsed.exponent {
+            None => Decimal::from(2u8),
+            Some(s) => {
+                let v = Decimal::from_str(&s).ok()?;
+                if v <= Decimal::ZERO {
+                    return None;
+                }
+                v
+            }
+        };
+        Some(Self { cap, exponent })
+    }
+}
+
+static INV_SKEW_INPUTS: Lazy<Vec<Port>> =
+    Lazy::new(|| vec![Port::new("level", PortType::Number)]);
+static INV_SKEW_OUTPUTS: Lazy<Vec<Port>> =
+    Lazy::new(|| vec![Port::new("skew", PortType::Number)]);
+
+impl NodeKind for InventorySkew {
+    fn kind(&self) -> &'static str {
+        "Math.InventorySkew"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &INV_SKEW_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &INV_SKEW_OUTPUTS
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![
+            ConfigField {
+                name: "cap",
+                label: "Inventory cap",
+                hint: Some("|level| ≥ cap → |skew|=1; absolute base-asset units"),
+                default: serde_json::json!("1"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.01) },
+            },
+            ConfigField {
+                name: "exponent",
+                label: "Curve exponent",
+                hint: Some("> 1 steepens the ramp near cap (default 2 = quadratic)"),
+                default: serde_json::json!("2"),
+                widget: ConfigWidget::Number { min: Some(0.1), max: Some(10.0), step: Some(0.1) },
+            },
+        ]
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+        let Some(level) = inputs.first().and_then(Value::as_number) else {
+            return Ok(vec![Value::Missing]);
+        };
+        if level.is_zero() {
+            return Ok(vec![Value::Number(Decimal::ZERO)]);
+        }
+        let abs = level.abs();
+        let normalised = (abs / self.cap).min(Decimal::ONE);
+        // f64 hop to raise to an arbitrary power — Decimal has
+        // no native pow. Values stay in `[0, 1]` so precision
+        // loss is bounded.
+        let base = normalised.to_f64().unwrap_or(0.0);
+        let exp = self.exponent.to_f64().unwrap_or(2.0);
+        let scaled = base.powf(exp).clamp(0.0, 1.0);
+        let magnitude = Decimal::from_f64(scaled).unwrap_or(Decimal::ZERO);
+        let signed = if level > Decimal::ZERO {
+            magnitude
+        } else {
+            -magnitude
+        };
+        Ok(vec![Value::Number(signed)])
+    }
+}

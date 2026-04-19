@@ -59,7 +59,7 @@ pub enum OrderStatus {
 }
 
 /// A quote that the strategy wants to place on the book.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Quote {
     pub side: Side,
     pub price: Price,
@@ -67,7 +67,7 @@ pub struct Quote {
 }
 
 /// Desired two-sided quote from the strategy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuotePair {
     pub bid: Option<Quote>,
     pub ask: Option<Quote>,

@@ -568,11 +568,106 @@ single_scalar_source!(RiskMarginRatio, "Risk.MarginRatio", "value");
 single_scalar_source!(RiskOtr, "Risk.OTR", "value");
 single_scalar_source!(InventoryLevel, "Inventory.Level", "value");
 
+// S4.1 — kill-switch guard signals as graph sources. Without
+// these, operators who author a risk-gated graph must
+// re-implement margin / circuit / news / lead-lag logic
+// because the engine's hand-coded guards bypass the graph and
+// drive the kill switch directly.
+
+/// `Risk.CircuitBreakerTripped` — Bool, `true` when the
+/// engine's stale-book / wide-spread circuit breaker has
+/// tripped.
+#[derive(Debug, Default)]
+pub struct RiskCircuitBreakerTripped;
+
+impl NodeKind for RiskCircuitBreakerTripped {
+    fn kind(&self) -> &'static str {
+        "Risk.CircuitBreakerTripped"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        static PORTS: Lazy<Vec<Port>> =
+            Lazy::new(|| vec![Port::new("tripped", PortType::Bool)]);
+        &PORTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
+/// `Risk.NewsRetreatState` — String in
+/// `{Normal, Low, High, Critical}`; reflects the engine's
+/// `NewsRetreatStateMachine::current_state`. Missing on
+/// engines without the state machine attached.
+#[derive(Debug, Default)]
+pub struct RiskNewsRetreatState;
+
+impl NodeKind for RiskNewsRetreatState {
+    fn kind(&self) -> &'static str {
+        "Risk.NewsRetreatState"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        static PORTS: Lazy<Vec<Port>> =
+            Lazy::new(|| vec![Port::new("state", PortType::String)]);
+        &PORTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
+/// `Risk.LeadLagMultiplier` — Number, the current multiplier
+/// the lead-lag guard is applying (`1.0` = neutral; > 1
+/// means the lagging venue's spread is being widened).
+#[derive(Debug, Default)]
+pub struct RiskLeadLagMultiplier;
+
+impl NodeKind for RiskLeadLagMultiplier {
+    fn kind(&self) -> &'static str {
+        "Risk.LeadLagMultiplier"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        static PORTS: Lazy<Vec<Port>> =
+            Lazy::new(|| vec![Port::new("mult", PortType::Number)]);
+        &PORTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
 // Phase 2 Wave C — signal + toxicity sources.
 single_scalar_source!(SignalImbalance, "Signal.ImbalanceDepth", "value");
 single_scalar_source!(SignalTradeFlow, "Signal.TradeFlow", "value");
 single_scalar_source!(SignalMicroprice, "Signal.Microprice", "value");
 single_scalar_source!(KyleLambda, "Toxicity.KyleLambda", "value");
+// S4.3 — rolling-average own-fill size. Useful for
+// calibration signals that want to scale risk down when
+// liquidity taken on our orders is trending bigger.
+single_scalar_source!(SignalFillDepth, "Signal.FillDepth", "value");
 
 // Phase 2 — strategy + pair-class metadata sources. Zero-input
 // typed-enum outputs; the evaluator short-circuits both and the

@@ -171,6 +171,13 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Decision.RealizedCostBps" => Some(Box::new(sources::DecisionRealizedCostBps)),
         "Portfolio.CrossVenueNetDelta" => Some(Box::new(sources::PortfolioCrossVenueNetDelta)),
         "Book.FillProbability" => Some(Box::new(sources::BookFillProbability)),
+        "Risk.CircuitBreakerTripped" => Some(Box::new(sources::RiskCircuitBreakerTripped)),
+        "Risk.NewsRetreatState" => Some(Box::new(sources::RiskNewsRetreatState)),
+        "Risk.LeadLagMultiplier" => Some(Box::new(sources::RiskLeadLagMultiplier)),
+        "Signal.FillDepth" => Some(Box::new(sources::SignalFillDepth)),
+        "Math.InventorySkew" => {
+            math::InventorySkew::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
+        }
         "Strategy.QueueAware" => Some(Box::new(strategies::QueueAware)),
         "Borrow.RateApr" => Some(Box::new(sources::BorrowRateApr)),
         "Borrow.MaxAvailable" => Some(Box::new(sources::BorrowMaxAvailable)),
@@ -317,6 +324,11 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Decision.RealizedCostBps" => NodeMeta { label: "Decision cost avg", summary: "Rolling avg realized cost bps across the last N resolved decisions", group: "Sources" },
         "Portfolio.CrossVenueNetDelta" => NodeMeta { label: "Cross-venue net delta", summary: "Sum of signed inventory across every connected venue for a base asset", group: "Sources" },
         "Book.FillProbability"    => NodeMeta { label: "Fill probability",   summary: "Queue-position-aware 60s fill probability for our frontmost own order on a side", group: "Sources" },
+        "Risk.CircuitBreakerTripped" => NodeMeta { label: "Circuit-breaker tripped", summary: "True when the engine's stale-book / wide-spread circuit has tripped", group: "Sources" },
+        "Risk.NewsRetreatState"   => NodeMeta { label: "News-retreat state",  summary: "Current NewsRetreatStateMachine state: Normal / Low / High / Critical", group: "Sources" },
+        "Risk.LeadLagMultiplier"  => NodeMeta { label: "Lead-lag mult",       summary: "Current lead-lag guard multiplier (1.0 neutral, > 1 widening)", group: "Sources" },
+        "Signal.FillDepth"        => NodeMeta { label: "Fill depth",          summary: "Rolling-average own-fill size (lifetime avg until a rolling window lands)", group: "Sources" },
+        "Math.InventorySkew"      => NodeMeta { label: "Inventory skew",      summary: "Composable skew: sign(level) · min(1, |level|/cap)^exponent — output in [-1, 1]", group: "Math" },
         "Strategy.QueueAware"     => NodeMeta { label: "Queue-aware scaler", summary: "Scales incoming quote qtys by a Book.FillProbability multiplier — composes with any Strategy.*", group: "Strategies" },
         "Borrow.RateApr"          => NodeMeta { label: "Borrow APR",         summary: "Spot venue borrow rate (annualised fraction) — Missing on perp", group: "Sources" },
         "Borrow.MaxAvailable"     => NodeMeta { label: "Max borrowable",     summary: "Base-asset cap the borrow manager will allow — Missing on perp", group: "Sources" },
@@ -445,6 +457,11 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Decision.RealizedCostBps",
         "Portfolio.CrossVenueNetDelta",
         "Book.FillProbability",
+        "Risk.CircuitBreakerTripped",
+        "Risk.NewsRetreatState",
+        "Risk.LeadLagMultiplier",
+        "Signal.FillDepth",
+        "Math.InventorySkew",
         "Strategy.QueueAware",
         "Borrow.RateApr",
         "Borrow.MaxAvailable",
@@ -543,9 +560,10 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_104_nodes_after_strat2_queue_aware() {
-        // 103 after BOOK-2 + 1 (STRAT-2: Strategy.QueueAware). = 104.
-        assert_eq!(kinds().len(), 104, "catalog drift");
+    fn catalog_has_109_nodes_after_s4_3_composable_inventory() {
+        // 107 after S4.1 + 2 (S4.3: Signal.FillDepth,
+        // Math.InventorySkew). = 109.
+        assert_eq!(kinds().len(), 109, "catalog drift");
     }
 
     /// GR-1 — every indicator with a `period` config field must

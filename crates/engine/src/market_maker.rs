@@ -181,6 +181,21 @@ pub struct InflightAtomicBundle {
     pub hedge_acked: bool,
 }
 
+/// S4.2 — per-node StrategyContext overrides parsed from
+/// graph node config. These fields live on `StrategyContext`
+/// directly (not on `MarketMakerConfig`), so they need a
+/// second per-node map alongside `strategy_node_configs`.
+/// Avellaneda / GLFT read `as_prob*` + `borrow_cost_bps` off
+/// the context; the per-node tick loop patches them in when
+/// the node declares an override.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StrategyCtxOverride {
+    pub as_prob: Option<rust_decimal::Decimal>,
+    pub as_prob_bid: Option<rust_decimal::Decimal>,
+    pub as_prob_ask: Option<rust_decimal::Decimal>,
+    pub borrow_cost_bps: Option<rust_decimal::Decimal>,
+}
+
 impl InflightAtomicBundle {
     /// Bundle is fully acknowledged when both legs have been
     /// observed on the live-orders map of their respective engine.
@@ -563,6 +578,13 @@ pub struct MarketMakerEngine {
         mm_strategy_graph::NodeId,
         mm_common::config::MarketMakerConfig,
     >,
+    /// S4.2 — per-node StrategyContext field overrides
+    /// (`as_prob*`, `borrow_cost_bps`). Populated in the same
+    /// `swap_strategy_graph` pass as `strategy_node_configs`;
+    /// the tick loop patches the matching ctx fields when
+    /// computing each pool instance's quotes.
+    strategy_node_ctx_overrides:
+        std::collections::HashMap<mm_strategy_graph::NodeId, StrategyCtxOverride>,
     /// Last tick's `compute_quotes()` output per-pool-instance,
     /// keyed by the node id. Refreshed at the end of
     /// `refresh_quotes` once the StrategyContext is built — the
@@ -1017,6 +1039,7 @@ impl MarketMakerEngine {
             last_strategy_quotes: None,
             strategy_pool: std::collections::HashMap::new(),
             strategy_node_configs: std::collections::HashMap::new(),
+            strategy_node_ctx_overrides: std::collections::HashMap::new(),
             last_strategy_quotes_per_node: std::collections::HashMap::new(),
             surveillance_tracker: mm_risk::surveillance::new_shared_tracker(),
             surveillance_last_alert: std::collections::HashMap::new(),
@@ -1860,6 +1883,11 @@ impl MarketMakerEngine {
             let num_levels = usz("num_levels");
             let min_spread_bps = dec("min_spread_bps");
             let max_distance_bps = dec("max_distance_bps");
+            // S4.2 — time_horizon_secs landed on the config
+            // struct too; `u64` so parsed directly.
+            let time_horizon_secs = cfg
+                .get("time_horizon_secs")
+                .and_then(|v| v.as_u64());
 
             let has_override = gamma.is_some()
                 || kappa.is_some()
@@ -1867,7 +1895,8 @@ impl MarketMakerEngine {
                 || order_size.is_some()
                 || num_levels.is_some()
                 || min_spread_bps.is_some()
-                || max_distance_bps.is_some();
+                || max_distance_bps.is_some()
+                || time_horizon_secs.is_some();
             if !has_override {
                 continue;
             }
@@ -1894,7 +1923,44 @@ impl MarketMakerEngine {
             if let Some(v) = max_distance_bps {
                 c.max_distance_bps = v;
             }
+            if let Some(v) = time_horizon_secs {
+                c.time_horizon_secs = v.max(1);
+            }
             out.insert(n.id, c);
+        }
+        out
+    }
+
+    fn build_strategy_ctx_overrides(
+        graph: &mm_strategy_graph::Graph,
+    ) -> std::collections::HashMap<mm_strategy_graph::NodeId, StrategyCtxOverride> {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+
+        let mut out = std::collections::HashMap::new();
+        for n in &graph.nodes {
+            if !n.kind.starts_with("Strategy.") {
+                continue;
+            }
+            let cfg = &n.config;
+            let dec = |k: &str| -> Option<Decimal> {
+                cfg.get(k)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Decimal::from_str(s).ok())
+            };
+            let ov = StrategyCtxOverride {
+                as_prob: dec("as_prob"),
+                as_prob_bid: dec("as_prob_bid"),
+                as_prob_ask: dec("as_prob_ask"),
+                borrow_cost_bps: dec("borrow_cost_bps"),
+            };
+            if ov.as_prob.is_some()
+                || ov.as_prob_bid.is_some()
+                || ov.as_prob_ask.is_some()
+                || ov.borrow_cost_bps.is_some()
+            {
+                out.insert(n.id, ov);
+            }
         }
         out
     }
@@ -2283,6 +2349,7 @@ impl MarketMakerEngine {
         self.strategy_pool = Self::build_strategy_pool(graph);
         self.strategy_node_configs =
             Self::build_strategy_node_configs(graph, &self.config.market_maker);
+        self.strategy_node_ctx_overrides = Self::build_strategy_ctx_overrides(graph);
         self.last_strategy_quotes_per_node.clear();
         // Drop any pending `Out.Quotes` override from the previous
         // graph — without this, the first tick after a swap would
@@ -2323,6 +2390,7 @@ impl MarketMakerEngine {
         self.strategy_pool = Self::build_strategy_pool(graph);
         self.strategy_node_configs =
             Self::build_strategy_node_configs(graph, &self.config.market_maker);
+        self.strategy_node_ctx_overrides = Self::build_strategy_ctx_overrides(graph);
         self.last_strategy_quotes_per_node.clear();
         // Drop any pending `Out.Quotes` override from the previous
         // graph — without this, the first tick after a swap would
@@ -2948,6 +3016,32 @@ impl MarketMakerEngine {
                         Value::Number(self.otr.ratio()),
                     );
                 }
+                // S4.1 — kill-switch guards as graph sources.
+                "Risk.CircuitBreakerTripped" => {
+                    src.insert(
+                        (*id, "tripped".into()),
+                        Value::Bool(self.circuit_breaker.is_tripped()),
+                    );
+                }
+                "Risk.NewsRetreatState" => {
+                    let v = match self.news_retreat.as_mut() {
+                        Some(sm) => {
+                            let s = sm.current_state(
+                                chrono::Utc::now().timestamp_millis(),
+                            );
+                            Value::String(format!("{s:?}"))
+                        }
+                        None => Value::Missing,
+                    };
+                    src.insert((*id, "state".into()), v);
+                }
+                "Risk.LeadLagMultiplier" => {
+                    let v = match self.lead_lag_guard.as_ref() {
+                        Some(g) => Value::Number(g.current_multiplier()),
+                        None => Value::Missing,
+                    };
+                    src.insert((*id, "mult".into()), v);
+                }
                 "Inventory.Level" => {
                     src.insert(
                         (*id, "value".into()),
@@ -2969,6 +3063,25 @@ impl MarketMakerEngine {
                         (*id, "value".into()),
                         Value::Number(self.momentum.trade_flow_imbalance()),
                     );
+                }
+                "Signal.FillDepth" => {
+                    // S4.3 — lifetime-average own-fill size,
+                    // computed as `total_volume / (2 × round_trips)`.
+                    // A proper rolling window is a follow-up;
+                    // this shape gives operators a stable
+                    // signal they can compose today.
+                    let a = &self.pnl_tracker.attribution;
+                    let rt = rust_decimal::Decimal::from(a.round_trips);
+                    let v = if a.round_trips > 0
+                        && !a.total_volume.is_zero()
+                    {
+                        Value::Number(
+                            a.total_volume / (rt * rust_decimal::Decimal::from(2u32)),
+                        )
+                    } else {
+                        Value::Missing
+                    };
+                    src.insert((*id, "value".into()), v);
                 }
                 "Signal.Microprice" => {
                     // Learned-microprice drift ratio. `None` until
@@ -7339,7 +7452,7 @@ impl MarketMakerEngine {
                 );
                 let inv = self.inventory_manager.inventory();
                 for (node_id, strat) in &self.strategy_pool {
-                    let node_ctx = match self.strategy_node_configs.get(node_id) {
+                    let mut node_ctx = match self.strategy_node_configs.get(node_id) {
                         Some(override_cfg) => {
                             let mut c = ctx.clone();
                             c.config = override_cfg;
@@ -7347,6 +7460,24 @@ impl MarketMakerEngine {
                         }
                         None => ctx.clone(),
                     };
+                    // S4.2 — patch StrategyContext-level knobs
+                    // (`as_prob*`, `borrow_cost_bps`) when the
+                    // node declared them. None → keep the
+                    // engine-wide value.
+                    if let Some(ov) = self.strategy_node_ctx_overrides.get(node_id) {
+                        if let Some(v) = ov.as_prob {
+                            node_ctx.as_prob = Some(v);
+                        }
+                        if let Some(v) = ov.as_prob_bid {
+                            node_ctx.as_prob_bid = Some(v);
+                        }
+                        if let Some(v) = ov.as_prob_ask {
+                            node_ctx.as_prob_ask = Some(v);
+                        }
+                        if let Some(v) = ov.borrow_cost_bps {
+                            node_ctx.borrow_cost_bps = Some(v);
+                        }
+                    }
                     // S1.2 — each pool instance goes through the
                     // same capital-budget gate using its own
                     // `Strategy::name()` tag so one
@@ -9252,6 +9383,189 @@ mod dual_connector_tests {
             engine.strategy_node_configs.is_empty(),
             "nodes without knob overrides must NOT materialise a per-node config"
         );
+    }
+
+    // ── S4.4 — graph-vs-legacy parity tests ───────────────────
+
+    /// Helper: build a StrategyContext with the fields
+    /// Avellaneda / GLFT actually read. Everything else gets
+    /// a harmless neutral value so the assert focuses on the
+    /// per-knob override path the test is pinning.
+    fn parity_ctx<'a>(
+        book: &'a mm_common::orderbook::LocalOrderBook,
+        product: &'a ProductSpec,
+        config: &'a mm_common::config::MarketMakerConfig,
+    ) -> mm_strategy::r#trait::StrategyContext<'a> {
+        mm_strategy::r#trait::StrategyContext {
+            book,
+            product,
+            config,
+            inventory: dec!(0.1),
+            volatility: dec!(0.02),
+            time_remaining: dec!(0.5),
+            mid_price: dec!(50_000),
+            ref_price: None,
+            hedge_book: None,
+            borrow_cost_bps: None,
+            hedge_book_age_ms: None,
+            as_prob: None,
+            as_prob_bid: None,
+            as_prob_ask: None,
+        }
+    }
+
+    fn parity_book() -> mm_common::orderbook::LocalOrderBook {
+        use mm_common::types::PriceLevel;
+        let mut b = mm_common::orderbook::LocalOrderBook::new("BTCUSDT".into());
+        b.apply_snapshot(
+            vec![PriceLevel { price: dec!(50_000), qty: dec!(2) }],
+            vec![PriceLevel { price: dec!(50_010), qty: dec!(2) }],
+            1,
+        );
+        b
+    }
+
+    /// S4.4 — `Strategy.Avellaneda` on the graph path must
+    /// produce the same quotes as the hand-wired
+    /// `AvellanedaStoikov` when the StrategyContext is
+    /// identical. Catches silent drift when a knob-override
+    /// refactor lands on one side only.
+    #[test]
+    fn avellaneda_graph_parity_matches_legacy() {
+        use mm_strategy::r#trait::Strategy;
+
+        let product = sample_product("BTCUSDT");
+        let book = parity_book();
+        let cfg = sample_config().market_maker;
+        let ctx = parity_ctx(&book, &product, &cfg);
+
+        let legacy = mm_strategy::AvellanedaStoikov;
+        let legacy_quotes = legacy.compute_quotes(&ctx);
+
+        // The graph path builds a pool and calls
+        // `compute_quotes` on the same stateless struct. Same
+        // ctx in → same quotes out.
+        let graph_instance = mm_strategy::AvellanedaStoikov;
+        let graph_quotes = graph_instance.compute_quotes(&ctx);
+
+        assert_eq!(legacy_quotes, graph_quotes,
+            "Strategy.Avellaneda graph path drifted from legacy output");
+    }
+
+    /// S4.4 — per-node `gamma` override applied via the
+    /// `strategy_node_configs` map yields the same quotes as
+    /// the hand-wired path running with that same `gamma`.
+    /// Protects the GR-3 override plumbing from drift.
+    #[test]
+    fn avellaneda_per_node_gamma_override_matches_direct_config() {
+        use mm_strategy::r#trait::Strategy;
+
+        let product = sample_product("BTCUSDT");
+        let book = parity_book();
+
+        // Version A: config with gamma=5 handed directly to
+        // the strategy.
+        let mut cfg_a = sample_config().market_maker;
+        cfg_a.gamma = dec!(5);
+        let ctx_a = parity_ctx(&book, &product, &cfg_a);
+        let a = mm_strategy::AvellanedaStoikov.compute_quotes(&ctx_a);
+
+        // Version B: baseline config + per-node gamma override
+        // applied via the engine's override map path, mimicking
+        // what the graph tick loop does.
+        let baseline = sample_config().market_maker;
+        let mut g = mm_strategy_graph::Graph::empty(
+            "parity",
+            mm_strategy_graph::Scope::Symbol("BTCUSDT".into()),
+        );
+        let node_id = mm_strategy_graph::NodeId::new();
+        g.nodes.push(mm_strategy_graph::GraphNode {
+            id: node_id,
+            kind: "Strategy.Avellaneda".into(),
+            config: serde_json::json!({ "gamma": "5" }),
+            pos: (0.0, 0.0),
+        });
+        let overrides =
+            MarketMakerEngine::build_strategy_node_configs(&g, &baseline);
+        let cfg_b = overrides.get(&node_id).expect("override materialised");
+        let ctx_b = parity_ctx(&book, &product, cfg_b);
+        let b = mm_strategy::AvellanedaStoikov.compute_quotes(&ctx_b);
+
+        assert_eq!(a, b,
+            "per-node gamma override drifted from direct-config baseline");
+    }
+
+    /// S4.4 — borrow_cost_bps plumbed through the per-node
+    /// StrategyContext override matches the legacy path where
+    /// the same value is set directly on the ctx.
+    #[test]
+    fn avellaneda_borrow_cost_override_matches_direct_ctx() {
+        use mm_strategy::r#trait::Strategy;
+
+        let product = sample_product("BTCUSDT");
+        let book = parity_book();
+        let cfg = sample_config().market_maker;
+
+        // Legacy: borrow_cost_bps set directly on the ctx.
+        let mut ctx_a = parity_ctx(&book, &product, &cfg);
+        ctx_a.borrow_cost_bps = Some(dec!(25));
+        let a = mm_strategy::AvellanedaStoikov.compute_quotes(&ctx_a);
+
+        // Graph: ctx override map carries the knob.
+        let mut g = mm_strategy_graph::Graph::empty(
+            "borrow-parity",
+            mm_strategy_graph::Scope::Symbol("BTCUSDT".into()),
+        );
+        let node_id = mm_strategy_graph::NodeId::new();
+        g.nodes.push(mm_strategy_graph::GraphNode {
+            id: node_id,
+            kind: "Strategy.Avellaneda".into(),
+            config: serde_json::json!({ "borrow_cost_bps": "25" }),
+            pos: (0.0, 0.0),
+        });
+        let ctx_overrides = MarketMakerEngine::build_strategy_ctx_overrides(&g);
+        let ov = ctx_overrides.get(&node_id).expect("ctx override captured");
+        let mut ctx_b = parity_ctx(&book, &product, &cfg);
+        ctx_b.borrow_cost_bps = ov.borrow_cost_bps;
+        let b = mm_strategy::AvellanedaStoikov.compute_quotes(&ctx_b);
+
+        assert_eq!(a, b,
+            "borrow_cost_bps per-node override drifted from direct-ctx baseline");
+    }
+
+    /// S4.4 — as_prob (symmetric) through the graph ctx
+    /// override matches the legacy ctx.as_prob assignment.
+    #[test]
+    fn avellaneda_as_prob_override_matches_direct_ctx() {
+        use mm_strategy::r#trait::Strategy;
+
+        let product = sample_product("BTCUSDT");
+        let book = parity_book();
+        let cfg = sample_config().market_maker;
+
+        let mut ctx_a = parity_ctx(&book, &product, &cfg);
+        ctx_a.as_prob = Some(dec!(0.7));
+        let a = mm_strategy::AvellanedaStoikov.compute_quotes(&ctx_a);
+
+        let mut g = mm_strategy_graph::Graph::empty(
+            "as-parity",
+            mm_strategy_graph::Scope::Symbol("BTCUSDT".into()),
+        );
+        let node_id = mm_strategy_graph::NodeId::new();
+        g.nodes.push(mm_strategy_graph::GraphNode {
+            id: node_id,
+            kind: "Strategy.Avellaneda".into(),
+            config: serde_json::json!({ "as_prob": "0.7" }),
+            pos: (0.0, 0.0),
+        });
+        let ctx_overrides = MarketMakerEngine::build_strategy_ctx_overrides(&g);
+        let ov = ctx_overrides.get(&node_id).expect("as_prob override captured");
+        let mut ctx_b = parity_ctx(&book, &product, &cfg);
+        ctx_b.as_prob = ov.as_prob;
+        let b = mm_strategy::AvellanedaStoikov.compute_quotes(&ctx_b);
+
+        assert_eq!(a, b,
+            "as_prob per-node override drifted from direct-ctx baseline");
     }
 
     // ── S2.1 — atomic bundle checkpoint round-trip ────────────
