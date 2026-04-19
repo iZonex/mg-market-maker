@@ -355,6 +355,10 @@ pub struct MarketMakerEngine {
     /// cancel-all, and fill routing never mix the two venues.
     hedge_order_manager: Option<OrderManager>,
     order_manager: OrderManager,
+    /// BOOK-1 — per-order queue-position tracker fed from book
+    /// deltas + trade feed. Backs the `Book.FillProbability`
+    /// graph source.
+    queue_tracker: crate::queue_tracker::QueueTracker,
     inventory_manager: InventoryManager,
     exposure_manager: ExposureManager,
     circuit_breaker: CircuitBreaker,
@@ -819,6 +823,7 @@ impl MarketMakerEngine {
             } else {
                 OrderManager::new()
             },
+            queue_tracker: crate::queue_tracker::QueueTracker::new(),
             inventory_manager: InventoryManager::new(),
             exposure_manager: ExposureManager::new(dec!(0)),
             circuit_breaker: CircuitBreaker::new(),
@@ -2986,6 +2991,52 @@ impl MarketMakerEngine {
                         Value::Number(a.fees_paid - a.rebate_income),
                     );
                 }
+                "Book.FillProbability" => {
+                    // BOOK-2 — queue-position-aware fill
+                    // probability for a resting own order on
+                    // this engine's symbol. Config keys:
+                    // `side` ("buy"|"sell", required) and
+                    // optionally `price` (Decimal string) —
+                    // when omitted, the tracker picks the
+                    // frontmost own order on that side.
+                    // Emits `Missing` if no order is tracked
+                    // at the resolved (side, price).
+                    let cfg = graph.node_configs().get(id);
+                    let side_str = cfg
+                        .and_then(|c| c.get("side"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let side_opt = match side_str {
+                        "buy" => Some(mm_common::types::Side::Buy),
+                        "sell" => Some(mm_common::types::Side::Sell),
+                        _ => None,
+                    };
+                    let price_opt: Option<Decimal> = cfg
+                        .and_then(|c| c.get("price"))
+                        .and_then(|v| {
+                            v.as_str()
+                                .and_then(|s| s.parse::<Decimal>().ok())
+                                .or_else(|| v.as_f64().and_then(Decimal::from_f64_retain))
+                        });
+                    let value = match side_opt {
+                        Some(side) => {
+                            let price = price_opt.or_else(|| {
+                                self.queue_tracker.best_price_on(&self.symbol, side)
+                            });
+                            match price
+                                .and_then(|p| {
+                                    self.queue_tracker
+                                        .fill_probability(&self.symbol, side, p)
+                                })
+                            {
+                                Some(p) => Value::Number(p),
+                                None => Value::Missing,
+                            }
+                        }
+                        None => Value::Missing,
+                    };
+                    src.insert((*id, "probability".into()), value);
+                }
                 "Decision.RealizedCostBps" => {
                     // RS-4 — rolling avg of `realized_cost_bps`
                     // across the last `window_decisions` resolved
@@ -5115,6 +5166,57 @@ impl MarketMakerEngine {
                 mm_dashboard::metrics::BOOK_UPDATE_LATENCY_MS
                     .with_label_values(&[&self.symbol, _bk_kind])
                     .observe(elapsed_ms);
+                // BOOK-1 — feed the book delta / snapshot into
+                // the queue-position tracker so per-order fill
+                // estimates stay aligned with the real book.
+                // A delta arrives with tuples of `(price,
+                // new_qty)` — `on_depth_change` compares each
+                // against its own prev-qty cache. For snapshots
+                // we walk the tracker's cached price levels and
+                // re-read the current qty, which re-anchors the
+                // prev-qty cache on a full restate.
+                match &event {
+                    MarketEvent::BookDelta { bids, asks, .. } => {
+                        for lvl in bids {
+                            self.queue_tracker.on_depth_change(
+                                &self.symbol,
+                                mm_common::types::Side::Buy,
+                                lvl.price,
+                                lvl.qty,
+                            );
+                        }
+                        for lvl in asks {
+                            self.queue_tracker.on_depth_change(
+                                &self.symbol,
+                                mm_common::types::Side::Sell,
+                                lvl.price,
+                                lvl.qty,
+                            );
+                        }
+                    }
+                    MarketEvent::BookSnapshot { .. } => {
+                        // Snapshots re-anchor the whole book.
+                        // Refresh every tracked price level from
+                        // the fresh book so the prev-qty cache
+                        // resyncs; no-op when the tracker is
+                        // empty.
+                        let live = self.order_manager.live_orders_snapshot();
+                        for (_oid, side, price, _qty, _status) in live {
+                            let new_qty = match side {
+                                mm_common::types::Side::Buy => {
+                                    self.book_keeper.book.bids.get(&price).copied()
+                                }
+                                mm_common::types::Side::Sell => {
+                                    self.book_keeper.book.asks.get(&price).copied()
+                                }
+                            }
+                            .unwrap_or(Decimal::ZERO);
+                            self.queue_tracker
+                                .on_depth_change(&self.symbol, side, price, new_qty);
+                        }
+                    }
+                    _ => {}
+                }
                 // OTR: every book event is a price-level update
                 // from the L2 perspective — we don't have L3
                 // add/cancel granularity, so we account for it
@@ -5175,6 +5277,16 @@ impl MarketMakerEngine {
             }
             MarketEvent::Trade { venue, trade } => {
                 let trade_venue = *venue;
+                // BOOK-1 — route the trade to every tracker
+                // sitting at the same price level and bump the
+                // per-symbol trade-rate EWMA. Cheap (two map
+                // lookups + a per-order advance).
+                self.queue_tracker.on_trade(
+                    &self.symbol,
+                    trade.price,
+                    trade.qty,
+                    trade.timestamp.timestamp_millis(),
+                );
                 // Epic R 1.2b — timestamp the arrival of any
                 // public trade near our touch. The
                 // `CancelOnReactionDetector` reads this to score
@@ -5350,7 +5462,16 @@ impl MarketMakerEngine {
                 );
 
                 self.inventory_manager.on_fill(fill);
+                // BOOK-1 — consume any queue-inferred fill
+                // overshoot and drop the tracker if the venue
+                // considers the order fully filled. We check
+                // post-on_fill because order_manager removes
+                // fully-filled orders inline.
+                self.queue_tracker.on_order_filled(fill.order_id);
                 self.order_manager.on_fill(fill.order_id, fill.qty);
+                if !self.order_manager.live_order_ids().contains(&fill.order_id) {
+                    self.queue_tracker.on_order_cancelled(fill.order_id);
+                }
                 // Epic R 1.2b — LatencyExploit + near-touch fill
                 // feeds. Compute delta from the last reprice; cap
                 // the deque so it stays the "recent" window.
@@ -6701,6 +6822,53 @@ impl MarketMakerEngine {
         let pre_exec_ids: std::collections::HashSet<mm_common::types::OrderId> =
             self.order_manager.live_order_ids().into_iter().collect();
 
+        // BOOK-1 — snapshot each existing order's (side, price)
+        // and the book qty at every desired price level BEFORE
+        // we fire execute_diff. The pre-placement book qty is
+        // the queue depth a fresh maker order will sit behind;
+        // reading it after the fact would include our own
+        // order's contribution once the book update round-trips.
+        let pre_live: std::collections::HashMap<
+            mm_common::types::OrderId,
+            (mm_common::types::Side, Decimal),
+        > = self
+            .order_manager
+            .live_orders_snapshot()
+            .into_iter()
+            .map(|(oid, side, price, _qty, _status)| (oid, (side, price)))
+            .collect();
+        let desired_levels: std::collections::HashSet<(mm_common::types::Side, Decimal)> =
+            quotes
+                .iter()
+                .flat_map(|p| {
+                    let bid = p.bid.as_ref().map(|q| {
+                        (mm_common::types::Side::Buy, self.product.round_price(q.price))
+                    });
+                    let ask = p.ask.as_ref().map(|q| {
+                        (mm_common::types::Side::Sell, self.product.round_price(q.price))
+                    });
+                    [bid, ask].into_iter().flatten()
+                })
+                .collect();
+        let pre_book_qty: std::collections::HashMap<
+            (mm_common::types::Side, Decimal),
+            Decimal,
+        > = desired_levels
+            .iter()
+            .map(|&(side, price)| {
+                let qty = match side {
+                    mm_common::types::Side::Buy => {
+                        self.book_keeper.book.bids.get(&price).copied()
+                    }
+                    mm_common::types::Side::Sell => {
+                        self.book_keeper.book.asks.get(&price).copied()
+                    }
+                }
+                .unwrap_or(Decimal::ZERO);
+                ((side, price), qty)
+            })
+            .collect();
+
         let amend_epsilon = if self.config.market_maker.amend_enabled {
             self.config.market_maker.amend_max_ticks
         } else {
@@ -6739,6 +6907,47 @@ impl MarketMakerEngine {
                         self.decision_ledger.bind_order(did, oid);
                     }
                 }
+            }
+        }
+
+        // BOOK-1 — reconcile queue-tracker state with the new
+        // post-execute_diff order set. Three cases:
+        // 1. id in post − pre  → freshly placed. Seed a
+        //    `QueuePos` with the pre-snapshot book qty at its
+        //    price.
+        // 2. id in pre − post  → cancelled or fully filled
+        //    inline. Drop the tracker.
+        // 3. id in pre ∩ post with different price → amended
+        //    in place. Reset the tracker at the new price.
+        let post_live: std::collections::HashMap<
+            mm_common::types::OrderId,
+            (mm_common::types::Side, Decimal),
+        > = self
+            .order_manager
+            .live_orders_snapshot()
+            .into_iter()
+            .map(|(oid, side, price, _qty, _status)| (oid, (side, price)))
+            .collect();
+        for (oid, (side, price)) in &post_live {
+            match pre_live.get(oid) {
+                None => {
+                    let book_qty =
+                        pre_book_qty.get(&(*side, *price)).copied().unwrap_or(Decimal::ZERO);
+                    self.queue_tracker
+                        .on_order_placed(*oid, &self.symbol, *side, *price, book_qty);
+                }
+                Some((_old_side, old_price)) if old_price != price => {
+                    let book_qty =
+                        pre_book_qty.get(&(*side, *price)).copied().unwrap_or(Decimal::ZERO);
+                    self.queue_tracker
+                        .on_order_amended(*oid, *price, book_qty);
+                }
+                _ => {}
+            }
+        }
+        for oid in pre_live.keys() {
+            if !post_live.contains_key(oid) {
+                self.queue_tracker.on_order_cancelled(*oid);
             }
         }
 

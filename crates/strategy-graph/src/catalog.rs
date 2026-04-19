@@ -170,6 +170,7 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Cost.CumulativeToday" => Some(Box::new(sources::CumulativeTodayCost)),
         "Decision.RealizedCostBps" => Some(Box::new(sources::DecisionRealizedCostBps)),
         "Portfolio.CrossVenueNetDelta" => Some(Box::new(sources::PortfolioCrossVenueNetDelta)),
+        "Book.FillProbability" => Some(Box::new(sources::BookFillProbability)),
         "Borrow.RateApr" => Some(Box::new(sources::BorrowRateApr)),
         "Borrow.MaxAvailable" => Some(Box::new(sources::BorrowMaxAvailable)),
         "Borrow.CarryBps" => Some(Box::new(sources::BorrowCarryBps)),
@@ -314,6 +315,7 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Cost.CumulativeToday"     => NodeMeta { label: "Cost today",        summary: "fees_paid − rebate_income since UTC midnight", group: "Sources" },
         "Decision.RealizedCostBps" => NodeMeta { label: "Decision cost avg", summary: "Rolling avg realized cost bps across the last N resolved decisions", group: "Sources" },
         "Portfolio.CrossVenueNetDelta" => NodeMeta { label: "Cross-venue net delta", summary: "Sum of signed inventory across every connected venue for a base asset", group: "Sources" },
+        "Book.FillProbability"    => NodeMeta { label: "Fill probability",   summary: "Queue-position-aware 60s fill probability for our frontmost own order on a side", group: "Sources" },
         "Borrow.RateApr"          => NodeMeta { label: "Borrow APR",         summary: "Spot venue borrow rate (annualised fraction) — Missing on perp", group: "Sources" },
         "Borrow.MaxAvailable"     => NodeMeta { label: "Max borrowable",     summary: "Base-asset cap the borrow manager will allow — Missing on perp", group: "Sources" },
         "Borrow.CarryBps"         => NodeMeta { label: "Expected carry bps", summary: "APR converted to bps over operator-tuned holding window", group: "Sources" },
@@ -440,6 +442,7 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Cost.CumulativeToday",
         "Decision.RealizedCostBps",
         "Portfolio.CrossVenueNetDelta",
+        "Book.FillProbability",
         "Borrow.RateApr",
         "Borrow.MaxAvailable",
         "Borrow.CarryBps",
@@ -537,8 +540,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_102_nodes_after_spot_1_borrow_sources() {
-        // 99 + 3 (SPOT-1: Borrow.{RateApr, MaxAvailable, CarryBps}). = 102.
-        assert_eq!(kinds().len(), 102, "catalog drift");
+    fn catalog_has_103_nodes_after_book_fill_probability() {
+        // 102 after SPOT-1 borrow trio + 1 (BOOK-2: Book.FillProbability). = 103.
+        assert_eq!(kinds().len(), 103, "catalog drift");
     }
 }

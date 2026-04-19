@@ -9,13 +9,13 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 use crate::data::RecordedEvent;
-use crate::queue_model::{LogProbQueueFunc, PowerProbQueueFunc, Probability, QueuePos};
 use crate::report::BacktestReport;
+use mm_common::queue_model::{LogProbQueueFunc, PowerProbQueueFunc, Probability, QueuePos};
 
 /// Which probability function drives the queue-aware fill model.
 ///
 /// Two canonical choices from the upstream hftbacktest library.
-/// See [`crate::queue_model`] for the full trait + math.
+/// See [`mm_common::queue_model`] for the full trait + math.
 #[derive(Debug, Clone, Copy)]
 pub enum QueueProbModel {
     /// `f(x) = ln(1 + x)` — good default. Log weighting pulls
@@ -46,7 +46,7 @@ pub enum FillModel {
     QueuePosition { fill_probability: f64 },
     /// Queue-position-aware fill model. Tracks per-order queue
     /// state (`front_q_qty`, `cum_trade_qty`) from
-    /// [`crate::queue_model::QueuePos`] and advances it on every
+    /// [`mm_common::queue_model::QueuePos`] and advances it on every
     /// trade / depth change at the order's price level. Fills fire
     /// only when the queue ahead actually clears. Closes the
     /// 10-30 % PnL over-estimate that `QueuePosition` /

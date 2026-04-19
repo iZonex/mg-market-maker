@@ -19,18 +19,19 @@ Legend:
 ## P0 — production-blocking
 
 ### Orderbook rigor
-- [ ] **BOOK-1** Live queue-position tracker (Rigtorp / L2-derived).
-  Crypto venues don't expose L3 feeds, but the queue-position
-  model in `crates/backtester/src/queue_model.rs` already works
-  off L2 depth + trade events — port it to a shared crate,
-  attach one `QueuePos` to every resting maker order, drive it
-  from book-keeper depth changes and trade-feed events so the
-  engine knows how many units of foreign qty sit ahead of each
-  of our orders in real time.
-- [ ] **BOOK-2** Graph source `Book.FillProbability` — derived
-  from tracked queue position + rolling trade-rate estimate.
-  Feeds decision sizing + a queue-aware variant of the
-  quoting strategy.
+- [x] **BOOK-1** Live queue-position tracker (Rigtorp / L2-derived).
+  Queue model moved from `backtester` to `mm_common::queue_model`.
+  `crates/engine/src/queue_tracker.rs` attaches one `QueuePos`
+  per resting maker order, fed by (1) placement/cancel/amend
+  hooks around `execute_diff` using pre-snapshot book qty,
+  (2) `MarketEvent::Trade` → `on_trade`, (3) book deltas →
+  `on_depth_change`, (4) `MarketEvent::Fill` → `on_order_filled`.
+- [x] **BOOK-2** Graph source `Book.FillProbability` — 60-second
+  Poisson-rate-matching estimator blending per-order queue
+  position with a 30-second half-life per-symbol trade-rate
+  EWMA. Config `{side, price?}`; price defaults to the
+  frontmost own order on that side. Registered in catalog
+  shape + meta; node count 102 → 103.
 
 ### Perpetual safety
 - [ ] **PERP-2** Use venue-reported `total_maintenance_margin`

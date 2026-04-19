@@ -209,6 +209,70 @@ impl NodeKind for PortfolioCrossVenueNetDelta {
     }
 }
 
+// ── Book.FillProbability (BOOK-2) ─────────────────────────
+
+/// `Book.FillProbability` — queue-position-aware estimate of the
+/// probability that one of the engine's resting own orders fills
+/// within the next 60 seconds. Driven by `crate::queue_tracker`
+/// in `mm-engine`: it tracks per-order queue position via the
+/// Rigtorp L2-derived model and blends that with a rolling
+/// per-symbol trade-rate EWMA.
+///
+/// Config: `{ side: "buy" | "sell", price?: "<decimal>" }`. When
+/// `price` is omitted the engine picks the frontmost own order
+/// on that side. Emits `Missing` when no order is tracked at the
+/// resolved level (e.g. before the first quote lands).
+#[derive(Debug, Default)]
+pub struct BookFillProbability;
+
+impl NodeKind for BookFillProbability {
+    fn kind(&self) -> &'static str {
+        "Book.FillProbability"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        static PORTS: Lazy<Vec<Port>> =
+            Lazy::new(|| vec![Port::new("probability", PortType::Number)]);
+        &PORTS
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigEnumOption, ConfigField, ConfigWidget};
+        vec![
+            ConfigField {
+                name: "side",
+                label: "Side",
+                hint: Some("Which side of our quote to estimate fill probability for"),
+                default: serde_json::json!("buy"),
+                widget: ConfigWidget::Enum {
+                    options: vec![
+                        ConfigEnumOption { value: "buy", label: "Buy" },
+                        ConfigEnumOption { value: "sell", label: "Sell" },
+                    ],
+                },
+            },
+            ConfigField {
+                name: "price",
+                label: "Price (optional)",
+                hint: Some(
+                    "Leave empty to target the frontmost own order on this side",
+                ),
+                default: serde_json::json!(""),
+                widget: ConfigWidget::Text,
+            },
+        ]
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
 // ── Cost.CumulativeToday / Decision.RealizedCostBps (RS-4) ─
 
 /// `Cost.CumulativeToday` — cumulative net trading cost since
