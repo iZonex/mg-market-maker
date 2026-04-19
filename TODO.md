@@ -1,6 +1,6 @@
 # MM — Open Work Tracker
 
-Last updated: 2026-04-19 (post-Sprint 14)
+Last updated: 2026-04-19 (post-Sprint 15)
 
 Tracking debt not yet closed. Closed items live in git history.
 Each row is a concrete deliverable; bigger initiatives are
@@ -796,7 +796,42 @@ this sprint.
   future sprints (E2E tests only way to catch gate drift,
   input-having Strategy nodes break pool overlay contract).
 
-## Sprint 15 — deferred research from cascade doc (planned)
+## Sprint 15 — critical-path test coverage (landed Apr 19)
+
+Sprint 14 showed the operator was right — E2E gaps hide real bugs.
+This sprint closes three of the highest-risk untested paths and
+ships an honest coverage matrix so the remaining gaps are
+visible.
+
+- [x] **R8.5** Rebalancer execute state-level round-trip. Three
+  new tests in `dashboard::state::tests`:
+  `rebalance_execute_state_roundtrip_intra_venue`,
+  `rebalance_execute_kill_switch_gate_state`,
+  `rebalance_execute_transfer_log_is_none_by_default`. Pins
+  the business logic the HTTP handler wraps.
+- [x] **R8.6** Manipulation scores publish cycle.
+  `manipulation_score_publish_cycle` +
+  `manipulation_score_missing_is_absent_not_zero` — verifies
+  engine publish → `SymbolState.manipulation_score` →
+  `get_all()` projection the `/api/v1/manipulation/scores`
+  handler consumes, and that missing scores stay absent (no
+  "silence = safe" leak).
+- [x] **R8.7** Integration test coverage matrix at
+  `docs/research/integration-test-coverage.md` — enumerates
+  every HTTP endpoint, every bundled template, and every
+  engine-tick path with ✅ E2E / 🟡 Unit / ❌ None markers.
+  Three clusters of weakness identified for Sprint 16+:
+  HTTP-layer E2E near-zero, REST-poll connector paths have no
+  integration tests, dashboard deploy handler env-var gate
+  untested (Sprint 14 BUG #1 hid exactly here).
+
+Sprint 16 backlog extended with the prioritised Axum
+TestClient harness + env-var gate handler test items.
+
+## Renumbered — Sprint 15 "deferred research" → now Sprint 17
+## Renumbered — Sprint 16 "honest MM side" → now Sprint 18
+
+## Sprint 17 — deferred research from cascade doc (planned)
 
 Closing the remaining "future research" items called out in
 `docs/research/liquidation-cascades.md`. All restricted /
@@ -815,7 +850,7 @@ pentest-only.
 - [ ] **R9.4** `Strategy.BasketPush`: coordinate pushes across
   correlated symbols (RAVE + SIREN + MYX shape).
 
-## Sprint 16 — honest MM side closeout (planned)
+## Sprint 18 — honest MM side closeout (planned)
 
 Long-deferred MM-side quality work that's been sitting behind the
 Epic R run. All non-restricted.

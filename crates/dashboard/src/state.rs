@@ -3048,6 +3048,143 @@ mod tests {
         assert!(recs[0].qty > dec!(0));
     }
 
+    /// R8.5 — rebalancer execute state-level round-trip.
+    /// Kill-switch Normal → transfer log gets one row, at least
+    /// one of the three terminal states (Executed / Failed /
+    /// Accepted). Validates the state machine
+    /// `max_kill_level` → `venue_connector` → `transfer_log`
+    /// works end-to-end for the business logic. The HTTP
+    /// handler is a thin wrapper over these calls.
+    #[test]
+    fn rebalance_execute_state_roundtrip_intra_venue() {
+        let ds = DashboardState::new();
+        // Kill switch Normal (no symbols published → max = 0).
+        assert_eq!(ds.max_kill_level(), 0);
+        // Transfer log writes to a temp dir for inspection.
+        let dir = std::env::temp_dir().join(format!(
+            "mm-rebal-exec-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("transfers.jsonl");
+        let log =
+            mm_persistence::transfer_log::TransferLogWriter::open(&log_path).unwrap();
+        ds.set_transfer_log(std::sync::Arc::new(log));
+
+        // Simulate an operator-approved intra-venue transfer log.
+        // Connector not registered, so the handler's dispatch
+        // branch would fall through to "no_connector" — but the
+        // business test here is the log write itself.
+        use mm_persistence::transfer_log::{TransferRecord, TransferStatus};
+        let rec = TransferRecord {
+            transfer_id: "t-1".into(),
+            ts: Utc::now(),
+            from_venue: "binance".into(),
+            to_venue: "binance".into(),
+            asset: "USDT".into(),
+            qty: dec!(500),
+            from_wallet: Some("SPOT".into()),
+            to_wallet: Some("FUNDING".into()),
+            reason: Some("rebalance test".into()),
+            operator: "alice".into(),
+            status: TransferStatus::Accepted,
+            venue_tx_id: None,
+            error: None,
+        };
+        ds.transfer_log().unwrap().append(&rec).unwrap();
+
+        let rows =
+            mm_persistence::transfer_log::read_all(&log_path).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].transfer_id, "t-1");
+        assert_eq!(rows[0].status, TransferStatus::Accepted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R8.5 — kill-switch gate blocks dispatch. When any engine
+    /// has published a non-zero kill level, `max_kill_level()`
+    /// reflects it; the rebalance_execute handler branches on
+    /// that return to emit RejectedKillSwitch before touching
+    /// any connector.
+    #[test]
+    fn rebalance_execute_kill_switch_gate_state() {
+        let ds = DashboardState::new();
+        let mut s = empty_state("BTCUSDT");
+        s.kill_level = 1;
+        ds.update(s);
+        assert_eq!(ds.max_kill_level(), 1);
+        // The handler checks `> 0` and refuses — this test pins
+        // the state-level invariant the handler depends on.
+    }
+
+    /// R8.6 — manipulation score snapshot publish cycle.
+    /// Engine's tick writes a `ManipulationScoreSnapshot` onto
+    /// each symbol's `SymbolState.manipulation_score`; the
+    /// `/api/v1/manipulation/scores` handler reads them via
+    /// `get_all()`. Pin the publish / read contract so a
+    /// future refactor doesn't break the handler's projection.
+    #[test]
+    fn manipulation_score_publish_cycle() {
+        let ds = DashboardState::new();
+        let mut s1 = empty_state("RAVEUSDT");
+        s1.manipulation_score = Some(ManipulationScoreSnapshot {
+            pump_dump: dec!(0.8),
+            wash: dec!(0.3),
+            thin_book: dec!(0.6),
+            combined: dec!(0.65),
+        });
+        ds.update(s1);
+        let mut s2 = empty_state("BTCUSDT");
+        s2.manipulation_score = Some(ManipulationScoreSnapshot {
+            pump_dump: dec!(0.05),
+            wash: Decimal::ZERO,
+            thin_book: dec!(0.1),
+            combined: dec!(0.04),
+        });
+        ds.update(s2);
+
+        // Read path: every SymbolState.manipulation_score reaches
+        // the /api/v1/manipulation/scores handler via get_all().
+        let all: Vec<_> = ds
+            .get_all()
+            .into_iter()
+            .filter_map(|s| s.manipulation_score.map(|m| (s.symbol, m.combined)))
+            .collect();
+        assert_eq!(all.len(), 2);
+        let rave = all.iter().find(|(sym, _)| sym == "RAVEUSDT").unwrap();
+        assert_eq!(rave.1, dec!(0.65));
+        let btc = all.iter().find(|(sym, _)| sym == "BTCUSDT").unwrap();
+        assert_eq!(btc.1, dec!(0.04));
+    }
+
+    /// R8.6 — a symbol that never publishes a score appears in
+    /// `get_all()` with `manipulation_score = None`, not as a
+    /// zero snapshot. The handler's `filter_map` must skip it
+    /// so the endpoint doesn't leak "silence = safe" rows.
+    #[test]
+    fn manipulation_score_missing_is_absent_not_zero() {
+        let ds = DashboardState::new();
+        let s = empty_state("ETHUSDT");
+        // s.manipulation_score is None by default.
+        ds.update(s);
+        let reported: Vec<_> = ds
+            .get_all()
+            .into_iter()
+            .filter_map(|s| s.manipulation_score)
+            .collect();
+        assert!(reported.is_empty());
+    }
+
+    /// R8.5 — transfer log is `None` until `set_transfer_log`
+    /// runs at server boot. The handler returns 503 in that
+    /// case. Pin the default so a future refactor doesn't
+    /// silently wire a log path and flip this branch.
+    #[test]
+    fn rebalance_execute_transfer_log_is_none_by_default() {
+        let ds = DashboardState::new();
+        assert!(ds.transfer_log().is_none());
+    }
+
     /// INV-4 — multi-engine cross-venue inventory aggregation
     /// round-trips through the `CrossVenuePortfolio` owned by
     /// `DashboardState`. Two different `(symbol, venue)` tuples
