@@ -1,6 +1,6 @@
 # MM — Open Work Tracker
 
-Last updated: 2026-04-19 (post-Sprint 4)
+Last updated: 2026-04-19 (post-Sprint 5)
 
 Tracking debt not yet closed. Closed items live in git history.
 Each row is a concrete deliverable; bigger initiatives are
@@ -342,6 +342,51 @@ client sees the system.
   + `avellaneda_as_prob_override_matches_direct_ctx` (S4.2
   ctx override path). `Quote` + `QuotePair` gained `PartialEq,
   Eq` derives so `assert_eq!` works byte-for-byte.
+
+## Sprint 5 — advisory panels + live calibration (landed Apr 19)
+
+- [x] **S5.1** Cross-venue rebalance recommendations. Moved
+  `rebalancer` module from `mm-engine` to `mm-risk` (switched
+  `VenueBalance.venue` to `String` in the process —
+  `VenueId::Debug` fmt was the only use). New
+  `DashboardState::{set_rebalancer_config, rebalance_recommendations}`
+  aggregates `venue_balances` across every engine's symbol by
+  `(venue, asset)` and runs the rebalancer. `AppConfig.rebalancer`
+  forwarded at server boot. `GET /api/v1/rebalance/recommendations`
+  + `RebalanceRecommendations.svelte` on AdminPage. Two round-trip
+  tests pin empty-without-config + deficit-surfacing.
+- [x] **S5.2** Funding-arb pair monitor. New
+  `DashboardFundingArbSink` (server crate, bridging the sink trait
+  so `mm-dashboard` stays free of `mm-strategy`) records every
+  `DriverEvent` into `DashboardState::record_funding_arb_event`
+  against a `pair_key = "{primary}|{hedge}"` bucket. Replaces the
+  previous `NullSink` at boot. `FundingArbPairState` carries
+  per-variant counters + last-event details;
+  `pair_break_uncompensated` is its own field so the UI flags
+  unhedged breaks in red. `GET /api/v1/funding-arb/pairs` +
+  `FundingArbPairs.svelte` on AdminPage.
+- [x] **S5.3** Adverse-selection tracker panel. New endpoint
+  `/api/v1/adverse-selection` projects `(adverse_bps,
+  as_prob_bid, as_prob_ask)` off every `SymbolState` the engine
+  already publishes. `AdverseSelection.svelte` highlights
+  symbols where either side's ρ deviates past 0.55 / 0.45 so
+  operators spot toxic-flow pairs without scraping the
+  Prometheus gauges.
+- [x] **S5.4** Live GLFT auto-calibration. New
+  `Strategy::{calibration_state, recalibrate_if_due}` trait
+  methods with no-op defaults; `GlftStrategy` overrides to
+  surface fitted `(a, k, samples, last_recalibrated_ms)` and
+  to run a periodic retune gated by the existing ≥50-sample
+  threshold AND a 30-second cooldown. Engine's `on_tick` path
+  calls `recalibrate_if_due` on the legacy strategy + every
+  pool node, then publishes the first `Some` snapshot into
+  `DashboardState::publish_calibration`. `GET
+  /api/v1/calibration/status` + `CalibrationStatus.svelte`
+  render the live `(a, k)` + time-since-retune.
+  `CalibrationState` is duplicated on the dashboard side as
+  `CalibrationSnapshot` so the dashboard stays independent of
+  `mm-strategy`. Three unit tests pin the throttling, trait
+  round-trip, and dashboard replace-on-publish semantics.
 
 ## Graph system audit — Apr 19 follow-ups
 

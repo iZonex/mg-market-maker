@@ -290,6 +290,42 @@ struct StateInner {
     /// without scraping Prometheus. Capped at
     /// `MAX_SOR_DECISIONS` most-recent entries per engine.
     sor_decisions: std::collections::VecDeque<SorDecisionRecord>,
+    /// S5.1 — cross-venue rebalancer knobs. `None` until the
+    /// server boot call to `set_rebalancer_config`. With `None`
+    /// the `/api/v1/rebalance/recommendations` endpoint replies
+    /// with an empty list, matching the "rebalancer disabled"
+    /// baseline.
+    rebalancer_config: Option<mm_risk::rebalancer::RebalancerConfig>,
+    /// S5.2 — funding-arb driver state per `(pair_key)`. Every
+    /// `DriverEvent` the server-side sink sees bumps the matching
+    /// counter and replaces `last_event` so the monitor panel
+    /// answers "what's the driver doing right now, has it tripped
+    /// yet" without tailing logs.
+    funding_arb_pairs: HashMap<String, FundingArbPairState>,
+    /// S5.4 — per-symbol calibration snapshot (currently only
+    /// `GlftStrategy` publishes into this map). The engine calls
+    /// the active strategy's `recalibrate_if_due` on a
+    /// minute-cadence tick and publishes the resulting
+    /// `Strategy::calibration_state` afterwards. `None` /
+    /// missing entry means the active strategy is stateless
+    /// (grid, basis, Avellaneda).
+    calibration_snapshots: HashMap<String, CalibrationSnapshot>,
+}
+
+/// S5.4 — mirror of `mm_strategy::trait::CalibrationState` so
+/// the dashboard crate stays independent of `mm-strategy`. The
+/// server-side caller (engine) builds both, forwards this
+/// variant here via `publish_calibration`. Fields kept
+/// 1:1 with the trait shape so the UI renders the same thing
+/// regardless of transport.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CalibrationSnapshot {
+    pub symbol: String,
+    pub strategy: String,
+    pub a: Decimal,
+    pub k: Decimal,
+    pub samples: usize,
+    pub last_recalibrated_ms: Option<i64>,
 }
 
 /// S1.3 — one recorded SOR routing decision. Carries the
@@ -366,6 +402,25 @@ pub struct AtomicBundleLegSnapshot {
     pub side: mm_common::types::Side,
     pub price: Decimal,
     pub acked: bool,
+}
+
+/// S5.2 — per-pair funding-arb driver snapshot. The server-side
+/// `DriverEventSink` implementation updates this struct on every
+/// event so the monitor panel can render a compact "last event /
+/// counts" row without re-playing audit history.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FundingArbPairState {
+    pub pair: String,
+    pub last_event: String,
+    pub last_reason: Option<String>,
+    pub last_event_at_ms: Option<i64>,
+    pub entered: u64,
+    pub exited: u64,
+    pub taker_rejected: u64,
+    pub pair_break: u64,
+    pub pair_break_uncompensated: u64,
+    pub hold: u64,
+    pub input_unavailable: u64,
 }
 
 const MAX_SOR_DECISIONS: usize = 256;
@@ -1573,6 +1628,119 @@ impl DashboardState {
         inner.venue_balances.clone()
     }
 
+    /// S5.2 — record a funding-arb driver event against a
+    /// `(pair_key)` bucket. `event_tag` is the lowercase
+    /// `DriverEvent` variant name (`"entered"`, `"exited"`,
+    /// `"taker_rejected"`, `"pair_break"`, `"hold"`,
+    /// `"input_unavailable"`). `uncompensated` is only meaningful
+    /// for `"pair_break"`.
+    pub fn record_funding_arb_event(
+        &self,
+        pair_key: &str,
+        event_tag: &str,
+        reason: Option<&str>,
+        uncompensated: bool,
+    ) {
+        let mut g = self.inner.write().unwrap();
+        let entry = g
+            .funding_arb_pairs
+            .entry(pair_key.to_string())
+            .or_insert_with(|| FundingArbPairState {
+                pair: pair_key.to_string(),
+                ..FundingArbPairState::default()
+            });
+        entry.last_event = event_tag.to_string();
+        entry.last_reason = reason.map(str::to_string);
+        entry.last_event_at_ms = Some(Utc::now().timestamp_millis());
+        match event_tag {
+            "entered" => entry.entered += 1,
+            "exited" => entry.exited += 1,
+            "taker_rejected" => entry.taker_rejected += 1,
+            "pair_break" => {
+                entry.pair_break += 1;
+                if uncompensated {
+                    entry.pair_break_uncompensated += 1;
+                }
+            }
+            "hold" => entry.hold += 1,
+            "input_unavailable" => entry.input_unavailable += 1,
+            _ => {}
+        }
+    }
+
+    /// S5.4 — engine-side hook: publish a calibration snapshot
+    /// for `symbol`. Overwrites any previous row so the panel
+    /// always sees the latest `(a, k, samples)`.
+    pub fn publish_calibration(&self, snap: CalibrationSnapshot) {
+        let mut g = self.inner.write().unwrap();
+        g.calibration_snapshots.insert(snap.symbol.clone(), snap);
+    }
+
+    /// S5.4 — flat snapshot list ordered by symbol for the
+    /// `/api/v1/calibration/status` handler.
+    pub fn calibration_snapshots(&self) -> Vec<CalibrationSnapshot> {
+        let g = self.inner.read().unwrap();
+        let mut out: Vec<_> = g.calibration_snapshots.values().cloned().collect();
+        out.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+        out
+    }
+
+    /// S5.2 — flat list of pair states for the monitor panel.
+    pub fn funding_arb_pairs(&self) -> Vec<FundingArbPairState> {
+        let g = self.inner.read().unwrap();
+        let mut out: Vec<_> = g.funding_arb_pairs.values().cloned().collect();
+        out.sort_by(|a, b| a.pair.cmp(&b.pair));
+        out
+    }
+
+    /// S5.1 — register the rebalancer config at server boot.
+    /// With `None`, `rebalance_recommendations` short-circuits to
+    /// an empty list.
+    pub fn set_rebalancer_config(
+        &self,
+        cfg: mm_risk::rebalancer::RebalancerConfig,
+    ) {
+        self.inner.write().unwrap().rebalancer_config = Some(cfg);
+    }
+
+    /// S5.1 — run the rebalancer over the dashboard-aggregated
+    /// venue balances and return recommendations. Groups all
+    /// `VenueBalanceSnapshot` rows across symbols by
+    /// `(venue, asset)` first (a single (venue, asset) can be
+    /// reported by multiple symbol-scoped engines), sums
+    /// `available`, then defers to `Rebalancer::recommend`.
+    pub fn rebalance_recommendations(
+        &self,
+    ) -> Vec<mm_risk::rebalancer::RebalanceRecommendation> {
+        let inner = self.inner.read().unwrap();
+        let Some(cfg) = inner.rebalancer_config.clone() else {
+            return Vec::new();
+        };
+        let mut by_key: HashMap<(String, String), (Decimal, Decimal)> =
+            HashMap::new();
+        for snaps in inner.venue_balances.values() {
+            for snap in snaps {
+                let key = (snap.venue.clone(), snap.asset.clone());
+                let entry = by_key.entry(key).or_insert((Decimal::ZERO, Decimal::ZERO));
+                entry.0 += snap.available;
+                entry.1 += snap.locked;
+            }
+        }
+        drop(inner);
+        let balances: Vec<_> = by_key
+            .into_iter()
+            .map(|((venue, asset), (available, locked))| {
+                mm_risk::rebalancer::VenueBalance {
+                    venue,
+                    asset,
+                    available,
+                    locked,
+                }
+            })
+            .collect();
+        mm_risk::rebalancer::Rebalancer::new(cfg).recommend(&balances)
+    }
+
     // ── Pending hyperopt calibrations (Epic 33) ──────────────
 
     /// Stage a new calibration suggestion. Overwrites any
@@ -2472,6 +2640,140 @@ mod tests {
         // Second update replaces, not appends.
         ds.update_venue_balances("BTCUSDT", vec![]);
         assert!(ds.venue_balances("BTCUSDT").is_empty());
+    }
+
+    /// S5.1 — rebalance recommendations read through
+    /// DashboardState. With no config registered the response
+    /// is empty; once set, the rebalancer runs over the
+    /// aggregated venue_balances across every symbol and
+    /// surfaces the expected transfer row.
+    #[test]
+    fn rebalance_recommendations_empty_without_config() {
+        let ds = DashboardState::new();
+        // Even with balances, no config means no recommendations.
+        let snap = VenueBalanceSnapshot {
+            venue: "binance".into(),
+            product: "Spot".into(),
+            asset: "USDT".into(),
+            wallet: "Spot".into(),
+            total: dec!(50),
+            available: dec!(50),
+            locked: dec!(0),
+            updated_at: Utc::now(),
+        };
+        ds.update_venue_balances("BTCUSDT", vec![snap]);
+        assert!(ds.rebalance_recommendations().is_empty());
+    }
+
+    /// S5.4 — calibration snapshots round-trip through the
+    /// dashboard: a fresh publish replaces the prior row for the
+    /// same symbol, and the readout is sorted by symbol ASC.
+    #[test]
+    fn calibration_snapshots_replace_and_sort() {
+        let ds = DashboardState::new();
+        ds.publish_calibration(CalibrationSnapshot {
+            symbol: "ETHUSDT".into(),
+            strategy: "glft".into(),
+            a: dec!(1.0),
+            k: dec!(2.0),
+            samples: 40,
+            last_recalibrated_ms: None,
+        });
+        ds.publish_calibration(CalibrationSnapshot {
+            symbol: "BTCUSDT".into(),
+            strategy: "glft".into(),
+            a: dec!(1.0),
+            k: dec!(1.5),
+            samples: 30,
+            last_recalibrated_ms: None,
+        });
+        // Replace ETHUSDT with a post-retune snapshot.
+        ds.publish_calibration(CalibrationSnapshot {
+            symbol: "ETHUSDT".into(),
+            strategy: "glft".into(),
+            a: dec!(1.0),
+            k: dec!(3.0),
+            samples: 80,
+            last_recalibrated_ms: Some(12_345_000),
+        });
+
+        let rows = ds.calibration_snapshots();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].symbol, "BTCUSDT");
+        assert_eq!(rows[0].samples, 30);
+        assert_eq!(rows[1].symbol, "ETHUSDT");
+        assert_eq!(rows[1].samples, 80);
+        assert_eq!(rows[1].k, dec!(3.0));
+        assert_eq!(rows[1].last_recalibrated_ms, Some(12_345_000));
+    }
+
+    /// S5.2 — funding-arb events accumulate per pair bucket
+    /// with correct per-variant counters; uncompensated
+    /// pair-break increments its dedicated counter on top of
+    /// the generic `pair_break` total.
+    #[test]
+    fn funding_arb_events_accumulate_per_pair() {
+        let ds = DashboardState::new();
+        ds.record_funding_arb_event("BTCUSDT|BTC-PERP", "entered", None, false);
+        ds.record_funding_arb_event("BTCUSDT|BTC-PERP", "hold", None, false);
+        ds.record_funding_arb_event(
+            "BTCUSDT|BTC-PERP",
+            "pair_break",
+            Some("hedge rejected"),
+            true,
+        );
+        ds.record_funding_arb_event("ETHUSDT|ETH-PERP", "hold", None, false);
+
+        let pairs = ds.funding_arb_pairs();
+        assert_eq!(pairs.len(), 2);
+        // Sort order is pair ASC.
+        assert_eq!(pairs[0].pair, "BTCUSDT|BTC-PERP");
+        assert_eq!(pairs[0].entered, 1);
+        assert_eq!(pairs[0].hold, 1);
+        assert_eq!(pairs[0].pair_break, 1);
+        assert_eq!(pairs[0].pair_break_uncompensated, 1);
+        assert_eq!(pairs[0].last_event, "pair_break");
+        assert_eq!(pairs[0].last_reason.as_deref(), Some("hedge rejected"));
+        assert_eq!(pairs[1].pair, "ETHUSDT|ETH-PERP");
+        assert_eq!(pairs[1].hold, 1);
+    }
+
+    #[test]
+    fn rebalance_recommendations_surface_deficit() {
+        let ds = DashboardState::new();
+        ds.set_rebalancer_config(mm_risk::rebalancer::RebalancerConfig {
+            min_balance_per_venue: dec!(100),
+            target_balance_per_venue: dec!(500),
+        });
+        let deficit = VenueBalanceSnapshot {
+            venue: "binance".into(),
+            product: "Spot".into(),
+            asset: "USDT".into(),
+            wallet: "Spot".into(),
+            total: dec!(50),
+            available: dec!(50),
+            locked: dec!(0),
+            updated_at: Utc::now(),
+        };
+        let surplus = VenueBalanceSnapshot {
+            venue: "bybit".into(),
+            product: "Spot".into(),
+            asset: "USDT".into(),
+            wallet: "Spot".into(),
+            total: dec!(1000),
+            available: dec!(1000),
+            locked: dec!(0),
+            updated_at: Utc::now(),
+        };
+        ds.update_venue_balances("BTCUSDT", vec![deficit]);
+        ds.update_venue_balances("ETHUSDT", vec![surplus]);
+
+        let recs = ds.rebalance_recommendations();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].asset, "USDT");
+        assert_eq!(recs[0].from_venue, "bybit");
+        assert_eq!(recs[0].to_venue, "binance");
+        assert!(recs[0].qty > dec!(0));
     }
 
     /// INV-4 — multi-engine cross-venue inventory aggregation

@@ -332,6 +332,18 @@ async fn main() -> Result<()> {
     // can gate US-jurisdiction clients at ingress time.
     dashboard_state.set_engine_product(config.exchange.product);
     dashboard_state.set_loans(config.loans.clone());
+    // S5.1 — forward the `[rebalancer]` config to the dashboard so
+    // `/api/v1/rebalance/recommendations` has thresholds to work
+    // with. Absent section leaves the endpoint returning an empty
+    // list (rebalancer disabled).
+    if let Some(rc) = config.rebalancer.as_ref() {
+        dashboard_state.set_rebalancer_config(
+            mm_risk::rebalancer::RebalancerConfig {
+                min_balance_per_venue: rc.min_balance_per_venue,
+                target_balance_per_venue: rc.target_balance_per_venue,
+            },
+        );
+    }
     // UX-5 — publish the effective AppConfig so operators can
     // inspect which features are configured vs on defaults from
     // the dashboard. Secrets live in env, not in `AppConfig`.
@@ -1056,6 +1068,17 @@ async fn run_symbol(
             let pair = bundle.pair.clone().ok_or_else(|| {
                 anyhow::anyhow!("strategy=funding_arb requires an instrument pair")
             })?;
+            // S5.2 — route driver events into the dashboard so
+            // the funding-arb monitor panel sees last-event +
+            // counts per pair. Pair key is `primary|hedge` so
+            // one engine's dispatches land under a stable,
+            // human-readable bucket on the panel.
+            let pair_key = format!("{}|{}", pair.primary_symbol, pair.hedge_symbol);
+            let sink: Arc<dyn mm_strategy::DriverEventSink> =
+                Arc::new(DashboardFundingArbSink::new(
+                    dashboard_state.clone(),
+                    pair_key,
+                ));
             let driver = mm_strategy::FundingArbDriver::new(
                 bundle.primary.clone(),
                 hedge_conn,
@@ -1070,7 +1093,7 @@ async fn run_symbol(
                         ..Default::default()
                     },
                 },
-                Arc::new(mm_strategy::NullSink),
+                sink,
             );
             Some((
                 driver,
@@ -1411,6 +1434,80 @@ async fn run_pair_screener_task(
                         &detail,
                     );
                 }
+            }
+        }
+    }
+}
+
+/// S5.2 — funding-arb driver event sink that writes each
+/// `DriverEvent` into `DashboardState::record_funding_arb_event`
+/// so the monitor panel can render per-pair last-event + counts
+/// without tailing audit. Lives in the server crate because
+/// mm-dashboard doesn't depend on mm-strategy (and we'd rather
+/// keep that direction so the dashboard stays agnostic to
+/// individual strategy traits).
+struct DashboardFundingArbSink {
+    dashboard: DashboardState,
+    pair_key: String,
+}
+
+impl DashboardFundingArbSink {
+    fn new(dashboard: DashboardState, pair_key: String) -> Self {
+        Self { dashboard, pair_key }
+    }
+}
+
+impl mm_strategy::DriverEventSink for DashboardFundingArbSink {
+    fn on_event(&self, event: mm_strategy::DriverEvent) {
+        use mm_strategy::DriverEvent as D;
+        match event {
+            D::Entered { .. } => {
+                self.dashboard.record_funding_arb_event(
+                    &self.pair_key,
+                    "entered",
+                    None,
+                    false,
+                );
+            }
+            D::Exited { reason, .. } => {
+                self.dashboard.record_funding_arb_event(
+                    &self.pair_key,
+                    "exited",
+                    Some(&reason),
+                    false,
+                );
+            }
+            D::TakerRejected { reason } => {
+                self.dashboard.record_funding_arb_event(
+                    &self.pair_key,
+                    "taker_rejected",
+                    Some(&reason),
+                    false,
+                );
+            }
+            D::PairBreak { reason, compensated } => {
+                self.dashboard.record_funding_arb_event(
+                    &self.pair_key,
+                    "pair_break",
+                    Some(&reason),
+                    !compensated,
+                );
+            }
+            D::Hold => {
+                self.dashboard.record_funding_arb_event(
+                    &self.pair_key,
+                    "hold",
+                    None,
+                    false,
+                );
+            }
+            D::InputUnavailable { reason } => {
+                self.dashboard.record_funding_arb_event(
+                    &self.pair_key,
+                    "input_unavailable",
+                    Some(&reason),
+                    false,
+                );
             }
         }
     }

@@ -5,6 +5,10 @@
   import AdminConfigPanels from '../components/AdminConfigPanels.svelte'
   import SorDecisions from '../components/SorDecisions.svelte'
   import AtomicBundles from '../components/AtomicBundles.svelte'
+  import RebalanceRecommendations from '../components/RebalanceRecommendations.svelte'
+  import FundingArbPairs from '../components/FundingArbPairs.svelte'
+  import AdverseSelection from '../components/AdverseSelection.svelte'
+  import CalibrationStatus from '../components/CalibrationStatus.svelte'
   let { ws, auth } = $props()
 </script>
 
@@ -30,6 +34,18 @@
     </Card>
     <Card title="Atomic bundles" subtitle="inflight maker / hedge pairs" span={3}>
       {#snippet children()}<AtomicBundles {auth} />{/snippet}
+    </Card>
+    <Card title="Rebalance advisories" subtitle="cross-venue transfer hints" span={3}>
+      {#snippet children()}<RebalanceRecommendations {auth} />{/snippet}
+    </Card>
+    <Card title="Funding-arb pairs" subtitle="per-pair driver events" span={3}>
+      {#snippet children()}<FundingArbPairs {auth} />{/snippet}
+    </Card>
+    <Card title="Adverse-selection" subtitle="Cartea ρ per side + toxicity bps" span={3}>
+      {#snippet children()}<AdverseSelection {auth} />{/snippet}
+    </Card>
+    <Card title="Live calibration" subtitle="GLFT a / k retune status" span={3}>
+      {#snippet children()}<CalibrationStatus {auth} />{/snippet}
     </Card>
     <Card title="Config surfaces" subtitle="webhooks · alerts · loans · sentiment" span={3}>
       {#snippet children()}<AdminConfigPanels {auth} />{/snippet}

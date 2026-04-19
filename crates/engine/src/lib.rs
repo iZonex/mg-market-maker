@@ -8,7 +8,6 @@ pub mod order_id_map;
 pub mod order_manager;
 pub mod pair_lifecycle;
 pub mod queue_tracker;
-pub mod rebalancer;
 pub mod sor;
 
 #[cfg(test)]

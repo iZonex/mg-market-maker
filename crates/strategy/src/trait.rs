@@ -156,6 +156,48 @@ pub trait Strategy: Send + Sync {
     /// private state here. Must not block — the engine calls this
     /// synchronously on the event-loop thread.
     fn on_fill(&self, _obs: &FillObservation) {}
+
+    /// S5.4 — snapshot of the strategy's live calibration state,
+    /// if any. Returns `None` for stateless strategies (grid,
+    /// basis, Avellaneda). `GlftStrategy` overrides to surface
+    /// the current fitted `(A, k)` + sample count so operators
+    /// can watch calibration convergence on the dashboard
+    /// without cracking open Prometheus. Cheap (mutex-guarded
+    /// read) and safe to poll on the engine's minute tick.
+    fn calibration_state(&self) -> Option<CalibrationState> {
+        None
+    }
+
+    /// S5.4 — ask the strategy to recalibrate *if it is due* —
+    /// i.e. enough time has passed since the last retune AND
+    /// enough samples have accumulated. Cadence is
+    /// strategy-specific (`GlftStrategy` uses a 30-second floor
+    /// with the existing ≥50 sample gate). Strategies that
+    /// calibrate only on fills override this to become a no-op
+    /// when nothing changed; default is no-op.
+    fn recalibrate_if_due(&self, _now_ms: i64) {}
+}
+
+/// S5.4 — snapshot of a strategy's live calibration state for
+/// the dashboard. The concrete numbers are strategy-specific
+/// (GLFT publishes fitted intensity `a` + decay `k`); the
+/// dashboard renders them side by side with sample count.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CalibrationState {
+    /// Name of the calibrating strategy (`"glft"`, etc.).
+    pub strategy: String,
+    /// Fitted intensity `a` from ln(λ) = ln(A) - k·δ.
+    pub a: Decimal,
+    /// Fitted decay `k` from ln(λ) = ln(A) - k·δ.
+    pub k: Decimal,
+    /// Number of fill-depth samples backing the current fit.
+    /// `< 50` means the strategy is still seeded with the
+    /// constructor defaults — the panel should call this out.
+    pub samples: usize,
+    /// `now_ms` at the last successful recalibration, or
+    /// `None` if the strategy has not yet crossed its sample
+    /// threshold.
+    pub last_recalibrated_ms: Option<i64>,
 }
 
 /// Helper: clamp a price to [mid - max_dist, mid + max_dist].

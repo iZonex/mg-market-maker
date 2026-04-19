@@ -7421,6 +7421,38 @@ impl MarketMakerEngine {
             strat.on_tick(&ctx);
         }
 
+        // S5.4 — periodic GLFT-style recalibration. Strategies
+        // without calibration no-op (trait default); GLFT
+        // self-throttles to one retune per 30 s. After the retune
+        // pass, publish whichever strategy's `calibration_state`
+        // returns `Some` first so the `/api/v1/calibration/status`
+        // panel sees the fitted `(a, k)` live.
+        let now_ms_cal = chrono::Utc::now().timestamp_millis();
+        self.strategy.recalibrate_if_due(now_ms_cal);
+        for strat in self.strategy_pool.values() {
+            strat.recalibrate_if_due(now_ms_cal);
+        }
+        let cal_state = self
+            .strategy
+            .calibration_state()
+            .or_else(|| {
+                self.strategy_pool
+                    .values()
+                    .find_map(|s| s.calibration_state())
+            });
+        if let (Some(cs), Some(dashboard)) = (cal_state, self.dashboard.as_ref()) {
+            dashboard.publish_calibration(
+                mm_dashboard::state::CalibrationSnapshot {
+                    symbol: self.symbol.clone(),
+                    strategy: cs.strategy,
+                    a: cs.a,
+                    k: cs.k,
+                    samples: cs.samples,
+                    last_recalibrated_ms: cs.last_recalibrated_ms,
+                },
+            );
+        }
+
         // Phase 4 — if the graph authored a quote bundle on the last
         // tick via `Out.Quotes`, use it instead of the hand-wired
         // strategy. Override is consumed (take) so the next tick

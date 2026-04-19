@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use tracing::debug;
 
-use crate::r#trait::{bps_to_frac, FillObservation, Strategy, StrategyContext};
+use crate::r#trait::{bps_to_frac, CalibrationState, FillObservation, Strategy, StrategyContext};
 use crate::volatility::decimal_sqrt;
 
 /// Guéant-Lehalle-Fernandez-Tapia (GLFT) optimal market making model.
@@ -54,6 +54,11 @@ struct IntensityCalibration {
     /// Recent fill depths for recalibration.
     fill_depths: VecDeque<Decimal>,
     max_samples: usize,
+    /// S5.4 — epoch-millis of the last successful recalibration.
+    /// Used by `recalibrate_if_due` to enforce a 30-second floor
+    /// between retunes so a burst of fills does not spin the
+    /// smoothing filter into a local minimum.
+    last_recalibrated_ms: Option<i64>,
 }
 
 impl IntensityCalibration {
@@ -63,6 +68,7 @@ impl IntensityCalibration {
             k: dec!(1.5),
             fill_depths: VecDeque::with_capacity(500),
             max_samples: 500,
+            last_recalibrated_ms: None,
         }
     }
 
@@ -73,14 +79,14 @@ impl IntensityCalibration {
             self.fill_depths.pop_front();
         }
         if self.fill_depths.len() >= 50 {
-            self.recalibrate();
+            self.recalibrate(None);
         }
     }
 
     /// Recalibrate A and k from observed fill depths.
     ///
     /// Method: bin depths, count fills per bin, fit ln(λ) = ln(A) - k·δ.
-    fn recalibrate(&mut self) {
+    fn recalibrate(&mut self, now_ms: Option<i64>) {
         if self.fill_depths.len() < 50 {
             return;
         }
@@ -99,6 +105,7 @@ impl IntensityCalibration {
         // A ≈ fill_rate (fills per second).
         // Simplified: we'll keep A at 1.0 since it cancels in the spread formula.
         debug!(k = %self.k, a = %self.a, samples = self.fill_depths.len(), "GLFT recalibrated");
+        self.last_recalibrated_ms = now_ms.or(self.last_recalibrated_ms);
     }
 }
 
@@ -292,6 +299,45 @@ impl Strategy for GlftStrategy {
     /// information, so we don't filter on `is_maker`.
     fn on_fill(&self, obs: &FillObservation) {
         self.record_fill_depth(obs.depth_from_mid);
+    }
+
+    /// S5.4 — surface the fitted `(A, k)` + sample count for the
+    /// calibration monitor panel. Returns `None` only if the
+    /// internal mutex is poisoned, so the panel treats missing
+    /// rows as "strategy has not reported".
+    fn calibration_state(&self) -> Option<CalibrationState> {
+        let cal = self.calibration.lock().ok()?;
+        Some(CalibrationState {
+            strategy: "glft".to_string(),
+            a: cal.a,
+            k: cal.k,
+            samples: cal.fill_depths.len(),
+            last_recalibrated_ms: cal.last_recalibrated_ms,
+        })
+    }
+
+    /// S5.4 — periodic retune. Engines call this on their
+    /// minute-cadence tick; the calibrator runs only if ≥30 s
+    /// have elapsed since the previous retune AND the sample
+    /// buffer has crossed the ≥50-fill threshold. Without this
+    /// hook, calibration only fires on fills, so a symbol
+    /// mid-low-activity window drifts on a stale `k`.
+    fn recalibrate_if_due(&self, now_ms: i64) {
+        let mut cal = match self.calibration.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if cal.fill_depths.len() < 50 {
+            return;
+        }
+        let due = match cal.last_recalibrated_ms {
+            Some(ts) => now_ms.saturating_sub(ts) >= 30_000,
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        cal.recalibrate(Some(now_ms));
     }
 }
 
@@ -1102,5 +1148,43 @@ mod tests {
         // Smoothed update (weight 0.1) pulls k a fraction of the
         // way toward 1/0.3 ≈ 3.33 — should exceed the 1.5 default.
         assert!(k_after > dec!(1.5), "k_after = {k_after}; expected to move past default 1.5");
+    }
+
+    /// S5.4 — `recalibrate_if_due` is a no-op below the 50-sample
+    /// threshold (state.samples stays 0, `a`+`k` keep the
+    /// constructor defaults) and only fires a retune when ≥30 s
+    /// have elapsed since the previous one.
+    #[test]
+    fn recalibrate_if_due_honours_sample_gate_and_cooldown() {
+        let strat = GlftStrategy::new();
+        // Below-threshold call: no retune.
+        strat.recalibrate_if_due(1_000_000);
+        let s1 = strat.calibration_state().expect("poisoned mutex");
+        assert_eq!(s1.samples, 0);
+        assert!(s1.last_recalibrated_ms.is_none());
+        assert_eq!(s1.k, dec!(1.5));
+
+        // Seed 60 samples at a skewed mean so `k` moves.
+        for _ in 0..60 {
+            strat.record_fill_depth(dec!(0.3));
+        }
+        // `record_fill_depth`'s implicit retune has already fired;
+        // a periodic retune at t=0 must update the timestamp.
+        strat.recalibrate_if_due(0);
+        let s2 = strat.calibration_state().unwrap();
+        assert_eq!(s2.samples, 60);
+        assert!(s2.last_recalibrated_ms.is_some());
+
+        // Same-second call: cooldown gate blocks the retune, so
+        // `last_recalibrated_ms` remains unchanged.
+        let ts2 = s2.last_recalibrated_ms.unwrap();
+        strat.recalibrate_if_due(ts2 + 10_000);
+        let s3 = strat.calibration_state().unwrap();
+        assert_eq!(s3.last_recalibrated_ms, Some(ts2));
+
+        // 30 s later: cooldown lifts, timestamp advances.
+        strat.recalibrate_if_due(ts2 + 30_000);
+        let s4 = strat.calibration_state().unwrap();
+        assert_eq!(s4.last_recalibrated_ms, Some(ts2 + 30_000));
     }
 }

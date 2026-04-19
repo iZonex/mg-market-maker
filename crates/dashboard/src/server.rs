@@ -90,6 +90,10 @@ pub async fn start(
         .route("/api/v1/venues/latency_p95", get(venues_latency_p95))
         .route("/api/v1/sor/decisions/recent", get(sor_decisions_recent))
         .route("/api/v1/atomic-bundles/inflight", get(atomic_bundles_inflight))
+        .route("/api/v1/rebalance/recommendations", get(rebalance_recommendations))
+        .route("/api/v1/funding-arb/pairs", get(funding_arb_pairs))
+        .route("/api/v1/adverse-selection", get(adverse_selection_snapshot))
+        .route("/api/v1/calibration/status", get(calibration_status))
         .merge(crate::client_api::client_routes())
         .merge(crate::client_portal::client_portal_routes())
         .route_layer(middleware::from_fn_with_state(
@@ -656,6 +660,92 @@ async fn atomic_bundles_inflight(
     Json(AtomicBundlesResponse {
         bundles: state.atomic_bundles_inflight(),
     })
+}
+
+/// S5.1 — cross-venue rebalance recommendations. Always safe to
+/// poll: with no rebalancer config registered the response is
+/// an empty list. Each recommendation is advisory — the
+/// operator clicks an "Execute" button elsewhere (deferred) to
+/// actually trigger a transfer.
+#[derive(Debug, serde::Serialize)]
+struct RebalanceRecommendationsResponse {
+    recommendations: Vec<mm_risk::rebalancer::RebalanceRecommendation>,
+}
+
+async fn rebalance_recommendations(
+    State(state): State<DashboardState>,
+) -> Json<RebalanceRecommendationsResponse> {
+    Json(RebalanceRecommendationsResponse {
+        recommendations: state.rebalance_recommendations(),
+    })
+}
+
+/// S5.2 — per-pair funding-arb driver state. Response order is
+/// stable (pair-key ASC) so the UI doesn't re-order rows on
+/// every poll.
+#[derive(Debug, serde::Serialize)]
+struct FundingArbPairsResponse {
+    pairs: Vec<crate::state::FundingArbPairState>,
+}
+
+async fn funding_arb_pairs(
+    State(state): State<DashboardState>,
+) -> Json<FundingArbPairsResponse> {
+    Json(FundingArbPairsResponse {
+        pairs: state.funding_arb_pairs(),
+    })
+}
+
+/// S5.3 — per-symbol adverse-selection view. Surfaces the
+/// Cartea-spread inputs the engine already publishes on each
+/// `SymbolState` so operators can see which symbols are in the
+/// toxic-flow regime without scraping Prometheus. Sort order is
+/// symbol ASC for stability.
+#[derive(Debug, serde::Serialize)]
+struct AdverseSelectionRow {
+    symbol: String,
+    adverse_bps: rust_decimal::Decimal,
+    as_prob_bid: Option<rust_decimal::Decimal>,
+    as_prob_ask: Option<rust_decimal::Decimal>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AdverseSelectionResponse {
+    rows: Vec<AdverseSelectionRow>,
+}
+
+/// S5.4 — live-calibration status endpoint. Returns one row per
+/// symbol whose active strategy publishes calibration
+/// (`GlftStrategy` today). Stateless-strategy symbols don't
+/// appear; the panel renders "no rows" as expected.
+#[derive(Debug, serde::Serialize)]
+struct CalibrationStatusResponse {
+    rows: Vec<crate::state::CalibrationSnapshot>,
+}
+
+async fn calibration_status(
+    State(state): State<DashboardState>,
+) -> Json<CalibrationStatusResponse> {
+    Json(CalibrationStatusResponse {
+        rows: state.calibration_snapshots(),
+    })
+}
+
+async fn adverse_selection_snapshot(
+    State(state): State<DashboardState>,
+) -> Json<AdverseSelectionResponse> {
+    let mut rows: Vec<AdverseSelectionRow> = state
+        .get_all()
+        .into_iter()
+        .map(|s| AdverseSelectionRow {
+            symbol: s.symbol,
+            adverse_bps: s.adverse_bps,
+            as_prob_bid: s.as_prob_bid,
+            as_prob_ask: s.as_prob_ask,
+        })
+        .collect();
+    rows.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    Json(AdverseSelectionResponse { rows })
 }
 
 async fn otr_tiered() -> Json<TieredOtrResponse> {

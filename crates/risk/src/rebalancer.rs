@@ -13,16 +13,19 @@
 //! Auto-execution is a stage-2 feature gated behind an
 //! operator config flag.
 
-use mm_exchange_core::connector::VenueId;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::Serialize;
 use std::collections::HashMap;
 
 /// Per-venue balance snapshot for rebalancing decisions.
+///
+/// Venue is string-typed so the dashboard can drive the
+/// rebalancer off its aggregated `VenueBalanceSnapshot` rows
+/// directly, without re-parsing back into an enum.
 #[derive(Debug, Clone)]
 pub struct VenueBalance {
-    pub venue: VenueId,
+    pub venue: String,
     pub asset: String,
     pub available: Decimal,
     pub locked: Decimal,
@@ -110,12 +113,12 @@ impl Rebalancer {
                     let transfer_qty = need.min(surplus.available - target);
                     if transfer_qty > Decimal::ZERO {
                         recs.push(RebalanceRecommendation {
-                            from_venue: format!("{:?}", surplus.venue),
-                            to_venue: format!("{:?}", deficit.venue),
+                            from_venue: surplus.venue.clone(),
+                            to_venue: deficit.venue.clone(),
                             asset: asset.clone(),
                             qty: transfer_qty,
                             reason: format!(
-                                "{:?} has {} available (below threshold {})",
+                                "{} has {} available (below threshold {})",
                                 deficit.venue, deficit.available, min_thresh
                             ),
                         });
@@ -139,13 +142,13 @@ mod tests {
         });
         let balances = vec![
             VenueBalance {
-                venue: VenueId::Binance,
+                venue: "binance".into(),
                 asset: "USDT".into(),
                 available: dec!(500),
                 locked: dec!(0),
             },
             VenueBalance {
-                venue: VenueId::Bybit,
+                venue: "bybit".into(),
                 asset: "USDT".into(),
                 available: dec!(500),
                 locked: dec!(0),
@@ -163,13 +166,13 @@ mod tests {
         });
         let balances = vec![
             VenueBalance {
-                venue: VenueId::Binance,
+                venue: "binance".into(),
                 asset: "USDT".into(),
                 available: dec!(50), // Below threshold.
                 locked: dec!(0),
             },
             VenueBalance {
-                venue: VenueId::Bybit,
+                venue: "bybit".into(),
                 asset: "USDT".into(),
                 available: dec!(1000), // Surplus.
                 locked: dec!(0),
@@ -188,7 +191,7 @@ mod tests {
             ..Default::default()
         });
         let balances = vec![VenueBalance {
-            venue: VenueId::Binance,
+            venue: "binance".into(),
             asset: "USDT".into(),
             available: dec!(10),
             locked: dec!(0),
@@ -205,13 +208,13 @@ mod tests {
         });
         let balances = vec![
             VenueBalance {
-                venue: VenueId::Binance,
+                venue: "binance".into(),
                 asset: "BTC".into(),
                 available: dec!(10), // Below threshold.
                 locked: dec!(0),
             },
             VenueBalance {
-                venue: VenueId::Bybit,
+                venue: "bybit".into(),
                 asset: "BTC".into(),
                 available: dec!(990), // Surplus.
                 locked: dec!(0),

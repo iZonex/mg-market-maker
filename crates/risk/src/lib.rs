@@ -26,6 +26,7 @@ pub mod session_calendar;
 pub mod portfolio_risk;
 pub mod portfolio_var;
 pub mod protections;
+pub mod rebalancer;
 pub mod reconciliation;
 pub mod sla;
 pub mod surveillance;
