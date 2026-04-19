@@ -9952,6 +9952,36 @@ impl MarketMakerEngine {
             self.inventory_manager.inventory(),
         );
 
+        // 23-P1-1 — periodic checkpoint flush (every 60 ticks;
+        // with the default ~500 ms refresh cadence that's
+        // every ~30 s). Builds a full SymbolCheckpoint from
+        // (a) InventoryManager state, (b) PnL attribution, (c)
+        // primary Strategy's checkpoint_state — covers 22B-0/1/5
+        // for GLFT + PumpDump + Campaign — and (d) engine-owned
+        // subsystem state from 22B-2/3/4/6 (Adaptive, Autotune
+        // regime, LearnedMicroprice, Momentum). Without this
+        // loop the 22B hooks serialise into the void — the
+        // server-side CheckpointManager only flushed at shutdown.
+        if self.tick_count.is_multiple_of(60) {
+            let sc = mm_persistence::checkpoint::SymbolCheckpoint {
+                symbol: self.symbol.clone(),
+                inventory: self.inventory_manager.inventory(),
+                avg_entry_price: self.inventory_manager.avg_entry_price(),
+                open_order_ids: self
+                    .order_manager
+                    .live_order_ids()
+                    .into_iter()
+                    .collect(),
+                realized_pnl: self.pnl_tracker.attribution.spread_pnl,
+                total_volume: self.pnl_tracker.attribution.total_volume,
+                total_fills: self.pnl_tracker.attribution.round_trips * 2,
+                inflight_atomic_bundles: self.inflight_atomic_bundles_checkpoint(),
+                strategy_state: self.strategy_checkpoint_state(),
+                engine_state: self.engine_checkpoint_state(),
+            };
+            ds.publish_symbol_checkpoint(sc);
+        }
+
         // Push market impact metrics to Prometheus.
         let impact = self.market_impact.report();
         mm_dashboard::metrics::MARKET_IMPACT_MEAN_BPS

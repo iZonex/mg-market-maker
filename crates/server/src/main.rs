@@ -332,6 +332,13 @@ async fn main() -> Result<()> {
     // can gate US-jurisdiction clients at ingress time.
     dashboard_state.set_engine_product(config.exchange.product);
     dashboard_state.set_loans(config.loans.clone());
+    // 23-P1-1 — give the dashboard the shared CheckpointManager
+    // so the engine's 60-tick checkpoint flush lands here
+    // instead of into the void. Prior shipping: CheckpointManager
+    // was only flushed at shutdown and update_symbol was never
+    // called at runtime — 22B-0 through 22B-6 hooks serialised
+    // into nowhere.
+    dashboard_state.set_checkpoint_manager(checkpoint.clone());
     // S5.1 — forward the `[rebalancer]` config to the dashboard so
     // `/api/v1/rebalance/recommendations` has thresholds to work
     // with. Absent section leaves the endpoint returning an empty

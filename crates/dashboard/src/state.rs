@@ -350,6 +350,18 @@ struct StateInner {
     /// boot; endpoint returns 503 when unset so tests never
     /// accidentally write to a shared path.
     transfer_log: Option<std::sync::Arc<mm_persistence::transfer_log::TransferLogWriter>>,
+    /// 23-P1-1 — shared CheckpointManager that the engine flushes
+    /// into periodically. `None` until `set_checkpoint_manager`
+    /// wires one; that keeps unit tests that build a bare
+    /// DashboardState free of disk I/O. When set, the engine
+    /// calls `publish_checkpoint_for_symbol` every 30 s with a
+    /// full SymbolCheckpoint (inventory + pnl +
+    /// strategy_checkpoint_state + engine_checkpoint_state). The
+    /// write path flushes every 10 updates per the manager's
+    /// flush_every config so we don't hit disk every tick.
+    checkpoint_manager: Option<
+        std::sync::Arc<std::sync::Mutex<mm_persistence::checkpoint::CheckpointManager>>,
+    >,
     /// S5.4 — per-symbol calibration snapshot (currently only
     /// `GlftStrategy` publishes into this map). The engine calls
     /// the active strategy's `recalibrate_if_due` on a
@@ -1962,6 +1974,43 @@ impl DashboardState {
         self.inner.read().unwrap().transfer_log.clone()
     }
 
+    /// 23-P1-1 — attach the shared CheckpointManager so engines
+    /// can flush SymbolCheckpoints through the dashboard. Called
+    /// once at server boot with the same Arc used by the final
+    /// shutdown flush.
+    pub fn set_checkpoint_manager(
+        &self,
+        mgr: std::sync::Arc<std::sync::Mutex<mm_persistence::checkpoint::CheckpointManager>>,
+    ) {
+        self.inner.write().unwrap().checkpoint_manager = Some(mgr);
+    }
+
+    /// 23-P1-1 — engine-facing checkpoint flush. Called from the
+    /// engine on its 30 s checkpoint tick with a fully-populated
+    /// SymbolCheckpoint (inventory + pnl + strategy_checkpoint_state
+    /// + engine_checkpoint_state + inflight_atomic_bundles).
+    /// Silently no-ops when no manager is configured (tests, smoke
+    /// runs without disk). Failures log at warn.
+    pub fn publish_symbol_checkpoint(
+        &self,
+        sc: mm_persistence::checkpoint::SymbolCheckpoint,
+    ) {
+        let mgr_arc = {
+            let inner = self.inner.read().unwrap();
+            inner.checkpoint_manager.clone()
+        };
+        let Some(mgr) = mgr_arc else { return };
+        let lock_result = mgr.lock();
+        match lock_result {
+            Ok(mut guard) => {
+                guard.update_symbol(sc);
+            }
+            Err(_) => {
+                tracing::warn!("checkpoint manager mutex poisoned — skipping flush");
+            }
+        }
+    }
+
     /// S6.4 — highest kill-switch level published by any
     /// engine on its per-tick SymbolState. Returns 0 (Normal)
     /// when no engine has published yet.
@@ -3437,6 +3486,67 @@ mod tests {
         }
         let ts = ds.get_spread_timeseries("BTCUSDT");
         assert_eq!(ts.len(), 14_400);
+    }
+
+    /// 23-P1-1 — publish_symbol_checkpoint is a no-op when no
+    /// manager is attached. Critical for unit tests that build a
+    /// bare DashboardState — without the guard they'd panic
+    /// trying to grab a Mutex that doesn't exist.
+    #[test]
+    fn publish_checkpoint_without_manager_is_noop() {
+        let ds = DashboardState::new();
+        // Should not panic.
+        ds.publish_symbol_checkpoint(mm_persistence::checkpoint::SymbolCheckpoint {
+            symbol: "BTCUSDT".into(),
+            inventory: dec!(0),
+            avg_entry_price: dec!(0),
+            open_order_ids: vec![],
+            realized_pnl: dec!(0),
+            total_volume: dec!(0),
+            total_fills: 0,
+            inflight_atomic_bundles: Vec::new(),
+            strategy_state: None,
+            engine_state: Default::default(),
+        });
+    }
+
+    /// 23-P1-1 — when a manager is attached, publish_symbol_checkpoint
+    /// routes through update_symbol and the checkpoint state is
+    /// observable via get_symbol.
+    #[test]
+    fn publish_checkpoint_with_manager_writes_through() {
+        use mm_persistence::checkpoint::{CheckpointManager, SymbolCheckpoint};
+        let tmpdir = std::env::temp_dir();
+        let path = tmpdir.join(format!(
+            "mm_23p11_{}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mgr = std::sync::Arc::new(std::sync::Mutex::new(CheckpointManager::new_with_secret(
+            &path, 1000, None,
+        )));
+        let ds = DashboardState::new();
+        ds.set_checkpoint_manager(mgr.clone());
+        ds.publish_symbol_checkpoint(SymbolCheckpoint {
+            symbol: "BTCUSDT".into(),
+            inventory: dec!(0.1234),
+            avg_entry_price: dec!(50000),
+            open_order_ids: vec![],
+            realized_pnl: dec!(12.5),
+            total_volume: dec!(100),
+            total_fills: 7,
+            inflight_atomic_bundles: Vec::new(),
+            strategy_state: None,
+            engine_state: Default::default(),
+        });
+        let guard = mgr.lock().unwrap();
+        let got = guard.get_symbol("BTCUSDT").unwrap();
+        assert_eq!(got.inventory, dec!(0.1234));
+        assert_eq!(got.total_fills, 7);
+        drop(guard);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// 23-UX-2 — per-leg history is populated as a side effect
