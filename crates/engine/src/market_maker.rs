@@ -4354,6 +4354,124 @@ impl MarketMakerEngine {
                 // through `strategy_pool` because the computation
                 // doesn't need a `Strategy` trait impl — there's no
                 // per-instance state worth pooling.
+                // ⚠ R13.1 — Strategy.BasketPush direct overlay.
+                // Parses the node's `basket` config (JSON array
+                // of legs) and emits `Value::VenueQuotes` with
+                // one leg per entry on each burst tick. Cycle
+                // (burst/rest) gated by a per-node tick counter
+                // stored in the evaluator state. Same pattern as
+                // Strategy.BasisArb — direct overlay, not
+                // strategy-pool-backed, because each basket leg
+                // targets a different (venue, symbol, product)
+                // that the engine's own per-symbol pool doesn't
+                // cover.
+                "Strategy.BasketPush" => {
+                    let cfg = graph.node_configs().get(id);
+                    let getdec = |k: &str, default: rust_decimal::Decimal| {
+                        cfg.and_then(|c| c.get(k))
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<rust_decimal::Decimal>().ok())
+                            .unwrap_or(default)
+                    };
+                    let getu64 = |k: &str, default: u64| {
+                        cfg.and_then(|c| c.get(k))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(default)
+                    };
+                    let burst_ticks = getu64("burst_ticks", 3);
+                    let rest_ticks = getu64("rest_ticks", 5);
+                    let cycle = burst_ticks + rest_ticks;
+                    // Tick counter — use the engine's own tick
+                    // count since we don't have node-state here.
+                    // Monotone enough for the (burst, rest) gate.
+                    let tick = self.tick_count;
+                    let in_burst = cycle == 0
+                        || tick % cycle < burst_ticks;
+                    if !in_burst {
+                        src.insert((*id, "quotes".into()), Value::Missing);
+                        continue;
+                    }
+                    let basket_raw = cfg
+                        .and_then(|c| c.get("basket"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("[]");
+                    let legs_cfg: Vec<serde_json::Value> = serde_json::from_str(basket_raw)
+                        .unwrap_or_default();
+                    let cross_depth = getdec("cross_depth_bps", rust_decimal_macros::dec!(30));
+                    let bus = self.dashboard.as_ref().map(|d| d.data_bus());
+                    let mut vqs: Vec<mm_strategy_graph::VenueQuote> = Vec::new();
+                    for leg in &legs_cfg {
+                        let venue = leg
+                            .get("venue")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let sym = leg
+                            .get("symbol")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let product_s = leg
+                            .get("product")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("spot");
+                        let product = match product_s.to_lowercase().as_str() {
+                            "linear_perp" | "perp" => {
+                                mm_common::config::ProductType::LinearPerp
+                            }
+                            "inverse_perp" => {
+                                mm_common::config::ProductType::InversePerp
+                            }
+                            _ => mm_common::config::ProductType::Spot,
+                        };
+                        let side_s = leg
+                            .get("side")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("buy");
+                        let side = if side_s.eq_ignore_ascii_case("sell") {
+                            mm_strategy_graph::QuoteSide::Sell
+                        } else {
+                            mm_strategy_graph::QuoteSide::Buy
+                        };
+                        let size: rust_decimal::Decimal = leg
+                            .get("size")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or_else(|| rust_decimal_macros::dec!(0.001));
+                        if venue.is_empty() || sym.is_empty() || size.is_zero() {
+                            continue;
+                        }
+                        let leg_mid = bus
+                            .as_ref()
+                            .and_then(|b| {
+                                b.get_l1(&(venue.clone(), sym.clone(), product))
+                            })
+                            .and_then(|s| s.mid)
+                            .unwrap_or(rust_decimal::Decimal::ZERO);
+                        if leg_mid.is_zero() {
+                            continue;
+                        }
+                        let cross_abs = leg_mid * cross_depth / rust_decimal_macros::dec!(10_000);
+                        let price = match side {
+                            mm_strategy_graph::QuoteSide::Buy => leg_mid + cross_abs,
+                            mm_strategy_graph::QuoteSide::Sell => {
+                                (leg_mid - cross_abs).max(rust_decimal::Decimal::ZERO)
+                            }
+                        };
+                        vqs.push(mm_strategy_graph::VenueQuote {
+                            venue,
+                            symbol: sym,
+                            product: format!("{product:?}").to_lowercase(),
+                            side,
+                            price,
+                            qty: size,
+                        });
+                    }
+                    src.insert(
+                        (*id, "quotes".into()),
+                        Value::VenueQuotes(vqs),
+                    );
+                }
                 "Strategy.BasisArb" => {
                     let cfg = graph.node_configs().get(id);
                     let getstr = |k: &str, default: &str| -> String {
@@ -13785,7 +13903,7 @@ mod graph_catalog_coverage {
         ("Strategy.InvPush", "pentest — pool-backed"),
         ("Strategy.NonFill", "pentest — pool-backed"),
         ("Strategy.CascadeHunter", "pentest — pool-backed"),
-        ("Strategy.BasketPush", "pentest — pool-backed, emits VenueQuotes per basket leg"),
+        ("Strategy.BasketPush", "pentest — direct overlay (not pool-backed) — parses basket config + emits VenueQuotes legs"),
         ("Strategy.PumpAndDump", "pentest — pool-backed"),
         ("Strategy.LeverageBuilder", "pentest — pool-backed"),
         ("Strategy.LiquidationHunt", "pentest — pool-backed"),

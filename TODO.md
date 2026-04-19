@@ -1,6 +1,6 @@
 # MM — Open Work Tracker
 
-Last updated: 2026-04-19 (post-Sprint 19)
+Last updated: 2026-04-19 (post-Sprint 20)
 
 Tracking debt not yet closed. Closed items live in git history.
 Each row is a concrete deliverable; bigger initiatives are
@@ -955,7 +955,51 @@ no venue exposes.
   legs). Out.VenueQuotes dispatches to multiple venues but
   sub-graph orchestration isn't plumbed.
 
-## Sprint 20 — honest MM side closeout (planned)
+## Sprint 20 — BasketPush silent bugs fix (landed Apr 19)
+
+Operator's "надо все фиксить что сломанное" instinct justified.
+Sprint 14 pattern holds: **every sprint that adds a feature
+adds 1-2 silent bugs**. Sprint 19 was no exception.
+
+Real bugs found + fixed:
+
+1. **`Strategy.BasketPush` had no pool builder arm.** Template
+   would compile + deploy but emit nothing (same pattern as
+   Sprint 14 BUG #2 — `last_strategy_quotes_per_node` never
+   populated → source overlay sees `Missing` → `Out.Quotes`
+   doesn't fire). Fixed by adding a dedicated overlay arm in
+   `tick_strategy_graph` that parses the `basket` config JSON
+   and emits `Value::VenueQuotes` directly — matches the
+   `Strategy.BasisArb` pattern, which is the right one for
+   nodes that fan out to multiple `(venue, symbol)` legs the
+   engine's symbol-scoped pool doesn't cover.
+
+2. **`pentest-basket-push` template routed to `Out.Quotes`
+   instead of `Out.VenueQuotes`.** `Out.Quotes` extracts via
+   `as_quotes()`, which returns `None` for `Value::VenueQuotes`
+   — so even with the overlay above, the sink would have
+   silently discarded the payload. Fixed the template; E2E
+   test now pins the contract.
+
+3. **EXEMPT entry misleading.** Initially said "pool-backed"
+   but actual wiring is direct overlay. Fixed to
+   "direct overlay (not pool-backed) — parses basket config
+   + emits VenueQuotes legs".
+
+Verification:
+- **R14.1** BasketPush overlay at
+  `crates/engine/src/market_maker.rs:4357` — parses `basket`
+  JSON + emits `VenueQuotes` with cross-through pricing
+  derived from DataBus L1 per leg. Fail-open: empty basket /
+  zero-size legs / missing mid → empty `VenueQuotes` (no-op,
+  not crash).
+- **R14.2** `basket_push_template_compiles_and_routes_venue_quotes`
+  E2E test in `pentest_templates_e2e.rs` — populates
+  `BasketPush.quotes` with a `Value::VenueQuotes` payload and
+  asserts `SinkAction::VenueQuotes(non_empty)` fires on the
+  tick.
+
+## Sprint 21 — honest MM side closeout (planned)
 
 Long-deferred MM-side quality work that's been sitting behind the
 Epic R run. All non-restricted.
