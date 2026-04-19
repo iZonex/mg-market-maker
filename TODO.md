@@ -1,6 +1,6 @@
 # MM — Open Work Tracker
 
-Last updated: 2026-04-19 (post-Sprint 16)
+Last updated: 2026-04-19 (post-Sprint 17)
 
 Tracking debt not yet closed. Closed items live in git history.
 Each row is a concrete deliverable; bigger initiatives are
@@ -857,10 +857,38 @@ deferred to Sprint 17+ because mocking the 20-method
 
 Dev-dep additions: `tower = "0.5"` + `http-body-util = "0.1"`.
 
-## Renumbered — Sprint 15 "deferred research" → now Sprint 17
-## Renumbered — Sprint 16 "honest MM side" → now Sprint 18
+## Sprint 17 — MockConnector fixture + REST-poll contracts (landed Apr 19)
 
-## Sprint 17 — deferred research from cascade doc (planned)
+Closes the third cluster weakness from the Sprint 15 matrix —
+REST-poll connector paths had no integration coverage before this
+sprint. Ships reusable fixture + 8 contract tests in one file.
+
+- [x] **R11.4a** `MockConnector` fixture at
+  `crates/exchange/core/tests/mock_connector_contracts.rs` —
+  full ExchangeConnector trait impl with sensible defaults +
+  three configurable hooks (`set_oi`, `set_ls_ratio`,
+  `fail_leverage`) plus `leverage_call_history()` for
+  inspection.
+- [x] **R11.4b** Eight contract tests:
+  `get_open_interest` / `get_long_short_ratio` default-None +
+  override-Value paths; `set_leverage` records calls,
+  succeeds by default, can be made to fail; capability flags
+  honest across spot vs perp product.
+- [x] **R11.5** `docs/research/integration-test-coverage.md`
+  matrix updated — REST-poll row flipped from ❌ None to
+  🟡 Unit; Sprint 16 + 17 backlog items crossed off.
+- [ ] **R10.2c DEFERRED** Engine tick integration (spin
+  MockConnector + drive fake WS events → verify SymbolState
+  publish) — fixture now exists, engine-side harness is
+  Sprint 18 work.
+
+Renumbered: "deferred research" (old Sprint 17) now Sprint 19;
+"honest MM side" (old Sprint 18) now Sprint 20.
+
+## Renumbered — old Sprint 17 "deferred research" → now Sprint 19
+## Renumbered — old Sprint 18 "honest MM side" → now Sprint 20
+
+## Sprint 19 — deferred research from cascade doc (planned)
 
 Closing the remaining "future research" items called out in
 `docs/research/liquidation-cascades.md`. All restricted /
@@ -879,7 +907,7 @@ pentest-only.
 - [ ] **R9.4** `Strategy.BasketPush`: coordinate pushes across
   correlated symbols (RAVE + SIREN + MYX shape).
 
-## Sprint 18 — honest MM side closeout (planned)
+## Sprint 20 — honest MM side closeout (planned)
 
 Long-deferred MM-side quality work that's been sitting behind the
 Epic R run. All non-restricted.

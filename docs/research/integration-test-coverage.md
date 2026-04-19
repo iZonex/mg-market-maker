@@ -68,7 +68,7 @@
 | Liquidation WS → `LiquidationHeatmap` → `Surveillance.LiquidationHeatmap` graph source | Connector parsers | Graph consumers | 🟡 Unit (parsers + heatmap each tested) |
 | `MarketEvent::Fill` → `InventoryManager` → drift reconciler | Engine | Risk + dashboard | 🟡 Unit |
 | Strategy pool tick → `last_strategy_quotes_per_node` → graph overlay → `Out.Quotes` | `build_strategy_pool` | Sink | ✅ E2E (Sprint 14 R8.2 for Strategy.* source nodes) |
-| Funding-rate refresh → `get_funding_rate` → `get_open_interest` → `get_long_short_ratio` | Connector REST | Engine state | ❌ None |
+| Funding-rate refresh → `get_funding_rate` → `get_open_interest` → `get_long_short_ratio` | Connector REST | Engine state | 🟡 Unit (Sprint 17 R11.4 — MockConnector contracts) |
 | `swap_strategy_graph` → `spawn_leverage_setup` → `set_leverage` | Dashboard config-override | Connector | ❌ None |
 | Config override → `refresh_quotes` → new strategy live | `register_config_channel` | Engine loop | 🟡 Unit |
 | Kill-switch L4 → `TwapExecutor` flatten | `kill_switch` | `OrderManager` | 🟡 Unit |
@@ -106,14 +106,24 @@ Three clusters of weakness:
 
 ## Sprint 16+ backlog
 
-- [ ] **R10.2a** Axum TestClient harness in `mm-dashboard` — one
-  helper that spins up the router with a test DashboardState,
-  exposes a `post_json` / `get_json` client for handler tests.
-- [ ] **R10.2b** Hit the 6 highest-risk endpoints via the harness.
-- [ ] **R10.2c** Engine tick integration: mock connector + drive
-  10 s of fake WS events → verify SymbolState publish.
-- [ ] **R10.2d** Dashboard deploy handler env-var gate test.
-- [ ] **R10.2e** Wire CI to run integration tests in addition to
-  unit tests — currently `--lib` + `--tests` runs everything
-  locally but we haven't verified the CI workflow picks up the
-  new `tests/*.rs` files.
+- [x] **R10.2a** Axum TestClient harness (Sprint 16 —
+  `crates/dashboard/tests/http_handlers_e2e.rs`)
+- [x] **R10.2b** Top-6 endpoints hit via harness (Sprint 16)
+- [x] **R10.2d** Dashboard deploy handler env-var gate test
+  (Sprint 16 R11.3 —
+  `restricted_env_gate_only_accepts_exact_literal`)
+- [x] **R11.4** MockConnector fixture + REST-poll contract
+  tests (Sprint 17 —
+  `crates/exchange/core/tests/mock_connector_contracts.rs`).
+  Pins default `Ok(None)` for `get_open_interest` +
+  `get_long_short_ratio` on spot; override path for perps;
+  `set_leverage` call recording + failure injection.
+- [ ] **R10.2c** Engine tick integration: spin MockConnector +
+  drive 10 s of fake WS events → verify SymbolState publish.
+  The MockConnector fixture now exists (Sprint 17) —
+  remaining work is the engine-side harness. Added to
+  Sprint 18 backlog.
+- [ ] **R10.2e** Wire CI to run integration tests in addition
+  to unit tests — currently `--lib` + `--tests` runs
+  everything locally but we haven't verified the CI workflow
+  picks up the new `tests/*.rs` files.
