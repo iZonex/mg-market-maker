@@ -272,6 +272,42 @@ struct StateInner {
     /// booleans as values) and scoped to the lifetime of the
     /// bundle — originator clears on rollback / success.
     atomic_bundle_legs: HashMap<AtomicBundleLegKey, AtomicBundleLeg>,
+    /// S1.3 — ring buffer of recent SOR routing decisions.
+    /// Every `GreedyRouter::route()` result gets recorded here
+    /// by the engine so the operator panel can show "which
+    /// venue won, what did it cost, what were the runner-ups"
+    /// without scraping Prometheus. Capped at
+    /// `MAX_SOR_DECISIONS` most-recent entries per engine.
+    sor_decisions: std::collections::VecDeque<SorDecisionRecord>,
+}
+
+/// S1.3 — one recorded SOR routing decision. Carries the
+/// target (side, qty), the legs the router picked (venue +
+/// qty + cost), and every runner-up the router considered so
+/// operators can see the cost differential between the winner
+/// and the next-best venue.
+#[derive(Debug, Clone, Serialize)]
+pub struct SorDecisionRecord {
+    pub ts_ms: i64,
+    pub symbol: String,
+    pub side: mm_common::types::Side,
+    pub target_qty: Decimal,
+    pub filled_qty: Decimal,
+    pub is_complete: bool,
+    pub winners: Vec<SorLegRecord>,
+    /// Venues the router evaluated but did NOT pick. Empty
+    /// when the router's input set was exhausted by the
+    /// winners. Sorted by `cost_bps` ascending — the first
+    /// entry is the closest miss.
+    pub considered: Vec<SorLegRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SorLegRecord {
+    pub venue: String,
+    pub qty: Decimal,
+    pub is_taker: bool,
+    pub cost_bps: Decimal,
 }
 
 /// MV-2 — dispatch-time fingerprint of a single leg in an
@@ -300,6 +336,7 @@ pub struct AtomicBundleLeg {
     pub acked: bool,
 }
 
+const MAX_SOR_DECISIONS: usize = 256;
 const MAX_DAILY_REPORTS: usize = 90;
 const MAX_PNL_TIMESERIES: usize = 1440;
 const MAX_SENTIMENT_HISTORY: usize = 1440;
@@ -1076,6 +1113,29 @@ impl DashboardState {
         let mut g = self.inner.write().unwrap();
         g.atomic_bundle_legs
             .retain(|k, _| k.bundle_id != bundle_id);
+    }
+
+    /// S1.3 — append a freshly-produced SOR routing decision
+    /// to the ring buffer. Capped at `MAX_SOR_DECISIONS`
+    /// (oldest entry dropped on overflow).
+    pub fn record_sor_decision(&self, rec: SorDecisionRecord) {
+        let mut g = self.inner.write().unwrap();
+        g.sor_decisions.push_back(rec);
+        while g.sor_decisions.len() > MAX_SOR_DECISIONS {
+            g.sor_decisions.pop_front();
+        }
+    }
+
+    /// S1.3 — most-recent `limit` entries, newest-first. The
+    /// `/api/v1/sor/decisions/recent` handler consumes this.
+    pub fn sor_decisions_recent(&self, limit: usize) -> Vec<SorDecisionRecord> {
+        let g = self.inner.read().unwrap();
+        g.sor_decisions
+            .iter()
+            .rev()
+            .take(limit.min(MAX_SOR_DECISIONS))
+            .cloned()
+            .collect()
     }
 
     /// UI-1 — publish active plans for a symbol. Empty vec

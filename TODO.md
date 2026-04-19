@@ -206,6 +206,39 @@ Legend:
 
 ---
 
+## Sprint 1 — P0 safety nets (landed Apr 19)
+
+Captured from the Apr-19 triple-audit (core MM + MV-UI + graph
+parity). These three items are the blocking set before any
+client sees the system.
+
+- [x] **S1.1** Funding-arb naked-leg retry. The compensating
+  reversal on pair-break now tries up to 4 times (initial +
+  100/200/400 ms backoff). A single transient venue hiccup
+  (429, brief disconnect) no longer leaves the perp leg
+  unhedged. Two tests pin the behaviour: retry-succeeds and
+  all-attempts-fail. `basis.rs` is quote-only; no pair
+  dispatcher there, no retry needed.
+- [x] **S1.2** Per-strategy capital budget. New
+  `strategy_capital_budget: HashMap<String, Decimal>` on
+  `MarketMakerConfig`. Engine's `apply_capital_budget` zeros
+  the side that would grow same-sign exposure when
+  `|inventory| × mid >= cap` for the running strategy tag.
+  Opposite-side leg kept for the unwind. 6 unit tests cover
+  absent/zero/different-strategy/long-over/short-over/under.
+- [x] **S1.3** SOR decision log + endpoint.
+  `DashboardState::record_sor_decision` + ring buffer (256
+  entries) + `GET /api/v1/sor/decisions/recent?limit=N`.
+  Engine's `publish_route_decision` now records winners +
+  every runner-up venue the router evaluated but didn't
+  pick, sorted by cost_bps. Operators can see "why this
+  venue, how close was the runner-up" without scraping
+  Prometheus.
+- [x] **S1.4** `SorDecisions.svelte` on AdminPage: polls
+  `/api/v1/sor/decisions/recent?limit=30`, renders per
+  decision with winner + considered legs, side colour,
+  partial-fill tag. 4-second refresh.
+
 ## Graph system audit — Apr 19 follow-ups
 
 Surfaced during the post-batch audit at

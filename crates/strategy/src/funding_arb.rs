@@ -259,22 +259,21 @@ impl FundingArbExecutor {
                     client_order_id: None,
                 };
 
-                let compensated = match self.hedge.place_order(&compensation).await {
-                    Ok(id) => {
-                        info!(
-                            %id,
-                            "pair dispatch: compensating reversal placed successfully"
-                        );
-                        true
-                    }
-                    Err(comp_err) => {
-                        error!(
-                            error = %comp_err,
-                            "pair dispatch: COMPENSATION FAILED — manual intervention required"
-                        );
-                        false
-                    }
-                };
+                // S1.1 — retry the compensation with exponential
+                // backoff before declaring the leg naked. Without
+                // the retry loop a single transient venue hiccup
+                // (429, short-lived disconnect, rate limit) left us
+                // with an unhedged perp fill for however long it
+                // took the operator to notice. Three attempts at
+                // 100 / 200 / 400 ms covers the common transient
+                // classes without turning a real outage into a
+                // second-long hang on the engine's select loop.
+                let compensated = place_with_retry(
+                    self.hedge.as_ref(),
+                    &compensation,
+                    &[100, 200, 400],
+                )
+                .await;
 
                 Err(PairLegError::PairBreak {
                     reason: maker_err.to_string(),
@@ -283,6 +282,59 @@ impl FundingArbExecutor {
             }
         }
     }
+}
+
+/// S1.1 — place `order` on `connector` with exponential-backoff
+/// retry. Returns `true` iff any attempt succeeds; `false` once
+/// every retry has been exhausted. Each delay is in milliseconds
+/// and fires BEFORE the subsequent attempt, so `[100, 200, 400]`
+/// means "try once, sleep 100ms, try again, sleep 200ms, try
+/// again, sleep 400ms, try one final time" for a total of 4
+/// attempts. Logs every failure with the attempt counter so
+/// audit trails can reconstruct the retry timeline.
+async fn place_with_retry(
+    connector: &dyn ExchangeConnector,
+    order: &NewOrder,
+    backoff_ms: &[u64],
+) -> bool {
+    let total_attempts = backoff_ms.len() + 1;
+    for attempt in 0..=backoff_ms.len() {
+        if attempt > 0 {
+            let delay = backoff_ms[attempt - 1];
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        match connector.place_order(order).await {
+            Ok(id) => {
+                if attempt == 0 {
+                    info!(
+                        %id,
+                        "pair dispatch: compensating reversal placed successfully"
+                    );
+                } else {
+                    warn!(
+                        %id,
+                        attempt = attempt + 1,
+                        total = total_attempts,
+                        "pair dispatch: compensation succeeded on retry"
+                    );
+                }
+                return true;
+            }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    attempt = attempt + 1,
+                    total = total_attempts,
+                    "pair dispatch: compensation attempt failed"
+                );
+            }
+        }
+    }
+    error!(
+        attempts = total_attempts,
+        "pair dispatch: COMPENSATION EXHAUSTED — naked leg, manual intervention required"
+    );
+    false
 }
 
 fn spot_action_to_side(a: &SpotAction) -> Side {
@@ -542,10 +594,13 @@ mod tests {
     #[tokio::test]
     async fn maker_rejection_with_failed_compensation_is_reported_as_uncompensated() {
         let (primary, hedge, exec) = setup();
-        // Taker ok (default), maker fail, compensation fail.
+        // Taker ok (default), maker fail, all 4 compensation
+        // attempts (initial + 3 retries per S1.1) fail.
         primary.queue(LegBehaviour::Err("post-only would cross".into()));
         hedge.queue(LegBehaviour::Ok); // Taker leg (entry).
-        hedge.queue(LegBehaviour::Err("venue down".into())); // Compensation leg.
+        for _ in 0..4 {
+            hedge.queue(LegBehaviour::Err("venue down".into()));
+        }
 
         let err = exec.enter(&enter_signal()).await.unwrap_err();
         match err {
@@ -558,6 +613,30 @@ mod tests {
             }
             _ => panic!("expected PairBreak"),
         }
+        // Entry taker (1) + 4 compensation attempts = 5 total.
+        assert_eq!(hedge.placed.lock().unwrap().len(), 5);
+    }
+
+    /// S1.1 — naked-leg retry. First compensation attempt fails
+    /// transiently, the retry succeeds, so the driver reports
+    /// `compensated=true` and no naked position survives.
+    #[tokio::test]
+    async fn compensation_retry_succeeds_on_second_attempt() {
+        let (primary, hedge, exec) = setup();
+        primary.queue(LegBehaviour::Err("post-only would cross".into()));
+        hedge.queue(LegBehaviour::Ok); // Taker leg.
+        hedge.queue(LegBehaviour::Err("429 rate limit".into())); // 1st comp attempt.
+        hedge.queue(LegBehaviour::Ok); // 2nd comp attempt — success.
+
+        let err = exec.enter(&enter_signal()).await.unwrap_err();
+        match err {
+            PairLegError::PairBreak { compensated, .. } => {
+                assert!(compensated, "retry must flip compensated to true");
+            }
+            _ => panic!("expected PairBreak"),
+        }
+        // Entry (1) + 2 compensation attempts.
+        assert_eq!(hedge.placed.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]

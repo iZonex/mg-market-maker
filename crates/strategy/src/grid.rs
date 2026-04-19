@@ -141,6 +141,7 @@ mod tests {
             var_guard_limit_99: None,
             var_guard_ewma_lambda: None,
             cross_venue_basis_max_staleness_ms: 1500,
+            strategy_capital_budget: std::collections::HashMap::new(),
             cross_exchange_min_profit_bps: dec!(5),
             max_cross_venue_divergence_pct: None,
             sor_inline_enabled: false,

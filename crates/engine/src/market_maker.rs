@@ -1307,7 +1307,7 @@ impl MarketMakerEngine {
     ) -> RouteDecision {
         let snapshots = self.sor_aggregator.collect(&self.connectors, side).await;
         let decision = self.sor_router.route(side, qty, urgency, &snapshots);
-        self.publish_route_decision(&decision);
+        self.publish_route_decision(&decision, &snapshots, urgency);
         decision
     }
 
@@ -1316,7 +1316,18 @@ impl MarketMakerEngine {
     /// produced [`RouteDecision`]. Split out from
     /// `recommend_route` so the synthetic test path can
     /// exercise the exact same publishing logic.
-    fn publish_route_decision(&self, decision: &RouteDecision) {
+    ///
+    /// S1.3 — also records the decision (winners + runner-up
+    /// venues the router evaluated but didn't pick) into
+    /// `DashboardState::record_sor_decision` so the operator
+    /// panel can show "why this venue, what did the losers
+    /// cost" without scraping Prometheus.
+    fn publish_route_decision(
+        &self,
+        decision: &RouteDecision,
+        snapshots: &[crate::sor::venue_state::VenueSnapshot],
+        urgency: Decimal,
+    ) {
         if decision.legs.is_empty() {
             return;
         }
@@ -1345,6 +1356,59 @@ impl MarketMakerEngine {
         );
         self.audit
             .risk_event(&self.symbol, AuditEventType::RouteDecisionEmitted, &detail);
+
+        // S1.3 — also publish to DashboardState for the
+        // operator panel.
+        if let Some(dash) = self.dashboard.as_ref() {
+            let urgency_clamped =
+                urgency.max(Decimal::ZERO).min(Decimal::ONE);
+            let is_taker = urgency_clamped
+                >= crate::sor::router::TAKER_THRESHOLD;
+            let winners: Vec<mm_dashboard::state::SorLegRecord> = decision
+                .legs
+                .iter()
+                .map(|l| mm_dashboard::state::SorLegRecord {
+                    venue: format!("{:?}", l.venue).to_lowercase(),
+                    qty: l.qty,
+                    is_taker: l.is_taker,
+                    cost_bps: l.expected_cost_bps,
+                })
+                .collect();
+            // Runner-ups: every snapshot venue not in the
+            // winners, priced through the same cost model,
+            // sorted ascending by cost.
+            let winner_venues: std::collections::HashSet<_> =
+                decision.legs.iter().map(|l| l.venue).collect();
+            let mut considered: Vec<mm_dashboard::state::SorLegRecord> = snapshots
+                .iter()
+                .filter(|s| s.is_available() && !winner_venues.contains(&s.venue))
+                .map(|s| {
+                    let cost = self.sor_router.cost_model.price(
+                        s,
+                        decision.target_side,
+                        urgency_clamped,
+                    );
+                    mm_dashboard::state::SorLegRecord {
+                        venue: format!("{:?}", s.venue).to_lowercase(),
+                        qty: s.available_qty,
+                        is_taker,
+                        cost_bps: cost.effective_cost_bps,
+                    }
+                })
+                .collect();
+            considered.sort_by(|a, b| a.cost_bps.cmp(&b.cost_bps));
+
+            dash.record_sor_decision(mm_dashboard::state::SorDecisionRecord {
+                ts_ms: chrono::Utc::now().timestamp_millis(),
+                symbol: self.symbol.clone(),
+                side: decision.target_side,
+                target_qty: decision.target_qty,
+                filled_qty: decision.filled_qty,
+                is_complete: decision.is_complete,
+                winners,
+                considered,
+            });
+        }
     }
 
     /// Test-only synchronous variant of `recommend_route`
@@ -1365,7 +1429,7 @@ impl MarketMakerEngine {
     ) -> RouteDecision {
         let snapshots = self.sor_aggregator.collect_synthetic(venues);
         let decision = self.sor_router.route(side, qty, urgency, &snapshots);
-        self.publish_route_decision(&decision);
+        self.publish_route_decision(&decision, &snapshots, urgency);
         decision
     }
 
@@ -1647,6 +1711,52 @@ impl MarketMakerEngine {
     /// (falls back to the strategy's `Default`) — the deploy
     /// validator already caught catalog-level issues; we just want
     /// the pool to keep running on configs it can't parse.
+    /// S1.2 — capital-budget gate. When the running
+    /// strategy's name appears in `strategy_capital_budget`
+    /// and the engine's current inventory notional already
+    /// equals or exceeds the cap, new quotes that would GROW
+    /// same-sign exposure are dropped (long → drop bids,
+    /// short → drop asks). The opposite-side leg is kept so
+    /// a hot inventory can still unwind via maker flow.
+    /// `None` cap or absent key → pass-through.
+    fn apply_capital_budget(
+        strategy_name: &str,
+        quotes: Vec<mm_common::types::QuotePair>,
+        inventory: rust_decimal::Decimal,
+        mid: rust_decimal::Decimal,
+        budget: &std::collections::HashMap<String, rust_decimal::Decimal>,
+    ) -> Vec<mm_common::types::QuotePair> {
+        let Some(cap) = budget.get(strategy_name).copied() else {
+            return quotes;
+        };
+        if cap <= rust_decimal::Decimal::ZERO {
+            return quotes;
+        }
+        let notional = inventory.abs() * mid;
+        if notional < cap {
+            return quotes;
+        }
+        // Over budget — zero the side that would grow the
+        // existing exposure.
+        let drop_bids = inventory > rust_decimal::Decimal::ZERO;
+        let drop_asks = inventory < rust_decimal::Decimal::ZERO;
+        // Flat + over-budget shouldn't happen (abs()=0 < cap),
+        // but guard defensively: drop both sides.
+        let (drop_bids, drop_asks) = if inventory.is_zero() {
+            (true, true)
+        } else {
+            (drop_bids, drop_asks)
+        };
+        quotes
+            .into_iter()
+            .map(|pair| mm_common::types::QuotePair {
+                bid: if drop_bids { None } else { pair.bid },
+                ask: if drop_asks { None } else { pair.ask },
+            })
+            .filter(|pair| pair.bid.is_some() || pair.ask.is_some())
+            .collect()
+    }
+
     /// GR-3 — parse every `Strategy.*` node's graph config for
     /// MM-knob overrides (γ / κ / σ / order_size / num_levels
     /// / min_spread_bps / max_distance_bps) and bake a clone of
@@ -6991,7 +7101,14 @@ impl MarketMakerEngine {
         let mut quotes = match self.graph_quotes_override.take() {
             Some(q) => q,
             None => {
-                let strategy_quotes = self.strategy.compute_quotes(&ctx);
+                let raw = self.strategy.compute_quotes(&ctx);
+                let strategy_quotes = Self::apply_capital_budget(
+                    self.strategy.name(),
+                    raw,
+                    self.inventory_manager.inventory(),
+                    mid,
+                    &self.config.market_maker.strategy_capital_budget,
+                );
                 // Cache for the next tick's `Strategy.*` composite
                 // nodes — they read it out of `last_strategy_quotes`
                 // via the source marshaller.
@@ -7006,6 +7123,7 @@ impl MarketMakerEngine {
                 let mut per_node = std::collections::HashMap::with_capacity(
                     self.strategy_pool.len(),
                 );
+                let inv = self.inventory_manager.inventory();
                 for (node_id, strat) in &self.strategy_pool {
                     let node_ctx = match self.strategy_node_configs.get(node_id) {
                         Some(override_cfg) => {
@@ -7015,7 +7133,21 @@ impl MarketMakerEngine {
                         }
                         None => ctx.clone(),
                     };
-                    per_node.insert(*node_id, strat.compute_quotes(&node_ctx));
+                    // S1.2 — each pool instance goes through the
+                    // same capital-budget gate using its own
+                    // `Strategy::name()` tag so one
+                    // `Strategy.Avellaneda` node running hot
+                    // doesn't starve a sibling via shared
+                    // inventory.
+                    let raw = strat.compute_quotes(&node_ctx);
+                    let gated = Self::apply_capital_budget(
+                        strat.name(),
+                        raw,
+                        inv,
+                        mid,
+                        &node_ctx.config.strategy_capital_budget,
+                    );
+                    per_node.insert(*node_id, gated);
                 }
                 self.last_strategy_quotes_per_node = per_node;
                 strategy_quotes
@@ -8906,6 +9038,126 @@ mod dual_connector_tests {
             engine.strategy_node_configs.is_empty(),
             "nodes without knob overrides must NOT materialise a per-node config"
         );
+    }
+
+    // ── S1.2 — per-strategy capital budget gate tests ─────────
+
+    fn qp(bid: Decimal, ask: Decimal) -> mm_common::types::QuotePair {
+        use mm_common::types::{Quote, QuotePair, Side};
+        QuotePair {
+            bid: Some(Quote {
+                side: Side::Buy,
+                price: bid,
+                qty: dec!(0.01),
+            }),
+            ask: Some(Quote {
+                side: Side::Sell,
+                price: ask,
+                qty: dec!(0.01),
+            }),
+        }
+    }
+
+    /// Absent key → pass-through unchanged.
+    #[test]
+    fn capital_budget_absent_is_passthrough() {
+        let budget = std::collections::HashMap::new();
+        let out = MarketMakerEngine::apply_capital_budget(
+            "avellaneda",
+            vec![qp(dec!(100), dec!(101))],
+            dec!(0.5),
+            dec!(100),
+            &budget,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].bid.is_some() && out[0].ask.is_some());
+    }
+
+    /// Under budget → pass-through.
+    #[test]
+    fn capital_budget_under_cap_passes_through() {
+        let mut budget = std::collections::HashMap::new();
+        // 1 BTC × 100 quote = 100 notional; cap = 200.
+        budget.insert("avellaneda".into(), dec!(200));
+        let out = MarketMakerEngine::apply_capital_budget(
+            "avellaneda",
+            vec![qp(dec!(100), dec!(101))],
+            dec!(1),
+            dec!(100),
+            &budget,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].bid.is_some() && out[0].ask.is_some());
+    }
+
+    /// Long + over budget → bid dropped, ask kept (unwind path).
+    #[test]
+    fn capital_budget_long_over_cap_drops_bids() {
+        let mut budget = std::collections::HashMap::new();
+        // 2 BTC × 100 = 200 notional; cap = 150.
+        budget.insert("avellaneda".into(), dec!(150));
+        let out = MarketMakerEngine::apply_capital_budget(
+            "avellaneda",
+            vec![qp(dec!(100), dec!(101))],
+            dec!(2),
+            dec!(100),
+            &budget,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].bid.is_none(), "long + over-cap must drop bids");
+        assert!(out[0].ask.is_some(), "ask kept so the position can unwind");
+    }
+
+    /// Short + over budget → ask dropped, bid kept.
+    #[test]
+    fn capital_budget_short_over_cap_drops_asks() {
+        let mut budget = std::collections::HashMap::new();
+        budget.insert("avellaneda".into(), dec!(150));
+        let out = MarketMakerEngine::apply_capital_budget(
+            "avellaneda",
+            vec![qp(dec!(100), dec!(101))],
+            dec!(-2),
+            dec!(100),
+            &budget,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].ask.is_none(), "short + over-cap must drop asks");
+        assert!(out[0].bid.is_some(), "bid kept for the unwind");
+    }
+
+    /// Budget keyed on a different strategy name → pass-through
+    /// for this strategy.
+    #[test]
+    fn capital_budget_different_strategy_passes_through() {
+        let mut budget = std::collections::HashMap::new();
+        budget.insert("funding_arb".into(), dec!(50)); // Very low cap.
+        let out = MarketMakerEngine::apply_capital_budget(
+            "avellaneda", // Different strategy — not in the map.
+            vec![qp(dec!(100), dec!(101))],
+            dec!(10), // Big inventory.
+            dec!(100),
+            &budget,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].bid.is_some() && out[0].ask.is_some());
+    }
+
+    /// Zero / negative cap is treated as "no gate" to avoid a
+    /// footgun where a user accidentally configures 0 and
+    /// immediately loses all quoting.
+    #[test]
+    fn capital_budget_zero_cap_is_passthrough() {
+        let mut budget = std::collections::HashMap::new();
+        budget.insert("avellaneda".into(), dec!(0));
+        let out = MarketMakerEngine::apply_capital_budget(
+            "avellaneda",
+            vec![qp(dec!(100), dec!(101))],
+            dec!(10),
+            dec!(100),
+            &budget,
+        );
+        assert_eq!(out.len(), 1);
+        assert!(out[0].bid.is_some() && out[0].ask.is_some());
     }
 
     /// Sprint 4 — watchdog path bumps the rolled-back counter +

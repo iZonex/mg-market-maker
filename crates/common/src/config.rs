@@ -1076,6 +1076,21 @@ pub struct MarketMakerConfig {
     #[serde(default = "default_sor_queue_refresh_secs")]
     pub sor_queue_refresh_secs: u64,
 
+    /// S1.2 — per-strategy capital budget cap in quote-asset
+    /// units. Keys are `Strategy::name()` tags (e.g.
+    /// `"avellaneda"`, `"funding_arb"`, `"basis"`, `"grid"`).
+    /// When a strategy's cumulative live notional
+    /// (|inventory| × mid + open-order notional) exceeds the
+    /// entry's budget, new quotes that would grow the
+    /// strategy's exposure are zeroed out until a fill or
+    /// cancel frees capital. Missing keys fall through to the
+    /// unbounded legacy behaviour — set the key explicitly to
+    /// opt into the gate. Prevents one runaway strategy
+    /// (e.g. grid hitting a cliff) from starving the rest of
+    /// the engine.
+    #[serde(default)]
+    pub strategy_capital_budget: std::collections::HashMap<String, Decimal>,
+
     /// Enable the Binance listen-key user-data stream. When
     /// `true` (the default), the server spawns a background
     /// task that opens a signed WebSocket against
@@ -2197,6 +2212,7 @@ impl Default for AppConfig {
                 sor_inventory_threshold: dec!(0),
                 sor_trade_rate_window_secs: default_sor_trade_rate_window_secs(),
                 sor_queue_refresh_secs: default_sor_queue_refresh_secs(),
+                strategy_capital_budget: std::collections::HashMap::new(),
                 cross_exchange_min_profit_bps: dec!(5),
                 max_cross_venue_divergence_pct: None,
             },

@@ -88,6 +88,7 @@ pub async fn start(
         .route("/api/v1/otr/tiered", get(otr_tiered))
         .route("/api/v1/portfolio/cross_venue", get(portfolio_cross_venue))
         .route("/api/v1/venues/latency_p95", get(venues_latency_p95))
+        .route("/api/v1/sor/decisions/recent", get(sor_decisions_recent))
         .merge(crate::client_api::client_routes())
         .merge(crate::client_portal::client_portal_routes())
         .route_layer(middleware::from_fn_with_state(
@@ -613,6 +614,30 @@ async fn venues_latency_p95() -> Json<VenueLatencyResponse> {
         })
         .collect();
     Json(VenueLatencyResponse { venues })
+}
+
+/// S1.3 — SOR routing decision log query. `?limit=N` clamps
+/// the response size (default 50, max equals the state's
+/// `MAX_SOR_DECISIONS` capacity). Newest-first.
+#[derive(serde::Deserialize)]
+struct SorDecisionsQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(serde::Serialize)]
+struct SorDecisionsResponse {
+    decisions: Vec<crate::state::SorDecisionRecord>,
+}
+
+async fn sor_decisions_recent(
+    State(state): State<DashboardState>,
+    axum::extract::Query(q): axum::extract::Query<SorDecisionsQuery>,
+) -> Json<SorDecisionsResponse> {
+    let limit = q.limit.unwrap_or(50).min(256);
+    Json(SorDecisionsResponse {
+        decisions: state.sor_decisions_recent(limit),
+    })
 }
 
 async fn otr_tiered() -> Json<TieredOtrResponse> {
