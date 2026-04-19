@@ -11,6 +11,82 @@ use rust_decimal_macros::dec;
 use crate::data::RecordedEvent;
 use crate::report::BacktestReport;
 use mm_common::queue_model::{LogProbQueueFunc, PowerProbQueueFunc, Probability, QueuePos};
+use mm_indicators::{Candle, MultiTriggerCandles, TickCandles, TradeSide, VolumeCandles};
+
+/// 22W-6 — optional candle resampling over replayed trades.
+/// The simulator ingests raw trade events; when the operator
+/// configures `with_candles(...)`, each trade is folded into an
+/// aggregator and the completed candles end up on
+/// `BacktestReport.completed_candles` for offline analysis or
+/// downstream hyperopt / alpha research.
+///
+/// Three modes mirror `mm_indicators::candles`:
+/// - `Tick { n }` — close after every `n` trades.
+/// - `Volume { base_qty }` — close after every `base_qty` base
+///   asset units traded (splits the straddling trade so the
+///   bucket fills exactly).
+/// - `MultiTrigger { max_duration_ms, max_ticks, max_volume }`
+///   — close on whichever trigger fires first. Useful when
+///   you want volume-normalised candles but cap latency in
+///   dead markets.
+#[derive(Debug, Clone, Copy)]
+pub enum CandleAggregation {
+    Tick {
+        n: u64,
+    },
+    Volume {
+        base_qty: Decimal,
+    },
+    MultiTrigger {
+        max_duration_ms: i64,
+        max_ticks: u64,
+        max_volume: Decimal,
+    },
+}
+
+/// Runtime aggregator state. Picked by [`CandleAggregation`].
+enum CandleAggregator {
+    Tick(TickCandles),
+    Volume(VolumeCandles),
+    MultiTrigger(MultiTriggerCandles),
+}
+
+impl CandleAggregator {
+    fn new(cfg: CandleAggregation, capacity: usize) -> Self {
+        match cfg {
+            CandleAggregation::Tick { n } => Self::Tick(TickCandles::new(n, capacity)),
+            CandleAggregation::Volume { base_qty } => {
+                Self::Volume(VolumeCandles::new(base_qty, capacity))
+            }
+            CandleAggregation::MultiTrigger {
+                max_duration_ms,
+                max_ticks,
+                max_volume,
+            } => Self::MultiTrigger(MultiTriggerCandles::new(
+                max_duration_ms,
+                max_ticks,
+                max_volume,
+                capacity,
+            )),
+        }
+    }
+
+    fn update(&mut self, ts_ms: i64, side: TradeSide, price: Decimal, qty: Decimal) {
+        match self {
+            Self::Tick(c) => c.update(ts_ms, side, price, qty),
+            Self::Volume(c) => c.update(ts_ms, side, price, qty),
+            Self::MultiTrigger(c) => c.update(ts_ms, side, price, qty),
+        }
+    }
+
+    fn into_completed(self) -> Vec<Candle> {
+        match self {
+            Self::Tick(c) => c.completed().iter().cloned().collect(),
+            Self::Volume(c) => c.completed().iter().cloned().collect(),
+            Self::MultiTrigger(c) => c.completed().iter().cloned().collect(),
+        }
+    }
+}
 
 /// Which probability function drives the queue-aware fill model.
 ///
@@ -96,6 +172,11 @@ pub struct Simulator {
     config: MarketMakerConfig,
     product: ProductSpec,
     fill_model: FillModel,
+    /// 22W-6 — optional candle aggregation config. When set, the
+    /// simulator instantiates an aggregator on each `run()` and
+    /// folds every replayed trade into it; the completed
+    /// candles land on the [`BacktestReport`].
+    candle_agg: Option<CandleAggregation>,
 }
 
 impl Simulator {
@@ -104,7 +185,17 @@ impl Simulator {
             config,
             product,
             fill_model,
+            candle_agg: None,
         }
+    }
+
+    /// 22W-6 — attach a candle aggregator so the simulator
+    /// resamples replayed trades into tick / volume /
+    /// multi-trigger candles for offline analysis. Capacity
+    /// bounds the kept ring (oldest candles roll off).
+    pub fn with_candles(mut self, cfg: CandleAggregation) -> Self {
+        self.candle_agg = Some(cfg);
+        self
     }
 
     /// Run a backtest over recorded events.
@@ -131,6 +222,13 @@ impl Simulator {
         let mut tracked_asks: Vec<TrackedQuote> = Vec::new();
 
         let queue_aware = matches!(self.fill_model, FillModel::QueueAware { .. });
+        // 22W-6 — optional candle aggregator. Capacity 10_000
+        // matches the mm-indicators test-suite default; big
+        // enough for a week of 5-minute candles without roll-off
+        // on typical backtests.
+        let mut candle_agg: Option<CandleAggregator> = self
+            .candle_agg
+            .map(|cfg| CandleAggregator::new(cfg, 10_000));
 
         for event in events {
             match event {
@@ -262,6 +360,19 @@ impl Simulator {
                 } => {
                     let mid = book.mid_price().unwrap_or(*price);
 
+                    // 22W-6 — fold the trade into the candle
+                    // aggregator when enabled. TradeSide maps
+                    // from mm_common::Side; the aggregator's
+                    // buy/sell_volume fields track taker-side
+                    // aggression for later VWAP + flow metrics.
+                    if let Some(agg) = candle_agg.as_mut() {
+                        let cs = match taker_side {
+                            Side::Buy => TradeSide::Buy,
+                            Side::Sell => TradeSide::Sell,
+                        };
+                        agg.update(timestamp.timestamp_millis(), cs, *price, *qty);
+                    }
+
                     if queue_aware {
                         let (entry_latency_ns, response_latency_ns) = match self.fill_model {
                             FillModel::QueueAware {
@@ -380,6 +491,9 @@ impl Simulator {
             unrealized_pnl: inventory_mgr.unrealized_pnl(final_mid),
             total_pnl: inventory_mgr.total_pnl(final_mid),
             pnl_attribution: pnl_tracker.attribution.clone(),
+            completed_candles: candle_agg
+                .map(|agg| agg.into_completed())
+                .unwrap_or_default(),
         }
     }
 

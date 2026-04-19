@@ -333,6 +333,37 @@ impl MomentumSignals {
         total / abs_total
     }
 
+    /// 22W-6 — EMA-weighted variant of [`Self::trade_flow_imbalance`]
+    /// that emphasises the **most recent** trades via
+    /// `mm_indicators::ema_weights`. Same [-1, 1] output range
+    /// and zero-safety as the uniform version; the difference
+    /// is the oldest trades in the window get small weight, so
+    /// a fresh flip in flow surfaces quickly without waiting
+    /// for the window to shift.
+    ///
+    /// `alpha = None` uses the upstream default `3 / (N + 1)`.
+    pub fn trade_flow_imbalance_ema_weighted(&self, alpha: Option<Decimal>) -> Decimal {
+        let n = self.signed_volumes.len();
+        if n < 2 {
+            return self.trade_flow_imbalance();
+        }
+        let weights = mm_indicators::ema_weights(n, alpha);
+        // Weights are oldest → newest; signed_volumes is the
+        // same order (VecDeque push_back for new trades, front
+        // is oldest).
+        let mut num = dec!(0);
+        let mut den = dec!(0);
+        for (w, v) in weights.iter().zip(self.signed_volumes.iter()) {
+            num += *w * *v;
+            den += *w * v.abs();
+        }
+        if den.is_zero() {
+            dec!(0)
+        } else {
+            num / den
+        }
+    }
+
     /// Micro-price: improved mid-price using order book imbalance.
     ///
     /// micro_price = ask * bid_qty / (bid_qty + ask_qty) + bid * ask_qty / (bid_qty + ask_qty)
@@ -1045,6 +1076,40 @@ mod tests {
         let mut dst = MomentumSignals::new(10); // smaller cap
         dst.restore_state(&snap).unwrap();
         assert_eq!(dst.signed_volumes.len(), 10);
+    }
+
+    /// 22W-6 — ema-weighted trade-flow imbalance uses
+    /// `mm_indicators::ema_weights` to emphasise recent trades
+    /// over the oldest ones. With 5 buy trades followed by 1
+    /// sell, uniform-weighted is positive; EMA-weighted should
+    /// tilt less positive because the most recent trade (sell)
+    /// gets the biggest weight.
+    #[test]
+    fn ema_weighted_flow_emphasises_recent_trades() {
+        let mut m = MomentumSignals::new(10);
+        for i in 0..5 {
+            m.on_trade(&mk_trade(dec!(1), Side::Buy, i));
+        }
+        m.on_trade(&mk_trade(dec!(1), Side::Sell, 5));
+
+        let uniform = m.trade_flow_imbalance();
+        let weighted = m.trade_flow_imbalance_ema_weighted(None);
+        assert!(uniform > dec!(0), "uniform = {uniform}");
+        assert!(
+            weighted < uniform,
+            "weighted ({weighted}) must be < uniform ({uniform}) when the most recent trade flipped"
+        );
+    }
+
+    /// 22W-6 — fewer than 2 samples falls through to the uniform
+    /// path so the ema_weights call never panics on `window < 2`.
+    #[test]
+    fn ema_weighted_flow_short_window_matches_uniform() {
+        let mut m = MomentumSignals::new(10);
+        m.on_trade(&mk_trade(dec!(1), Side::Buy, 1));
+        let u = m.trade_flow_imbalance();
+        let w = m.trade_flow_imbalance_ema_weighted(None);
+        assert_eq!(u, w);
     }
 
     /// 22B-4 — learned_mp round-trips through snapshot/restore
