@@ -7117,9 +7117,30 @@ impl MarketMakerEngine {
                 // accumulate end-to-end without touching the
                 // venue. No-op in live mode.
                 if self.order_manager.is_paper() {
-                    let synthetic = self
-                        .order_manager
-                        .paper_match_trade(trade.price, trade.taker_side);
+                    // 22C-2 — queue-aware gate. For each
+                    // candidate fill the closure checks the
+                    // queue_tracker's front_q_qty: if the book
+                    // still has liquidity ahead of us, we let
+                    // the trade pass through without filling
+                    // the order. This aligns paper-mode fill
+                    // semantics with the backtester's
+                    // QueueAware simulator so PnL from a paper
+                    // run tracks a backtest on the same feed.
+                    // Orders without a queue position (edge
+                    // case — queue_tracker hasn't seen a
+                    // placement event yet) fall through to
+                    // fill for backwards compat.
+                    let queue_tracker = &self.queue_tracker;
+                    let synthetic = self.order_manager.paper_match_trade_filtered(
+                        trade.price,
+                        trade.taker_side,
+                        |id| {
+                            queue_tracker
+                                .queue_pos_of(id)
+                                .map(|pos| pos.front_q_qty <= rust_decimal::Decimal::ZERO)
+                                .unwrap_or(true)
+                        },
+                    );
                     for fill in synthetic {
                         info!(
                             order_id = %fill.order_id,

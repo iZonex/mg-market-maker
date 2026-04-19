@@ -308,9 +308,10 @@ impl QueueTracker {
     }
 
     /// Read-only accessor for the queue position of a specific
-    /// order, used by tests that want to assert the front moved
-    /// after a trade or depth change.
-    #[cfg(test)]
+    /// order. Used by tests to assert the front moved after a
+    /// trade / depth change, and by the engine's 22C-2
+    /// queue-aware paper fill gate to decide whether a
+    /// crossing trade should fire a synthetic fill.
     pub fn queue_pos_of(&self, order_id: OrderId) -> Option<QueuePos> {
         self.orders.get(&order_id).map(|t| t.queue_pos)
     }

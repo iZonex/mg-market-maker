@@ -1075,6 +1075,31 @@ impl OrderManager {
     /// here we just want "something fills" so the pipeline
     /// exercises the real fill path.
     pub fn paper_match_trade(&mut self, trade_price: Price, taker_side: Side) -> Vec<Fill> {
+        self.paper_match_trade_filtered(trade_price, taker_side, |_| true)
+    }
+
+    /// 22C-2 — queue-aware paper fill path. Same shape as
+    /// `paper_match_trade` but consults `should_fill(order_id)`
+    /// before firing each candidate. The engine passes a
+    /// closure that checks `QueueTracker::queue_pos_of(id)` —
+    /// orders with non-zero front_q_qty get skipped because
+    /// the book still has liquidity ahead of them that would
+    /// have absorbed the trade first.
+    ///
+    /// Closes the backtester / paper-mode fill-model parity
+    /// gap: the old unconditional aggressive fill fired every
+    /// eligible resting quote on every crossing trade,
+    /// producing paper PnL that diverged from the backtester's
+    /// queue-position-aware simulator (and from live venue
+    /// behaviour). Operators who want the legacy aggressive
+    /// fill still get it via `paper_match_trade` — the filter
+    /// defaults to always-fill.
+    pub fn paper_match_trade_filtered(
+        &mut self,
+        trade_price: Price,
+        taker_side: Side,
+        should_fill: impl Fn(OrderId) -> bool,
+    ) -> Vec<Fill> {
         if !self.paper_mode {
             return Vec::new();
         }
@@ -1087,6 +1112,7 @@ impl OrderManager {
                 _ => false,
             })
             .map(|o| o.order_id)
+            .filter(|id| should_fill(*id))
             .collect();
         let mut fills = Vec::with_capacity(to_fill.len());
         for id in to_fill {
@@ -1749,6 +1775,41 @@ mod tests {
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].price, dec!(76_000));
         assert_eq!(mgr.live_count(), 1);
+    }
+
+    /// 22C-2 — queue-aware filter skips orders whose closure
+    /// returns false. Two resting Sells: one at the front of
+    /// queue (closure true), one deep in queue (closure false).
+    /// A crossing trade should only fill the front.
+    #[test]
+    fn paper_match_trade_filtered_honours_queue_gate() {
+        let mut mgr = OrderManager::new_paper();
+        let front = live(Side::Sell, dec!(76_100), dec!(0.001));
+        let deep = live(Side::Sell, dec!(76_050), dec!(0.001));
+        let front_id = front.order_id;
+        let deep_id = deep.order_id;
+        mgr.track_order(front);
+        mgr.track_order(deep);
+        let fills = mgr.paper_match_trade_filtered(
+            dec!(76_150),
+            Side::Buy,
+            |id| id == front_id, // deep skipped
+        );
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].order_id, front_id);
+        // Deep order still live — queue gate said "not yet".
+        assert!(mgr.live_orders.contains_key(&deep_id));
+    }
+
+    /// 22C-2 — closure returning true for all callers replicates
+    /// the legacy unconditional-fill behaviour exactly.
+    #[test]
+    fn paper_match_trade_filtered_fires_all_when_gate_open() {
+        let mut mgr = OrderManager::new_paper();
+        mgr.track_order(live(Side::Sell, dec!(76_100), dec!(0.001)));
+        mgr.track_order(live(Side::Sell, dec!(76_050), dec!(0.001)));
+        let fills = mgr.paper_match_trade_filtered(dec!(76_150), Side::Buy, |_| true);
+        assert_eq!(fills.len(), 2);
     }
 
     #[test]
