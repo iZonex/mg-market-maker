@@ -23,6 +23,7 @@ use mm_risk::kill_switch::{KillLevel, KillSwitch, KillSwitchConfig};
 use mm_risk::lead_lag_guard::LeadLagGuard;
 use mm_risk::margin_guard::{MarginGuard, MarginGuardThresholds};
 use mm_risk::news_retreat::{NewsRetreatState, NewsRetreatStateMachine, NewsRetreatTransition};
+use mm_risk::dca::{self, DcaSlice, DcaSpec};
 use mm_risk::order_emulator::{
     EmulatorAction, EmulatorOrder, EmulatorOrderId, EmulatorOrderSpec, OrderEmulator,
 };
@@ -424,6 +425,16 @@ pub struct MarketMakerEngine {
     /// orders via `ConfigOverride::RegisterEmulatorOrder` +
     /// cancel via `CancelEmulatorOrder`.
     order_emulator: OrderEmulator,
+    /// 22W-4 — pending DCA reduction slices. Populated via
+    /// `ConfigOverride::StartDcaReduction` and drained by
+    /// `refresh_quotes` — once per tick we pop slices whose
+    /// `offset` has elapsed since `dca_started_at` and dispatch
+    /// each as a market IOC on the primary connector.
+    pending_dca: Vec<DcaSlice>,
+    /// 22W-4 — wall-clock stamp for the active DCA schedule.
+    /// Paired with `pending_dca`; both are reset to empty /
+    /// None when the schedule completes.
+    dca_started_at: Option<std::time::Instant>,
     audit: Arc<AuditLog>,
     balance_cache: BalanceCache,
     order_id_map: OrderIdMap,
@@ -979,6 +990,8 @@ impl MarketMakerEngine {
             protections_last_status: ProtectionStatus::Clear,
             protections_last_kill_level: KillLevel::Normal,
             order_emulator: OrderEmulator::new(),
+            pending_dca: Vec::new(),
+            dca_started_at: None,
             audit,
             balance_cache: if paper_mode {
                 BalanceCache::new_paper_for(mm_common::types::WalletType::Spot)
@@ -7730,6 +7743,15 @@ impl MarketMakerEngine {
             }
         }
 
+        // 22W-4 — DCA reduction tick. Pop slices whose offset
+        // has elapsed since `dca_started_at` and fire each as
+        // an IOC market order on the primary connector.
+        // `pending_dca` drains to empty when the schedule
+        // completes.
+        if !self.pending_dca.is_empty() {
+            self.dispatch_due_dca_slices().await;
+        }
+
         // Per-client loss circuit (Epic 6). When the aggregate
         // daily PnL across this client's symbols has breached
         // the configured limit, STOP quoting everywhere for that
@@ -9026,6 +9048,122 @@ impl MarketMakerEngine {
         }
     }
 
+    /// 22W-4 — plan a DCA schedule toward `spec.target` and
+    /// stash it on the engine. Existing in-flight schedules
+    /// are replaced (operator re-issuing a spec means "forget
+    /// the old plan"). No dispatch happens here — the tick
+    /// loop drains `pending_dca` on each refresh.
+    pub fn start_dca_reduction(&mut self, spec: DcaSpec) -> usize {
+        let current = self.inventory_manager.inventory();
+        let lot = self.product.lot_size;
+        let req = spec.to_request(current, lot);
+        let slices = dca::plan(&req);
+        let n = slices.len();
+        self.pending_dca = slices;
+        self.dca_started_at = if n > 0 {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        tracing::info!(
+            symbol = %self.symbol,
+            current = %current,
+            slices = n,
+            "DCA reduction scheduled"
+        );
+        n
+    }
+
+    /// 22W-4 — cancel a pending DCA schedule in place.
+    pub fn cancel_dca_reduction(&mut self) {
+        if !self.pending_dca.is_empty() {
+            tracing::info!(
+                symbol = %self.symbol,
+                dropped = self.pending_dca.len(),
+                "DCA schedule cancelled"
+            );
+        }
+        self.pending_dca.clear();
+        self.dca_started_at = None;
+    }
+
+    /// 22W-4 — fire every slice whose wall-clock offset has
+    /// elapsed since `dca_started_at`. Slices retain their
+    /// relative ordering so we drain from the front until the
+    /// first not-yet-due slice.
+    async fn dispatch_due_dca_slices(&mut self) {
+        let Some(started) = self.dca_started_at else {
+            // Defensive — pending_dca non-empty but no start
+            // stamp means we ended up in an inconsistent
+            // state; drop the schedule so we don't spin.
+            self.pending_dca.clear();
+            return;
+        };
+        let now = std::time::Instant::now();
+        let elapsed = now.saturating_duration_since(started);
+        while let Some(slice) = self.pending_dca.first() {
+            if slice.offset > elapsed {
+                break;
+            }
+            let slice = self.pending_dca.remove(0);
+            self.dispatch_dca_slice(&slice).await;
+        }
+        if self.pending_dca.is_empty() {
+            tracing::info!(
+                symbol = %self.symbol,
+                "DCA schedule completed"
+            );
+            self.dca_started_at = None;
+        }
+    }
+
+    /// 22W-4 — fire a single DCA slice via the primary
+    /// connector as IOC. `reduce_only` is honoured where the
+    /// venue supports it — currently threaded only into the
+    /// client order id prefix as a forensic tag; true
+    /// venue-side reduceOnly plumbing is stage-2.
+    async fn dispatch_dca_slice(&mut self, slice: &DcaSlice) {
+        use mm_common::types::{OrderType, Side as CommonSide, TimeInForce};
+        use mm_exchange_core::connector::NewOrder;
+        let side = if slice.delta > Decimal::ZERO {
+            CommonSide::Buy
+        } else {
+            CommonSide::Sell
+        };
+        let qty = slice.delta.abs();
+        let tag = if slice.reduce_only { "dca-red" } else { "dca-add" };
+        let order = NewOrder {
+            symbol: self.symbol.clone(),
+            side,
+            order_type: OrderType::Market,
+            price: None,
+            qty,
+            time_in_force: Some(TimeInForce::Ioc),
+            client_order_id: Some(format!(
+                "{tag}-{}-{}",
+                chrono::Utc::now().timestamp_millis(),
+                slice.offset.as_secs()
+            )),
+        };
+        match self.connectors.primary.place_order(&order).await {
+            Ok(order_id) => tracing::info!(
+                symbol = %self.symbol,
+                venue_order_id = %order_id,
+                side = ?side,
+                qty = %qty,
+                reduce_only = slice.reduce_only,
+                "DCA slice fired"
+            ),
+            Err(e) => tracing::warn!(
+                symbol = %self.symbol,
+                side = ?side,
+                qty = %qty,
+                error = %e,
+                "DCA slice placement failed"
+            ),
+        }
+    }
+
     /// 22W-3 — register an emulated order and return its id.
     /// Operator-facing via `ConfigOverride::RegisterEmulatorOrder`
     /// + the `POST /api/v1/ops/emulator/{symbol}` HTTP endpoint.
@@ -9133,6 +9271,26 @@ impl MarketMakerEngine {
             }
             ConfigOverride::CancelEmulatedOrder(id) => {
                 self.cancel_emulator_order(id);
+            }
+            ConfigOverride::StartDcaReduction(spec_json) => {
+                match serde_json::from_str::<DcaSpec>(&spec_json) {
+                    Ok(spec) => {
+                        let n = self.start_dca_reduction(spec);
+                        info!(
+                            symbol = %self.symbol,
+                            slices = n,
+                            "ops: DCA reduction scheduled"
+                        );
+                    }
+                    Err(e) => warn!(
+                        symbol = %self.symbol,
+                        error = %e,
+                        "ops: bad StartDcaReduction JSON"
+                    ),
+                }
+            }
+            ConfigOverride::CancelDcaReduction => {
+                self.cancel_dca_reduction();
             }
             ConfigOverride::ManualKillSwitch { level, reason } => {
                 let kl = match level {

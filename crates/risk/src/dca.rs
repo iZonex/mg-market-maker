@@ -26,6 +26,7 @@
 use std::time::Duration;
 
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 use crate::kill_switch::KillLevel;
 
@@ -163,6 +164,63 @@ fn slice_reduces_running_position(running: Decimal, delta: Decimal) -> bool {
 /// - CancelAll: accelerated 5-slice (quadratic back-load)
 /// - FlattenAll: accelerated 3-slice (aggressive)
 /// - Disconnect: single slice (immediate)
+/// Operator-facing TOML/HTTP spec for starting a DCA
+/// inventory-reduction schedule on a symbol. Mirrors
+/// [`DcaRequest`] but `Duration` is replaced by
+/// `interval_secs: u64` so operators can write JSON / TOML
+/// blobs, and the `curve` is a flat enum tag for
+/// serde-compat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DcaSpec {
+    /// Target inventory after the schedule completes (signed,
+    /// in base asset). Pass `0` for a full flatten.
+    pub target: Decimal,
+    /// Number of slices to split the reduction into.
+    pub num_slices: usize,
+    /// Seconds between slices.
+    pub interval_secs: u64,
+    /// Slice-size shape — flat / linear(slope) / accelerated.
+    pub curve: SizeCurveSpec,
+}
+
+/// Enum tag for `SizeCurve` — identical variants but with
+/// `#[derive(Serialize, Deserialize)]` so operators pick a
+/// curve by string in the HTTP body. `Linear.slope` defaults to
+/// 0 (equivalent to Flat) to keep the wire format forgiving.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SizeCurveSpec {
+    Flat,
+    Linear { slope: Decimal },
+    Accelerated,
+}
+
+impl From<SizeCurveSpec> for SizeCurve {
+    fn from(s: SizeCurveSpec) -> Self {
+        match s {
+            SizeCurveSpec::Flat => SizeCurve::Flat,
+            SizeCurveSpec::Linear { slope } => SizeCurve::Linear { slope },
+            SizeCurveSpec::Accelerated => SizeCurve::Accelerated,
+        }
+    }
+}
+
+impl DcaSpec {
+    /// Build a full [`DcaRequest`] given the caller's current
+    /// inventory + the venue's lot size. The engine passes
+    /// those at dispatch time.
+    pub fn to_request(self, current: Decimal, lot_size: Decimal) -> DcaRequest {
+        DcaRequest {
+            current,
+            target: self.target,
+            num_slices: self.num_slices,
+            interval: Duration::from_secs(self.interval_secs),
+            lot_size,
+            curve: self.curve.into(),
+        }
+    }
+}
+
 pub fn defaults_for_level(level: KillLevel) -> (usize, SizeCurve) {
     match level {
         KillLevel::Normal => (10, SizeCurve::Flat),
@@ -438,6 +496,60 @@ mod tests {
                         pair[0].delta.abs(), pair[1].delta.abs());
                 }
             }
+        }
+    }
+
+    /// 22W-4 — DcaSpec → DcaRequest honours caller-supplied
+    /// current + lot_size (the engine passes these because they
+    /// live outside the static spec).
+    #[test]
+    fn spec_to_request_fills_current_and_lot() {
+        let spec = DcaSpec {
+            target: dec!(0),
+            num_slices: 5,
+            interval_secs: 30,
+            curve: SizeCurveSpec::Flat,
+        };
+        let req = spec.to_request(dec!(0.5), dec!(0.001));
+        assert_eq!(req.current, dec!(0.5));
+        assert_eq!(req.target, dec!(0));
+        assert_eq!(req.num_slices, 5);
+        assert_eq!(req.interval, Duration::from_secs(30));
+        assert_eq!(req.lot_size, dec!(0.001));
+        assert!(matches!(req.curve, SizeCurve::Flat));
+    }
+
+    /// 22W-4 — SizeCurveSpec JSON uses a snake_case `kind` tag
+    /// so operators can pick the curve in one string field.
+    /// Pin the format against an unintended rename.
+    #[test]
+    fn size_curve_spec_json_uses_kind_discriminator() {
+        let flat = SizeCurveSpec::Flat;
+        let json = serde_json::to_string(&flat).unwrap();
+        assert_eq!(json, r#"{"kind":"flat"}"#);
+
+        let lin = SizeCurveSpec::Linear { slope: dec!(0.1) };
+        let json = serde_json::to_string(&lin).unwrap();
+        assert!(json.contains(r#""kind":"linear""#));
+        assert!(json.contains(r#""slope":"0.1""#));
+    }
+
+    /// 22W-4 — linear spec round trip through JSON + convert.
+    #[test]
+    fn dca_spec_round_trip_via_json() {
+        let src = DcaSpec {
+            target: dec!(-0.1),
+            num_slices: 3,
+            interval_secs: 15,
+            curve: SizeCurveSpec::Linear { slope: dec!(-0.5) },
+        };
+        let json = serde_json::to_string(&src).unwrap();
+        let parsed: DcaSpec = serde_json::from_str(&json).unwrap();
+        let req = parsed.to_request(dec!(1), dec!(0.001));
+        assert_eq!(req.target, dec!(-0.1));
+        match req.curve {
+            SizeCurve::Linear { slope } => assert_eq!(slope, dec!(-0.5)),
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 }

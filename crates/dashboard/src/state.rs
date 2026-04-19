@@ -65,6 +65,12 @@ pub enum ConfigOverride {
     /// 22W-3 — cancel a previously-registered emulated order
     /// by id.
     CancelEmulatedOrder(u64),
+    /// 22W-4 — start a DCA reduction schedule on the symbol.
+    /// Spec JSON string (DcaSpec from mm-risk::dca) parsed by
+    /// the engine; dashboard crate passes it through opaquely.
+    StartDcaReduction(String),
+    /// 22W-4 — cancel an in-flight DCA schedule.
+    CancelDcaReduction,
     /// Manually escalate the kill switch to a specific level.
     /// `level` maps onto `mm_risk::KillLevel` (1..=5); `reason`
     /// is recorded to the audit trail. Emitted by the dashboard

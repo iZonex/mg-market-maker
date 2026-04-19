@@ -146,6 +146,11 @@ pub async fn start(
             "/api/v1/ops/emulator/{symbol}/{id}",
             axum::routing::delete(ops_cancel_emulated_order),
         )
+        .route("/api/v1/ops/dca/{symbol}", post(ops_start_dca_reduction))
+        .route(
+            "/api/v1/ops/dca/{symbol}",
+            axum::routing::delete(ops_cancel_dca_reduction),
+        )
         .route("/api/admin/config/{symbol}", post(admin_config_override))
         .route("/api/admin/config", post(admin_config_broadcast))
         .route("/api/admin/config/bulk", post(admin_config_bulk))
@@ -1344,6 +1349,37 @@ async fn ops_cancel_emulated_order(
     Path((symbol, id)): Path<(String, u64)>,
 ) -> Json<ConfigOverrideResponse> {
     let ok = state.send_config_override(&symbol, ConfigOverride::CancelEmulatedOrder(id));
+    Json(ConfigOverrideResponse { symbol, applied: ok })
+}
+
+/// 22W-4 — start a DCA reduction schedule on the symbol. Body
+/// is `DcaSpec` JSON (see mm-risk::dca). Engine plans slices
+/// from the current inventory toward `target`, then drains the
+/// schedule on subsequent refresh_quotes ticks.
+///
+/// Example body:
+/// ```json
+/// {"target":"0","num_slices":5,"interval_secs":30,"curve":{"kind":"flat"}}
+/// ```
+async fn ops_start_dca_reduction(
+    State(state): State<DashboardState>,
+    Path(symbol): Path<String>,
+    body: axum::body::Bytes,
+) -> Json<ConfigOverrideResponse> {
+    let spec_json = String::from_utf8(body.to_vec()).unwrap_or_default();
+    let ok = state.send_config_override(
+        &symbol,
+        ConfigOverride::StartDcaReduction(spec_json),
+    );
+    Json(ConfigOverrideResponse { symbol, applied: ok })
+}
+
+/// 22W-4 — cancel an in-flight DCA schedule. No body.
+async fn ops_cancel_dca_reduction(
+    State(state): State<DashboardState>,
+    Path(symbol): Path<String>,
+) -> Json<ConfigOverrideResponse> {
+    let ok = state.send_config_override(&symbol, ConfigOverride::CancelDcaReduction);
     Json(ConfigOverrideResponse { symbol, applied: ok })
 }
 
