@@ -176,6 +176,43 @@ pub trait Strategy: Send + Sync {
     /// calibrate only on fills override this to become a no-op
     /// when nothing changed; default is no-op.
     fn recalibrate_if_due(&self, _now_ms: i64) {}
+
+    /// 22B-0 — snapshot the strategy's persistent internal
+    /// state as a JSON value. Called by the engine's checkpoint
+    /// flush path; the returned value is stashed verbatim in
+    /// `SymbolCheckpoint.strategy_state` and fed back via
+    /// [`Self::restore_state`] on the next boot.
+    ///
+    /// Stateless strategies (Avellaneda, Basis, Grid) return
+    /// `None` and skip the round-trip entirely. Stateful ones
+    /// (GLFT calibration, Adaptive bucket window, Autotune
+    /// regime detector, LearnedMicroprice online ring,
+    /// PumpAndDump / Campaign FSM tick, Momentum history)
+    /// override to serialise their internals so a restart
+    /// doesn't nuke 50-500 ticks of accumulated learning.
+    ///
+    /// Must be cheap — the engine polls this on the periodic
+    /// checkpoint flush. Interior-mutability strategies typically
+    /// do `self.inner.lock().unwrap().snapshot()` here.
+    fn checkpoint_state(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// 22B-0 — restore the strategy from a previously-captured
+    /// [`Self::checkpoint_state`]. Called by the engine once
+    /// after the strategy is constructed and before the first
+    /// tick when a valid checkpoint with `strategy_state` is on
+    /// disk. Errors are logged at WARN and the strategy keeps
+    /// its default state — a broken snapshot never blocks boot.
+    ///
+    /// The schema is private to each strategy. Operators read
+    /// the JSON via the dashboard or audit trail; version fields
+    /// or breaking-change guards are each strategy's
+    /// responsibility (add a `schema_version` key when the
+    /// serialised shape changes).
+    fn restore_state(&self, _state: &serde_json::Value) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// S5.4 — snapshot of a strategy's live calibration state for

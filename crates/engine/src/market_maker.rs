@@ -1312,6 +1312,31 @@ impl MarketMakerEngine {
             );
         }
 
+        // 22B-0 — feed the saved strategy state into the
+        // `Strategy` impl. Stateless strategies (default
+        // impl returns Ok(())) ignore it; stateful ones
+        // (GLFT / Adaptive / Autotune / LearnedMicroprice /
+        // PumpAndDump / Campaign / Momentum) rehydrate their
+        // rolling windows + fitted calibrations so the restart
+        // doesn't force a cold warmup. A deserialisation error
+        // logs at warn and the strategy keeps its defaults —
+        // a broken snapshot never blocks the boot.
+        if let Some(state) = &checkpoint.strategy_state {
+            match self.strategy.restore_state(state) {
+                Ok(()) => tracing::info!(
+                    symbol = %self.symbol,
+                    strategy = %self.strategy.name(),
+                    "strategy state restored from checkpoint"
+                ),
+                Err(e) => tracing::warn!(
+                    symbol = %self.symbol,
+                    strategy = %self.strategy.name(),
+                    error = %e,
+                    "strategy restore_state failed — starting from defaults"
+                ),
+            }
+        }
+
         self.audit.risk_event(
             &self.symbol,
             mm_risk::audit::AuditEventType::CheckpointSaved,
@@ -1328,6 +1353,24 @@ impl MarketMakerEngine {
             "engine state restored from checkpoint"
         );
         self
+    }
+
+    /// 22B-0 — accessor the checkpoint-writer loop uses to
+    /// serialise the primary strategy's persistent state into
+    /// the `SymbolCheckpoint.strategy_state` field. Returns
+    /// `None` for stateless strategies (Avellaneda / Basis /
+    /// Grid / CrossExchange), `Some(json)` for GLFT, Adaptive,
+    /// Autotune, LearnedMicroprice, PumpAndDump, Campaign, and
+    /// Momentum after their 22B-1..6 landings.
+    ///
+    /// **NOTE**: the per-tick checkpoint writer is not wired in
+    /// this crate — the server's `CheckpointManager` at
+    /// `main.rs:92` is flushed only at shutdown, and
+    /// `update_symbol` is never called during runtime. Wiring
+    /// that loop is a separate task (22C-5); this accessor is
+    /// the hook the future loop calls into.
+    pub fn strategy_checkpoint_state(&self) -> Option<serde_json::Value> {
+        self.strategy.checkpoint_state()
     }
 
     /// S2.1 — serialise the currently-inflight atomic bundle
@@ -10675,6 +10718,7 @@ mod dual_connector_tests {
             total_volume: dec!(0),
             total_fills: 0,
             inflight_atomic_bundles: snapshot,
+            strategy_state: None,
         };
         let b = b.with_checkpoint_restore(&cp);
 
@@ -10716,6 +10760,7 @@ mod dual_connector_tests {
                 serde_json::json!("not a tuple"),
                 serde_json::json!({ "shape": "wrong" }),
             ],
+            strategy_state: None,
         };
         let engine = engine.with_checkpoint_restore(&cp);
         assert!(engine.inflight_atomic_bundles.is_empty());

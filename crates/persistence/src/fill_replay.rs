@@ -219,6 +219,7 @@ mod tests {
             total_volume: dec!(1000),
             total_fills: 3,
             inflight_atomic_bundles: Vec::new(),
+            strategy_state: None,
         };
         let replay = FillReplayResult {
             inventory: dec!(0.12),
@@ -242,6 +243,7 @@ mod tests {
             total_volume: dec!(1000),
             total_fills: 5,
             inflight_atomic_bundles: Vec::new(),
+            strategy_state: None,
         };
         let replay = FillReplayResult {
             inventory: dec!(0.5),
@@ -352,6 +354,7 @@ mod tests {
                 total_volume: Decimal::new(vol_raw, 2),
                 total_fills: fills,
                 inflight_atomic_bundles: Vec::new(),
+                strategy_state: None,
             };
             let r = FillReplayResult {
                 inventory: inv,
@@ -379,6 +382,7 @@ mod tests {
                 total_volume: dec!(0),
                 total_fills: cp_fills + delta,
                 inflight_atomic_bundles: Vec::new(),
+                strategy_state: None,
             };
             let r = FillReplayResult {
                 inventory: dec!(0),

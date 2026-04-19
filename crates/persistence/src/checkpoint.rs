@@ -52,6 +52,15 @@ pub struct SymbolCheckpoint {
     /// pending and no record of the pair.
     #[serde(default)]
     pub inflight_atomic_bundles: Vec<serde_json::Value>,
+    /// 22B-0 — strategy-owned calibration / FSM / window state.
+    /// `None` for stateless strategies. The engine reads this
+    /// into `Strategy::restore_state` on the next boot. The
+    /// schema is opaque to this crate — each strategy defines
+    /// its own shape and schema version. Missing key after a
+    /// crate upgrade is fine (serde_default = None), lets
+    /// legacy checkpoints keep loading.
+    #[serde(default)]
+    pub strategy_state: Option<serde_json::Value>,
 }
 
 impl Checkpoint {
@@ -337,6 +346,55 @@ mod tests {
         p
     }
 
+    /// 22B-0 — strategy_state round-trips verbatim through the
+    /// signed envelope. A strategy writes an opaque JSON blob;
+    /// loader returns it intact for the restore path to feed
+    /// back into `Strategy::restore_state`.
+    #[test]
+    fn strategy_state_roundtrips() {
+        let path = fresh_path("strat-state");
+        let secret = Some("test-secret-stratstate".to_string());
+        let mut mgr = CheckpointManager::new_with_secret(&path, 1, secret.clone());
+        let state = serde_json::json!({
+            "schema_version": 1,
+            "glft": {"a": "1.23", "k": "4.56", "samples": 72},
+        });
+        mgr.update_symbol(SymbolCheckpoint {
+            symbol: "BTCUSDT".into(),
+            inventory: dec!(0),
+            avg_entry_price: dec!(0),
+            open_order_ids: vec![],
+            realized_pnl: dec!(0),
+            total_volume: dec!(0),
+            total_fills: 0,
+            inflight_atomic_bundles: Vec::new(),
+            strategy_state: Some(state.clone()),
+        });
+
+        let loaded = CheckpointManager::new_with_secret(&path, 10, secret);
+        let got = loaded.get_symbol("BTCUSDT").unwrap();
+        assert_eq!(got.strategy_state, Some(state));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 22B-0 — legacy checkpoints (pre-strategy_state) load with
+    /// `strategy_state = None` via `serde(default)`. Critical:
+    /// operators upgrading from pre-22B-0 must not hit a
+    /// deserialisation error on first boot.
+    #[test]
+    fn legacy_checkpoint_without_strategy_state_loads() {
+        let path = fresh_path("strat-legacy");
+        // Raw JSON without the `strategy_state` key.
+        let legacy = r#"{"timestamp":"2026-04-19T00:00:00Z","symbols":{"BTCUSDT":{"symbol":"BTCUSDT","inventory":"0","avg_entry_price":"0","open_order_ids":[],"realized_pnl":"0","total_volume":"0","total_fills":0}},"daily_pnl":"0","total_realized_pnl":"0"}"#;
+        std::fs::write(&path, legacy).unwrap();
+
+        let loaded = CheckpointManager::new_with_secret(&path, 10, None);
+        let got = loaded.get_symbol("BTCUSDT").unwrap();
+        assert!(got.strategy_state.is_none());
+        assert!(got.inflight_atomic_bundles.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn test_checkpoint_roundtrip() {
         let path = fresh_path("roundtrip");
@@ -352,6 +410,7 @@ mod tests {
             total_volume: dec!(10000),
             total_fills: 100,
             inflight_atomic_bundles: Vec::new(),
+            strategy_state: None,
         });
 
         let loaded = CheckpointManager::new_with_secret(&path, 10, secret);
@@ -377,6 +436,7 @@ mod tests {
             total_volume: dec!(50000),
             total_fills: 1,
             inflight_atomic_bundles: Vec::new(),
+            strategy_state: None,
         });
 
         // Tamper with the file — bump inventory directly in the
@@ -411,6 +471,7 @@ mod tests {
             total_volume: dec!(25000),
             total_fills: 1,
             inflight_atomic_bundles: Vec::new(),
+            strategy_state: None,
         });
 
         let loaded =
@@ -440,6 +501,7 @@ mod tests {
                         total_volume: dec!(600),
                         total_fills: 1,
                         inflight_atomic_bundles: Vec::new(),
+                        strategy_state: None,
                     },
                 );
                 m
@@ -497,6 +559,7 @@ mod tests {
                 total_volume,
                 total_fills,
                 inflight_atomic_bundles: Vec::new(),
+                strategy_state: None,
             }
         }
     }
@@ -658,6 +721,7 @@ mod tests {
                 total_volume: Decimal::new(vol_cents, 2),
                 total_fills: fills,
                 inflight_atomic_bundles: Vec::new(),
+                strategy_state: None,
             });
             prop_assert!(cp.validate().is_empty(),
                 "clean state flagged: {:?}", cp.validate());
@@ -680,6 +744,7 @@ mod tests {
                 total_volume: dec!(0),
                 total_fills: 0,
                 inflight_atomic_bundles: Vec::new(),
+                strategy_state: None,
             });
             prop_assert!(!cp.validate().is_empty(),
                 "negative entry price not flagged");
@@ -702,6 +767,7 @@ mod tests {
                 total_volume: dec!(0),
                 total_fills: 0,
                 inflight_atomic_bundles: Vec::new(),
+                strategy_state: None,
             });
             prop_assert!(!cp.validate().is_empty(),
                 "inventory without entry price not flagged");
