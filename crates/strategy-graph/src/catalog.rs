@@ -143,6 +143,10 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Strategy.NonFill" => Some(Box::new(strategies::NonFill)),
         // R2.9 — pump-and-dump orchestrator (pentest-only)
         "Strategy.PumpAndDump" => Some(Box::new(strategies::PumpAndDump)),
+        // R4.1/R4.3/R4.5 — multi-venue exploit suite (pentest-only)
+        "Strategy.CampaignOrchestrator" => Some(Box::new(strategies::CampaignOrchestrator)),
+        "Strategy.LiquidationHunt" => Some(Box::new(strategies::LiquidationHunt)),
+        "Strategy.LeverageBuilder" => Some(Box::new(strategies::LeverageBuilder)),
         // MM-3 — execution plan DSL
         "Plan.Accumulate" => {
             plan::Accumulate::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
@@ -154,6 +158,9 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Surveillance.RugScore" => Some(Box::new(sources::RugScoreSource)),
         "Onchain.HolderConcentration" => Some(Box::new(sources::OnchainHolderConcentration)),
         "Onchain.SuspectInflowRate" => Some(Box::new(sources::OnchainSuspectInflowRate)),
+        // R4.2 / R4.4 — liquidation heatmap + OI sources
+        "Surveillance.LiquidationHeatmap" => Some(Box::new(sources::LiquidationHeatmapSource)),
+        "Signal.OpenInterest" => Some(Box::new(sources::OpenInterestSource)),
         "Surveillance.SpoofingScore" => Some(Box::new(sources::SpoofingScore)),
         "Surveillance.LayeringScore" => Some(Box::new(sources::LayeringScore)),
         "Surveillance.QuoteStuffingScore" => Some(Box::new(sources::QuoteStuffingScore)),
@@ -303,6 +310,9 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Strategy.InvPush"     => NodeMeta { label: "Inv push (pentest)",  summary: "⚠ RESTRICTED — drive price in unwinding direction to dump inventory", group: "Exploit" },
         "Strategy.NonFill"     => NodeMeta { label: "Non-filling (pentest)", summary: "⚠ RESTRICTED — orders placed near-touch but pulled before fill", group: "Exploit" },
         "Strategy.PumpAndDump" => NodeMeta { label: "Pump & Dump (pentest)", summary: "⚠ RESTRICTED — 4-phase FSM: accumulate → pump → distribute → dump. Reproduces the RAVE-style cycle for exchange-side surveillance validation.", group: "Exploit" },
+        "Strategy.LiquidationHunt" => NodeMeta { label: "Liquidation hunt (pentest)", summary: "⚠ RESTRICTED — crossing push calibrated to trigger a specific liquidation cluster on a thin perp book. Requires Surveillance.LiquidationHeatmap upstream.", group: "Exploit" },
+        "Strategy.LeverageBuilder" => NodeMeta { label: "Leverage builder (pentest)", summary: "⚠ RESTRICTED — opens a leveraged perp position to set up an asymmetric multi-venue exposure. Respects venue leverage caps.", group: "Exploit" },
+        "Strategy.CampaignOrchestrator" => NodeMeta { label: "Campaign orchestrator (pentest)", summary: "⚠ RESTRICTED — multi-phase timeline FSM chaining sub-strategies across venues. The full RAVE campaign replica used for exchange surveillance validation.", group: "Exploit" },
 
         // MM-3 — execution plan DSL
         "Plan.Accumulate"      => NodeMeta { label: "Plan: Accumulate", summary: "Time-sliced accumulate / distribute with abort-price guard", group: "Plans" },
@@ -314,6 +324,8 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Surveillance.RugScore" => NodeMeta { label: "Composite rug score", summary: "Weighted sum of every rug signal into one [0..1]. Pipe through Cast.ToBool(>=0.6) → Out.KillEscalate for a one-node RAVE defender", group: "Surveillance" },
         "Onchain.HolderConcentration" => NodeMeta { label: "Onchain holder concentration", summary: "Fraction of total supply held by the top-N on-chain holders [0..1]. ~0.9 is a RAVE-style rug precondition", group: "Surveillance" },
         "Onchain.SuspectInflowRate" => NodeMeta { label: "Onchain CEX inflow rate", summary: "Notional flowing from operator-listed suspect wallets to known-CEX addresses over the tracker window", group: "Surveillance" },
+        "Surveillance.LiquidationHeatmap" => NodeMeta { label: "Liquidation heatmap", summary: "Rolling window of forced-liquidation events bucketed by bps-from-mid. Honest MMs widen near clusters; pentest consumers target them", group: "Surveillance" },
+        "Signal.OpenInterest" => NodeMeta { label: "Open interest", summary: "Per-symbol open interest (when connector exposes it). Legitimate input for any MM that cares about positioning risk", group: "Signals" },
         "Surveillance.SpoofingScore" => NodeMeta { label: "Spoofing score", summary: "Likelihood our own flow looks like spoofing [0..1] + cancel_ratio + lifetime", group: "Surveillance" },
         "Surveillance.LayeringScore" => NodeMeta { label: "Layering score", summary: "Multi-order structured pressure + synchronous cancels [0..1]", group: "Surveillance" },
         "Surveillance.QuoteStuffingScore" => NodeMeta { label: "Quote stuffing score", summary: "High orders/sec + high cancel ratio + near-zero fill rate [0..1]", group: "Surveillance" },
@@ -463,6 +475,9 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Strategy.InvPush",
         "Strategy.NonFill",
         "Strategy.PumpAndDump",
+        "Strategy.LiquidationHunt",
+        "Strategy.LeverageBuilder",
+        "Strategy.CampaignOrchestrator",
         "Plan.Accumulate",
         "Surveillance.ForeignTwap",
         "Cost.Sweep",
@@ -488,6 +503,8 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Surveillance.RugScore",
         "Onchain.HolderConcentration",
         "Onchain.SuspectInflowRate",
+        "Surveillance.LiquidationHeatmap",
+        "Signal.OpenInterest",
         "Surveillance.SpoofingScore",
         "Surveillance.LayeringScore",
         "Surveillance.QuoteStuffingScore",
@@ -582,10 +599,11 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_116_nodes_after_r2_phase2_rug_sources() {
-        // 113 after R3.8 + 3 (R2.11 ListingAge, R2.12
-        // MarketCapRatio, R2.13 RugScore) = 116.
-        assert_eq!(kinds().len(), 116, "catalog drift");
+    fn catalog_has_121_nodes_after_r4_multi_venue_exploit() {
+        // 116 after R2 Phase 2 + 5 (R4.1 CampaignOrchestrator,
+        // R4.2 LiquidationHeatmap source, R4.3 LiquidationHunt,
+        // R4.4 OpenInterest, R4.5 LeverageBuilder) = 121.
+        assert_eq!(kinds().len(), 121, "catalog drift");
     }
 
     /// GR-1 — every indicator with a `period` config field must

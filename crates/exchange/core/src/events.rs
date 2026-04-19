@@ -56,6 +56,26 @@ pub enum MarketEvent {
         available: Decimal,
     },
 
+    /// R4.2 — forced-liquidation event from a futures / perp
+    /// venue. Published by connectors that subscribe to the
+    /// venue's liquidation stream (Binance `!forceOrder@arr`,
+    /// Bybit `liquidation`). Not every venue supports this;
+    /// `VenueCapabilities::supports_liquidation_feed` gates
+    /// whether the connector subscribes. Consumers use the
+    /// rolling feed to build an open-interest-per-price-level
+    /// heatmap ([`Surveillance.LiquidationHeatmap`]).
+    Liquidation {
+        venue: VenueId,
+        symbol: String,
+        /// Which side got liquidated (liquidated long = `Sell`
+        /// market taker, liquidated short = `Buy` market taker).
+        side: mm_common::types::Side,
+        qty: Qty,
+        price: Decimal,
+        /// Liquidation venue timestamp (millis).
+        timestamp_ms: i64,
+    },
+
     /// Connection established.
     Connected { venue: VenueId },
 
@@ -72,6 +92,7 @@ impl MarketEvent {
             MarketEvent::Fill { venue, .. } => *venue,
             MarketEvent::OrderUpdate { venue, .. } => *venue,
             MarketEvent::BalanceUpdate { venue, .. } => *venue,
+            MarketEvent::Liquidation { venue, .. } => *venue,
             MarketEvent::Connected { venue } => *venue,
             MarketEvent::Disconnected { venue } => *venue,
         }

@@ -1181,6 +1181,216 @@ impl NodeKind for PumpAndDump {
     }
 }
 
+// ⚠⚠⚠ Epic R4 — multi-venue exploit orchestration.
+//
+// The three nodes below are PENTEST-ONLY. They exist so the
+// operator can stress-test their own exchange's surveillance
+// stack against documented market-manipulation patterns
+// (liquidation hunts, leveraged perp attacks, multi-phase
+// coordinated campaigns). Running these against a venue you
+// do not own or are not explicitly authorized to pentest is:
+//   - A violation of every exchange ToS we are aware of.
+//   - Likely illegal under MiFID II (EU), Dodd-Frank / SEA
+//     §9(a) (US), FSA (Japan), MiCA (EU from 2024-12).
+//   - Civilly actionable by any trader who takes a loss.
+//
+// Every `Strategy.*` node in this block sets `restricted() =
+// true` so `Evaluator::build` refuses to compile unless
+// `MM_RESTRICTED_ALLOW=1` is set at process start. The
+// operator is expected to have read `docs/guides/pentest.md`
+// and confirmed written authorization before flipping that
+// switch.
+
+/// ⚠ RESTRICTED — `Strategy.LiquidationHunt` — aggressive
+/// crossing orders calibrated to trigger a known
+/// liquidation cascade cluster on a thin perp book.
+/// Typically used by the offensive side of a RAVE-style
+/// campaign to force a cascade on over-leveraged retail
+/// shorts / longs before distributing.
+///
+/// Reads `Surveillance.LiquidationHeatmap`'s
+/// `nearest_above_bps` / `nearest_below_bps` to target
+/// exactly the right price — no blind push.
+#[derive(Debug, Default)]
+pub struct LiquidationHunt;
+
+static LIQ_HUNT_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
+    vec![
+        Port::new("target_bps", PortType::Number),
+        Port::new("cluster_notional", PortType::Number),
+    ]
+});
+
+impl NodeKind for LiquidationHunt {
+    fn kind(&self) -> &'static str {
+        "Strategy.LiquidationHunt"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &LIQ_HUNT_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUOTES_OUT
+    }
+    fn restricted(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<ConfigField> {
+        vec![
+            ConfigField {
+                name: "push_size",
+                label: "⚠ Push order size",
+                hint: Some("Per-tick cross-through qty. PENTEST ONLY — authorized venue only."),
+                default: serde_json::json!("0.002"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+            ConfigField {
+                name: "max_bps_overshoot",
+                label: "⚠ Max bps past cluster",
+                hint: Some("Bps to cross past the target cluster. Higher = more aggressive trigger."),
+                default: serde_json::json!("5"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: Some(200.0), step: Some(1.0) },
+            },
+        ]
+    }
+}
+
+/// ⚠ RESTRICTED — `Strategy.LeverageBuilder` — opens a
+/// leveraged perp position on the running venue. Config
+/// specifies side, size, and target leverage. Paired with a
+/// spot short / long on another venue via
+/// `Strategy.CampaignOrchestrator` to build the asymmetric
+/// exposure characteristic of a RAVE-style setup.
+///
+/// Uses the engine's existing perp order path; `set_leverage`
+/// on the connector is called during orchestrator phase setup
+/// so the broker state is consistent. PENTEST venues only.
+#[derive(Debug, Default)]
+pub struct LeverageBuilder;
+
+impl NodeKind for LeverageBuilder {
+    fn kind(&self) -> &'static str {
+        "Strategy.LeverageBuilder"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &[]
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUOTES_OUT
+    }
+    fn restricted(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<ConfigField> {
+        vec![
+            ConfigField {
+                name: "direction",
+                label: "⚠ Direction",
+                hint: Some("long = buy perp to set up a squeeze; short = sell perp before spot dump"),
+                default: serde_json::json!("long"),
+                widget: ConfigWidget::Enum {
+                    options: vec![
+                        ConfigEnumOption { value: "long", label: "Long (buy)" },
+                        ConfigEnumOption { value: "short", label: "Short (sell)" },
+                    ],
+                },
+            },
+            ConfigField {
+                name: "position_size",
+                label: "⚠ Position size (base units)",
+                hint: Some("Notional = size × current mark. Bigger = more market impact."),
+                default: serde_json::json!("0.01"),
+                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+            },
+            ConfigField {
+                name: "leverage",
+                label: "⚠ Leverage (1–125)",
+                hint: Some("Higher = more position per margin dollar. Venue-capped."),
+                default: serde_json::json!(5),
+                widget: ConfigWidget::Integer { min: Some(1), max: Some(125) },
+            },
+            ConfigField {
+                name: "max_slippage_bps",
+                label: "⚠ Max slippage (bps)",
+                hint: Some("Refuse to open if fill would cross further than this past mid."),
+                default: serde_json::json!("100"),
+                widget: ConfigWidget::Number { min: Some(1.0), max: Some(1000.0), step: Some(1.0) },
+            },
+        ]
+    }
+}
+
+/// ⚠ RESTRICTED — `Strategy.CampaignOrchestrator` — multi-
+/// phase multi-venue timeline FSM. Chains a sequence of
+/// sub-strategies (accumulate → pump → liquidation-hunt →
+/// distribute → dump) across venues, each phase timed in
+/// seconds. Reproduces the full RAVE campaign structure so
+/// the operator can validate their own exchange's
+/// surveillance + circuit-breaker response.
+///
+/// Config is a JSON array of `{name, duration_secs, venue,
+/// sub_strategy, sub_config}`. Phase output is routed via
+/// `Out.VenueQuotes` when `venue` differs from the engine's
+/// primary.
+#[derive(Debug, Default)]
+pub struct CampaignOrchestrator;
+
+impl NodeKind for CampaignOrchestrator {
+    fn kind(&self) -> &'static str {
+        "Strategy.CampaignOrchestrator"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &[]
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUOTES_OUT
+    }
+    fn restricted(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<ConfigField> {
+        vec![
+            ConfigField {
+                name: "phases",
+                label: "⚠ Campaign phases (JSON array)",
+                hint: Some("Array of {name, duration_secs, sub_strategy}. Each phase runs for its duration, then advances to the next."),
+                default: serde_json::json!("[]"),
+                widget: ConfigWidget::Text,
+            },
+            ConfigField {
+                name: "loop_cycle",
+                label: "Loop after final phase",
+                hint: Some("Restart from phase 0 after the last one — useful for smoke-test replays."),
+                default: serde_json::json!(false),
+                widget: ConfigWidget::Bool,
+            },
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

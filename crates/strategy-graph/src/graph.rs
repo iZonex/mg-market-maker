@@ -236,6 +236,25 @@ impl Graph {
             if shape.restricted && !allow_restricted_env() {
                 return Err(ValidationError::RestrictedNotAllowed(n.kind.clone()));
             }
+            if shape.restricted {
+                // R4.7 — loud, repeated warning every time a
+                // restricted node compiles. The `MM_RESTRICTED_ALLOW`
+                // gate is intentional — running a restricted node
+                // without explicit operator authorization (written
+                // approval from the venue owner) is a ToS
+                // violation everywhere and illegal under MiFID II /
+                // Dodd-Frank / MiCA. This log line is a permanent
+                // forensic marker that the deployment knew what
+                // it was doing.
+                tracing::warn!(
+                    kind = %n.kind,
+                    node_id = %n.id,
+                    "⚠⚠⚠ RESTRICTED pentest node compiling. Authorized \
+                    testing only — venue owner must grant written approval. \
+                    Using on unauthorized venues is illegal and a ToS \
+                    violation. See docs/guides/pentest.md."
+                );
+            }
             validate_node_config(n, &shape)?;
             shapes.insert(n.id, shape);
         }

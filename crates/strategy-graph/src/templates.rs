@@ -35,6 +35,7 @@ static BASIS_CARRY_SPOT_PERP: &str = include_str!("../templates/basis-carry-spot
 static PENTEST_SPOOF_CLASSIC: &str = include_str!("../templates/pentest/spoof-classic.json");
 static PENTEST_PUMP_AND_DUMP: &str = include_str!("../templates/pentest/pump-and-dump.json");
 static PENTEST_RAVE_CYCLE: &str = include_str!("../templates/pentest/rave-cycle.json");
+static PENTEST_RAVE_FULL_CAMPAIGN: &str = include_str!("../templates/pentest/rave-full-campaign.json");
 static RUG_DETECTOR_COMPOSITE: &str = include_str!("../templates/rug-detector-composite.json");
 static FUNDING_AWARE_QUOTER: &str = include_str!("../templates/funding-aware-quoter.json");
 static LIQUIDITY_BURN_GUARD: &str = include_str!("../templates/liquidity-burn-guard.json");
@@ -134,6 +135,11 @@ const BUILTIN: &[BuiltinTemplate] = &[
         name: "pentest-rave-cycle",
         description: "⚠ PENTEST ONLY — Strategy.PumpAndDump runs the RAVE 4-phase cycle; Surveillance.RugScore watches the tape and trips kill L4 if combined ≥ 0.5. Requires MM_RESTRICTED_ALLOW=1.",
         body: PENTEST_RAVE_CYCLE,
+    },
+    BuiltinTemplate {
+        name: "pentest-rave-full-campaign",
+        description: "⚠⚠⚠ PENTEST ONLY — FULL MULTI-PHASE RAVE CAMPAIGN. CampaignOrchestrator chains accumulate → leverage_long → liquidation_hunt → distribute → dump across the configured timeline. Surveillance.RugScore self-guard trips kill L4 on ≥ 0.5. Running this against any venue you don't own / aren't explicitly authorized to pentest is illegal under MiFID II / Dodd-Frank / MiCA and a ToS violation everywhere. Requires MM_RESTRICTED_ALLOW=1. OPERATOR MUST CONFIRM: (1) authorized pentest only, (2) own exchange or written authorization, (3) compliance review complete. THIS TOOL IS A PENTEST INSTRUMENT, NOT AN ATTACK KIT.",
+        body: PENTEST_RAVE_FULL_CAMPAIGN,
     },
 ];
 

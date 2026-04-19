@@ -1,6 +1,6 @@
 # MM — Open Work Tracker
 
-Last updated: 2026-04-19 (post-Sprint 9)
+Last updated: 2026-04-19 (post-Sprint 10)
 
 Tracking debt not yet closed. Closed items live in git history.
 Each row is a concrete deliverable; bigger initiatives are
@@ -604,6 +604,54 @@ them up end-to-end in one click — one defensive, one pentest.
   rug-detector-composite templates.
 - [x] **Catalog**: 113 → 116 kinds (ListingAge +
   MarketCapRatio + RugScore).
+
+## Sprint 10 — Epic R4: multi-venue exploit orchestration (landed Apr 19)
+
+⚠ **Pentest-only build.** Every new exploit node in this sprint is
+`restricted()=true` behind `MM_RESTRICTED_ALLOW=1`. `docs/guides/pentest.md`
+gates operator use; loud `tracing::warn!` on every restricted graph compile.
+
+- [x] **R4.1** `Strategy.CampaignOrchestrator` graph node.
+  Multi-phase timeline FSM config schema (phases JSON array,
+  loop_cycle bool). V1 is advisory-only — engine logs a warn
+  reminding the operator to chain the explicit exploit nodes
+  instead until the FSM driver is plumbed (documented in
+  `docs/guides/pentest.md`).
+- [x] **R4.2** `LiquidationHeatmap` in `mm-risk`. Rolling
+  30-minute window of forced liquidations, bucketed by
+  bps-from-mid (20-bps default). `MarketEvent::Liquidation`
+  variant added to `mm_exchange_core`. Engine feeds on arrival.
+  `Surveillance.LiquidationHeatmap` graph source emits 6-field
+  summary (total, event_count, nearest_above/below bps +
+  notional).
+- [x] **R4.3** `Strategy.LiquidationHunt` (restricted). Reads
+  the heatmap's `nearest_above/below_bps` for targeted
+  cross-through push. V1 wraps `IgniteStrategy` — same
+  cross-book mechanic, plus the `max_bps_overshoot` knob.
+- [x] **R4.4** `Signal.OpenInterest` source. Non-restricted —
+  OI is legitimate MM input. V1 derives from the liquidation
+  feed's total notional; returns Missing on a cold tracker so
+  silence doesn't gate risk decisions.
+- [x] **R4.5** `Strategy.LeverageBuilder` (restricted). Single
+  directional push with leverage + position_size + max
+  slippage config. V1 wraps `IgniteStrategy` with one-shot
+  burst; real `connector.set_leverage()` plumbing marked as
+  stage-2 in `pentest.md`.
+- [x] **R4.6** `pentest-rave-full-campaign` template. Full
+  multi-phase campaign shell paired with
+  `Surveillance.RugScore` → `Cast.ToBool(≥0.5)` →
+  `Out.KillEscalate(L4)` self-guard. Bundled under the
+  restricted template-family alongside `spoof-classic` /
+  `pump-and-dump` / `rave-cycle`.
+- [x] **R4.7** Restricted-gate warnings. `tracing::warn!` fires
+  on every restricted-node compile inside
+  `Evaluator::build`; quadruple-star warning with
+  "authorized testing only" + "MiFID II / Dodd-Frank / MiCA
+  violation" + `docs/guides/pentest.md` pointer. `pentest.md`
+  written as the README for the restricted suite with the
+  three operator-confirmation conditions + full exploit /
+  detector / template cross-reference table.
+- [x] Catalog 116 → 121 kinds (+5 from R4).
 
 ## Graph system audit — Apr 19 follow-ups
 

@@ -1137,6 +1137,87 @@ impl NodeKind for OnchainSuspectInflowRate {
     }
 }
 
+/// R4.2 — Surveillance.LiquidationHeatmap — per-symbol rolling
+/// liquidation heatmap snapshot. Outputs summary stats the
+/// defensive + offensive consumers both need:
+///
+///   * `total_notional` — sum of liquidation notional in the
+///     rolling window (pure observability, honest MMs widen
+///     near high values)
+///   * `nearest_above_bps` / `nearest_above_notional` — signed
+///     bps to the nearest above-mid cluster + its notional
+///     (pentest consumer `Strategy.LiquidationHunt` reads
+///     these)
+///   * `nearest_below_bps` / `nearest_below_notional` — same,
+///     below mid
+///
+/// ⚠ The heatmap data is neutral (the venue publishes it);
+/// ⚠ downstream `Strategy.LiquidationHunt` is RESTRICTED.
+#[derive(Debug, Default)]
+pub struct LiquidationHeatmapSource;
+
+static LIQ_HEATMAP_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
+    vec![
+        Port::new("total_notional", PortType::Number),
+        Port::new("nearest_above_bps", PortType::Number),
+        Port::new("nearest_above_notional", PortType::Number),
+        Port::new("nearest_below_bps", PortType::Number),
+        Port::new("nearest_below_notional", PortType::Number),
+        Port::new("event_count", PortType::Number),
+    ]
+});
+
+impl NodeKind for LiquidationHeatmapSource {
+    fn kind(&self) -> &'static str {
+        "Surveillance.LiquidationHeatmap"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &LIQ_HEATMAP_OUTPUTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing; 6])
+    }
+}
+
+/// R4.4 — Signal.OpenInterest. Per-venue, per-symbol open
+/// interest (contract count or notional — venue-dependent).
+/// Derived either from the connector's funding/OI API when
+/// available, or from the accumulated liquidation feed as a
+/// lower-bound proxy.
+///
+/// Non-restricted — OI is a legitimate market data signal
+/// every honest MM consumes.
+#[derive(Debug, Default)]
+pub struct OpenInterestSource;
+
+impl NodeKind for OpenInterestSource {
+    fn kind(&self) -> &'static str {
+        "Signal.OpenInterest"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &VALUE_NUMBER
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
 /// R2.11 — listing-age signal. Output `value` is a `[0, 1]`
 /// newness score that peaks at 1.0 for a fresh listing and
 /// decays linearly to 0 at the guard's `mature_days`. Useful

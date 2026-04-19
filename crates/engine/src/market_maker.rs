@@ -428,6 +428,10 @@ pub struct MarketMakerEngine {
     /// `symbol_circulating_supply`. Absence means the mcap
     /// proxy signal stays at zero (neutral, not suspicious).
     mcap_proxy_guard: Option<mm_risk::manipulation::MarketCapProxyGuard>,
+    /// R4.2 — rolling forced-liquidation heatmap. Fed from
+    /// `MarketEvent::Liquidation` arrivals, read by
+    /// `Surveillance.LiquidationHeatmap` + `Strategy.LiquidationHunt`.
+    liquidation_heatmap: mm_risk::liquidation_heatmap::LiquidationHeatmap,
     /// Regulatory OTR counter: `(adds + 2·updates + cancels) /
     /// max(trades, 1) - 1`. Exported into the audit trail and
     /// Prometheus. Market-quality / spoofing proxy tracked for
@@ -926,6 +930,7 @@ impl MarketMakerEngine {
                     mm_risk::manipulation::MarketCapProxyGuard::new(supply)
                 })
             },
+            liquidation_heatmap: mm_risk::liquidation_heatmap::LiquidationHeatmap::new(),
             otr: OrderToTradeRatio::new(),
             tiered_otr: mm_risk::otr::TieredOtrTracker::new(),
             inventory_drift: InventoryDriftReconciler::new(
@@ -2346,6 +2351,83 @@ impl MarketMakerEngine {
                     Some(Box::new(
                         mm_strategy::exploits::NonFillStrategy::with_config(c),
                     ))
+                }
+                // ⚠ R4.3 — LiquidationHunt pentest wrapper.
+                // Reuses IgniteStrategy internally: the
+                // crossing-through-book behaviour is identical,
+                // only the triggering layer differs (the graph
+                // gates this via the LiquidationHeatmap).
+                "Strategy.LiquidationHunt" => {
+                    let cfg = &n.config;
+                    let parse_dec = |k: &str, default: rust_decimal::Decimal| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(default)
+                    };
+                    let push_size = parse_dec("push_size", dec!(0.002));
+                    let cross_depth = parse_dec("max_bps_overshoot", dec!(5));
+                    let hunt_cfg = mm_strategy::ignite::IgniteConfig {
+                        push_side: mm_common::types::Side::Buy,
+                        burst_size: push_size,
+                        cross_depth_bps: cross_depth,
+                        burst_ticks: 3,
+                        rest_ticks: 7,
+                    };
+                    Some(Box::new(
+                        mm_strategy::ignite::IgniteStrategy::with_config(hunt_cfg),
+                    ))
+                }
+                // ⚠ R4.5 — LeverageBuilder pentest wrapper.
+                // V1 reuses IgniteStrategy with a one-shot
+                // aggressive push — real leverage-setting would
+                // need `connector.set_leverage()` plumbed
+                // through the engine. Documented as a stage-2
+                // extension on the node schema.
+                "Strategy.LeverageBuilder" => {
+                    let cfg = &n.config;
+                    let parse_dec = |k: &str, default: rust_decimal::Decimal| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(default)
+                    };
+                    let direction = match cfg
+                        .get("direction")
+                        .and_then(|v| v.as_str())
+                    {
+                        Some("short") => mm_common::types::Side::Sell,
+                        _ => mm_common::types::Side::Buy,
+                    };
+                    let pos_size = parse_dec("position_size", dec!(0.01));
+                    let max_slip = parse_dec("max_slippage_bps", dec!(100));
+                    let cfg_lev = mm_strategy::ignite::IgniteConfig {
+                        push_side: direction,
+                        burst_size: pos_size,
+                        cross_depth_bps: max_slip,
+                        burst_ticks: 1,
+                        rest_ticks: 1_000_000,
+                    };
+                    Some(Box::new(
+                        mm_strategy::ignite::IgniteStrategy::with_config(cfg_lev),
+                    ))
+                }
+                // ⚠ R4.1 — CampaignOrchestrator V1 stub. A
+                // proper implementation needs its own
+                // multi-phase FSM in mm-strategy; for this
+                // sprint we expose the node so templates can
+                // reference it, and the engine logs a warning
+                // on build telling the operator the phase FSM
+                // is advisory-only.
+                "Strategy.CampaignOrchestrator" => {
+                    warn!(
+                        node_id = %n.id,
+                        "⚠ Strategy.CampaignOrchestrator is ADVISORY-ONLY in this \
+                        build — phase transitions are not wired to sub-strategies yet. \
+                        Use the explicit `Strategy.PumpAndDump` + `Strategy.LiquidationHunt` \
+                        + `Strategy.LeverageBuilder` nodes in parallel for now."
+                    );
+                    Some(Box::new(mm_strategy::ignite::IgniteStrategy::default()))
                 }
                 "Strategy.PumpAndDump" => {
                     let cfg = &n.config;
@@ -3826,6 +3908,90 @@ impl MarketMakerEngine {
                     src.insert((*id, "pump_dump".into()), Value::Number(snap.pump_dump));
                     src.insert((*id, "wash".into()), Value::Number(snap.wash));
                     src.insert((*id, "thin_book".into()), Value::Number(snap.thin_book));
+                }
+                // R4.2 — Surveillance.LiquidationHeatmap.
+                // Reads rolling summary from the engine-local
+                // heatmap; `Missing` on empty buckets so a
+                // quiet symbol doesn't trip downstream gates.
+                "Surveillance.LiquidationHeatmap" => {
+                    // Keep the heatmap's mid fresh on each
+                    // tick — bucketing depends on it.
+                    self.liquidation_heatmap.on_mid(self.last_mid);
+                    let total = self.liquidation_heatmap.total_notional();
+                    let count = rust_decimal::Decimal::from(
+                        self.liquidation_heatmap.event_count() as u64,
+                    );
+                    // Nearest above / below — ignored when the
+                    // heatmap has no buckets.
+                    use mm_common::types::Side;
+                    let above = self
+                        .liquidation_heatmap
+                        .nearest_cluster_above_threshold(
+                            Side::Buy,
+                            rust_decimal::Decimal::ZERO,
+                            10,
+                            1000,
+                        );
+                    let below = self
+                        .liquidation_heatmap
+                        .nearest_cluster_above_threshold(
+                            Side::Sell,
+                            rust_decimal::Decimal::ZERO,
+                            10,
+                            1000,
+                        );
+                    src.insert((*id, "total_notional".into()), Value::Number(total));
+                    src.insert((*id, "event_count".into()), Value::Number(count));
+                    match above {
+                        Some(b) => {
+                            src.insert(
+                                (*id, "nearest_above_bps".into()),
+                                Value::Number(rust_decimal::Decimal::from(
+                                    b.signed_bps_from_mid as i64,
+                                )),
+                            );
+                            src.insert(
+                                (*id, "nearest_above_notional".into()),
+                                Value::Number(b.notional),
+                            );
+                        }
+                        None => {
+                            src.insert((*id, "nearest_above_bps".into()), Value::Missing);
+                            src.insert((*id, "nearest_above_notional".into()), Value::Missing);
+                        }
+                    }
+                    match below {
+                        Some(b) => {
+                            src.insert(
+                                (*id, "nearest_below_bps".into()),
+                                Value::Number(rust_decimal::Decimal::from(
+                                    b.signed_bps_from_mid as i64,
+                                )),
+                            );
+                            src.insert(
+                                (*id, "nearest_below_notional".into()),
+                                Value::Number(b.notional),
+                            );
+                        }
+                        None => {
+                            src.insert((*id, "nearest_below_bps".into()), Value::Missing);
+                            src.insert((*id, "nearest_below_notional".into()), Value::Missing);
+                        }
+                    }
+                }
+                // R4.4 — Signal.OpenInterest. Proxy derived
+                // from the liquidation-feed total notional when
+                // the connector doesn't expose OI directly.
+                // Missing when no events yet — don't gate on
+                // silence.
+                "Signal.OpenInterest" => {
+                    let total = self.liquidation_heatmap.total_notional();
+                    let v = if total.is_zero() {
+                        Value::Missing
+                    } else {
+                        Value::Number(total)
+                    };
+                    src.insert((*id, "value".into()), v);
                 }
                 // R2.11 — listing-age score.
                 "Surveillance.ListingAge" => {
@@ -6720,6 +6886,27 @@ impl MarketMakerEngine {
                 self.audit
                     .risk_event(&self.symbol, AuditEventType::ExchangeDisconnected, "");
                 self.circuit_breaker.trip(TripReason::StaleBook);
+            }
+            MarketEvent::Liquidation {
+                symbol: ev_sym,
+                side,
+                qty,
+                price,
+                timestamp_ms,
+                ..
+            } => {
+                if ev_sym == &self.symbol {
+                    let ts = chrono::DateTime::from_timestamp_millis(*timestamp_ms)
+                        .unwrap_or_else(chrono::Utc::now);
+                    self.liquidation_heatmap.on_liquidation(
+                        mm_risk::liquidation_heatmap::LiquidationEvent {
+                            side: *side,
+                            price: *price,
+                            qty: *qty,
+                            timestamp: ts,
+                        },
+                    );
+                }
             }
         }
     }
