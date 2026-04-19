@@ -37,7 +37,6 @@ strategy/              Strategies + signals + execution:
   ├── glft             Guéant-Lehalle-Fernandez-Tapia with calibration
   ├── grid             Symmetric grid quoting
   ├── cross_exchange   Make on venue A, hedge on venue B
-  ├── xemm             Dedicated cross-exchange executor with slippage band
   ├── basis            Basis-shifted reservation price (spot + ref_price)
   ├── funding_arb      Atomic pair dispatcher (market-take hedge, maker-post primary)
   ├── funding_arb_driver Periodic FundingArbEngine loop + DriverEventSink
@@ -62,8 +61,6 @@ risk/                  Risk management:
   ├── kill_switch      5-level emergency (widen→stop→cancel→flatten→disconnect)
   ├── protections      StoplossGuard / CooldownPeriod / MaxDrawdown / LowProfitPairs
   ├── circuit_breaker  Stale book, wide spread detection
-  ├── dca              Position-adjustment planner (flat/linear/accelerated)
-  ├── order_emulator   Client-side stops/trailing/OCO/GTD emulation
   ├── inventory        Position tracking, PnL, limits
   ├── exposure         Drawdown tracking
   ├── toxicity         VPIN, Kyle's Lambda, adverse selection
