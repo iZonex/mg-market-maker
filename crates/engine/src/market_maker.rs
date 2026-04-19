@@ -657,6 +657,15 @@ pub struct MarketMakerEngine {
     /// knows which asset to pull sentiment for without re-reading
     /// the whole graph JSON.
     strategy_graph_scope: Option<mm_strategy_graph::Scope>,
+    /// S6.1 — epoch-millis stamped at the last successful
+    /// `with_strategy_graph` / `swap_strategy_graph`. Threaded
+    /// into the per-tick `ActiveGraphSnapshot` so operators see
+    /// the deployed-at time without consulting audit.
+    strategy_graph_deployed_at_ms: Option<i64>,
+    /// S6.1 — cached node-count for the active graph. Snapshotted
+    /// at swap time so the tick-path doesn't need to re-borrow
+    /// the graph to count nodes.
+    strategy_graph_node_count: Option<usize>,
     /// Epic G — reservation-price skew contribution from the
     /// most recent social evaluation. Bumped by
     /// `SocialRiskState.inv_skew_bps` on every tick and
@@ -1057,6 +1066,8 @@ impl MarketMakerEngine {
             last_reprice_ts: None,
             last_nearby_trade_ts: None,
             strategy_graph_scope: None,
+            strategy_graph_deployed_at_ms: None,
+            strategy_graph_node_count: None,
             margin_guard: config.margin.as_ref().map(|m| {
                 // PERP-3 — pin the guard to this engine's
                 // symbol + configured margin mode so isolated
@@ -2346,6 +2357,9 @@ impl MarketMakerEngine {
         self.strategy_graph_name = Some(graph.name.clone());
         self.strategy_graph_hash = Some(graph.content_hash());
         self.strategy_graph_scope = Some(graph.scope.clone());
+        self.strategy_graph_deployed_at_ms =
+            Some(chrono::Utc::now().timestamp_millis());
+        self.strategy_graph_node_count = Some(graph.nodes.len());
         self.strategy_pool = Self::build_strategy_pool(graph);
         self.strategy_node_configs =
             Self::build_strategy_node_configs(graph, &self.config.market_maker);
@@ -2387,6 +2401,9 @@ impl MarketMakerEngine {
         self.strategy_graph_name = Some(graph.name.clone());
         self.strategy_graph_hash = Some(graph.content_hash());
         self.strategy_graph_scope = Some(graph.scope.clone());
+        self.strategy_graph_deployed_at_ms =
+            Some(chrono::Utc::now().timestamp_millis());
+        self.strategy_graph_node_count = Some(graph.nodes.len());
         self.strategy_pool = Self::build_strategy_pool(graph);
         self.strategy_node_configs =
             Self::build_strategy_node_configs(graph, &self.config.market_maker);
@@ -8340,6 +8357,28 @@ impl MarketMakerEngine {
                     }
                 })
                 .collect(),
+            // S6.1 — fold the cached graph identifiers into every
+            // publish so operators see which graph is driving this
+            // symbol without consulting audit. `None` = legacy
+            // `strategy` slot only, graph not active.
+            active_graph: self.strategy_graph_name.as_ref().map(|name| {
+                mm_dashboard::state::ActiveGraphSnapshot {
+                    name: name.clone(),
+                    hash: self
+                        .strategy_graph_hash
+                        .clone()
+                        .unwrap_or_default(),
+                    scope: self
+                        .strategy_graph_scope
+                        .as_ref()
+                        .map(|s| format!("{s:?}").to_lowercase())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    deployed_at_ms: self
+                        .strategy_graph_deployed_at_ms
+                        .unwrap_or(0),
+                    node_count: self.strategy_graph_node_count.unwrap_or(0),
+                }
+            }),
         });
 
         // Push PnL time-series sample for charting.

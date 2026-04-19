@@ -101,7 +101,7 @@ persistence/         State management:
   ├── fill_replay    Audit log fill replay for crash recovery
   ├── funding        Funding rate arbitrage engine
   ├── loan           LoanAgreement lifecycle + JSONL persistence
-  └── transfer_log   Cross-venue transfer JSONL persistence
+  └── transfer_log   Operator-approved rebalance transfer JSONL (S6.4)
 ```
 
 ## Documentation
@@ -164,6 +164,7 @@ Secrets via environment (NEVER in config files):
 - A/B testing: `AbSplitEngine` with time-based/symbol-based split, per-variant performance tracking
 - Demo data: synthetic market event generator with configurable volatility + mean-reversion
 - Paper fill simulation: `PaperFillCfg` config for `ProbabilisticFiller` (queue pos, slippage, latency)
+- Two strategy execution paths coexist. **Synchronous quote-producers** (Avellaneda, GLFT, Grid, Basis, CrossExchange) run every engine tick and are graph-compatible — deploy via `Strategy.*` nodes or the matching bundled template. **Async drivers** (`funding_arb`, `stat_arb`) run on their own tokio tasks, fire atomic two-leg dispatches via `FundingArbExecutor` / `StatArbDriver`, and are NOT graph nodes — activating them is `strategy = "funding_arb"` + `[funding_arb]` section in config. Observability: Admin → Funding-arb pairs (S5.2) and Overview's `graph:` pill (S6.1).
 
 ## Protocol architecture rule
 

@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "name": "cross-exchange-basic",
+  "scope": { "kind": "symbol", "value": "BTCUSDT" },
+  "stale_hold_ms": 30000,
+  "nodes": [
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "kind": "Strategy.CrossExchange",
+      "config": null,
+      "pos": [40, 80]
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000002",
+      "kind": "Out.Quotes",
+      "config": null,
+      "pos": [320, 80]
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000003",
+      "kind": "Math.Const",
+      "config": { "value": "1" },
+      "pos": [40, 220]
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000004",
+      "kind": "Out.SpreadMult",
+      "config": null,
+      "pos": [320, 220]
+    }
+  ],
+  "edges": [
+    {
+      "from": { "node": "00000000-0000-4000-8000-000000000001", "port": "quotes" },
+      "to":   { "node": "00000000-0000-4000-8000-000000000002", "port": "quotes" }
+    },
+    {
+      "from": { "node": "00000000-0000-4000-8000-000000000003", "port": "value" },
+      "to":   { "node": "00000000-0000-4000-8000-000000000004", "port": "mult" }
+    }
+  ]
+}

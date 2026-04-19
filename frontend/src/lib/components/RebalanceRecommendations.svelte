@@ -38,6 +38,40 @@
     const t = setInterval(refresh, REFRESH_MS)
     return () => clearInterval(t)
   })
+
+  // S6.4 — Execute flow: modal confirm → POST /api/v1/rebalance/execute.
+  let pending = $state(null)     // the rec currently awaiting confirm
+  let submitting = $state(false)
+  let execResult = $state(null)  // { status, venue_tx_id?, error? }
+
+  function openExecute(rec) {
+    pending = rec
+    execResult = null
+  }
+  function cancelExecute() {
+    if (submitting) return
+    pending = null
+  }
+  async function confirmExecute() {
+    if (!pending || submitting) return
+    submitting = true
+    try {
+      const body = {
+        from_venue: pending.from_venue,
+        to_venue: pending.to_venue,
+        asset: pending.asset,
+        qty: pending.qty.toString(),
+        reason: pending.reason,
+      }
+      const data = await api.postJson('/api/v1/rebalance/execute', body)
+      execResult = data
+    } catch (e) {
+      execResult = { status: 'error', error: e?.message || String(e) }
+    } finally {
+      submitting = false
+      await refresh()
+    }
+  }
 </script>
 
 <div class="rebal">
@@ -64,10 +98,53 @@
             <span class="asset mono">{r.asset}</span>
             <span class="qty mono">{r.qty}</span>
             <span class="route mono">{r.from_venue}<span class="arrow"> → </span>{r.to_venue}</span>
+            <button class="exec" onclick={() => openExecute(r)}>Execute</button>
           </div>
           <div class="reason">{r.reason}</div>
         </div>
       {/each}
+    </div>
+  {/if}
+
+  {#if pending}
+    <div class="modal-backdrop" onclick={cancelExecute}>
+      <div class="modal" onclick={(e) => e.stopPropagation()}>
+        <h3>Confirm transfer</h3>
+        <div class="kv">
+          <span class="k">Asset</span><span class="v mono">{pending.asset}</span>
+          <span class="k">Qty</span><span class="v mono">{pending.qty}</span>
+          <span class="k">From</span><span class="v mono">{pending.from_venue}</span>
+          <span class="k">To</span><span class="v mono">{pending.to_venue}</span>
+          <span class="k">Reason</span><span class="v">{pending.reason}</span>
+        </div>
+        {#if pending.from_venue !== pending.to_venue}
+          <div class="warning">
+            Cross-venue transfer — the decision will be logged but NOT dispatched. Complete the move manually on the venue UI.
+          </div>
+        {/if}
+        {#if execResult}
+          <div class="result" class:ok={execResult.status === 'executed' || execResult.status === 'accepted'}
+               class:err={execResult.status === 'failed' || execResult.status === 'rejected_kill_switch' || execResult.status === 'error'}>
+            <div class="status mono">status: {execResult.status}</div>
+            {#if execResult.venue_tx_id}
+              <div class="tx mono">venue tx: {execResult.venue_tx_id}</div>
+            {/if}
+            {#if execResult.error}
+              <div class="err-text">{execResult.error}</div>
+            {/if}
+          </div>
+        {/if}
+        <div class="actions">
+          <button class="cancel" onclick={cancelExecute} disabled={submitting}>
+            {execResult ? 'Close' : 'Cancel'}
+          </button>
+          {#if !execResult}
+            <button class="confirm" onclick={confirmExecute} disabled={submitting}>
+              {submitting ? 'Submitting…' : 'Confirm'}
+            </button>
+          {/if}
+        </div>
+      </div>
     </div>
   {/if}
 </div>
@@ -105,11 +182,83 @@
   }
   .head {
     display: grid;
-    grid-template-columns: 80px 1fr 2fr;
+    grid-template-columns: 70px 1fr 1.5fr 70px;
     gap: var(--s-2);
-    align-items: baseline;
+    align-items: center;
     font-size: var(--fs-xs);
   }
+  .exec {
+    justify-self: end;
+    padding: 3px 10px;
+    font-size: 10px;
+    background: var(--accent-dim);
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: var(--r-md);
+    cursor: pointer;
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-label);
+    transition: background var(--dur-fast) var(--ease-out);
+  }
+  .exec:hover { background: var(--accent); color: var(--bg-primary); }
+
+  .modal-backdrop {
+    position: fixed; inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 1000;
+  }
+  .modal {
+    background: var(--bg-chip);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--r-md);
+    padding: var(--s-4);
+    max-width: 440px;
+    width: 90%;
+    display: flex; flex-direction: column; gap: var(--s-3);
+  }
+  .modal h3 { margin: 0; color: var(--fg-primary); font-size: var(--fs-md); }
+  .kv {
+    display: grid;
+    grid-template-columns: 70px 1fr;
+    gap: var(--s-2);
+    font-size: var(--fs-xs);
+  }
+  .k { color: var(--fg-muted); }
+  .v { color: var(--fg-primary); }
+  .warning {
+    padding: var(--s-2);
+    background: var(--warn-dim, rgba(255,180,0,0.1));
+    color: var(--warn);
+    font-size: var(--fs-xs);
+    border-radius: var(--r-md);
+  }
+  .result {
+    padding: var(--s-2);
+    border-radius: var(--r-md);
+    font-size: var(--fs-xs);
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .result.ok { background: var(--accent-dim); color: var(--accent); }
+  .result.err { background: var(--danger-dim, rgba(255,80,80,0.1)); color: var(--danger); }
+  .status { font-weight: 700; text-transform: uppercase; letter-spacing: var(--tracking-label); }
+  .tx, .err-text { font-size: 10px; }
+  .actions {
+    display: flex; justify-content: flex-end; gap: var(--s-2);
+  }
+  .actions button {
+    padding: 6px 14px;
+    font-size: var(--fs-xs);
+    border-radius: var(--r-md);
+    cursor: pointer;
+    border: 1px solid var(--border-subtle);
+  }
+  .actions .cancel { background: transparent; color: var(--fg-secondary); }
+  .actions .confirm {
+    background: var(--accent); color: var(--bg-primary);
+    border-color: var(--accent);
+  }
+  .actions button:disabled { opacity: 0.5; cursor: not-allowed; }
   .asset { color: var(--fg-primary); font-weight: 600; text-transform: uppercase; }
   .qty { color: var(--fg-secondary); text-align: right; font-variant-numeric: tabular-nums; }
   .route { color: var(--fg-primary); text-transform: uppercase; text-align: right; }

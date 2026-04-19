@@ -1,6 +1,6 @@
 # MM — Open Work Tracker
 
-Last updated: 2026-04-19 (post-Sprint 5)
+Last updated: 2026-04-19 (post-Sprint 6)
 
 Tracking debt not yet closed. Closed items live in git history.
 Each row is a concrete deliverable; bigger initiatives are
@@ -387,6 +387,55 @@ client sees the system.
   `CalibrationSnapshot` so the dashboard stays independent of
   `mm-strategy`. Three unit tests pin the throttling, trait
   round-trip, and dashboard replace-on-publish semantics.
+
+## Sprint 6 — graph E2E closeout + rebalancer execute (landed Apr 19)
+
+- [x] **S6.1** Active-graph visibility. `SymbolState.active_graph:
+  Option<ActiveGraphSnapshot>` carries `{name, hash, scope,
+  deployed_at_ms, node_count}`. Engine stamps `deployed_at_ms`
+  + `node_count` on both `with_strategy_graph` and
+  `swap_strategy_graph`, then folds them into every tick's
+  `update(SymbolState{...})`. New endpoint
+  `/api/v1/active-graphs` returns a flat per-symbol list for
+  scripting. Overview page shows a `graph: <name>` pill next to
+  the strategy name with tooltip for hash + deploy time.
+- [x] **S6.2** Bundled starter templates. Two new JSONs —
+  `glft-via-graph` (Strategy.GLFT + Out.Quotes, mirror of
+  legacy `strategy=glft`) and `cross-exchange-basic`
+  (Strategy.CrossExchange + Out.Quotes, mirror of
+  `strategy=cross_exchange`). Registered in `templates::BUILTIN`
+  so the Strategy page template picker lists them; both round-
+  trip through `Evaluator::build` via the existing
+  `every_safe_template_compiles` guard test.
+- [x] **S6.3** Orphaned-strategy docs.
+  `docs/guides/writing-strategies.md` gained a "Two Classes of
+  Strategies" section explaining that `funding_arb` + `stat_arb`
+  are async drivers (not graph nodes), how to activate them via
+  `[funding_arb]` / `[stat_arb]` config, and how to observe via
+  the S5.2 panel + `/api/v1/funding-arb/pairs`. CLAUDE.md's
+  Key Design block gained the same distinction.
+- [x] **S6.4** Rebalancer execute path. New
+  `mm-persistence::transfer_log` JSONL module with
+  `TransferRecord` + `TransferLogWriter` + `read_all` (2 round-
+  trip tests). `DashboardState::register_venue_connector` /
+  `venue_connector` / `set_transfer_log` / `max_kill_level`
+  wired in. New endpoint `POST /api/v1/rebalance/execute` (body
+  `{from_venue, to_venue, asset, qty, from_wallet?, to_wallet?,
+  reason?}`):
+  1. refuses with 403 + `rejected_kill_switch` when any engine
+     reports `kill_level > 0`;
+  2. intra-venue → calls `connector.internal_transfer`, returns
+     200 on success / 502 on venue failure;
+  3. cross-venue → 202 Accepted + `status=accepted` (logged but
+     NOT dispatched — V1 keeps on-chain withdrawals manual
+     because deposit-address whitelisting is not yet wired).
+  Every outcome writes a `TransferRecord` row. Companion
+  endpoint `GET /api/v1/rebalance/log` returns the full history
+  for the panel. Frontend: Execute button on every
+  recommendation row + confirmation modal with result display.
+  Server boot opens `data/transfers.jsonl`, registers every
+  bundle connector by `VenueId::Display` lowercase. Operator
+  identity taken from the JWT `TokenClaims::user_id` for audit.
 
 ## Graph system audit — Apr 19 follow-ups
 

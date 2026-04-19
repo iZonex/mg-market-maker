@@ -227,3 +227,67 @@ mod tests {
 ```
 
 Run: `cargo test -p mm-strategy -- my_strategy`
+
+---
+
+## Two Classes of Strategies
+
+Not every strategy fits the `compute_quotes(&ctx) -> Vec<QuotePair>` shape. The
+engine carries **two** distinct strategy execution paths:
+
+### A. Synchronous quote-producers (graph-compatible)
+
+These implement the `Strategy` trait directly and are called every tick to
+produce quotes. They correspond to `Strategy.*` nodes in the strategy graph
+and can be selected per-symbol via a bundled template:
+
+| Legacy name       | Graph node              | Bundled template             |
+| ----------------- | ----------------------- | ---------------------------- |
+| `avellaneda`      | `Strategy.Avellaneda`   | `avellaneda-via-graph`       |
+| `glft`            | `Strategy.GLFT`         | `glft-via-graph`             |
+| `grid`            | `Strategy.Grid`         | `grid-via-graph`             |
+| `basis`           | `Strategy.Basis`        | `basis-carry-spot-perp`      |
+| `cross_exchange`  | `Strategy.CrossExchange`| `cross-exchange-basic`       |
+
+Deploy any of the bundled templates from the UI (Strategy page → "Load
+template") and the engine's tick loop picks up `Out.Quotes` on the next
+refresh. No restart needed.
+
+### B. Async drivers (NOT graph-nodes)
+
+`funding_arb` and `stat_arb` are **periodic drivers** — not
+`compute_quotes` producers. They wake on their own cadence (60 s / 5 s),
+sample funding rates or cointegration residuals, and fire atomic
+two-leg dispatches through `FundingArbExecutor` /
+`StatArbDriver::try_dispatch_legs_for_entry`. The engine's main tick does
+not call them; they run in their own `tokio::spawn`-ed task and emit
+`DriverEvent` / `StatArbEvent` into the kill switch + audit paths.
+
+**There is no `Strategy.FundingArb` or `Strategy.StatArb` graph node**
+— and there shouldn't be. The graph evaluator runs synchronously on the
+engine tick and has no contract for "place two orders atomically across
+two venues". Forcing driver semantics through the graph would lose
+atomicity guarantees on pair-break compensation.
+
+**How to activate a driver:**
+- Put `strategy = "funding_arb"` or `"stat_arb"` in `[market_maker]`.
+- Add the matching `[funding_arb]` / `[stat_arb]` section with
+  `enabled = true`.
+- Boot the server. The driver runs on its own tokio task; the graph
+  slot is independent and may still carry a quote-producer like
+  `basis-carry-spot-perp` for the spot leg.
+
+**How to observe a driver:**
+- Dashboard → Admin → **Funding-arb pairs** panel (S5.2) shows per-pair
+  event counts + last-event reason.
+- `GET /api/v1/funding-arb/pairs` returns the same data for scripting.
+- Audit log `data/audit.jsonl` captures every `PairDispatchEntered` /
+  `PairBreak` row with `compensated=true|false`.
+
+### How to tell which path is live on a symbol
+
+The Overview page shows the currently-active strategy name inline with
+a `graph:` pill when a graph is deployed on that symbol. If the pill is
+absent, the symbol is on the legacy `strategy` slot (async driver or
+hand-wired quote producer). The `GET /api/v1/active-graphs` endpoint
+returns the machine-readable mapping `symbol → graph name + hash + deployed_at`.

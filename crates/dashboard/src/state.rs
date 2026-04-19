@@ -114,8 +114,13 @@ pub struct ClientState {
     pub config_overrides: HashMap<String, tokio::sync::mpsc::UnboundedSender<ConfigOverride>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct StateInner {
+    // S6.4 — intentionally no derived `Debug`. The inner
+    // `dyn ExchangeConnector` and kill-switch closure types do
+    // not implement `Debug` and we don't want a format placeholder
+    // that can accidentally print credentials off the connector.
+    // See the manual `impl Debug` below for what is safe to print.
     /// Per-client state partitions. In legacy mode (no clients
     /// configured), a single `"default"` client owns everything.
     clients: HashMap<String, ClientState>,
@@ -302,6 +307,20 @@ struct StateInner {
     /// answers "what's the driver doing right now, has it tripped
     /// yet" without tailing logs.
     funding_arb_pairs: HashMap<String, FundingArbPairState>,
+    /// S6.4 — per-venue connector handles for the rebalancer
+    /// execute endpoint. Populated at boot by the server from
+    /// its `ConnectorBundle`; the endpoint looks the sender
+    /// venue up here and dispatches `internal_transfer` /
+    /// `withdraw` directly. `None` entries mean the dashboard
+    /// is headless (tests, paper) — execute POSTs refuse.
+    venue_connectors: HashMap<
+        String,
+        std::sync::Arc<dyn mm_exchange_core::connector::ExchangeConnector>,
+    >,
+    /// S6.4 — append-only transfer log. `None` until server
+    /// boot; endpoint returns 503 when unset so tests never
+    /// accidentally write to a shared path.
+    transfer_log: Option<std::sync::Arc<mm_persistence::transfer_log::TransferLogWriter>>,
     /// S5.4 — per-symbol calibration snapshot (currently only
     /// `GlftStrategy` publishes into this map). The engine calls
     /// the active strategy's `recalibrate_if_due` on a
@@ -310,6 +329,24 @@ struct StateInner {
     /// missing entry means the active strategy is stateless
     /// (grid, basis, Avellaneda).
     calibration_snapshots: HashMap<String, CalibrationSnapshot>,
+}
+
+impl std::fmt::Debug for StateInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Only print bookkeeping counts. Connectors / kill-switch
+        // closures / webhook channels are elided both for Debug
+        // brevity and because they may transitively reference
+        // credentials (connector config).
+        f.debug_struct("StateInner")
+            .field("clients", &self.clients.len())
+            .field("incidents", &self.incidents.len())
+            .field("venue_connectors_registered", &self.venue_connectors.len())
+            .field(
+                "transfer_log",
+                &self.transfer_log.as_ref().map(|w| w.path().display().to_string()),
+            )
+            .finish()
+    }
 }
 
 /// S5.4 — mirror of `mm_strategy::trait::CalibrationState` so
@@ -707,6 +744,39 @@ pub struct SymbolState {
     /// hitting a dedicated REST endpoint.
     #[serde(default)]
     pub open_orders: Vec<OrderSnapshot>,
+    /// S6.1 — when a strategy graph is currently driving this
+    /// symbol, carries the deployed graph's metadata. `None`
+    /// means the engine is on the legacy `strategy` slot with no
+    /// graph override active. Published on every tick so a swap
+    /// becomes visible within one refresh cycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_graph: Option<ActiveGraphSnapshot>,
+}
+
+/// S6.1 — per-symbol active-graph descriptor. Fields mirror the
+/// canonical `mm_strategy_graph::Graph` identifiers so operators
+/// can cross-reference the /api/admin/strategy/graphs history
+/// record by hash if needed.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ActiveGraphSnapshot {
+    /// Graph name as authored in the deployed JSON
+    /// (`graph.name`). Human-friendly identifier.
+    pub name: String,
+    /// Content-hash of the deployed graph body
+    /// (`graph.content_hash()`). Stable across byte-identical
+    /// re-deploys, flips on any edit.
+    pub hash: String,
+    /// Graph scope (`"symbol"`, `"pair"`, `"global"`) plus the
+    /// scope-value text. Example: `"symbol: BTCUSDT"` or
+    /// `"global"`.
+    pub scope: String,
+    /// Epoch-millis of the last successful `swap_strategy_graph`
+    /// / `with_strategy_graph` call on this engine. Used by the
+    /// frontend to render "deployed 14:22 UTC".
+    pub deployed_at_ms: i64,
+    /// Number of nodes in the deployed graph. Stamped once on
+    /// swap so the UI can show density without re-parsing.
+    pub node_count: usize,
 }
 
 /// Per-symbol adaptive-calibration snapshot published to the
@@ -1668,6 +1738,65 @@ impl DashboardState {
         }
     }
 
+    /// S6.4 — register a connector for `venue` (lowercase).
+    /// Boot calls this once per venue in the bundle so the
+    /// rebalancer execute endpoint can dispatch transfers
+    /// without threading engine handles through request
+    /// state.
+    pub fn register_venue_connector(
+        &self,
+        venue: &str,
+        connector: std::sync::Arc<dyn mm_exchange_core::connector::ExchangeConnector>,
+    ) {
+        self.inner
+            .write()
+            .unwrap()
+            .venue_connectors
+            .insert(venue.to_lowercase(), connector);
+    }
+
+    /// S6.4 — connector handle for `venue`, if registered.
+    pub fn venue_connector(
+        &self,
+        venue: &str,
+    ) -> Option<std::sync::Arc<dyn mm_exchange_core::connector::ExchangeConnector>> {
+        self.inner
+            .read()
+            .unwrap()
+            .venue_connectors
+            .get(&venue.to_lowercase())
+            .cloned()
+    }
+
+    /// S6.4 — attach the transfer log writer. `None` leaves the
+    /// execute endpoint returning 503.
+    pub fn set_transfer_log(
+        &self,
+        log: std::sync::Arc<mm_persistence::transfer_log::TransferLogWriter>,
+    ) {
+        self.inner.write().unwrap().transfer_log = Some(log);
+    }
+
+    pub fn transfer_log(
+        &self,
+    ) -> Option<std::sync::Arc<mm_persistence::transfer_log::TransferLogWriter>> {
+        self.inner.read().unwrap().transfer_log.clone()
+    }
+
+    /// S6.4 — highest kill-switch level published by any
+    /// engine on its per-tick SymbolState. Returns 0 (Normal)
+    /// when no engine has published yet.
+    pub fn max_kill_level(&self) -> u8 {
+        let inner = self.inner.read().unwrap();
+        inner
+            .clients
+            .values()
+            .flat_map(|c| c.symbols.values())
+            .map(|s| s.kill_level)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// S5.4 — engine-side hook: publish a calibration snapshot
     /// for `symbol`. Overwrites any previous row so the panel
     /// always sees the latest `(a, k, samples)`.
@@ -2429,6 +2558,7 @@ mod tests {
             tunable_config: None,
             adaptive_state: None,
             open_orders: vec![],
+            active_graph: None,
         }
     }
 
@@ -2663,6 +2793,57 @@ mod tests {
         };
         ds.update_venue_balances("BTCUSDT", vec![snap]);
         assert!(ds.rebalance_recommendations().is_empty());
+    }
+
+    /// S6.4 — `max_kill_level` takes the highest kill level
+    /// across every published SymbolState. Used by the execute
+    /// endpoint to refuse a transfer when any engine has
+    /// escalated.
+    #[test]
+    fn max_kill_level_is_maxed_across_engines() {
+        let ds = DashboardState::new();
+        assert_eq!(ds.max_kill_level(), 0, "no engines → Normal");
+
+        let mut a = empty_state("BTCUSDT");
+        a.kill_level = 0;
+        ds.update(a);
+        let mut b = empty_state("ETHUSDT");
+        b.kill_level = 3; // L3 flatten on ETH
+        ds.update(b);
+        let mut c = empty_state("SOLUSDT");
+        c.kill_level = 1; // L1 widen on SOL
+        ds.update(c);
+
+        assert_eq!(ds.max_kill_level(), 3);
+    }
+
+    /// S6.1 — engine's `active_graph` payload round-trips
+    /// through `DashboardState::update` and survives a
+    /// subsequent publish with `None` (graph deactivation).
+    #[test]
+    fn active_graph_snapshot_round_trips_and_clears() {
+        let ds = DashboardState::new();
+        let mut s = empty_state("BTCUSDT");
+        s.active_graph = Some(ActiveGraphSnapshot {
+            name: "funding-aware-quoter".into(),
+            hash: "0xabc".into(),
+            scope: "symbol(btcusdt)".into(),
+            deployed_at_ms: 1_700_000_000_000,
+            node_count: 42,
+        });
+        ds.update(s);
+        let got = ds.get_symbol("BTCUSDT").unwrap();
+        let ag = got.active_graph.expect("active_graph should survive");
+        assert_eq!(ag.name, "funding-aware-quoter");
+        assert_eq!(ag.hash, "0xabc");
+        assert_eq!(ag.node_count, 42);
+
+        // Re-publish with `None` (graph swapped off) clears it.
+        let mut s2 = empty_state("BTCUSDT");
+        s2.active_graph = None;
+        ds.update(s2);
+        let got2 = ds.get_symbol("BTCUSDT").unwrap();
+        assert!(got2.active_graph.is_none());
     }
 
     /// S5.4 — calibration snapshots round-trip through the

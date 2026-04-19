@@ -91,9 +91,12 @@ pub async fn start(
         .route("/api/v1/sor/decisions/recent", get(sor_decisions_recent))
         .route("/api/v1/atomic-bundles/inflight", get(atomic_bundles_inflight))
         .route("/api/v1/rebalance/recommendations", get(rebalance_recommendations))
+        .route("/api/v1/rebalance/execute", post(rebalance_execute))
+        .route("/api/v1/rebalance/log", get(rebalance_log))
         .route("/api/v1/funding-arb/pairs", get(funding_arb_pairs))
         .route("/api/v1/adverse-selection", get(adverse_selection_snapshot))
         .route("/api/v1/calibration/status", get(calibration_status))
+        .route("/api/v1/active-graphs", get(active_graphs_snapshot))
         .merge(crate::client_api::client_routes())
         .merge(crate::client_portal::client_portal_routes())
         .route_layer(middleware::from_fn_with_state(
@@ -680,6 +683,211 @@ async fn rebalance_recommendations(
     })
 }
 
+/// S6.4 — rebalance execute request. Operator-approved transfer.
+/// Intra-venue wallet transfers dispatch through the venue's
+/// `internal_transfer` immediately; cross-venue are logged as
+/// `accepted` but not dispatched (V1 deliberately excludes
+/// on-chain withdrawals pending deposit-address whitelisting).
+#[derive(Debug, serde::Deserialize)]
+struct RebalanceExecuteRequest {
+    from_venue: String,
+    to_venue: String,
+    asset: String,
+    qty: rust_decimal::Decimal,
+    #[serde(default)]
+    from_wallet: Option<String>,
+    #[serde(default)]
+    to_wallet: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RebalanceExecuteResponse {
+    transfer_id: String,
+    status: String,
+    venue_tx_id: Option<String>,
+    error: Option<String>,
+}
+
+async fn rebalance_execute(
+    State(state): State<DashboardState>,
+    axum::Extension(claims): axum::Extension<crate::auth::TokenClaims>,
+    axum::Json(req): axum::Json<RebalanceExecuteRequest>,
+) -> (axum::http::StatusCode, Json<RebalanceExecuteResponse>) {
+    use axum::http::StatusCode;
+    use mm_persistence::transfer_log::{TransferRecord, TransferStatus};
+
+    let Some(log) = state.transfer_log() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(RebalanceExecuteResponse {
+                transfer_id: String::new(),
+                status: "unconfigured".into(),
+                venue_tx_id: None,
+                error: Some("transfer log not registered".into()),
+            }),
+        );
+    };
+
+    let now = chrono::Utc::now();
+    let transfer_id = uuid::Uuid::new_v4().to_string();
+
+    // Kill-switch gate — any level above Normal blocks an
+    // operator transfer. Prevents a toxic-flow widen / pause from
+    // being dismissed by an accidental Execute click during the
+    // same incident.
+    let kl = state.max_kill_level();
+    if kl > 0 {
+        let rec = TransferRecord {
+            transfer_id: transfer_id.clone(),
+            ts: now,
+            from_venue: req.from_venue.to_lowercase(),
+            to_venue: req.to_venue.to_lowercase(),
+            asset: req.asset.clone(),
+            qty: req.qty,
+            from_wallet: req.from_wallet.clone(),
+            to_wallet: req.to_wallet.clone(),
+            reason: req.reason.clone(),
+            operator: claims.user_id.clone(),
+            status: TransferStatus::RejectedKillSwitch,
+            venue_tx_id: None,
+            error: Some(format!("kill_level={kl}")),
+        };
+        if let Err(e) = log.append(&rec) {
+            warn!(error = %e, "transfer log append failed; returning error anyway");
+        }
+        return (
+            StatusCode::FORBIDDEN,
+            Json(RebalanceExecuteResponse {
+                transfer_id,
+                status: "rejected_kill_switch".into(),
+                venue_tx_id: None,
+                error: Some(format!("kill_level={kl}")),
+            }),
+        );
+    }
+
+    // Intra-venue: dispatch through the venue connector.
+    if req.from_venue.eq_ignore_ascii_case(&req.to_venue) {
+        let Some(conn) = state.venue_connector(&req.from_venue) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(RebalanceExecuteResponse {
+                    transfer_id,
+                    status: "no_connector".into(),
+                    venue_tx_id: None,
+                    error: Some(format!(
+                        "no connector registered for venue {}",
+                        req.from_venue
+                    )),
+                }),
+            );
+        };
+        let from = req.from_wallet.as_deref().unwrap_or("SPOT");
+        let to = req.to_wallet.as_deref().unwrap_or("SPOT");
+        let outcome = conn
+            .internal_transfer(&req.asset, req.qty, from, to)
+            .await;
+        let (status_enum, tx_id, err_text, http) = match &outcome {
+            Ok(tx) => (
+                TransferStatus::Executed,
+                Some(tx.clone()),
+                None,
+                StatusCode::OK,
+            ),
+            Err(e) => (
+                TransferStatus::Failed,
+                None,
+                Some(e.to_string()),
+                StatusCode::BAD_GATEWAY,
+            ),
+        };
+        let rec = TransferRecord {
+            transfer_id: transfer_id.clone(),
+            ts: now,
+            from_venue: req.from_venue.to_lowercase(),
+            to_venue: req.to_venue.to_lowercase(),
+            asset: req.asset.clone(),
+            qty: req.qty,
+            from_wallet: Some(from.to_string()),
+            to_wallet: Some(to.to_string()),
+            reason: req.reason.clone(),
+            operator: claims.user_id.clone(),
+            status: status_enum,
+            venue_tx_id: tx_id.clone(),
+            error: err_text.clone(),
+        };
+        if let Err(e) = log.append(&rec) {
+            warn!(error = %e, "transfer log append failed after dispatch");
+        }
+        return (
+            http,
+            Json(RebalanceExecuteResponse {
+                transfer_id,
+                status: match status_enum {
+                    TransferStatus::Executed => "executed".into(),
+                    TransferStatus::Failed => "failed".into(),
+                    _ => "unknown".into(),
+                },
+                venue_tx_id: tx_id,
+                error: err_text,
+            }),
+        );
+    }
+
+    // Cross-venue (V1): log intent but don't dispatch. On-chain
+    // withdraws need deposit-address whitelisting that isn't yet
+    // wired — the operator owns the transfer via the venue UI
+    // and the audit row here documents the decision.
+    let rec = TransferRecord {
+        transfer_id: transfer_id.clone(),
+        ts: now,
+        from_venue: req.from_venue.to_lowercase(),
+        to_venue: req.to_venue.to_lowercase(),
+        asset: req.asset.clone(),
+        qty: req.qty,
+        from_wallet: req.from_wallet.clone(),
+        to_wallet: req.to_wallet.clone(),
+        reason: req.reason.clone(),
+        operator: claims.user_id.clone(),
+        status: TransferStatus::Accepted,
+        venue_tx_id: None,
+        error: None,
+    };
+    if let Err(e) = log.append(&rec) {
+        warn!(error = %e, "transfer log append failed");
+    }
+    (
+        StatusCode::ACCEPTED,
+        Json(RebalanceExecuteResponse {
+            transfer_id,
+            status: "accepted".into(),
+            venue_tx_id: None,
+            error: Some(
+                "cross-venue transfers require manual venue-side action; decision logged"
+                    .into(),
+            ),
+        }),
+    )
+}
+
+/// S6.4 — tail of the transfer log for the history panel.
+#[derive(Debug, serde::Serialize)]
+struct RebalanceLogResponse {
+    records: Vec<mm_persistence::transfer_log::TransferRecord>,
+}
+
+async fn rebalance_log(
+    State(state): State<DashboardState>,
+) -> Json<RebalanceLogResponse> {
+    let records = state
+        .transfer_log()
+        .and_then(|log| mm_persistence::transfer_log::read_all(log.path()).ok())
+        .unwrap_or_default();
+    Json(RebalanceLogResponse { records })
+}
+
 /// S5.2 — per-pair funding-arb driver state. Response order is
 /// stable (pair-key ASC) so the UI doesn't re-order rows on
 /// every poll.
@@ -729,6 +937,51 @@ async fn calibration_status(
     Json(CalibrationStatusResponse {
         rows: state.calibration_snapshots(),
     })
+}
+
+/// S6.1 — which graph is driving each symbol. Compact projection
+/// of `SymbolState.active_graph` for a dedicated widget so the
+/// frontend doesn't need to fetch the full symbol snapshot to
+/// show "Graph: X (hash abc…)". Symbols without a deployed graph
+/// are skipped — empty response means the whole system is on
+/// legacy strategies.
+#[derive(Debug, serde::Serialize)]
+struct ActiveGraphRow {
+    symbol: String,
+    strategy: String,
+    name: String,
+    hash: String,
+    scope: String,
+    deployed_at_ms: i64,
+    node_count: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ActiveGraphsResponse {
+    rows: Vec<ActiveGraphRow>,
+}
+
+async fn active_graphs_snapshot(
+    State(state): State<DashboardState>,
+) -> Json<ActiveGraphsResponse> {
+    let mut rows: Vec<ActiveGraphRow> = state
+        .get_all()
+        .into_iter()
+        .filter_map(|s| {
+            let ag = s.active_graph?;
+            Some(ActiveGraphRow {
+                symbol: s.symbol,
+                strategy: s.strategy,
+                name: ag.name,
+                hash: ag.hash,
+                scope: ag.scope,
+                deployed_at_ms: ag.deployed_at_ms,
+                node_count: ag.node_count,
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    Json(ActiveGraphsResponse { rows })
 }
 
 async fn adverse_selection_snapshot(

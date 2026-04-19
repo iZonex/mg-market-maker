@@ -73,7 +73,14 @@
           </div>
           <div class="mq-row">
             <span class="label">Strategy</span>
-            <span class="mq-val">{symData.strategy || '—'}</span>
+            <span class="mq-val">
+              {symData.strategy || '—'}
+              {#if symData.active_graph}
+                <span class="graph-tag" title="Deployed {new Date(symData.active_graph.deployed_at_ms).toLocaleString()} · hash {symData.active_graph.hash?.slice(0, 8)} · {symData.active_graph.node_count} nodes">
+                  graph: {symData.active_graph.name}
+                </span>
+              {/if}
+            </span>
           </div>
           <div class="mq-row">
             <span class="label">Mode</span>
@@ -142,5 +149,18 @@
     font-size: var(--fs-sm);
     font-weight: 500;
     color: var(--fg-primary);
+  }
+  .graph-tag {
+    display: inline-block;
+    margin-left: var(--s-2);
+    padding: 1px 6px;
+    border-radius: var(--r-pill);
+    background: var(--accent-dim);
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-label);
+    cursor: help;
   }
 </style>

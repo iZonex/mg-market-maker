@@ -344,6 +344,27 @@ async fn main() -> Result<()> {
             },
         );
     }
+    // S6.4 — open the transfer log JSONL for Execute endpoint
+    // appends. Parent dir must exist.
+    let transfer_log_path = std::path::PathBuf::from("data/transfers.jsonl");
+    if let Some(parent) = transfer_log_path.parent() {
+        if !parent.exists() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+    match mm_persistence::transfer_log::TransferLogWriter::open(&transfer_log_path) {
+        Ok(w) => {
+            dashboard_state.set_transfer_log(std::sync::Arc::new(w));
+            info!(
+                path = %transfer_log_path.display(),
+                "transfer log ready"
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, path = %transfer_log_path.display(),
+                "transfer log open failed; /api/v1/rebalance/execute disabled");
+        }
+    }
     // UX-5 — publish the effective AppConfig so operators can
     // inspect which features are configured vs on defaults from
     // the dashboard. Secrets live in env, not in `AppConfig`.
@@ -998,6 +1019,25 @@ async fn run_symbol(
             "attaching SOR extra venues to bundle"
         );
         bundle = bundle.with_extra(sor_extras.into_iter().map(|(_, c)| c).collect());
+    }
+
+    // S6.4 — register every bundle connector against the
+    // dashboard so `/api/v1/rebalance/execute` can dispatch
+    // transfers. Primary + hedge + every SOR extra goes in.
+    // Re-registration is idempotent (keyed by venue lowercase),
+    // which means the loop over symbols at the end simply
+    // overwrites with the same Arc.
+    dashboard_state.register_venue_connector(
+        &bundle.primary.venue_id().to_string(),
+        bundle.primary.clone(),
+    );
+    if let Some(h) = bundle.hedge.as_ref() {
+        dashboard_state
+            .register_venue_connector(&h.venue_id().to_string(), h.clone());
+    }
+    for extra in &bundle.extra {
+        dashboard_state
+            .register_venue_connector(&extra.venue_id().to_string(), extra.clone());
     }
 
     // If the operator selected FundingArb, build the driver

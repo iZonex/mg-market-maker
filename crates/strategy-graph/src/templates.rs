@@ -36,6 +36,8 @@ static PENTEST_SPOOF_CLASSIC: &str = include_str!("../templates/pentest/spoof-cl
 static FUNDING_AWARE_QUOTER: &str = include_str!("../templates/funding-aware-quoter.json");
 static LIQUIDITY_BURN_GUARD: &str = include_str!("../templates/liquidity-burn-guard.json");
 static COST_GATED_QUOTER: &str = include_str!("../templates/cost-gated-quoter.json");
+static GLFT_VIA_GRAPH: &str = include_str!("../templates/glft-via-graph.json");
+static CROSS_EXCHANGE_BASIC: &str = include_str!("../templates/cross-exchange-basic.json");
 
 const BUILTIN: &[BuiltinTemplate] = &[
     BuiltinTemplate {
@@ -89,6 +91,20 @@ const BUILTIN: &[BuiltinTemplate] = &[
         name: "cost-gated-quoter",
         description: "Pauses quoting when Cost.CumulativeToday passes 100 quote units. Useful for intraday cost-budget limits on low-edge pairs.",
         body: COST_GATED_QUOTER,
+    },
+    // S6.2 — starter templates mirroring the legacy single-strategy
+    // slot, so operators coming from `strategy=glft` or
+    // `strategy=cross_exchange` config can pick an equivalent
+    // graph without hand-authoring nodes.
+    BuiltinTemplate {
+        name: "glft-via-graph",
+        description: "GLFT single-strategy starter (mirror of legacy strategy=glft). Clone + tweak γ, κ on Strategy.GLFT node config.",
+        body: GLFT_VIA_GRAPH,
+    },
+    BuiltinTemplate {
+        name: "cross-exchange-basic",
+        description: "CrossExchange make-A / hedge-B single-strategy starter (mirror of legacy strategy=cross_exchange).",
+        body: CROSS_EXCHANGE_BASIC,
     },
 ];
 
