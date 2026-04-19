@@ -489,7 +489,18 @@ pub struct FundingArbPairState {
 
 const MAX_SOR_DECISIONS: usize = 256;
 const MAX_DAILY_REPORTS: usize = 90;
-const MAX_PNL_TIMESERIES: usize = 1440;
+/// 23-UX-1 — ring buffer size for PnL / spread / inventory
+/// time-series. Paired with the 1-second min gap gate in
+/// `push_pnl_sample` etc. so 14400 points = 4 hours of history
+/// at 1-second resolution. Operators opening the dashboard
+/// after a 4-hour session see the full chart from engine boot
+/// instead of the previous "warm up from 0 on panel mount" UX.
+/// Memory: ~230 KB per metric per symbol.
+const MAX_PNL_TIMESERIES: usize = 14400;
+/// Minimum milliseconds between successive time-series samples.
+/// Engine publishes ~every tick (500 ms); we downsample to 1 s
+/// so the ring covers 4 hours instead of 2 hours.
+const MIN_TIMESERIES_GAP_MS: i64 = 1000;
 const MAX_SENTIMENT_HISTORY: usize = 1440;
 
 /// Optimization run state (Epic 6).
@@ -2147,9 +2158,17 @@ impl DashboardState {
     // ── PnL time-series ──────────────────────────────────────
 
     /// Push a PnL sample for a symbol's time-series.
+    /// 23-UX-1 — enforces `MIN_TIMESERIES_GAP_MS` between
+    /// successive samples so the ring holds ~4 hours of history
+    /// regardless of engine tick rate.
     pub fn push_pnl_sample(&self, symbol: &str, timestamp_ms: i64, total_pnl: Decimal) {
         let mut inner = self.inner.write().unwrap();
         let ts = inner.pnl_timeseries.entry(symbol.to_string()).or_default();
+        if let Some((last_ts, _)) = ts.back() {
+            if timestamp_ms - *last_ts < MIN_TIMESERIES_GAP_MS {
+                return;
+            }
+        }
         ts.push_back((timestamp_ms, total_pnl));
         while ts.len() > MAX_PNL_TIMESERIES {
             ts.pop_front();
@@ -2173,29 +2192,39 @@ impl DashboardState {
             .unwrap_or_default()
     }
 
-    /// UX-2 — push one (timestamp, value) sample into the
-    /// spread-bps rolling history. Same 1440-cap FIFO as
-    /// `push_pnl_sample`. Engine calls once per tick.
+    /// UX-2 / 23-UX-1 — push one (timestamp, value) sample into
+    /// the spread-bps rolling history. Same `MIN_TIMESERIES_GAP_MS`
+    /// downsample gate + 14400-cap FIFO as `push_pnl_sample`.
     pub fn push_spread_sample(&self, symbol: &str, timestamp_ms: i64, spread_bps: Decimal) {
         let mut inner = self.inner.write().unwrap();
         let ts = inner
             .spread_timeseries
             .entry(symbol.to_string())
             .or_default();
+        if let Some((last_ts, _)) = ts.back() {
+            if timestamp_ms - *last_ts < MIN_TIMESERIES_GAP_MS {
+                return;
+            }
+        }
         ts.push_back((timestamp_ms, spread_bps));
         while ts.len() > MAX_PNL_TIMESERIES {
             ts.pop_front();
         }
     }
 
-    /// UX-2 — push one inventory sample into the rolling
-    /// history.
+    /// UX-2 / 23-UX-1 — push one inventory sample into the
+    /// rolling history.
     pub fn push_inventory_sample(&self, symbol: &str, timestamp_ms: i64, inventory: Decimal) {
         let mut inner = self.inner.write().unwrap();
         let ts = inner
             .inventory_timeseries
             .entry(symbol.to_string())
             .or_default();
+        if let Some((last_ts, _)) = ts.back() {
+            if timestamp_ms - *last_ts < MIN_TIMESERIES_GAP_MS {
+                return;
+            }
+        }
         ts.push_back((timestamp_ms, inventory));
         while ts.len() > MAX_PNL_TIMESERIES {
             ts.pop_front();
@@ -3302,5 +3331,49 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert!(all.iter().any(|p| p.symbol == "BTCUSDT" && !p.aborted));
         assert!(all.iter().any(|p| p.symbol == "ETHUSDT" && p.aborted));
+    }
+
+    /// 23-UX-1 — time-series pushes within MIN_TIMESERIES_GAP_MS
+    /// of the previous sample are dropped so the ring buffer
+    /// covers a real ~4-hour window at 1-second resolution
+    /// instead of 2 hours at 500ms tick rate.
+    #[test]
+    fn pnl_timeseries_downsamples_sub_second_pushes() {
+        let ds = DashboardState::new();
+        ds.push_pnl_sample("BTCUSDT", 1_000, dec!(0));
+        // Within the 1s gap — dropped.
+        ds.push_pnl_sample("BTCUSDT", 1_400, dec!(1));
+        ds.push_pnl_sample("BTCUSDT", 1_900, dec!(2));
+        // First sample past the gap — accepted.
+        ds.push_pnl_sample("BTCUSDT", 2_100, dec!(3));
+        let ts = ds.get_pnl_timeseries("BTCUSDT");
+        assert_eq!(ts.len(), 2);
+        assert_eq!(ts[0].total_pnl, dec!(0));
+        assert_eq!(ts[1].total_pnl, dec!(3));
+    }
+
+    #[test]
+    fn spread_timeseries_respects_gap_and_cap() {
+        let ds = DashboardState::new();
+        // Push 20000 samples spaced by 1s — should cap at 14400.
+        for i in 0..20_000i64 {
+            ds.push_spread_sample("BTCUSDT", i * 1_000, dec!(1));
+        }
+        let ts = ds.get_spread_timeseries("BTCUSDT");
+        assert_eq!(ts.len(), 14_400);
+    }
+
+    #[test]
+    fn inventory_timeseries_rejects_out_of_order_early_pushes() {
+        // Regression guard: an out-of-order timestamp older
+        // than the last should not accidentally re-open the
+        // gate. Our gate uses signed delta so an older push
+        // has `delta < 0 < MIN_GAP` → rejected.
+        let ds = DashboardState::new();
+        ds.push_inventory_sample("BTCUSDT", 2_000, dec!(0.5));
+        ds.push_inventory_sample("BTCUSDT", 1_500, dec!(0.3)); // older — rejected
+        let ts = ds.get_inventory_timeseries("BTCUSDT");
+        assert_eq!(ts.len(), 1);
+        assert_eq!(ts[0].value, dec!(0.5));
     }
 }
