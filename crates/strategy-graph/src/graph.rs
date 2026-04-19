@@ -118,7 +118,7 @@ pub enum ValidationError {
     UnknownKind(String),
     #[error(
         "node \"{0}\" is restricted (pentest-only) — deploy blocked \
-         unless MM_RESTRICTED_ALLOW=1 is set on the server"
+         unless MM_ALLOW_RESTRICTED=yes-pentest-mode is set on the server"
     )]
     RestrictedNotAllowed(String),
     #[error(
@@ -238,7 +238,7 @@ impl Graph {
             }
             if shape.restricted {
                 // R4.7 — loud, repeated warning every time a
-                // restricted node compiles. The `MM_RESTRICTED_ALLOW`
+                // restricted node compiles. The `MM_ALLOW_RESTRICTED`
                 // gate is intentional — running a restricted node
                 // without explicit operator authorization (written
                 // approval from the venue owner) is a ToS

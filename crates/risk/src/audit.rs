@@ -303,7 +303,7 @@ pub enum AuditEventType {
     StrategyGraphRolledBack,
     /// A deploy attempt was refused because the graph contained a
     /// restricted (pentest-only) node kind and the runtime was not
-    /// started with `MM_RESTRICTED_ALLOW=true`. `detail` carries the
+    /// started with `MM_ALLOW_RESTRICTED=yes-pentest-mode`. `detail` carries the
     /// offending kind(s) so the regulator can confirm the gate
     /// actually fired rather than being silently suppressed.
     StrategyGraphDeployRejected,

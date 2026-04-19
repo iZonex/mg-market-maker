@@ -1196,7 +1196,7 @@ impl NodeKind for PumpAndDump {
 //
 // Every `Strategy.*` node in this block sets `restricted() =
 // true` so `Evaluator::build` refuses to compile unless
-// `MM_RESTRICTED_ALLOW=1` is set at process start. The
+// `MM_ALLOW_RESTRICTED=yes-pentest-mode` is set at process start. The
 // operator is expected to have read `docs/guides/pentest.md`
 // and confirmed written authorization before flipping that
 // switch.
@@ -1452,23 +1452,26 @@ impl NodeKind for CampaignOrchestrator {
 /// full attack-defense loop with this node + RugScore +
 /// CascadeCompleted in one template.
 ///
-/// Pentest only, restricted behind `MM_RESTRICTED_ALLOW=1`.
+/// Pentest only, restricted behind `MM_ALLOW_RESTRICTED=yes-pentest-mode`.
 #[derive(Debug, Default)]
 pub struct CascadeHunter;
-
-static CASCADE_HUNTER_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
-    vec![
-        Port::new("target_bps", PortType::Number),
-        Port::new("trigger", PortType::Bool),
-    ]
-});
 
 impl NodeKind for CascadeHunter {
     fn kind(&self) -> &'static str {
         "Strategy.CascadeHunter"
     }
+    // ⚠ Sprint 14 R8.2 fix — CascadeHunter is a PURE SOURCE
+    // node (zero inputs) so the engine's strategy-pool
+    // overlay can populate `(node_id, "quotes")` in
+    // `source_inputs` and have the evaluator inject the
+    // pool-computed quotes as this node's output. Nodes
+    // with declared input ports route `quotes` through
+    // `evaluate()`, which for this composite returns
+    // `Value::Missing` — breaking downstream `Out.Quotes`.
+    // Triggering semantics live downstream via `Logic.Mux`
+    // (operator composes the gate around the hunter quotes).
     fn input_ports(&self) -> &[Port] {
-        &CASCADE_HUNTER_INPUTS
+        &[]
     }
     fn output_ports(&self) -> &[Port] {
         &QUOTES_OUT

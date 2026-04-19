@@ -20,7 +20,7 @@
 //!
 //! **Never ship into a real operator's TOML.** The composite
 //! `Strategy.Spoof` graph node is marked `restricted: true`, which
-//! the deploy handler refuses without `MM_RESTRICTED_ALLOW=1`.
+//! the deploy handler refuses without `MM_ALLOW_RESTRICTED=yes-pentest-mode`.
 
 use mm_common::types::{Quote, QuotePair, Side};
 use rust_decimal::Decimal;

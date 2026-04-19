@@ -29,7 +29,7 @@
 //! you are not explicitly authorized to pentest is illegal
 //! under MiFID II, Dodd-Frank / SEA §9(a), MiCA, and a ToS
 //! violation everywhere. The `restricted()=true` flag on the
-//! graph node + the `MM_RESTRICTED_ALLOW=1` env gate stops the
+//! graph node + the `MM_ALLOW_RESTRICTED=yes-pentest-mode` env gate stops the
 //! graph from compiling without operator opt-in. See
 //! `docs/guides/pentest.md` for the three operator conditions.
 

@@ -5,7 +5,7 @@
 //! RAVE / SIREN / MYX pattern on a test venue so the defensive
 //! [`mm_risk::manipulation`] detectors can be validated against
 //! the offensive side under controlled conditions. Never ship
-//! with `MM_RESTRICTED_ALLOW` enabled on a real production
+//! with `MM_ALLOW_RESTRICTED` enabled on a real production
 //! deployment — the same gate that blocks the bundled
 //! `pentest-spoof-classic` template gates this strategy.
 //!

@@ -77,12 +77,12 @@ const BUILTIN: &[BuiltinTemplate] = &[
     },
     BuiltinTemplate {
         name: "pentest-spoof-classic",
-        description: "⚠ PENTEST ONLY — Strategy.Spoof + co-located SpoofingScore guard that trips kill L4 when the detector catches us. Requires MM_RESTRICTED_ALLOW=1.",
+        description: "⚠ PENTEST ONLY — Strategy.Spoof + co-located SpoofingScore guard that trips kill L4 when the detector catches us. Requires MM_ALLOW_RESTRICTED=yes-pentest-mode.",
         body: PENTEST_SPOOF_CLASSIC,
     },
     BuiltinTemplate {
         name: "pentest-pump-and-dump",
-        description: "⚠ PENTEST ONLY — Strategy.PumpAndDump FSM (accumulate → pump → distribute → dump) paired with Surveillance.ManipulationScore as the self-kill guard. Reproduces the RAVE cycle on a test venue so the detectors fire against the exploit. Requires MM_RESTRICTED_ALLOW=1.",
+        description: "⚠ PENTEST ONLY — Strategy.PumpAndDump FSM (accumulate → pump → distribute → dump) paired with Surveillance.ManipulationScore as the self-kill guard. Reproduces the RAVE cycle on a test venue so the detectors fire against the exploit. Requires MM_ALLOW_RESTRICTED=yes-pentest-mode.",
         body: PENTEST_PUMP_AND_DUMP,
     },
     // RS-5 — risk-aware starter graphs using the new Phase II
@@ -128,23 +128,23 @@ const BUILTIN: &[BuiltinTemplate] = &[
         body: RUG_DETECTOR_COMPOSITE,
     },
     // R2.15 — exploit + guard pentest template. Runs the
-    // PumpAndDump FSM under `MM_RESTRICTED_ALLOW=1` AND checks
+    // PumpAndDump FSM under `MM_ALLOW_RESTRICTED=yes-pentest-mode` AND checks
     // if the defensive RugScore catches its own attack —
     // mirror image of what the user's "other agent" will do to
     // stress-test their own exchange's surveillance stack.
     BuiltinTemplate {
         name: "pentest-rave-cycle",
-        description: "⚠ PENTEST ONLY — Strategy.PumpAndDump runs the RAVE 4-phase cycle; Surveillance.RugScore watches the tape and trips kill L4 if combined ≥ 0.5. Requires MM_RESTRICTED_ALLOW=1.",
+        description: "⚠ PENTEST ONLY — Strategy.PumpAndDump runs the RAVE 4-phase cycle; Surveillance.RugScore watches the tape and trips kill L4 if combined ≥ 0.5. Requires MM_ALLOW_RESTRICTED=yes-pentest-mode.",
         body: PENTEST_RAVE_CYCLE,
     },
     BuiltinTemplate {
         name: "pentest-rave-full-campaign",
-        description: "⚠⚠⚠ PENTEST ONLY — FULL MULTI-PHASE RAVE CAMPAIGN. CampaignOrchestrator chains accumulate → leverage_long → liquidation_hunt → distribute → dump across the configured timeline. Surveillance.RugScore self-guard trips kill L4 on ≥ 0.5. Running this against any venue you don't own / aren't explicitly authorized to pentest is illegal under MiFID II / Dodd-Frank / MiCA and a ToS violation everywhere. Requires MM_RESTRICTED_ALLOW=1. OPERATOR MUST CONFIRM: (1) authorized pentest only, (2) own exchange or written authorization, (3) compliance review complete. THIS TOOL IS A PENTEST INSTRUMENT, NOT AN ATTACK KIT.",
+        description: "⚠⚠⚠ PENTEST ONLY — FULL MULTI-PHASE RAVE CAMPAIGN. CampaignOrchestrator chains accumulate → leverage_long → liquidation_hunt → distribute → dump across the configured timeline. Surveillance.RugScore self-guard trips kill L4 on ≥ 0.5. Running this against any venue you don't own / aren't explicitly authorized to pentest is illegal under MiFID II / Dodd-Frank / MiCA and a ToS violation everywhere. Requires MM_ALLOW_RESTRICTED=yes-pentest-mode. OPERATOR MUST CONFIRM: (1) authorized pentest only, (2) own exchange or written authorization, (3) compliance review complete. THIS TOOL IS A PENTEST INSTRUMENT, NOT AN ATTACK KIT.",
         body: PENTEST_RAVE_FULL_CAMPAIGN,
     },
     BuiltinTemplate {
         name: "pentest-liquidation-cascade",
-        description: "⚠⚠⚠ PENTEST ONLY — LIQUIDATION CASCADE TRIGGER. Combines Signal.LongShortRatio (crowd positioning) + Signal.LiquidationLevelEstimate (forward-looking cluster distance) → Strategy.CascadeHunter (gated crossing push). Surveillance.RugScore self-guard fires at 0.5. Reproduces the 2021-05 BTC flash-crash pattern (see docs/research/liquidation-cascades.md for the full public-investigation reference). Running this on any venue you don't own or aren't explicitly authorized to pentest is market manipulation under MAR Article 12 / CEA §9(a) / MiCA Article 92 and a ToS violation everywhere. Requires MM_RESTRICTED_ALLOW=1 + written venue-owner authorization + compliance review sign-off before deploy.",
+        description: "⚠⚠⚠ PENTEST ONLY — LIQUIDATION CASCADE TRIGGER. Combines Signal.LongShortRatio (crowd positioning) + Signal.LiquidationLevelEstimate (forward-looking cluster distance) → Strategy.CascadeHunter (gated crossing push). Surveillance.RugScore self-guard fires at 0.5. Reproduces the 2021-05 BTC flash-crash pattern (see docs/research/liquidation-cascades.md for the full public-investigation reference). Running this on any venue you don't own or aren't explicitly authorized to pentest is market manipulation under MAR Article 12 / CEA §9(a) / MiCA Article 92 and a ToS violation everywhere. Requires MM_ALLOW_RESTRICTED=yes-pentest-mode + written venue-owner authorization + compliance review sign-off before deploy.",
         body: PENTEST_LIQUIDATION_CASCADE,
     },
 ];

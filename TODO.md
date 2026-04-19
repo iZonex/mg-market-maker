@@ -1,6 +1,6 @@
 # MM — Open Work Tracker
 
-Last updated: 2026-04-19 (post-Sprint 13)
+Last updated: 2026-04-19 (post-Sprint 14)
 
 Tracking debt not yet closed. Closed items live in git history.
 Each row is a concrete deliverable; bigger initiatives are
@@ -765,6 +765,72 @@ operator read of `docs/guides/pentest.md` and
   + attack-shape data table + defensive-use recommendations +
   deferred research items.
 - [x] Catalog 121 → 125 kinds (+4 from R7).
+
+## Sprint 14 — honest audit + 2 real bug fixes (landed Apr 19)
+
+Operator intuition was right — the audit found TWO real bugs that
+made the flagship pentest suite a no-op. Both bundled pentest
+templates were effectively unreachable or silently inert before
+this sprint.
+
+- [x] **R8.2** E2E integration test
+  (`crates/strategy-graph/tests/pentest_templates_e2e.rs`). Five
+  tests cover `pentest-liquidation-cascade`,
+  `pentest-rave-cycle`, `rug-detector-composite`. Single-thread
+  run required (env-var flip is unsafe in parallel).
+- [x] **BUG FIX — env-var gate drift.** `MM_RESTRICTED_ALLOW=1` in
+  dashboard vs `MM_ALLOW_RESTRICTED=yes-pentest-mode` in evaluator
+  → nobody could actually deploy a restricted template.
+  Consolidated on the explicit `MM_ALLOW_RESTRICTED=yes-pentest-mode`;
+  dashboard code + all docs + all template descriptions fixed.
+  E2E test exercises the real gate so can't silently regress.
+- [x] **BUG FIX — Strategy.CascadeHunter always emitted Missing.**
+  Input-having Strategy.* nodes break the engine's strategy-pool
+  overlay (which only populates SOURCE node outputs via
+  `source_inputs`). Refactored CascadeHunter to zero inputs; the
+  `pentest-liquidation-cascade` template now uses `Quote.Mux`
+  downstream for the trigger gate.
+- [x] **R8.4** Full audit findings at
+  `docs/research/audit-apr19-sprint14.md` — two real bugs
+  documented, three false positives documented, takeaways for
+  future sprints (E2E tests only way to catch gate drift,
+  input-having Strategy nodes break pool overlay contract).
+
+## Sprint 15 — deferred research from cascade doc (planned)
+
+Closing the remaining "future research" items called out in
+`docs/research/liquidation-cascades.md`. All restricted /
+pentest-only.
+
+- [ ] **R9.1** Cross-venue cascade: trigger a perp cascade via a
+  spot push on a different venue. Needs sub-graph composition —
+  `Out.VenueQuotes` exists, orchestration across graphs TBD.
+- [ ] **R9.2** Funding-rate weaponization: use extreme funding
+  rates to force leverage unwinds without a price push. Open
+  question whether this works without large counterparty
+  inventory; investigation + proof-of-concept.
+- [ ] **R9.3** Index-composition gaming: move a weighted index by
+  pushing its thinnest constituent. Needs per-index metadata
+  source the venue has to expose.
+- [ ] **R9.4** `Strategy.BasketPush`: coordinate pushes across
+  correlated symbols (RAVE + SIREN + MYX shape).
+
+## Sprint 16 — honest MM side closeout (planned)
+
+Long-deferred MM-side quality work that's been sitting behind the
+Epic R run. All non-restricted.
+
+- [ ] **R10.1** Client onboarding UX polish — dashboard flow for
+  new client registration needs end-to-end smoke.
+- [ ] **PAPER-2** Two-venue paper smoke runbook exercise (operator
+  task, runbook at `docs/guides/paper-smoke-two-venue.md`).
+- [ ] **OBS-1** OTel DSN + Sentry sanity — both exist, neither
+  tested against a live endpoint (operator task).
+- [ ] **HARD-3** Reconciliation loop real-exchange test — exists
+  in code, needs live venue keys (operator task).
+- [ ] **R10.2** Integration test coverage audit: we have ~1600
+  unit tests, but how many integration / E2E? Sprint 14 showed
+  this gap is what lets gate drift hide. Enumerate, fill gaps.
 
 ## Graph system audit — Apr 19 follow-ups
 

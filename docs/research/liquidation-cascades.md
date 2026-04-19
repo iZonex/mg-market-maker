@@ -111,7 +111,7 @@ An honest MM running near a concentration cluster should:
   adverse selection during a cascade.
 
 These are non-restricted signals. A legitimate MM graph can
-reference all four sources without `MM_RESTRICTED_ALLOW=1`.
+reference all four sources without `MM_ALLOW_RESTRICTED=yes-pentest-mode`.
 
 ## Offensive components (RESTRICTED — pentest only)
 
@@ -139,7 +139,7 @@ reference all four sources without `MM_RESTRICTED_ALLOW=1`.
 ```
 
 Deploy it only on a venue you are explicitly authorized to
-pentest. The graph's `MM_RESTRICTED_ALLOW=1` gate plus the
+pentest. The graph's `MM_ALLOW_RESTRICTED=yes-pentest-mode` gate plus the
 loud `tracing::warn!` on every restricted compile is the
 minimum audit trail; add operator-side logging per your
 venue's compliance framework.

@@ -236,7 +236,7 @@ data/strategy_graphs/
 
 **Restricted gate.** Graphs that reference a node kind marked
 `restricted: true` (pentest-only strategies) are refused unless the
-runtime was started with `MM_RESTRICTED_ALLOW=1` (env-only — the
+runtime was started with `MM_ALLOW_RESTRICTED=yes-pentest-mode` (env-only — the
 flag is deliberately absent from TOML so prod must be explicit).
 Refusal emits `StrategyGraphDeployRejected` before returning 403;
 the `detail` field names every offending kind.

@@ -1707,7 +1707,7 @@ struct DeployQuery {
     #[serde(default)]
     rollback_from: Option<String>,
     /// UI-6 — operator acknowledgement of a restricted-node
-    /// deploy. When the env gate is ON (`MM_RESTRICTED_ALLOW`)
+    /// deploy. When the env gate is ON (`MM_ALLOW_RESTRICTED`)
     /// AND the graph references pentest kinds, the deploy must
     /// carry `restricted_ack=yes-pentest-mode` so a routine
     /// deploy can't silently promote a pentest template into
@@ -1805,14 +1805,17 @@ async fn admin_deploy_strategy_graph(
         }
     }
 
-    // Restricted-kind gate. `MM_RESTRICTED_ALLOW=1` opts in
-    // deploying graphs that reference pentest-only nodes; any
-    // other value (including the default absent case) refuses the
-    // deploy and emits an audit row so regulators can confirm the
-    // gate actually fired. Intentional no-config default: prod
-    // must be explicit about enabling.
-    let allow_restricted = std::env::var("MM_RESTRICTED_ALLOW")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    // Restricted-kind gate. `MM_ALLOW_RESTRICTED=yes-pentest-mode`
+    // opts in deploying graphs that reference pentest-only nodes;
+    // any other value (including the default absent case) refuses
+    // the deploy and emits an audit row so regulators can confirm
+    // the gate actually fired. Intentional literal value check:
+    // a shell-dotfile `MM_ALLOW_RESTRICTED=1` left from a prior
+    // session must NOT silently unlock production. MUST match the
+    // graph evaluator's `graph::allow_restricted_env` byte-for-byte
+    // — Sprint 14 R8 caught these drifting apart.
+    let allow_restricted = std::env::var("MM_ALLOW_RESTRICTED")
+        .map(|v| v == "yes-pentest-mode")
         .unwrap_or(false);
     let offenders: Vec<String> = graph
         .nodes
@@ -1826,7 +1829,7 @@ async fn admin_deploy_strategy_graph(
         .collect();
     if !allow_restricted && !offenders.is_empty() {
         let reason = format!(
-            "restricted nodes without MM_RESTRICTED_ALLOW: {}",
+            "restricted nodes without MM_ALLOW_RESTRICTED=yes-pentest-mode: {}",
             offenders.join(",")
         );
         if let Some(audit) = state.audit_log() {
