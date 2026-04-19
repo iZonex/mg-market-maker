@@ -113,6 +113,56 @@ pub fn reconcile_balances(
     mismatches
 }
 
+/// S3.2 — position-delta reconciliation. The two existing
+/// paths (`reconcile_orders` + `reconcile_balances`) catch
+/// ID-level and wallet-level drift, but a fill that slips
+/// within the balance tolerance still silently desyncs the
+/// inventory tracker. This path reconstructs the expected
+/// inventory from the cumulative fill totals
+/// (`total_bought - total_sold`) and compares against the
+/// tracker's current reading. A non-zero delta beyond
+/// `abs_tolerance` (base-asset units, covering per-step
+/// rounding + fee residuals) surfaces as a `PositionDelta`
+/// mismatch the engine should either auto-correct or escalate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionDeltaReport {
+    /// Tracker's current inventory.
+    pub reported_inventory: Decimal,
+    /// What the cumulative fills say the inventory *should* be.
+    pub expected_inventory: Decimal,
+    /// `reported - expected`; signed so the caller knows which
+    /// side drifted.
+    pub delta: Decimal,
+    /// `true` when `|delta| > abs_tolerance`.
+    pub drifted: bool,
+}
+
+pub fn reconcile_position_delta(
+    total_bought: Decimal,
+    total_sold: Decimal,
+    reported_inventory: Decimal,
+    abs_tolerance: Decimal,
+) -> PositionDeltaReport {
+    let expected = total_bought - total_sold;
+    let delta = reported_inventory - expected;
+    let drifted = delta.abs() > abs_tolerance;
+    if drifted {
+        warn!(
+            expected = %expected,
+            reported = %reported_inventory,
+            delta = %delta,
+            tolerance = %abs_tolerance,
+            "POSITION DELTA DRIFT — fill stream likely missed an event"
+        );
+    }
+    PositionDeltaReport {
+        reported_inventory,
+        expected_inventory: expected,
+        delta,
+        drifted,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,5 +392,64 @@ mod tests {
             let mismatches = reconcile_balances(&internal, &exchange, dec!(0));
             prop_assert!(mismatches.is_empty());
         }
+    }
+
+    // ── S3.2 — position-delta reconciliation tests ────────────
+
+    /// Tracker agrees with the cumulative totals — no drift.
+    #[test]
+    fn position_delta_agrees_with_totals() {
+        let r = reconcile_position_delta(
+            dec!(1.5), // bought
+            dec!(0.5), // sold
+            dec!(1.0), // reported (matches expected)
+            dec!(0.0001),
+        );
+        assert_eq!(r.expected_inventory, dec!(1.0));
+        assert_eq!(r.delta, dec!(0));
+        assert!(!r.drifted);
+    }
+
+    /// A fill missed by the WS stream means `reported <
+    /// expected`; the reconciler flags it.
+    #[test]
+    fn position_delta_detects_missed_buy_fill() {
+        // Exchange shows we bought 1.5 total, sold 0.5. We should
+        // be long 1.0, but WS dropped a 0.2 buy so tracker thinks
+        // long 0.8.
+        let r = reconcile_position_delta(
+            dec!(1.5),
+            dec!(0.5),
+            dec!(0.8),
+            dec!(0.0001),
+        );
+        assert_eq!(r.expected_inventory, dec!(1.0));
+        assert_eq!(r.delta, dec!(-0.2));
+        assert!(r.drifted);
+    }
+
+    /// Drift strictly within tolerance is NOT flagged — fee
+    /// residuals + rounding shouldn't trip the alarm.
+    #[test]
+    fn position_delta_within_tolerance_is_clean() {
+        let r = reconcile_position_delta(
+            dec!(1.5),
+            dec!(0.5),
+            dec!(1.00005), // 0.00005 drift
+            dec!(0.0001),  // 0.0001 tolerance
+        );
+        assert!(!r.drifted);
+    }
+
+    /// Drift equal to tolerance is NOT flagged (strict >).
+    #[test]
+    fn position_delta_equal_to_tolerance_is_clean() {
+        let r = reconcile_position_delta(
+            dec!(1),
+            dec!(0),
+            dec!(1.001),
+            dec!(0.001),
+        );
+        assert!(!r.drifted);
     }
 }

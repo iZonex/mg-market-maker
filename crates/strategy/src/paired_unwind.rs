@@ -154,6 +154,20 @@ impl PairedUnwindExecutor {
         }
     }
 
+    /// S3.1 — stagger this unwind's start by `delay_secs`. The
+    /// slice scheduler reads `started_at`, so pushing it into
+    /// the future defers every slice uniformly. Engines with
+    /// the worst trade drawdown pass `delay=0`; lighter ones
+    /// queue behind so the biggest bleeder exits first and the
+    /// venue doesn't see a simultaneous flatten storm across
+    /// the pool.
+    pub fn with_start_delay(mut self, delay_secs: u64) -> Self {
+        if delay_secs > 0 {
+            self.started_at += chrono::Duration::seconds(delay_secs as i64);
+        }
+        self
+    }
+
     pub fn pair(&self) -> &InstrumentPair {
         &self.pair
     }

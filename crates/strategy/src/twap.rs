@@ -71,6 +71,21 @@ impl TwapExecutor {
         }
     }
 
+    /// S3.1 — defer the first slice by `delay_secs`. The slice
+    /// scheduler keys off `started_at` so pushing it into the
+    /// future delays every slice by the same amount. Used by
+    /// the engine's kill-switch L4 waterfall to stagger
+    /// flatten starts across multiple engines: the
+    /// worst-drawdown symbol fires immediately (`delay=0`)
+    /// while lighter losses wait their turn so the venue sees
+    /// the biggest bleeder exit first.
+    pub fn with_start_delay(mut self, delay_secs: u64) -> Self {
+        if delay_secs > 0 {
+            self.started_at += chrono::Duration::seconds(delay_secs as i64);
+        }
+        self
+    }
+
     /// Check if it's time for the next slice. Returns a Quote if yes.
     pub fn next_slice(&mut self, mid_price: Price) -> Option<Quote> {
         if !self.active || self.is_complete() {

@@ -48,6 +48,17 @@ impl InventoryManager {
         self.inventory
     }
 
+    /// S3.2 — cumulative fill totals. Used by the
+    /// position-delta reconciliation path to detect silent
+    /// WS-level fill drops within the balance tolerance.
+    pub fn total_bought(&self) -> Decimal {
+        self.total_bought
+    }
+
+    pub fn total_sold(&self) -> Decimal {
+        self.total_sold
+    }
+
     /// Realized PnL.
     pub fn realized_pnl(&self) -> Decimal {
         self.realized_pnl

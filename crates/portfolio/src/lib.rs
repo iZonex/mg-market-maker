@@ -145,11 +145,48 @@ pub struct Portfolio {
     /// fills on the same class re-hash and reuse the existing
     /// entry.
     per_strategy_pnl: HashMap<String, Decimal>,
+    /// S3.5 — per-symbol PnL attribution breakdown carried
+    /// here so a multi-engine deployment can expose a single
+    /// consolidated view without double-counting. Each engine
+    /// publishes its tracker's latest snapshot via
+    /// [`Self::record_attribution`]; the map is keyed by the
+    /// engine's symbol (`"BTCUSDT"`, `"BTC-USDT"`, etc.), which
+    /// is already unique per engine since one engine runs per
+    /// `(symbol, venue)` tuple. Rollups across the map give
+    /// operators a true portfolio-wide spread / inventory /
+    /// fee breakdown without summing per-engine PnlTracker
+    /// views (which would double-count shared spread
+    /// capture).
+    attribution_by_symbol: HashMap<String, AttributionSnap>,
     /// Dust threshold for the factor iterator. Factors with
     /// absolute delta below this are pruned from the
     /// [`Self::factors`] output so the dashboard doesn't show
     /// micro-residuals from fee rounding.
     dust_threshold: Decimal,
+}
+
+/// S3.5 — compact per-symbol attribution snapshot the engine
+/// publishes to the portfolio on every refresh. Signed
+/// quote-asset units.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AttributionSnap {
+    pub spread_pnl: Decimal,
+    pub inventory_pnl: Decimal,
+    pub rebate_income: Decimal,
+    pub fees_paid: Decimal,
+    pub funding_pnl_realised: Decimal,
+    pub loan_cost_amortized: Decimal,
+}
+
+impl AttributionSnap {
+    pub fn total(&self) -> Decimal {
+        self.spread_pnl
+            + self.inventory_pnl
+            + self.rebate_income
+            + self.funding_pnl_realised
+            - self.fees_paid
+            - self.loan_cost_amortized
+    }
 }
 
 impl Portfolio {
@@ -161,8 +198,69 @@ impl Portfolio {
             fx_to_reporting: HashMap::new(),
             symbol_assets: HashMap::new(),
             per_strategy_pnl: HashMap::new(),
+            attribution_by_symbol: HashMap::new(),
             dust_threshold: dec!(0.00000001),
         }
+    }
+
+    /// S3.5 — publish the latest PnL attribution snapshot for
+    /// a symbol. Replaces any previous entry (engines always
+    /// send the absolute current state, not a delta, so repeat
+    /// calls don't accumulate).
+    pub fn record_attribution(&mut self, symbol: &str, snap: AttributionSnap) {
+        self.attribution_by_symbol
+            .insert(symbol.to_string(), snap);
+    }
+
+    /// S3.5 — per-symbol attribution read-back. Keys match
+    /// the symbols engines register.
+    pub fn attribution_by_symbol(&self) -> &HashMap<String, AttributionSnap> {
+        &self.attribution_by_symbol
+    }
+
+    /// S3.5 — consolidated attribution summed across every
+    /// registered symbol. This is the view that avoids the
+    /// cross-venue double-count the audit flagged: two
+    /// engines on BTC would each report `spread_pnl=100` via
+    /// their own `PnlTracker`, but here each symbol publishes
+    /// once and the aggregate reflects the true portfolio
+    /// figure.
+    pub fn consolidated_attribution(&self) -> AttributionSnap {
+        let mut total = AttributionSnap::default();
+        for snap in self.attribution_by_symbol.values() {
+            total.spread_pnl += snap.spread_pnl;
+            total.inventory_pnl += snap.inventory_pnl;
+            total.rebate_income += snap.rebate_income;
+            total.fees_paid += snap.fees_paid;
+            total.funding_pnl_realised += snap.funding_pnl_realised;
+            total.loan_cost_amortized += snap.loan_cost_amortized;
+        }
+        total
+    }
+
+    /// S3.5 — attribution rollup by base asset. Useful when
+    /// two venues both quote the same underlying (BTCUSDT on
+    /// Binance + BTC-USDT on Bybit) and the operator wants a
+    /// "total BTC capture" figure. Requires `register_symbol`
+    /// to have been called so the base asset is known;
+    /// unregistered symbols fall into an `"unknown"` bucket.
+    pub fn attribution_by_asset(&self) -> HashMap<String, AttributionSnap> {
+        let mut out: HashMap<String, AttributionSnap> = HashMap::new();
+        for (symbol, snap) in &self.attribution_by_symbol {
+            let key = self
+                .symbol_assets
+                .get(symbol)
+                .map(|(base, _quote)| base.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            let entry = out.entry(key).or_default();
+            entry.spread_pnl += snap.spread_pnl;
+            entry.inventory_pnl += snap.inventory_pnl;
+            entry.rebate_income += snap.rebate_income;
+            entry.fees_paid += snap.fees_paid;
+            entry.funding_pnl_realised += snap.funding_pnl_realised;
+            entry.loan_cost_amortized += snap.loan_cost_amortized;
+        }
+        out
     }
 
     /// Seed the per-factor aggregation with the (base, quote)
@@ -673,6 +771,71 @@ mod tests {
             .find(|(k, _)| k == "basis")
             .expect("basis bucket present");
         assert_eq!(basis.1, dec!(10));
+    }
+
+    // ---- S3.5 cross-venue attribution consolidation ----
+
+    fn snap(
+        spread: Decimal,
+        inventory: Decimal,
+        fees: Decimal,
+        rebates: Decimal,
+    ) -> AttributionSnap {
+        AttributionSnap {
+            spread_pnl: spread,
+            inventory_pnl: inventory,
+            rebate_income: rebates,
+            fees_paid: fees,
+            funding_pnl_realised: dec!(0),
+            loan_cost_amortized: dec!(0),
+        }
+    }
+
+    /// Two engines on the same asset but different venues
+    /// publish their attributions; the consolidated view is
+    /// the sum without double-counting (each symbol writes
+    /// under its own key).
+    #[test]
+    fn consolidated_attribution_sums_per_venue_symbols() {
+        let mut pf = Portfolio::new("USDT");
+        pf.register_symbol("BTCUSDT", "BTC", "USDT");
+        pf.register_symbol("BTC-USDC", "BTC", "USDC");
+        pf.record_attribution("BTCUSDT", snap(dec!(100), dec!(10), dec!(5), dec!(2)));
+        pf.record_attribution("BTC-USDC", snap(dec!(50), dec!(8), dec!(3), dec!(1)));
+
+        let total = pf.consolidated_attribution();
+        assert_eq!(total.spread_pnl, dec!(150));
+        assert_eq!(total.inventory_pnl, dec!(18));
+        assert_eq!(total.fees_paid, dec!(8));
+        assert_eq!(total.rebate_income, dec!(3));
+    }
+
+    /// A repeat publish for the same symbol REPLACES (doesn't
+    /// accumulate) — engines send absolute current state.
+    #[test]
+    fn record_attribution_replaces_prior_entry() {
+        let mut pf = Portfolio::new("USDT");
+        pf.record_attribution("BTCUSDT", snap(dec!(100), dec!(0), dec!(0), dec!(0)));
+        pf.record_attribution("BTCUSDT", snap(dec!(120), dec!(0), dec!(0), dec!(0)));
+        assert_eq!(pf.consolidated_attribution().spread_pnl, dec!(120));
+    }
+
+    /// Rollup by base asset groups cross-venue symbols so a
+    /// multi-venue BTC deployment reports a single "BTC
+    /// capture" figure across BTCUSDT + BTC-USDC + BTC-USD.
+    #[test]
+    fn attribution_by_asset_groups_by_base() {
+        let mut pf = Portfolio::new("USDT");
+        pf.register_symbol("BTCUSDT", "BTC", "USDT");
+        pf.register_symbol("BTC-USDC", "BTC", "USDC");
+        pf.register_symbol("ETHUSDT", "ETH", "USDT");
+        pf.record_attribution("BTCUSDT", snap(dec!(100), dec!(0), dec!(0), dec!(0)));
+        pf.record_attribution("BTC-USDC", snap(dec!(50), dec!(0), dec!(0), dec!(0)));
+        pf.record_attribution("ETHUSDT", snap(dec!(30), dec!(0), dec!(0), dec!(0)));
+
+        let by_asset = pf.attribution_by_asset();
+        assert_eq!(by_asset.get("BTC").unwrap().spread_pnl, dec!(150));
+        assert_eq!(by_asset.get("ETH").unwrap().spread_pnl, dec!(30));
     }
 
     // ---- Epic C sub-component #2: per-strategy labeling tests ----

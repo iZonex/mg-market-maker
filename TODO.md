@@ -269,6 +269,47 @@ client sees the system.
   aggregates the max across a venue's symbols and red-flags
   margin ≥ 50% or ADL rank ≥ 3.
 
+## Sprint 3 — multi-venue correctness (landed Apr 19)
+
+- [x] **S3.1** Liquidation waterfall priority.
+  `TwapExecutor::with_start_delay` + `PairedUnwindExecutor::with_start_delay`
+  defer slice scheduling by shifting `started_at` forward.
+  `DashboardState::register_flatten_priority` +
+  `flatten_priority_rank` let engines self-rank on L4 entry;
+  worst-drawdown symbol fires immediately (`delay=0`), others
+  stagger `rank × 3 s`. Tied drawdowns break by lexicographic
+  symbol order for deterministic behaviour. Test covers
+  descending sort + clear path.
+- [x] **S3.2** Position-delta reconciliation.
+  `mm_risk::reconciliation::reconcile_position_delta` sums
+  `total_bought − total_sold` → expected inventory, diffs
+  against `InventoryManager::inventory()` at
+  `inventory_drift_tolerance × 2`. Called from the engine's
+  reconcile loop alongside the existing order + balance paths;
+  drift fires a `high`-severity incident + audit row. 4 unit
+  tests cover agree / missed-buy / tolerance-edge paths.
+- [x] **S3.3** Hedge-book staleness gate on PairedUnwind.
+  Before emitting a paired slice the engine checks
+  `hedge_book.last_update_ms`; if > 5 s stale, the unwind
+  pauses, a single `hedge_book_stale_during_flatten` audit row
+  fires (latch prevents repeat spam), and the loop retries
+  next tick. Latch resets on feed recovery so the operator
+  sees both the pause and the resume.
+- [x] **S3.4** Per-venue inventory drift. `InventoryDriftReconciler`
+  gained `venue: String` + `with_venue` builder; `DriftReport`
+  carries the venue through to the audit row. Engine tags its
+  reconciler with `exchange_type.to_lowercase()` at construction
+  so the drift log answers "which venue's wallet slice
+  drifted", not just "which asset".
+- [x] **S3.5** Cross-venue PnL attribution. New
+  `mm_portfolio::AttributionSnap` + `Portfolio::record_attribution`
+  + `consolidated_attribution` + `attribution_by_asset`.
+  Engine publishes its `PnlTracker::attribution` per-tick;
+  the portfolio replaces (never accumulates) so a
+  double-counting across venues is impossible by construction.
+  Three portfolio-level tests pin consolidation, replace
+  semantics, and base-asset rollup.
+
 ## Graph system audit — Apr 19 follow-ups
 
 Surfaced during the post-batch audit at

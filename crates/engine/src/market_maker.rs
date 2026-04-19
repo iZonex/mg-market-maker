@@ -451,6 +451,10 @@ pub struct MarketMakerEngine {
     /// executor in dual-connector mode — running both would
     /// double-flatten the primary leg.
     paired_unwind: Option<PairedUnwindExecutor>,
+    /// S3.3 — latch so the `hedge_book_stale_during_flatten`
+    /// audit row fires once per stale window, not once per
+    /// tick. Reset when the hedge feed recovers.
+    paired_unwind_stale_audited: bool,
     /// Funding-arb driver owned by the engine. When set, the
     /// engine's select loop adds a periodic tick that pulls
     /// funding rate + both mids, asks
@@ -875,7 +879,8 @@ impl MarketMakerEngine {
                 product.base_asset.clone(),
                 config.market_maker.inventory_drift_tolerance,
                 config.market_maker.inventory_drift_auto_correct,
-            ),
+            )
+            .with_venue(format!("{:?}", config.exchange.exchange_type).to_lowercase()),
             market_impact: mm_risk::market_impact::MarketImpactEstimator::new(20),
             performance: mm_risk::performance::PerformanceTracker::new(1440),
             webhooks: None,
@@ -995,6 +1000,7 @@ impl MarketMakerEngine {
             adv_inventory: AdvancedInventoryManager::new(config.risk.max_inventory),
             twap: None,
             paired_unwind: None,
+            paired_unwind_stale_audited: false,
             funding_arb_driver: None,
             funding_arb_tick: std::time::Duration::from_secs(60),
             stat_arb_driver: None,
@@ -4814,6 +4820,27 @@ impl MarketMakerEngine {
                             self.pnl_tracker.attribution.total_pnl(),
                         );
                     }
+                    // S3.5 — publish this engine's PnL
+                    // attribution to the shared Portfolio so
+                    // the consolidated cross-venue view
+                    // aggregates without double-counting.
+                    // Keyed on symbol (unique per engine).
+                    if let Some(pf) = &self.portfolio {
+                        if let Ok(mut pf) = pf.lock() {
+                            let a = &self.pnl_tracker.attribution;
+                            pf.record_attribution(
+                                &self.symbol,
+                                mm_portfolio::AttributionSnap {
+                                    spread_pnl: a.spread_pnl,
+                                    inventory_pnl: a.inventory_pnl,
+                                    rebate_income: a.rebate_income,
+                                    fees_paid: a.fees_paid,
+                                    funding_pnl_realised: a.funding_pnl_realised,
+                                    loan_cost_amortized: a.loan_cost_amortized,
+                                },
+                            );
+                        }
+                    }
                     // Epic F sub-component #2: drive the
                     // news retreat cooldown forward so an
                     // expired Critical state drops the
@@ -5305,6 +5332,46 @@ impl MarketMakerEngine {
         // the wallet delta and surface any mismatch to the
         // audit trail + optional auto-correct.
         self.check_inventory_drift();
+
+        // S3.2 — position-delta reconciliation. The two
+        // existing paths compare orders and wallet balances;
+        // this third path reconstructs expected inventory
+        // from cumulative fill totals and flags a mismatch
+        // that slipped under both (a WS fill drop that's too
+        // small to trip the balance tolerance). Tolerance
+        // here is `inventory_drift_tolerance × 2` — loose
+        // enough to absorb rounding + fee residuals on one
+        // cycle but tight enough to catch a genuine missed
+        // fill.
+        let bought = self.inventory_manager.total_bought();
+        let sold = self.inventory_manager.total_sold();
+        let reported = self.inventory_manager.inventory();
+        let tolerance = self.config.market_maker.inventory_drift_tolerance
+            * rust_decimal_macros::dec!(2);
+        let delta_report =
+            mm_risk::reconciliation::reconcile_position_delta(bought, sold, reported, tolerance);
+        if delta_report.drifted {
+            self.audit.risk_event(
+                &self.symbol,
+                AuditEventType::BalanceReconciled,
+                &format!(
+                    "position delta drift: expected={} reported={} delta={} tolerance={}",
+                    delta_report.expected_inventory,
+                    delta_report.reported_inventory,
+                    delta_report.delta,
+                    tolerance
+                ),
+            );
+            self.record_incident(
+                "high",
+                &format!(
+                    "position delta drift {} (reported {} vs expected {})",
+                    delta_report.delta,
+                    delta_report.reported_inventory,
+                    delta_report.expected_inventory
+                ),
+            );
+        }
     }
 
     /// Compare `InventoryManager.inventory()` against the
@@ -5321,6 +5388,7 @@ impl MarketMakerEngine {
         };
         warn!(
             asset = %report.asset,
+            venue = %report.venue,
             baseline_wallet = %report.baseline_wallet,
             current_wallet = %report.current_wallet,
             expected = %report.expected_inventory,
@@ -5330,7 +5398,8 @@ impl MarketMakerEngine {
             "INVENTORY DRIFT DETECTED"
         );
         let detail = format!(
-            "asset={} baseline={} current={} expected={} tracked={} drift={} corrected={}",
+            "venue={} asset={} baseline={} current={} expected={} tracked={} drift={} corrected={}",
+            report.venue,
             report.asset,
             report.baseline_wallet,
             report.current_wallet,
@@ -5483,8 +5552,49 @@ impl MarketMakerEngine {
             // `OrderManager` so cancel-all + fill tracking
             // stay per-venue.
             if let Some(unwind) = self.paired_unwind.as_mut() {
-                if let Some(hedge_mid) = self.hedge_book.as_ref().and_then(|hb| hb.book.mid_price())
+                // S3.3 — hedge-book staleness gate. Do NOT emit
+                // a paired slice while the hedge WS feed is
+                // older than 5 seconds; a spot leg quote on
+                // fresh primary data paired against a stale
+                // hedge mid would flatten asymmetrically (spot
+                // clears, perp lingers on stale price). Audit
+                // the pause so the operator can see why
+                // flatten paused during a reconnect window.
+                const HEDGE_STALE_MS: i64 = 5_000;
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let hedge_age_ms = self
+                    .hedge_book
+                    .as_ref()
+                    .map(|hb| now_ms - hb.book.last_update_ms);
+                let hedge_stale = matches!(hedge_age_ms, Some(age) if age > HEDGE_STALE_MS);
+                if hedge_stale {
+                    let age_ms = hedge_age_ms.unwrap_or(0);
+                    if !self.paired_unwind_stale_audited {
+                        warn!(
+                            symbol = %self.symbol,
+                            age_ms,
+                            "paired unwind: hedge book stale — holding slices until feed recovers"
+                        );
+                        self.audit.risk_event(
+                            &self.symbol,
+                            AuditEventType::CircuitBreakerTripped,
+                            &format!(
+                                "hedge_book_stale_during_flatten: age_ms={}",
+                                age_ms
+                            ),
+                        );
+                        self.paired_unwind_stale_audited = true;
+                    }
+                } else if let Some(hedge_mid) =
+                    self.hedge_book.as_ref().and_then(|hb| hb.book.mid_price())
                 {
+                    if self.paired_unwind_stale_audited {
+                        info!(
+                            symbol = %self.symbol,
+                            "paired unwind: hedge feed recovered, resuming slices"
+                        );
+                        self.paired_unwind_stale_audited = false;
+                    }
                     let slice = unwind.next_slice(mid, hedge_mid);
                     if let Some(p) = &slice.primary {
                         if let Err(e) = self
@@ -5573,6 +5683,30 @@ impl MarketMakerEngine {
                         mm_common::types::Side::Buy
                     };
 
+                    // S3.1 — waterfall priority. Publish our
+                    // notional drawdown to the shared state,
+                    // then read back our rank among siblings
+                    // that have also entered L4. Each step of
+                    // rank defers our first slice by
+                    // WATERFALL_STAGGER_SECS so the worst
+                    // bleeder exits the venue first.
+                    const WATERFALL_STAGGER_SECS: u64 = 3;
+                    let mid = self
+                        .book_keeper
+                        .book
+                        .mid_price()
+                        .unwrap_or(rust_decimal::Decimal::ZERO);
+                    let notional_dd = inv.abs() * mid;
+                    let start_delay = if let Some(dash) = &self.dashboard {
+                        dash.register_flatten_priority(&self.symbol, notional_dd);
+                        let rank = dash
+                            .flatten_priority_rank(&self.symbol)
+                            .unwrap_or(0);
+                        (rank as u64) * WATERFALL_STAGGER_SECS
+                    } else {
+                        0
+                    };
+
                     if let Some(pair) = self.connectors.pair.clone() {
                         // Paired unwind: infer the hedge-leg
                         // direction from the primary inventory
@@ -5585,41 +5719,57 @@ impl MarketMakerEngine {
                             mm_common::types::Side::Sell
                         };
                         let hedge_side = primary_side.opposite();
-                        self.paired_unwind = Some(PairedUnwindExecutor::new(
-                            pair,
-                            primary_side,
-                            hedge_side,
-                            inv.abs(),
-                            60,
-                            10,
-                            dec!(5),
-                        ));
+                        self.paired_unwind = Some(
+                            PairedUnwindExecutor::new(
+                                pair,
+                                primary_side,
+                                hedge_side,
+                                inv.abs(),
+                                60,
+                                10,
+                                dec!(5),
+                            )
+                            .with_start_delay(start_delay),
+                        );
                         self.audit.risk_event(
                             &self.symbol,
                             AuditEventType::KillSwitchEscalated,
-                            &format!("paired unwind started: primary {side:?} {}", inv.abs()),
+                            &format!(
+                                "paired unwind started: primary {side:?} {} notional_dd={} delay={}s",
+                                inv.abs(),
+                                notional_dd,
+                                start_delay
+                            ),
                         );
                         self.record_incident(
                             "critical",
-                            &format!("Kill switch L4: paired unwind {} base", inv.abs()),
+                            &format!("Kill switch L4: paired unwind {} base (delay {}s)", inv.abs(), start_delay),
                         );
                     } else {
-                        self.twap = Some(TwapExecutor::new(
-                            self.symbol.clone(),
-                            side,
-                            inv.abs(),
-                            60,      // 60 seconds.
-                            10,      // 10 slices.
-                            dec!(5), // 5 bps aggressive.
-                        ));
+                        self.twap = Some(
+                            TwapExecutor::new(
+                                self.symbol.clone(),
+                                side,
+                                inv.abs(),
+                                60,      // 60 seconds.
+                                10,      // 10 slices.
+                                dec!(5), // 5 bps aggressive.
+                            )
+                            .with_start_delay(start_delay),
+                        );
                         self.audit.risk_event(
                             &self.symbol,
                             AuditEventType::KillSwitchEscalated,
-                            &format!("TWAP flatten started: {side:?} {}", inv.abs()),
+                            &format!(
+                                "TWAP flatten started: {side:?} {} notional_dd={} delay={}s",
+                                inv.abs(),
+                                notional_dd,
+                                start_delay
+                            ),
                         );
                         self.record_incident(
                             "critical",
-                            &format!("Kill switch L4: TWAP flatten {side:?} {}", inv.abs()),
+                            &format!("Kill switch L4: TWAP flatten {side:?} {} (delay {}s)", inv.abs(), start_delay),
                         );
                     }
                 }

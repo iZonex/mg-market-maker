@@ -32,6 +32,12 @@ use rust_decimal::Decimal;
 pub struct DriftReport {
     /// Base asset of the symbol being checked (e.g. `"BTC"`).
     pub asset: String,
+    /// S3.4 — venue tag the reconciler was bound to. Empty
+    /// string in legacy single-venue mode. Multi-venue
+    /// deployments carry the venue here so the audit row
+    /// tells operators WHICH venue's wallet slice drifted,
+    /// not just WHICH asset.
+    pub venue: String,
     /// Wallet total at the baseline reconcile. Held so the
     /// report is self-contained when emitted into audit JSONL.
     pub baseline_wallet: Decimal,
@@ -77,6 +83,13 @@ pub struct InventoryDriftReconciler {
     baseline_wallet: Option<Decimal>,
     tolerance: Decimal,
     auto_correct: bool,
+    /// S3.4 — venue this reconciler attributes drift to. Empty
+    /// string keeps the legacy single-venue semantics (wallet
+    /// totals treated as belonging wholly to this engine's
+    /// symbol). Multi-venue deployments set it so reports
+    /// carry the venue and cross-margin wallets don't
+    /// false-attribute one venue's miss to another.
+    venue: String,
 }
 
 impl InventoryDriftReconciler {
@@ -102,7 +115,23 @@ impl InventoryDriftReconciler {
             baseline_wallet: None,
             tolerance,
             auto_correct,
+            venue: String::new(),
         }
+    }
+
+    /// S3.4 — tag this reconciler with the venue whose wallet
+    /// slice it compares against. Empty string = legacy
+    /// single-venue mode. Setter is a builder so the engine
+    /// can chain `InventoryDriftReconciler::new(...)
+    /// .with_venue("binance")` without touching existing call
+    /// sites.
+    pub fn with_venue(mut self, venue: impl Into<String>) -> Self {
+        self.venue = venue.into();
+        self
+    }
+
+    pub fn venue(&self) -> &str {
+        &self.venue
     }
 
     /// Asset this reconciler watches.
@@ -159,6 +188,7 @@ impl InventoryDriftReconciler {
         }
         Some(DriftReport {
             asset: self.asset.clone(),
+            venue: self.venue.clone(),
             baseline_wallet: baseline,
             current_wallet,
             expected_inventory,

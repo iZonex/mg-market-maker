@@ -230,6 +230,13 @@ struct StateInner {
     /// this symbol's positions (0..=4 per PERP-4). Missing
     /// entry = spot engine or no venue-reported data yet.
     per_symbol_adl_quantile: HashMap<String, u8>,
+    /// S3.1 — kill-switch L4 flatten waterfall. Each engine
+    /// publishes its notional drawdown (|inventory| × mid,
+    /// quote-asset units) when it enters L4. Subsequent
+    /// entrants read the map, rank themselves among siblings,
+    /// and defer their first slice by `rank × slice_stagger_s`
+    /// so the venue sees the worst bleeder exit first.
+    flatten_priorities: HashMap<String, Decimal>,
     /// Configurable alert rules.
     alert_rules: Vec<AlertRule>,
     /// Loan agreements (Epic 2). Keyed by loan ID.
@@ -1264,6 +1271,51 @@ impl DashboardState {
             .per_symbol_adl_quantile
             .get(symbol)
             .copied()
+    }
+
+    /// S3.1 — register this engine's flatten priority when it
+    /// enters kill-switch L4. Priority key is the absolute
+    /// notional drawdown (`|inventory| × mid` in quote-asset
+    /// units at entry time); higher = more urgent.
+    pub fn register_flatten_priority(&self, symbol: &str, notional_drawdown: Decimal) {
+        self.inner
+            .write()
+            .unwrap()
+            .flatten_priorities
+            .insert(symbol.to_string(), notional_drawdown);
+    }
+
+    /// S3.1 — drop the registration once the unwind completes
+    /// so a repeat kill-switch escalation sees a clean queue.
+    pub fn clear_flatten_priority(&self, symbol: &str) {
+        self.inner
+            .write()
+            .unwrap()
+            .flatten_priorities
+            .remove(symbol);
+    }
+
+    /// S3.1 — rank of `symbol` in the waterfall (0-based;
+    /// 0 = highest drawdown, first to flatten). Returns
+    /// `None` when the symbol isn't registered yet (caller
+    /// treats as rank 0 since it's about to register). Ties
+    /// are broken by lexicographic symbol order for
+    /// deterministic cross-restart behaviour.
+    pub fn flatten_priority_rank(&self, symbol: &str) -> Option<usize> {
+        let g = self.inner.read().unwrap();
+        let self_dd = g.flatten_priorities.get(symbol).copied()?;
+        let mut rank = 0usize;
+        for (other_sym, other_dd) in g.flatten_priorities.iter() {
+            if other_sym == symbol {
+                continue;
+            }
+            if *other_dd > self_dd
+                || (*other_dd == self_dd && other_sym.as_str() < symbol)
+            {
+                rank += 1;
+            }
+        }
+        Some(rank)
     }
 
     // ── Client registration ──────────────────────────────────
@@ -2460,6 +2512,36 @@ mod tests {
     }
 
     /// PAPER-1 — active-plan publish/read round-trip behaves as
+    /// S3.1 — the flatten waterfall ranks by notional
+    /// drawdown desc, with symbol as deterministic tiebreak.
+    /// Highest drawdown → rank 0 (first to flatten).
+    #[test]
+    fn flatten_priority_ranks_descending_by_drawdown() {
+        let ds = DashboardState::new();
+        ds.register_flatten_priority("BTCUSDT", dec!(5000));
+        ds.register_flatten_priority("ETHUSDT", dec!(1500));
+        ds.register_flatten_priority("SOLUSDT", dec!(12000));
+
+        assert_eq!(ds.flatten_priority_rank("SOLUSDT"), Some(0));
+        assert_eq!(ds.flatten_priority_rank("BTCUSDT"), Some(1));
+        assert_eq!(ds.flatten_priority_rank("ETHUSDT"), Some(2));
+
+        // Ties broken by lexicographic symbol order.
+        ds.register_flatten_priority("AAAUSDT", dec!(5000));
+        // AAAUSDT and BTCUSDT tie at 5000 notional; SOL is
+        // still first (12000). AAA < BTC alphabetically so
+        // AAA outranks BTC at the tie.
+        assert_eq!(ds.flatten_priority_rank("SOLUSDT"), Some(0));
+        assert_eq!(ds.flatten_priority_rank("AAAUSDT"), Some(1));
+        assert_eq!(ds.flatten_priority_rank("BTCUSDT"), Some(2));
+        assert_eq!(ds.flatten_priority_rank("ETHUSDT"), Some(3));
+
+        // Clearing a symbol removes it from the queue.
+        ds.clear_flatten_priority("AAAUSDT");
+        assert_eq!(ds.flatten_priority_rank("AAAUSDT"), None);
+        assert_eq!(ds.flatten_priority_rank("BTCUSDT"), Some(1));
+    }
+
     /// UI-1 expects: per-symbol publish, flat-list read.
     #[test]
     fn active_plans_publish_then_flat_list() {
