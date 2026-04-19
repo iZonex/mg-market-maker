@@ -1044,6 +1044,87 @@ Epic R run. All non-restricted.
   unit tests, but how many integration / E2E? Sprint 14 showed
   this gap is what lets gate drift hide. Enumerate, fill gaps.
 
+## Sprint 22 — full-stack honesty audit backlog (opened Apr 19)
+
+Operator intuition 99% right — four parallel adversarial audits
+found substantial rot beyond Sprint 19-21 scope. Captured as
+tasks #163-#179; summary below so nothing is lost if the task
+list is cleared.
+
+### 22A — HIGH: config → живое (operator thinks it works, doesn't)
+
+- [ ] **22A-1 stat_arb config + dispatch** (task #163) —
+  `stat_arb/driver.rs` is complete, `market_maker.rs:524` has
+  the field, `main.rs:1022-1100` has no match arm, no
+  `[stat_arb]` TOML section. Entire cointegration / Kalman /
+  Z-score subsystem is dead code reachable only from unit tests.
+- [ ] **22A-2 var_guard instantiation** (task #164) —
+  `config.rs:1465-1468` parses `var_guard_enabled` +
+  `var_guard_limit_95/99` + `var_guard_ewma_lambda`, ZERO call
+  sites in `main.rs`. Operator sets these, nothing happens.
+- [ ] **22A-3 exec algo selector** (task #165) — TWAP / VWAP /
+  POV / Iceberg exist in `exec_algo.rs`, engine always hardcodes
+  `TwapExecutor`. No `[execution]` TOML section.
+- [ ] **22A-4 paper-mode hard-fail on empty keys** (task #166) —
+  `main.rs:1860` `unwrap_or_default()` on keys, `user_stream`
+  silently skips at `main.rs:2043` → `BalanceCache` blind,
+  paper fills run without inventory baseline. Either hard-fail
+  or seed-balance config.
+
+### 22B — MEDIUM: state persistence (cold-start every restart)
+
+Blocker: `SymbolCheckpoint` has no slot for strategy internals.
+`fill_replay.rs` replays inventory + PnL only, not strategy
+callbacks. 8 of 12 strategies audited have state that is lost.
+
+- [ ] **22B-0 Strategy checkpoint hook** (task #167) —
+  architectural. `Strategy` trait gains `checkpoint_state()` +
+  `restore_state(v)` default-no-op methods. `SymbolCheckpoint`
+  gains `strategy_state: Option<serde_json::Value>`.
+  **Blocks all of 22B-1..22B-6.**
+- [ ] **22B-1 GLFT** (task #168, blocked-by #167) — fitted
+  (a, k) + 50-sample `fill_depths` buffer.
+- [ ] **22B-2 Adaptive** (task #169, blocked-by #167) —
+  60-bucket minute-resolution rolling stats.
+- [ ] **22B-3 Autotune** (task #170, blocked-by #167) —
+  regime detector returns window + current_regime.
+- [ ] **22B-4 Learned microprice** (task #171, blocked-by #167) —
+  online_ring + g-matrix bucket accumulators.
+- [ ] **22B-5 Pentest FSM** (task #172, blocked-by #167) —
+  `pump_and_dump` AtomicU64 tick counter + `campaign_orchestrator`
+  `first_tick_at` stamp.
+- [ ] **22B-6 Momentum** (task #173, blocked-by #167) —
+  `signed_volumes` + `snapshots` VecDeques.
+
+### 22C — LOW: polish / decide
+
+- [ ] **22C-1 xemm wire-or-remove** (task #174) — `xemm.rs:31-39`
+  docstring admits "not currently driven by the live engine".
+  Wire the SOR inline-dispatch plumbing or delete.
+- [ ] **22C-2 fill-model parity** (task #175) — backtester
+  simulator uses queue-aware log probability model;
+  `paper_match_trade()` in engine uses different logic. PnL in
+  backtest ≠ PnL in paper mode on same feed.
+- [ ] **22C-3 ReportsPanel shape drift** (task #176) — panel
+  reads `data.dates`, backend returns bare `Vec<String>`. Works
+  today by JS truthy fallback; breaks under any response-shape
+  normaliser.
+- [ ] **22C-4 dca + order_emulator wire-or-remove** (task #177).
+
+### 22M — meta
+
+- [ ] **22M-1 CI frontend build gap** (task #178) — `ci.yml`
+  has a Frontend Build job (line 69-84) but
+  `StrategyDeployHistory.svelte` had build-breaking CSS since
+  UI-5 landed (commit 0e1ace2). Either CI isn't running or
+  nobody's reading failures. Bigger than any single bug —
+  affects whether every other audit item gets caught next time.
+- [ ] **22M-2 exhaustive audit sweep** (task #179) — the four
+  audits hit ~30% coverage. Missed: individual risk modules
+  (borrow / sla / otr / protections / circuit_breaker /
+  inventory_drift), 32 of 40 dashboard endpoints for shape
+  drift, `mm-indicators` crate for "library but unused".
+
 ## Graph system audit — Apr 19 follow-ups
 
 Surfaced during the post-batch audit at
