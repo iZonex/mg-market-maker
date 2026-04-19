@@ -1218,6 +1218,78 @@ impl NodeKind for OpenInterestSource {
     }
 }
 
+/// R13.2 — `Signal.FundingExtreme` — Bool observability
+/// signal that flips `true` when funding rate AND open
+/// interest are both past their configured thresholds. Honest
+/// framing: this is an OBSERVABILITY signal, not a weapon.
+/// True weaponization of funding rates requires controlling
+/// majority of OI on the perp — impossible for anyone except
+/// exchange-internal arb desks. What this signal catches:
+/// "funding rate is already extreme and OI is already large,
+/// so a push now is likely to force leverage unwinds."
+/// Operators use it as a gate on `Strategy.CascadeHunter`
+/// when the baseline conditions for a cascade are already
+/// met organically.
+///
+/// Not restricted — funding + OI are public data, defensive
+/// operators widen spreads on extreme-funding symbols too.
+#[derive(Debug, Default)]
+pub struct FundingExtremeSource;
+
+static FUNDING_EXTREME_OUTPUTS: Lazy<Vec<Port>> =
+    Lazy::new(|| vec![Port::new("value", PortType::Bool)]);
+
+impl NodeKind for FundingExtremeSource {
+    fn kind(&self) -> &'static str {
+        "Signal.FundingExtreme"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &FUNDING_EXTREME_OUTPUTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![
+            ConfigField {
+                name: "funding_rate_threshold",
+                label: "Funding rate threshold (fraction)",
+                hint: Some(
+                    "Absolute funding rate past which the signal fires (0.0005 = 5 bps per interval).",
+                ),
+                default: serde_json::json!("0.0005"),
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: Some(0.01),
+                    step: Some(0.0001),
+                },
+            },
+            ConfigField {
+                name: "min_oi_notional",
+                label: "Minimum OI notional",
+                hint: Some(
+                    "Open interest (USD) above which the symbol is treated as liquid enough for the signal to matter.",
+                ),
+                default: serde_json::json!("10000000"),
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(1_000_000.0),
+                },
+            },
+        ]
+    }
+}
+
 /// R7.1 — `Signal.LongShortRatio` — aggregate retail long vs
 /// short positioning on the running symbol. Three outputs:
 ///   * `long_pct` — fraction of accounts net-long (0..=1)

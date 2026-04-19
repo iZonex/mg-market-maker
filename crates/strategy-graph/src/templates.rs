@@ -37,6 +37,7 @@ static PENTEST_PUMP_AND_DUMP: &str = include_str!("../templates/pentest/pump-and
 static PENTEST_RAVE_CYCLE: &str = include_str!("../templates/pentest/rave-cycle.json");
 static PENTEST_RAVE_FULL_CAMPAIGN: &str = include_str!("../templates/pentest/rave-full-campaign.json");
 static PENTEST_LIQUIDATION_CASCADE: &str = include_str!("../templates/pentest/liquidation-cascade.json");
+static PENTEST_BASKET_PUSH: &str = include_str!("../templates/pentest/basket-push.json");
 static RUG_DETECTOR_COMPOSITE: &str = include_str!("../templates/rug-detector-composite.json");
 static FUNDING_AWARE_QUOTER: &str = include_str!("../templates/funding-aware-quoter.json");
 static LIQUIDITY_BURN_GUARD: &str = include_str!("../templates/liquidity-burn-guard.json");
@@ -146,6 +147,11 @@ const BUILTIN: &[BuiltinTemplate] = &[
         name: "pentest-liquidation-cascade",
         description: "⚠⚠⚠ PENTEST ONLY — LIQUIDATION CASCADE TRIGGER. Combines Signal.LongShortRatio (crowd positioning) + Signal.LiquidationLevelEstimate (forward-looking cluster distance) → Strategy.CascadeHunter (gated crossing push). Surveillance.RugScore self-guard fires at 0.5. Reproduces the 2021-05 BTC flash-crash pattern (see docs/research/liquidation-cascades.md for the full public-investigation reference). Running this on any venue you don't own or aren't explicitly authorized to pentest is market manipulation under MAR Article 12 / CEA §9(a) / MiCA Article 92 and a ToS violation everywhere. Requires MM_ALLOW_RESTRICTED=yes-pentest-mode + written venue-owner authorization + compliance review sign-off before deploy.",
         body: PENTEST_LIQUIDATION_CASCADE,
+    },
+    BuiltinTemplate {
+        name: "pentest-basket-push",
+        description: "⚠⚠⚠ PENTEST ONLY — CORRELATED BASKET PUSH. Strategy.BasketPush fans VenueQuotes across a pre-configured 3-symbol basket (placeholder: RAVEUSDT + SIRENUSDT + MYXUSDT) to replay the 2026-04 ZachXBT correlated-group attack shape. Surveillance.RugScore self-guard trips kill L4 on combined ≥ 0.5. Running on any venue without written owner authorization is market manipulation under MAR Art. 12 / CEA §9(a) / MiCA Art. 92. Requires MM_ALLOW_RESTRICTED=yes-pentest-mode + compliance review sign-off + the explicit basket members replaced with your authorized pentest symbols before deploy.",
+        body: PENTEST_BASKET_PUSH,
     },
 ];
 

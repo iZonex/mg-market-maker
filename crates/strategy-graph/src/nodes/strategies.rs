@@ -1519,6 +1519,88 @@ impl NodeKind for CascadeHunter {
     }
 }
 
+/// ⚠ RESTRICTED — `Strategy.BasketPush` — coordinated push
+/// across a basket of correlated symbols / venues. Operators
+/// configure a list of `(venue, symbol, side, size)` legs;
+/// every tick the node emits a `VenueQuotes` bundle with one
+/// leg per basket entry so the engine's multi-venue dispatch
+/// (already wired for `Out.VenueQuotes`) fans out the orders.
+///
+/// # Use case
+///
+/// The 2026-04 ZachXBT write-ups show correlated token groups
+/// (RAVE / SIREN / MYX) moving in lock-step. Attacking any one
+/// in isolation rarely gets the leverage a basket play does —
+/// coordinated pressure on three correlated low-liquidity
+/// symbols produces a much bigger index move than pushing any
+/// one alone.
+///
+/// # Why restricted
+///
+/// Same as every other Epic R node — running this against any
+/// venue you do not own or are not authorized to pentest is
+/// market manipulation under MAR Art. 12 / CEA §9(a) / MiCA
+/// Art. 92. The `restricted() = true` flag + the
+/// `MM_ALLOW_RESTRICTED=yes-pentest-mode` env gate refuse the
+/// deploy without explicit operator opt-in.
+#[derive(Debug, Default)]
+pub struct BasketPush;
+
+impl NodeKind for BasketPush {
+    fn kind(&self) -> &'static str {
+        "Strategy.BasketPush"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &[]
+    }
+    fn output_ports(&self) -> &[Port] {
+        &QUOTES_OUT
+    }
+    fn restricted(&self) -> bool {
+        true
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+    fn config_schema(&self) -> Vec<ConfigField> {
+        vec![
+            ConfigField {
+                name: "basket",
+                label: "⚠ Basket legs (JSON array)",
+                hint: Some("Array of {venue, symbol, product, side, size}. Every tick the node emits one VenueQuote per leg."),
+                default: serde_json::json!("[]"),
+                widget: ConfigWidget::Text,
+            },
+            ConfigField {
+                name: "cross_depth_bps",
+                label: "⚠ Cross depth (bps)",
+                hint: Some("Bps across the opposite touch each leg crosses — the aggression level per leg."),
+                default: serde_json::json!("30"),
+                widget: ConfigWidget::Number { min: Some(1.0), max: Some(500.0), step: Some(1.0) },
+            },
+            ConfigField {
+                name: "burst_ticks",
+                label: "⚠ Burst ticks per cycle",
+                hint: Some("How many consecutive ticks each cycle emits before resting."),
+                default: serde_json::json!(3),
+                widget: ConfigWidget::Integer { min: Some(1), max: Some(100) },
+            },
+            ConfigField {
+                name: "rest_ticks",
+                label: "⚠ Rest ticks per cycle",
+                hint: Some("Idle ticks between bursts so the observable fingerprint looks intentional, not a bug loop."),
+                default: serde_json::json!(5),
+                widget: ConfigWidget::Integer { min: Some(0), max: Some(100) },
+            },
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

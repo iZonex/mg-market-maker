@@ -149,6 +149,7 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Strategy.LeverageBuilder" => Some(Box::new(strategies::LeverageBuilder)),
         // R7.4 — cascade hunter (pentest-only)
         "Strategy.CascadeHunter" => Some(Box::new(strategies::CascadeHunter)),
+        "Strategy.BasketPush" => Some(Box::new(strategies::BasketPush)),
         // MM-3 — execution plan DSL
         "Plan.Accumulate" => {
             plan::Accumulate::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
@@ -167,6 +168,7 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Signal.LongShortRatio" => Some(Box::new(sources::LongShortRatioSource)),
         "Signal.LiquidationLevelEstimate" => Some(Box::new(sources::LiquidationLevelEstimateSource)),
         "Signal.CascadeCompleted" => Some(Box::new(sources::CascadeCompletedSource)),
+        "Signal.FundingExtreme" => Some(Box::new(sources::FundingExtremeSource)),
         "Surveillance.SpoofingScore" => Some(Box::new(sources::SpoofingScore)),
         "Surveillance.LayeringScore" => Some(Box::new(sources::LayeringScore)),
         "Surveillance.QuoteStuffingScore" => Some(Box::new(sources::QuoteStuffingScore)),
@@ -320,6 +322,7 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Strategy.LeverageBuilder" => NodeMeta { label: "Leverage builder (pentest)", summary: "⚠ RESTRICTED — opens a leveraged perp position to set up an asymmetric multi-venue exposure. Respects venue leverage caps.", group: "Exploit" },
         "Strategy.CampaignOrchestrator" => NodeMeta { label: "Campaign orchestrator (pentest)", summary: "⚠ RESTRICTED — multi-phase timeline FSM chaining sub-strategies across venues. The full RAVE campaign replica used for exchange surveillance validation.", group: "Exploit" },
         "Strategy.CascadeHunter" => NodeMeta { label: "Cascade hunter (pentest)", summary: "⚠ RESTRICTED — one-shot liquidation cascade trigger gated by target_bps + trigger bool inputs. Couple to Signal.LongShortRatio + Surveillance.LiquidationHeatmap for the full 2021-BTC-crash pattern replay.", group: "Exploit" },
+        "Strategy.BasketPush" => NodeMeta { label: "Basket push (pentest)", summary: "⚠ RESTRICTED — coordinated push across a basket of correlated symbols / venues. Emits VenueQuotes per leg every burst tick. Replays the RAVE+SIREN+MYX correlated-group 2026-04 pattern.", group: "Exploit" },
 
         // MM-3 — execution plan DSL
         "Plan.Accumulate"      => NodeMeta { label: "Plan: Accumulate", summary: "Time-sliced accumulate / distribute with abort-price guard", group: "Plans" },
@@ -336,6 +339,7 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Signal.LongShortRatio" => NodeMeta { label: "Long/short ratio", summary: "Aggregate retail long vs short positioning. Honest MMs widen at extremes; pentest operators target the crowded side. Missing on spot / unsupported venues", group: "Signals" },
         "Signal.LiquidationLevelEstimate" => NodeMeta { label: "Liq level estimate", summary: "Forward-looking cluster distance (bps) from current mid, derived from assumed avg leverage. Pure computation — no venue API. Estimate only: treat as order-of-magnitude", group: "Signals" },
         "Signal.CascadeCompleted" => NodeMeta { label: "Cascade completed", summary: "Bool that flips true when in-window liquidation notional exceeds threshold. Downstream exit / stand-down trigger", group: "Signals" },
+        "Signal.FundingExtreme" => NodeMeta { label: "Funding extreme", summary: "Bool — flips true when |funding_rate| > threshold AND OI > min_notional. Observability, not weaponization — spot defensively-useful too.", group: "Signals" },
         "Surveillance.SpoofingScore" => NodeMeta { label: "Spoofing score", summary: "Likelihood our own flow looks like spoofing [0..1] + cancel_ratio + lifetime", group: "Surveillance" },
         "Surveillance.LayeringScore" => NodeMeta { label: "Layering score", summary: "Multi-order structured pressure + synchronous cancels [0..1]", group: "Surveillance" },
         "Surveillance.QuoteStuffingScore" => NodeMeta { label: "Quote stuffing score", summary: "High orders/sec + high cancel ratio + near-zero fill rate [0..1]", group: "Surveillance" },
@@ -489,6 +493,7 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Strategy.LeverageBuilder",
         "Strategy.CampaignOrchestrator",
         "Strategy.CascadeHunter",
+        "Strategy.BasketPush",
         "Plan.Accumulate",
         "Surveillance.ForeignTwap",
         "Cost.Sweep",
@@ -519,6 +524,7 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Signal.LongShortRatio",
         "Signal.LiquidationLevelEstimate",
         "Signal.CascadeCompleted",
+        "Signal.FundingExtreme",
         "Surveillance.SpoofingScore",
         "Surveillance.LayeringScore",
         "Surveillance.QuoteStuffingScore",
@@ -613,11 +619,10 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_125_nodes_after_r7_liquidation_cascade() {
-        // 121 after R4 + 4 (R7.1 LongShortRatio,
-        // R7.2 LiquidationLevelEstimate, R7.3 CascadeCompleted,
-        // R7.4 CascadeHunter) = 125.
-        assert_eq!(kinds().len(), 125, "catalog drift");
+    fn catalog_has_127_nodes_after_r13_basket_push() {
+        // 125 after R7 + 2 (R13.1 Strategy.BasketPush,
+        // R13.2 Signal.FundingExtreme) = 127.
+        assert_eq!(kinds().len(), 127, "catalog drift");
     }
 
     /// GR-1 — every indicator with a `period` config field must

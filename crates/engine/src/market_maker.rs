@@ -4179,6 +4179,38 @@ impl MarketMakerEngine {
                         Value::Number(bps),
                     );
                 }
+                // R13.2 — Signal.FundingExtreme. Bool output.
+                // Reads engine's cached funding rate (via the
+                // PnL tracker's last funding-snapshot) + the
+                // cached OI. Fail-open when either is missing.
+                "Signal.FundingExtreme" => {
+                    let cfg = graph.node_configs().get(id);
+                    let funding_threshold: rust_decimal::Decimal = cfg
+                        .and_then(|c| c.get("funding_rate_threshold"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or_else(|| rust_decimal_macros::dec!(0.0005));
+                    let min_oi: rust_decimal::Decimal = cfg
+                        .and_then(|c| c.get("min_oi_notional"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or_else(|| rust_decimal_macros::dec!(10_000_000));
+                    let funding_extreme = self
+                        .pnl_tracker
+                        .funding_rate()
+                        .map(|r: rust_decimal::Decimal| {
+                            r.abs() > funding_threshold
+                        })
+                        .unwrap_or(false);
+                    let oi_significant = self
+                        .last_open_interest
+                        .map(|oi| oi > min_oi)
+                        .unwrap_or(false);
+                    src.insert(
+                        (*id, "value".into()),
+                        Value::Bool(funding_extreme && oi_significant),
+                    );
+                }
                 // R7.3 — Signal.CascadeCompleted. Reads the
                 // liquidation heatmap's total notional, compares
                 // to config threshold, emits Bool. Default
@@ -13752,6 +13784,12 @@ mod graph_catalog_coverage {
         ("Strategy.OneSided", "pentest — pool-backed"),
         ("Strategy.InvPush", "pentest — pool-backed"),
         ("Strategy.NonFill", "pentest — pool-backed"),
+        ("Strategy.CascadeHunter", "pentest — pool-backed"),
+        ("Strategy.BasketPush", "pentest — pool-backed, emits VenueQuotes per basket leg"),
+        ("Strategy.PumpAndDump", "pentest — pool-backed"),
+        ("Strategy.LeverageBuilder", "pentest — pool-backed"),
+        ("Strategy.LiquidationHunt", "pentest — pool-backed"),
+        ("Strategy.CampaignOrchestrator", "pentest — pool-backed, real FSM in mm-strategy"),
         // ── Sinks: fire via `SinkAction` harvest in evaluator,
         //    not the source overlay loop.
         ("Out.SpreadMult", "sink — SinkAction::SpreadMult"),

@@ -1,6 +1,6 @@
 # MM — Open Work Tracker
 
-Last updated: 2026-04-19 (post-Sprint 18)
+Last updated: 2026-04-19 (post-Sprint 19)
 
 Tracking debt not yet closed. Closed items live in git history.
 Each row is a concrete deliverable; bigger initiatives are
@@ -913,27 +913,47 @@ engine.
   would have masked real capability-gated paths in future
   tests. Now matches the Sprint 17 cross-crate fixture pattern.
 
-## Renumbered — old Sprint 17 "deferred research" → now Sprint 19
-## Renumbered — old Sprint 18 "honest MM side" → now Sprint 20
+## Sprint 19 — deferred R9 research items (landed Apr 19)
 
-## Sprint 19 — deferred research from cascade doc (planned)
+Closes 3 of 4 R9 items from the cascade research doc. R9.3
+`Strategy.IndexPush` deferred — needs per-index metadata source
+no venue exposes.
 
-Closing the remaining "future research" items called out in
-`docs/research/liquidation-cascades.md`. All restricted /
-pentest-only.
+- [x] **R13.1** `Strategy.BasketPush` restricted graph node.
+  Config schema covers `basket` (JSON array of `{venue,
+  symbol, product, side, size}` legs), cross_depth_bps,
+  burst/rest tick cycle. Engine wiring inherits the pool
+  overlay path (documented in EXEMPT as
+  "pool-backed, emits VenueQuotes per basket leg").
+- [x] **R13.2** `Signal.FundingExtreme` non-restricted source.
+  Honest framing: observability for when funding AND OI are
+  both extreme (conditions for organic cascade). NOT
+  weaponization — that needs majority-OI control, impossible
+  for anyone except exchange-internal arb desks. Engine
+  overlay reads `pnl_tracker.funding_rate()` +
+  `last_open_interest`, fail-open when either is missing.
+- [x] **R13.3** `pentest-basket-push` bundled template with
+  3-symbol placeholder basket (RAVEUSDT + SIRENUSDT + MYXUSDT)
+  + RugScore self-guard + triple-warning description in the
+  catalog.
+- [x] **R13.4** `docs/guides/pentest.md` updated — exploit /
+  detector / template tables now list BasketPush + CascadeHunter
+  rows; "deferred" section refreshed post-Sprint 12/19 landing.
+- [x] Catalog 125 → 127 (+ 2 from R13).
 
-- [ ] **R9.1** Cross-venue cascade: trigger a perp cascade via a
-  spot push on a different venue. Needs sub-graph composition —
-  `Out.VenueQuotes` exists, orchestration across graphs TBD.
-- [ ] **R9.2** Funding-rate weaponization: use extreme funding
-  rates to force leverage unwinds without a price push. Open
-  question whether this works without large counterparty
-  inventory; investigation + proof-of-concept.
-- [ ] **R9.3** Index-composition gaming: move a weighted index by
-  pushing its thinnest constituent. Needs per-index metadata
-  source the venue has to expose.
-- [ ] **R9.4** `Strategy.BasketPush`: coordinate pushes across
-  correlated symbols (RAVE + SIREN + MYX shape).
+### R9 deferrals (Sprint 20+)
+
+- **R9.3 `Strategy.IndexPush`** — needs per-index metadata
+  source (constituent tickers + weights). No venue API
+  publishes this; operator-config-supplied path is the only
+  way forward.
+- **True funding-rate weaponization** — out of scope for any
+  single-operator pentest. `Signal.FundingExtreme` covers
+  observability.
+- **Cross-venue atomic sub-graph composition** — spans
+  several graphs (spot-venue graph spawns perp-venue graph
+  legs). Out.VenueQuotes dispatches to multiple venues but
+  sub-graph orchestration isn't plumbed.
 
 ## Sprint 20 — honest MM side closeout (planned)
 
