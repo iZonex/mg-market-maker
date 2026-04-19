@@ -19,12 +19,18 @@ Legend:
 ## P0 — production-blocking
 
 ### Orderbook rigor
-- [ ] **BOOK-1** Live L3 queue-position tracker. Port Rigtorp
-  model from `crates/backtester/src/queue_model.rs` into the
-  live path; attach to every resting order so the engine can
-  estimate fill probability before placing a quote.
-- [ ] **BOOK-2** Graph source `Book.FillProbability` —
-  derived from queue pos + trade rate. Feeds decision sizing.
+- [ ] **BOOK-1** Live queue-position tracker (Rigtorp / L2-derived).
+  Crypto venues don't expose L3 feeds, but the queue-position
+  model in `crates/backtester/src/queue_model.rs` already works
+  off L2 depth + trade events — port it to a shared crate,
+  attach one `QueuePos` to every resting maker order, drive it
+  from book-keeper depth changes and trade-feed events so the
+  engine knows how many units of foreign qty sit ahead of each
+  of our orders in real time.
+- [ ] **BOOK-2** Graph source `Book.FillProbability` — derived
+  from tracked queue position + rolling trade-rate estimate.
+  Feeds decision sizing + a queue-aware variant of the
+  quoting strategy.
 
 ### Perpetual safety
 - [ ] **PERP-2** Use venue-reported `total_maintenance_margin`
@@ -148,6 +154,11 @@ Legend:
   every one needs a safety comment or refactor.
 - [ ] **HARD-5** CI/CD pipeline: github actions for build +
   clippy + test + frontend build on every PR.
+- [ ] **HARD-6** Fix flaky `auth::tests::token_round_trips_and_expires`.
+  The test tampers a token by `pop()` + `push('a')`; if the
+  original token already ends in `'a'` the tamper is a no-op
+  and the assertion fails. Replace with a deterministic tamper
+  (e.g. flip the final char to a known-different byte).
 
 ---
 
