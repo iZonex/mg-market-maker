@@ -21,6 +21,7 @@ pub fn client_routes() -> Router<DashboardState> {
     Router::new()
         .route("/api/v1/positions", get(get_positions))
         .route("/api/v1/pnl", get(get_pnl))
+        .route("/api/v1/pnl/per_leg", get(get_pnl_per_leg))
         .route("/api/v1/sla", get(get_sla))
         .route("/api/v1/sla/certificate", get(get_sla_certificate))
         .route("/api/v1/sla/hourly", get(get_sla_hourly))
@@ -149,6 +150,63 @@ struct PnlResponse {
     round_trips: u64,
     volume: Decimal,
     efficiency_bps: Decimal,
+}
+
+/// 23-UX-3 — per-leg PnL attribution. One row per
+/// (venue, symbol, product) combining the leg's SymbolState
+/// with its PnL breakdown. Answers "when total PnL moved -$100,
+/// which leg caused it?" without the operator having to scrape
+/// multiple endpoints.
+#[derive(Debug, Serialize)]
+struct PnlPerLegRow {
+    venue: String,
+    symbol: String,
+    product: String,
+    mode: String,
+    strategy: String,
+    total: Decimal,
+    spread_capture: Decimal,
+    inventory_pnl: Decimal,
+    rebate_income: Decimal,
+    fees_paid: Decimal,
+    volume: Decimal,
+    round_trips: u64,
+    fills: u64,
+    /// Effective PnL per $ of quote-currency volume (bps).
+    /// Helps spot which leg is underperforming on capital
+    /// efficiency.
+    efficiency_bps: Decimal,
+}
+
+async fn get_pnl_per_leg(State(state): State<DashboardState>) -> Json<Vec<PnlPerLegRow>> {
+    let symbols = state.get_all();
+    let rows: Vec<PnlPerLegRow> = symbols
+        .into_iter()
+        .map(|s| {
+            let efficiency = if s.pnl.volume > dec!(0) {
+                s.pnl.total / s.pnl.volume * dec!(10_000)
+            } else {
+                dec!(0)
+            };
+            PnlPerLegRow {
+                venue: s.venue,
+                symbol: s.symbol,
+                product: s.product,
+                mode: s.mode,
+                strategy: s.strategy,
+                total: s.pnl.total,
+                spread_capture: s.pnl.spread,
+                inventory_pnl: s.pnl.inventory,
+                rebate_income: s.pnl.rebates,
+                fees_paid: s.pnl.fees,
+                volume: s.pnl.volume,
+                round_trips: s.pnl.round_trips,
+                fills: s.total_fills,
+                efficiency_bps: efficiency,
+            }
+        })
+        .collect();
+    Json(rows)
 }
 
 async fn get_pnl(State(state): State<DashboardState>) -> Json<Vec<PnlResponse>> {

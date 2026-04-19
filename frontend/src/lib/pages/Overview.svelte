@@ -11,6 +11,7 @@
   import CrossVenuePortfolio from '../components/CrossVenuePortfolio.svelte'
   import FundingPanel from '../components/FundingPanel.svelte'
   import PerLegInventoryChart from '../components/PerLegInventoryChart.svelte'
+  import PerLegPnl from '../components/PerLegPnl.svelte'
 
   let { ws, auth } = $props()
 
@@ -52,6 +53,13 @@
   <div class="row row-1">
     <Card title="Inventory by leg" subtitle="per-venue history, 4h window">
       {#snippet children()}<PerLegInventoryChart {auth} />{/snippet}
+    </Card>
+  </div>
+
+  <!-- Row 2.7: Per-leg PnL attribution (full width) -->
+  <div class="row row-1">
+    <Card title="PnL attribution by leg" subtitle="which leg sources the PnL">
+      {#snippet children()}<PerLegPnl {auth} />{/snippet}
     </Card>
   </div>
 
