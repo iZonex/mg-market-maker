@@ -106,6 +106,44 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
         );
     }
 
+    // --- API key gating (22A-4) ---
+    // Live mode with `user_stream_enabled=true` but no
+    // `MM_API_KEY` set is the silent failure Sprint 22 audit
+    // flagged: the engine boots, public WS connects, but the
+    // user-stream task short-circuits at main.rs:2043 and
+    // BalanceCache / InventoryManager never see real fills.
+    // In live mode that's a hard refusal. In paper mode the
+    // operator is free to run without keys (paper_match_trade
+    // still emits fills) but we want them to have explicitly
+    // opted in — either `user_stream_enabled=false` OR keys set.
+    let api_key_set = !config
+        .exchange
+        .api_key
+        .as_deref()
+        .unwrap_or("")
+        .is_empty();
+    if mm.user_stream_enabled && !api_key_set {
+        if config.mode.eq_ignore_ascii_case("live") {
+            errors.push(
+                "LIVE MODE with user_stream_enabled=true but MM_API_KEY \
+                 is not set. The user-data WebSocket would skip silently, \
+                 leaving BalanceCache + InventoryManager blind to real \
+                 fills. Set MM_API_KEY+MM_API_SECRET, or disable \
+                 user_stream_enabled explicitly if you really want to \
+                 run without account state."
+                    .to_string(),
+            );
+        } else {
+            warnings.push(
+                "user_stream_enabled=true but MM_API_KEY is empty — \
+                 the user-data stream will skip. Paper-mode PnL / VaR / \
+                 portfolio-risk panels will report zeros. Set the key or \
+                 disable user_stream_enabled to silence this warning."
+                    .to_string(),
+            );
+        }
+    }
+
     // --- Symbols ---
     if config.symbols.is_empty() && config.clients.is_empty() {
         errors.push("at least one symbol is required (via symbols or clients)".to_string());
@@ -763,6 +801,67 @@ mod tests {
         cfg.risk.max_exposure_quote = dec!(7500);
         cfg.risk.max_drawdown_quote = dec!(350);
         cfg.kill_switch.daily_loss_limit = dec!(800);
+        // 22A-4 — live mode + user_stream_enabled requires API
+        // keys. base_config() defaults to a Custom venue without
+        // keys so we populate them here to exercise the happy path.
+        cfg.exchange.api_key = Some("k".into());
+        cfg.exchange.api_secret = Some("s".into());
+        validate_config(&cfg).unwrap();
+    }
+
+    /// 22A-4 — live mode with `user_stream_enabled=true` but no
+    /// `MM_API_KEY` refuses to boot. The silent skip at
+    /// `main.rs:2043` used to let the engine run without ever
+    /// seeing real balances.
+    #[test]
+    fn live_mode_without_api_key_is_rejected() {
+        let mut cfg = base_config();
+        cfg.mode = "live".into();
+        // Calibrated values so the placeholder guard doesn't
+        // fire first — the error we want is the API key gate.
+        cfg.market_maker.gamma = dec!(0.08);
+        cfg.market_maker.kappa = dec!(42.3);
+        cfg.market_maker.sigma = dec!(0.00005);
+        cfg.risk.max_exposure_quote = dec!(7500);
+        cfg.risk.max_drawdown_quote = dec!(350);
+        cfg.kill_switch.daily_loss_limit = dec!(800);
+        cfg.market_maker.user_stream_enabled = true;
+        cfg.exchange.api_key = None;
+        cfg.exchange.api_secret = None;
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("MM_API_KEY"), "{err}");
+        assert!(err.contains("LIVE MODE"), "{err}");
+    }
+
+    /// 22A-4 — operator can opt out by explicitly disabling the
+    /// user-stream. No key needed in that case (the engine runs
+    /// on public data only, by design).
+    #[test]
+    fn live_mode_user_stream_disabled_accepts_empty_key() {
+        let mut cfg = base_config();
+        cfg.mode = "live".into();
+        cfg.market_maker.gamma = dec!(0.08);
+        cfg.market_maker.kappa = dec!(42.3);
+        cfg.market_maker.sigma = dec!(0.00005);
+        cfg.risk.max_exposure_quote = dec!(7500);
+        cfg.risk.max_drawdown_quote = dec!(350);
+        cfg.kill_switch.daily_loss_limit = dec!(800);
+        cfg.market_maker.user_stream_enabled = false;
+        cfg.exchange.api_key = None;
+        cfg.exchange.api_secret = None;
+        validate_config(&cfg).unwrap();
+    }
+
+    /// 22A-4 — paper mode with the same broken state warns but
+    /// does NOT refuse to boot (operator might be running a
+    /// public-data-only smoke test).
+    #[test]
+    fn paper_mode_without_api_key_is_accepted_with_warning() {
+        let mut cfg = base_config();
+        cfg.mode = "paper".into();
+        cfg.market_maker.user_stream_enabled = true;
+        cfg.exchange.api_key = None;
+        cfg.exchange.api_secret = None;
         validate_config(&cfg).unwrap();
     }
 

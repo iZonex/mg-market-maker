@@ -2041,6 +2041,23 @@ fn spawn_event_merger(
     let api_key = config.exchange.api_key.clone().unwrap_or_default();
     let api_secret = config.exchange.api_secret.clone().unwrap_or_default();
     if api_key.is_empty() {
+        // 22A-4 — this skip used to be silent. Paper mode with
+        // user_stream_enabled=true but no API key means the
+        // engine boots, subscribes to public data, and runs
+        // without ever seeing real account balances — PnL
+        // attribution, InventoryManager, VarGuard, BalanceCache
+        // all operate off empty state. Loud warn! so the
+        // operator notices before an audit chases a "PnL says
+        // zero" symptom back to this quiet return.
+        warn!(
+            symbol = symbol,
+            mode = %config.mode,
+            "user_stream_enabled=true but MM_API_KEY is empty — skipping \
+             user-data stream. In paper mode this means fills + inventory \
+             + balances run off an empty BalanceCache (paper_match_trade \
+             still emits fills, but PnL/VaR/portfolio risk are blind). In \
+             live mode validate_config would have already refused to boot."
+        );
         return merged_rx;
     }
 
