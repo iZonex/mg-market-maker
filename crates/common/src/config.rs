@@ -1282,6 +1282,23 @@ pub struct MarketMakerConfig {
     #[serde(default)]
     pub var_guard_ewma_lambda: Option<Decimal>,
 
+    /// 95 %-CVaR (Expected Shortfall) floor. CVaR is the
+    /// average loss *conditional on* being in the 5 % worst
+    /// tail — strictly more negative than VaR_95 by
+    /// construction. Breach throttles size to 0.5 via the
+    /// same ladder as `var_guard_limit_95`. `None` skips the
+    /// tier. Epic C stage-2 — implemented in
+    /// `mm-risk::var_guard` with 4 unit tests; exposed here
+    /// so operators can configure tail-severity gating.
+    #[serde(default)]
+    pub var_guard_cvar_limit_95: Option<Decimal>,
+
+    /// 99 %-CVaR floor. Hard-halt tier; breach drops size to
+    /// 0.0. Typically more negative than `var_guard_limit_99`.
+    /// `None` skips the tier.
+    #[serde(default)]
+    pub var_guard_cvar_limit_99: Option<Decimal>,
+
     /// Maximum acceptable hedge-book staleness in milliseconds
     /// for the cross-venue basis strategy (P1.4 stage-1).
     /// Default `1500` — typical cross-venue WS feeds jitter
@@ -2277,6 +2294,8 @@ impl Default for AppConfig {
                 var_guard_limit_95: None,
                 var_guard_limit_99: None,
                 var_guard_ewma_lambda: None,
+                var_guard_cvar_limit_95: None,
+                var_guard_cvar_limit_99: None,
                 cross_venue_basis_max_staleness_ms: 1500,
                 sor_inline_enabled: false,
                 sor_dispatch_interval_secs: default_sor_dispatch_interval_secs(),

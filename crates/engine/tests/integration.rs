@@ -75,6 +75,8 @@ fn test_config() -> MarketMakerConfig {
         var_guard_limit_95: None,
         var_guard_limit_99: None,
         var_guard_ewma_lambda: None,
+        var_guard_cvar_limit_95: None,
+        var_guard_cvar_limit_99: None,
         cross_venue_basis_max_staleness_ms: 1500,
         strategy_capital_budget: std::collections::HashMap::new(),
             symbol_circulating_supply: std::collections::HashMap::new(),

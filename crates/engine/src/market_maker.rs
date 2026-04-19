@@ -873,8 +873,8 @@ impl MarketMakerEngine {
                     limit_95: config.market_maker.var_guard_limit_95,
                     limit_99: config.market_maker.var_guard_limit_99,
                     ewma_lambda: config.market_maker.var_guard_ewma_lambda,
-                    cvar_limit_95: None,
-                    cvar_limit_99: None,
+                    cvar_limit_95: config.market_maker.var_guard_cvar_limit_95,
+                    cvar_limit_99: config.market_maker.var_guard_cvar_limit_99,
                 }))
             } else {
                 None
