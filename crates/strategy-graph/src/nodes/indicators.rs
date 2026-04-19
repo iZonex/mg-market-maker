@@ -43,6 +43,26 @@ fn parse_period(cfg: &Json, default: usize) -> Option<usize> {
     Some(p)
 }
 
+/// GR-1 — shared `period` ConfigField for every `Indicator.*`
+/// node. Keeps the UI schema in sync with the runtime range
+/// enforced by [`parse_period`] (`1 ≤ period ≤ 10_000`). Every
+/// indicator calls this in its `config_schema()` and then
+/// optionally appends additional fields (Bollinger adds
+/// `k_stddev`).
+fn period_config_field(default: i64) -> crate::node::ConfigField {
+    use crate::node::{ConfigField, ConfigWidget};
+    ConfigField {
+        name: "period",
+        label: "Period",
+        hint: Some("Lookback window (1–10000 samples)"),
+        default: serde_json::json!(default),
+        widget: ConfigWidget::Integer {
+            min: Some(1),
+            max: Some(10_000),
+        },
+    }
+}
+
 // ── Indicator.SMA ──────────────────────────────────────────
 
 #[derive(Debug)]
@@ -73,6 +93,9 @@ impl NodeKind for SmaNode {
     }
     fn output_ports(&self) -> &[Port] {
         &IND_OUTPUTS
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        vec![period_config_field(14)]
     }
     fn evaluate(
         &self,
@@ -141,6 +164,9 @@ impl NodeKind for EmaNode {
     fn output_ports(&self) -> &[Port] {
         &IND_OUTPUTS
     }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        vec![period_config_field(14)]
+    }
     fn evaluate(
         &self,
         _ctx: &EvalCtx,
@@ -198,6 +224,9 @@ impl NodeKind for HmaNode {
     fn output_ports(&self) -> &[Port] {
         &IND_OUTPUTS
     }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        vec![period_config_field(14)]
+    }
     fn evaluate(
         &self,
         _ctx: &EvalCtx,
@@ -254,6 +283,9 @@ impl NodeKind for RsiNode {
     }
     fn output_ports(&self) -> &[Port] {
         &IND_OUTPUTS
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        vec![period_config_field(14)]
     }
     fn evaluate(
         &self,
@@ -325,6 +357,9 @@ impl NodeKind for AtrNode {
     }
     fn output_ports(&self) -> &[Port] {
         &IND_OUTPUTS
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        vec![period_config_field(14)]
     }
     fn evaluate(
         &self,
@@ -428,6 +463,23 @@ impl NodeKind for BollingerNode {
     }
     fn output_ports(&self) -> &[Port] {
         &BOLLINGER_OUTPUTS
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![
+            period_config_field(20),
+            ConfigField {
+                name: "k_stddev",
+                label: "σ multiplier",
+                hint: Some("Band width in standard deviations (> 0)"),
+                default: serde_json::json!("2"),
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.1),
+                },
+            },
+        ]
     }
     fn evaluate(
         &self,

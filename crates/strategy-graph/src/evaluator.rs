@@ -35,7 +35,16 @@ pub type EvalTrace = HashMap<(NodeId, String), Value>;
 pub enum SinkAction {
     SpreadMult(Decimal),
     SizeMult(Decimal),
-    KillEscalate { level: u8, reason: String },
+    KillEscalate {
+        level: u8,
+        reason: String,
+        /// GR-2 — optional venue scope. When `Some(v)` the
+        /// engine applies the escalation only if its own
+        /// venue matches `v`; cross-engine fan-out stays
+        /// idle. `None` keeps the legacy global semantics
+        /// (every engine receiving this action escalates).
+        venue: Option<String>,
+    },
     /// Phase 2 Wave D — graph-authored flatten. `policy` is the
     /// compact string emitted by an `Exec.*Config` node
     /// (`twap:120:5`, `vwap:300`, `pov:10`, `iceberg:0.1`). The
@@ -330,7 +339,19 @@ impl Evaluator {
                             .and_then(Value::as_string)
                             .unwrap_or("graph sink")
                             .to_string();
-                        sinks.push(SinkAction::KillEscalate { level, reason });
+                        // GR-2 — honour an optional `venue`
+                        // config string so a detector can scope
+                        // the kill to a single venue's pool
+                        // entry instead of every engine sharing
+                        // the graph.
+                        let venue = self
+                            .configs
+                            .get(id)
+                            .and_then(|c| c.get("venue"))
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string());
+                        sinks.push(SinkAction::KillEscalate { level, reason, venue });
                     }
                 }
                 "Out.Flatten" => {

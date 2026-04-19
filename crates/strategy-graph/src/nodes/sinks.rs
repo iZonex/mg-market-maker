@@ -100,6 +100,20 @@ impl NodeKind for KillEscalate {
     fn output_ports(&self) -> &[Port] {
         &UNIT_OUT
     }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        // GR-2 — optional `venue` scope. Empty = global
+        // (every engine sharing the graph escalates). Match
+        // values are case-insensitive; the engine compares
+        // against `format!("{:?}", exchange_type).to_lowercase()`.
+        vec![ConfigField {
+            name: "venue",
+            label: "Venue (optional)",
+            hint: Some("Leave empty for a global kill; otherwise e.g. `binance`, `bybit`"),
+            default: serde_json::json!(""),
+            widget: ConfigWidget::Text,
+        }]
+    }
     fn evaluate(
         &self,
         _ctx: &EvalCtx,

@@ -90,12 +90,14 @@ Legend:
   Run binance paper + bybit paper side-by-side; deploy a
   graph using cross-venue reads; verify DecisionLedger
   resolves, tiered OTR publishes per venue, cross-venue
-  inventory aggregates. Operator-driven — write a smoke-test
-  runbook in `docs/guides/`.
-- [ ] **PAPER-3** Paper-fill sanity tests for the new graph
-  sources (Plan.Accumulate, Cost.Sweep, Risk.UnrealizedIfFlatten)
-  — unit tests that feed synthetic book state and assert the
-  source node emits the expected value.
+  inventory aggregates. **Operator-driven** — needs a live
+  paper-mode run of the binary. See the new runbook at
+  `docs/guides/paper-smoke-two-venue.md`.
+- [x] **PAPER-3** Engine-level sanity tests added at
+  `crates/engine/src/market_maker.rs` (`graph_source_sanity_tests`):
+  Cost.Sweep on empty vs stocked book, Risk.UnrealizedIfFlatten
+  with / without inventory. Plan.Accumulate already covered by
+  7 tests in `crates/strategy-graph/src/nodes/plan.rs`.
 
 ### UI / UX
 - [ ] **UI-5** Graph deploy diff viewer. History panel shows
@@ -147,11 +149,22 @@ Legend:
   probability estimate.
 
 ### Graph polish
-- [ ] **GR-1** Per-node kind schema validation extensions —
-  enum coverage for fields like `cmp` on Cast.ToBool, range
-  validators on windows (> 0).
-- [ ] **GR-2** Per-venue kill-switch link (detector score
-  ≥ 0.8 on venue X kills pool entry on venue X only).
+- [x] **GR-1** `period_config_field(default)` helper in
+  `crates/strategy-graph/src/nodes/indicators.rs` gives every
+  Indicator.* kind a bounded `Integer { min: 1, max: 10_000 }`
+  widget matching `parse_period`. Bollinger also gets a `σ
+  multiplier` `Number { min: 0.0 }` widget. Cast.ToBool already
+  had Enum-widget coverage for `cmp`. Catalog guard test
+  (`every_period_indicator_declares_bounded_integer_schema`)
+  blocks regressions on new indicators.
+- [x] **GR-2** `SinkAction::KillEscalate` now carries an
+  optional `venue: Option<String>`. The evaluator reads the
+  string from `Out.KillEscalate`'s node config; the engine
+  compares (case-insensitive) against its own
+  `exchange_type.to_lowercase()` and skips the kill on
+  mismatch. Empty / missing venue keeps the legacy global
+  semantics. Two evaluator round-trip tests + engine-level
+  handling in `market_maker.rs`.
 
 ---
 

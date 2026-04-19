@@ -544,4 +544,44 @@ mod tests {
         // 102 after SPOT-1 borrow trio + 1 (BOOK-2: Book.FillProbability). = 103.
         assert_eq!(kinds().len(), 103, "catalog drift");
     }
+
+    /// GR-1 — every indicator with a `period` config field must
+    /// declare an `Integer` widget with `min ≥ 1`. Catches the
+    /// regression where a new indicator landed with `period` but
+    /// no schema, so the UI rendered a free-form text input and
+    /// operators could paste `-5` or `0` and only see the graph
+    /// fail to compile at deploy time.
+    #[test]
+    fn every_period_indicator_declares_bounded_integer_schema() {
+        use crate::node::ConfigWidget;
+        let period_bearing_kinds = [
+            "Indicator.SMA",
+            "Indicator.EMA",
+            "Indicator.HMA",
+            "Indicator.RSI",
+            "Indicator.ATR",
+            "Indicator.Bollinger",
+        ];
+        for k in period_bearing_kinds {
+            let node = build(k, &Json::Null).expect("indicator builds");
+            let schema = node.config_schema();
+            let period_field = schema
+                .iter()
+                .find(|f| f.name == "period")
+                .unwrap_or_else(|| panic!("{k} must expose a `period` field"));
+            match &period_field.widget {
+                ConfigWidget::Integer { min, max } => {
+                    assert!(
+                        matches!(min, Some(n) if *n >= 1),
+                        "{k} period widget must have min ≥ 1, got {min:?}"
+                    );
+                    assert!(
+                        matches!(max, Some(n) if *n >= 1),
+                        "{k} period widget must cap max, got {max:?}"
+                    );
+                }
+                other => panic!("{k} period widget must be Integer, got {other:?}"),
+            }
+        }
+    }
 }

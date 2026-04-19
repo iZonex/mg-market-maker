@@ -3490,7 +3490,28 @@ impl MarketMakerEngine {
                 SinkAction::SizeMult(m) => {
                     self.auto_tuner.set_graph_size_mult(m);
                 }
-                SinkAction::KillEscalate { level, reason } => {
+                SinkAction::KillEscalate { level, reason, venue } => {
+                    // GR-2 — per-venue scoped kill. When the
+                    // sink's `venue` string is set and doesn't
+                    // match this engine's venue, skip the kill
+                    // entirely so the sibling engine on the
+                    // named venue catches it instead.
+                    if let Some(ref target) = venue {
+                        let own_venue = format!(
+                            "{:?}",
+                            self.config.exchange.exchange_type
+                        )
+                        .to_lowercase();
+                        if !target.eq_ignore_ascii_case(&own_venue) {
+                            debug!(
+                                symbol = %self.symbol,
+                                own = %own_venue,
+                                target = %target,
+                                "graph kill sink scoped to a different venue — skipping"
+                            );
+                            continue;
+                        }
+                    }
                     let kl = match level {
                         1 => mm_risk::kill_switch::KillLevel::WidenSpreads,
                         2 => mm_risk::kill_switch::KillLevel::StopNewOrders,
@@ -11056,5 +11077,205 @@ mod stage2_track1_integration {
         assert_ne!(seed_after.queue_wait_secs, dec!(999),
             "refresh must replace the seeded value once enough trades arrive");
         assert!(seed_after.queue_wait_secs > dec!(0));
+    }
+}
+
+// -------------------------------------------------------------
+// PAPER-3 — sanity tests for source-overlay nodes. Each test
+// primes engine state (book + inventory), builds a tiny graph
+// that pipes the source into `Out.SpreadMult`, ticks, and
+// asserts on `auto_tuner.graph_spread_mult()`. SpreadMult
+// floors at `1.0`, so any source emitting `Missing` leaves the
+// multiplier at its default while a Number-emitting source
+// pushes it above the floor.
+// -------------------------------------------------------------
+
+#[cfg(test)]
+mod graph_source_sanity_tests {
+    use super::*;
+    use crate::connector_bundle::ConnectorBundle;
+    use crate::test_support::MockConnector;
+    use mm_common::config::AppConfig;
+    use mm_common::types::{Fill, PriceLevel, Side};
+    use mm_exchange_core::connector::{VenueId, VenueProduct};
+    use mm_exchange_core::events::MarketEvent;
+    use mm_strategy::AvellanedaStoikov;
+    use mm_strategy_graph::{Edge, Graph, GraphNode, NodeId, PortRef, Scope};
+    use uuid::Uuid;
+
+    fn sample_config() -> AppConfig {
+        AppConfig::default()
+    }
+
+    fn sample_product(symbol: &str) -> ProductSpec {
+        ProductSpec {
+            symbol: symbol.to_string(),
+            base_asset: "BTC".to_string(),
+            quote_asset: "USDT".to_string(),
+            tick_size: dec!(0.01),
+            lot_size: dec!(0.0001),
+            min_notional: dec!(10),
+            maker_fee: dec!(0.0001),
+            taker_fee: dec!(0.0005),
+            trading_status: Default::default(),
+        }
+    }
+
+    fn build_engine() -> MarketMakerEngine {
+        let primary = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(primary);
+        MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            sample_config(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        )
+    }
+
+    fn feed_snapshot(
+        engine: &mut MarketMakerEngine,
+        bids: Vec<(Decimal, Decimal)>,
+        asks: Vec<(Decimal, Decimal)>,
+    ) {
+        engine.handle_ws_event(MarketEvent::BookSnapshot {
+            venue: VenueId::Binance,
+            symbol: "BTCUSDT".into(),
+            bids: bids
+                .into_iter()
+                .map(|(price, qty)| PriceLevel { price, qty })
+                .collect(),
+            asks: asks
+                .into_iter()
+                .map(|(price, qty)| PriceLevel { price, qty })
+                .collect(),
+            sequence: 1,
+        });
+    }
+
+    fn sink_graph(source_kind: &str, source_port: &str, source_cfg: serde_json::Value) -> Graph {
+        let src = NodeId::new();
+        let sink = NodeId::new();
+        let mut g = Graph::empty("t", Scope::Symbol("BTCUSDT".into()));
+        g.nodes.push(GraphNode {
+            id: src,
+            kind: source_kind.into(),
+            config: source_cfg,
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(GraphNode {
+            id: sink,
+            kind: "Out.SpreadMult".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        g.edges.push(Edge {
+            from: PortRef { node: src, port: source_port.into() },
+            to: PortRef { node: sink, port: "mult".into() },
+        });
+        g
+    }
+
+    /// Cost.Sweep against an empty book emits `Missing` on every
+    /// port; SpreadMult sink doesn't fire; multiplier stays at
+    /// its `1.0` default.
+    #[test]
+    fn cost_sweep_on_empty_book_leaves_spread_mult_default() {
+        let mut engine = build_engine();
+        let g = sink_graph(
+            "Cost.Sweep",
+            "impact_bps",
+            serde_json::json!({"side": "buy", "size": "1"}),
+        );
+        engine.swap_strategy_graph(&g).expect("compiles");
+        engine.tick_strategy_graph();
+        assert_eq!(engine.auto_tuner.graph_spread_mult(), dec!(1));
+    }
+
+    /// Cost.Sweep against a stocked book emits `impact_bps` as a
+    /// number; SpreadMult sink picks it up. A 3-BTC buy against
+    /// thin asks at 50_100 / 50_200 vs mid ~50_050 produces
+    /// impact well north of 10 bps, so the floored multiplier
+    /// lands above the default 1.0.
+    #[test]
+    fn cost_sweep_on_stocked_book_propagates_impact_bps() {
+        let mut engine = build_engine();
+        feed_snapshot(
+            &mut engine,
+            vec![(dec!(50_000), dec!(5)), (dec!(49_900), dec!(10))],
+            vec![(dec!(50_100), dec!(2)), (dec!(50_200), dec!(5))],
+        );
+        let g = sink_graph(
+            "Cost.Sweep",
+            "impact_bps",
+            serde_json::json!({"side": "buy", "size": "3"}),
+        );
+        engine.swap_strategy_graph(&g).expect("compiles");
+        engine.tick_strategy_graph();
+        let mult = engine.auto_tuner.graph_spread_mult();
+        assert!(
+            mult > dec!(1),
+            "Cost.Sweep impact_bps should propagate past SpreadMult floor, got {mult}"
+        );
+    }
+
+    /// Risk.UnrealizedIfFlatten with zero inventory emits
+    /// `Missing`; the sink stays silent.
+    #[test]
+    fn risk_unrealized_without_inventory_leaves_spread_mult_default() {
+        let mut engine = build_engine();
+        feed_snapshot(
+            &mut engine,
+            vec![(dec!(50_000), dec!(5))],
+            vec![(dec!(50_100), dec!(5))],
+        );
+        let g = sink_graph(
+            "Risk.UnrealizedIfFlatten",
+            "value",
+            serde_json::Value::Null,
+        );
+        engine.swap_strategy_graph(&g).expect("compiles");
+        engine.tick_strategy_graph();
+        assert_eq!(engine.auto_tuner.graph_spread_mult(), dec!(1));
+    }
+
+    /// Risk.UnrealizedIfFlatten with a profitable long position
+    /// emits a positive number (quote-asset PnL). A long of
+    /// 1 BTC at cost 49_500 against a 50_000-bid book produces
+    /// a flatten VWAP near 50_000 → PnL ≈ +500 USDT. SpreadMult
+    /// floors at 1 but preserves numbers ≥ 1, and 500 ≫ 1, so
+    /// the multiplier moves off its default.
+    #[test]
+    fn risk_unrealized_with_profitable_long_propagates_pnl() {
+        let mut engine = build_engine();
+        feed_snapshot(
+            &mut engine,
+            vec![(dec!(50_000), dec!(5)), (dec!(49_900), dec!(5))],
+            vec![(dec!(50_100), dec!(5))],
+        );
+        engine.inventory_manager.on_fill(&Fill {
+            trade_id: 1,
+            order_id: Uuid::new_v4(),
+            symbol: "BTCUSDT".into(),
+            side: Side::Buy,
+            price: dec!(49_500),
+            qty: dec!(1),
+            is_maker: true,
+            timestamp: chrono::Utc::now(),
+        });
+        let g = sink_graph(
+            "Risk.UnrealizedIfFlatten",
+            "value",
+            serde_json::Value::Null,
+        );
+        engine.swap_strategy_graph(&g).expect("compiles");
+        engine.tick_strategy_graph();
+        let mult = engine.auto_tuner.graph_spread_mult();
+        assert!(
+            mult > dec!(1),
+            "profitable-long flatten PnL should propagate to SpreadMult, got {mult}"
+        );
     }
 }

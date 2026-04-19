@@ -491,4 +491,160 @@ mod integration_tests {
         });
         Evaluator::build(&g).expect("clean config passes validation");
     }
+
+    /// GR-2 — `Out.KillEscalate` with a `venue` config attaches
+    /// the string to the emitted `SinkAction::KillEscalate`.
+    /// Engine-side filtering happens in `mm-engine`; here we
+    /// only prove the evaluator round-trips the config value.
+    #[test]
+    fn kill_escalate_sink_propagates_venue_config() {
+        let trigger_src = NodeId::new();
+        let level_src = NodeId::new();
+        let kill_id = NodeId::new();
+        let mult_sink = NodeId::new();
+        let mut g = Graph::empty("gr-2", GScope::Global);
+        // A pair of Math.Const inputs so the graph has no
+        // free edges — KillEscalate gets a `trigger`, a
+        // `level`, and nothing for `reason`.
+        g.nodes.push(graph::Node {
+            id: trigger_src,
+            kind: "Math.Const".into(),
+            config: serde_json::json!({ "value": "1" }),
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(graph::Node {
+            id: level_src,
+            kind: "Math.Const".into(),
+            config: serde_json::json!({ "value": "3" }),
+            pos: (0.0, 0.0),
+        });
+        let to_bool = NodeId::new();
+        g.nodes.push(graph::Node {
+            id: to_bool,
+            kind: "Cast.ToBool".into(),
+            config: serde_json::json!({ "threshold": "0.5", "cmp": "ge" }),
+            pos: (0.0, 0.0),
+        });
+        g.edges.push(Edge {
+            from: PortRef { node: trigger_src, port: "value".into() },
+            to: PortRef { node: to_bool, port: "x".into() },
+        });
+        g.nodes.push(graph::Node {
+            id: kill_id,
+            kind: "Out.KillEscalate".into(),
+            config: serde_json::json!({ "venue": "binance" }),
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(graph::Node {
+            id: mult_sink,
+            kind: "Out.SpreadMult".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        g.edges.push(Edge {
+            from: PortRef { node: to_bool, port: "out".into() },
+            to: PortRef { node: kill_id, port: "trigger".into() },
+        });
+        // SpreadMult sink is required for validation — feed a
+        // Math.Const(1) so nothing widens.
+        let passthrough = NodeId::new();
+        g.nodes.push(graph::Node {
+            id: passthrough,
+            kind: "Math.Const".into(),
+            config: serde_json::json!({ "value": "1" }),
+            pos: (0.0, 0.0),
+        });
+        g.edges.push(Edge {
+            from: PortRef { node: passthrough, port: "value".into() },
+            to: PortRef { node: mult_sink, port: "mult".into() },
+        });
+
+        let mut ev = Evaluator::build(&g).expect("valid graph");
+        // Supply a KillLevel for the `level` input port on the
+        // kill sink — without an edge, the evaluator reads
+        // `source_inputs`.
+        let mut src: HashMap<(NodeId, String), Value> = HashMap::new();
+        src.insert((kill_id, "level".into()), Value::KillLevel(3));
+        let actions = ev.tick(&EvalCtx::default(), &src).expect("eval ok");
+        let kill = actions
+            .iter()
+            .find(|a| matches!(a, SinkAction::KillEscalate { .. }))
+            .expect("kill sink fired");
+        match kill {
+            SinkAction::KillEscalate { level, venue, .. } => {
+                assert_eq!(*level, 3);
+                assert_eq!(venue.as_deref(), Some("binance"));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Empty venue string behaves the same as omitted — engine
+    /// treats it as a global kill. Guards against operators
+    /// leaving the field blank in the UI and getting a surprise
+    /// mismatch against `""`.
+    #[test]
+    fn kill_escalate_empty_venue_string_is_none() {
+        let trigger_src = NodeId::new();
+        let to_bool = NodeId::new();
+        let kill_id = NodeId::new();
+        let mult_sink = NodeId::new();
+        let mut g = Graph::empty("gr-2-empty", GScope::Global);
+        g.nodes.push(graph::Node {
+            id: trigger_src,
+            kind: "Math.Const".into(),
+            config: serde_json::json!({ "value": "1" }),
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(graph::Node {
+            id: to_bool,
+            kind: "Cast.ToBool".into(),
+            config: serde_json::json!({ "threshold": "0.5", "cmp": "ge" }),
+            pos: (0.0, 0.0),
+        });
+        g.edges.push(Edge {
+            from: PortRef { node: trigger_src, port: "value".into() },
+            to: PortRef { node: to_bool, port: "x".into() },
+        });
+        g.nodes.push(graph::Node {
+            id: kill_id,
+            kind: "Out.KillEscalate".into(),
+            config: serde_json::json!({ "venue": "" }),
+            pos: (0.0, 0.0),
+        });
+        g.edges.push(Edge {
+            from: PortRef { node: to_bool, port: "out".into() },
+            to: PortRef { node: kill_id, port: "trigger".into() },
+        });
+        let passthrough = NodeId::new();
+        g.nodes.push(graph::Node {
+            id: passthrough,
+            kind: "Math.Const".into(),
+            config: serde_json::json!({ "value": "1" }),
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(graph::Node {
+            id: mult_sink,
+            kind: "Out.SpreadMult".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        g.edges.push(Edge {
+            from: PortRef { node: passthrough, port: "value".into() },
+            to: PortRef { node: mult_sink, port: "mult".into() },
+        });
+
+        let mut ev = Evaluator::build(&g).expect("valid graph");
+        let mut src: HashMap<(NodeId, String), Value> = HashMap::new();
+        src.insert((kill_id, "level".into()), Value::KillLevel(2));
+        let actions = ev.tick(&EvalCtx::default(), &src).expect("eval ok");
+        let kill = actions
+            .iter()
+            .find(|a| matches!(a, SinkAction::KillEscalate { .. }))
+            .expect("kill sink fired");
+        match kill {
+            SinkAction::KillEscalate { venue, .. } => assert!(venue.is_none()),
+            _ => unreachable!(),
+        }
+    }
 }
