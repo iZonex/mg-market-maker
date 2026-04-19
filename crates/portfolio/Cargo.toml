@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+chrono = { workspace = true }
 mm-common = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }

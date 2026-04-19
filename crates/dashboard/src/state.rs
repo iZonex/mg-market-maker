@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use mm_common::config::LoanConfig;
-use mm_portfolio::PortfolioSnapshot;
+use mm_portfolio::{AssetAggregate, CrossVenuePortfolio, PortfolioSnapshot, VenueInventory};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
@@ -200,10 +200,13 @@ struct StateInner {
     /// Written every tick by engines that hold a plan-bearing
     /// graph; read by the `/api/v1/plans/active` endpoint.
     active_plans: HashMap<String, Vec<PlanSnapshot>>,
-    /// INV-3 — per-(symbol, venue) signed inventory published by
-    /// each engine once per tick. Key = `(symbol, venue)` so the
-    /// aggregator can sum across venues for the same base asset.
-    engine_inventory: HashMap<(String, String), Decimal>,
+    /// INV-4 — dedicated cross-venue portfolio aggregator. Owns
+    /// every engine's live `(symbol, venue) → inventory + mark`
+    /// snapshot so graph sources, HTTP endpoints, and daily
+    /// reports read through one struct instead of a raw map on
+    /// `DashboardState`. Engines publish via
+    /// [`DashboardState::publish_inventory`] once per tick.
+    cross_venue: CrossVenuePortfolio,
     /// Epic H Phase 3 — shared audit sink the dashboard uses to
     /// record deploy / rollback / reject events on the same
     /// hash-chained timeline as order-lifecycle + risk rows.
@@ -894,42 +897,46 @@ impl DashboardState {
         out
     }
 
-    /// INV-3 — publish engine-side inventory for the (symbol,
-    /// venue) tuple. Engines call this every tick so the cross-
-    /// venue aggregator reads a fresh picture without a round-
-    /// trip through the engine.
-    pub fn publish_inventory(&self, symbol: &str, venue: &str, inv: Decimal) {
+    /// INV-4 — publish engine-side inventory (and optional mark
+    /// price) for the `(symbol, venue)` tuple. Engines call this
+    /// every tick so the cross-venue aggregator reads a fresh
+    /// picture without a round-trip through the engine. Pass
+    /// `mark = None` while the book is still warming up — the
+    /// aggregator will track delta but skip the leg for notional.
+    pub fn publish_inventory(
+        &self,
+        symbol: &str,
+        venue: &str,
+        inv: Decimal,
+        mark: Option<Decimal>,
+    ) {
         self.inner
             .write()
             .unwrap()
-            .engine_inventory
-            .insert((symbol.to_string(), venue.to_string()), inv);
+            .cross_venue
+            .publish(symbol, venue, inv, mark);
     }
 
-    /// INV-3 — sum of every published inventory whose symbol
-    /// STARTS WITH the given base asset (e.g. `"BTC"` matches
-    /// `"BTCUSDT"` on Binance + `"BTCUSDC"` on Bybit). Result
-    /// is the net delta in base asset across every connected
-    /// venue.
+    /// INV-4 — net delta in `base_asset` units, summed across
+    /// every venue. `"BTC"` matches both `BTCUSDT` on Binance
+    /// and `BTCUSDC` on Bybit because the underlying aggregator
+    /// infers base asset once at publish time.
     pub fn cross_venue_net_delta(&self, base_asset: &str) -> Decimal {
-        let g = self.inner.read().unwrap();
-        g.engine_inventory
-            .iter()
-            .filter(|((sym, _), _)| sym.starts_with(base_asset))
-            .map(|(_, v)| *v)
-            .sum()
+        self.inner.read().unwrap().cross_venue.net_delta(base_asset)
     }
 
-    /// MV-UI-1 — full picture for the cross-venue panel: every
-    /// published `(symbol, venue) → inventory` tuple. Frontend
-    /// groups by the first 3–4 chars of the symbol to produce
-    /// per-base asset breakdowns.
-    pub fn engine_inventory_all(&self) -> Vec<(String, String, Decimal)> {
-        let g = self.inner.read().unwrap();
-        g.engine_inventory
-            .iter()
-            .map(|((sym, venue), v)| (sym.clone(), venue.clone(), *v))
-            .collect()
+    /// INV-4 — flat list of every published leg. Readers that
+    /// need grouping prefer [`Self::cross_venue_by_asset`].
+    pub fn cross_venue_entries(&self) -> Vec<VenueInventory> {
+        self.inner.read().unwrap().cross_venue.entries()
+    }
+
+    /// INV-4 — per-base-asset grouped view used by the
+    /// cross-venue UI panel (`/api/v1/portfolio/cross_venue`).
+    /// Legs are sorted `(venue, symbol)` for deterministic
+    /// rendering.
+    pub fn cross_venue_by_asset(&self) -> Vec<AssetAggregate> {
+        self.inner.read().unwrap().cross_venue.by_asset()
     }
 
     /// UI-1 — publish active plans for a symbol. Empty vec
@@ -2127,26 +2134,40 @@ mod tests {
         assert!(ds.venue_balances("BTCUSDT").is_empty());
     }
 
-    /// PAPER-1 — multi-engine cross-venue inventory aggregation
-    /// works through DashboardState. Two different (symbol,
-    /// venue) tuples for the same base asset sum into a single
-    /// net delta readable by `Portfolio.CrossVenueNetDelta`.
+    /// INV-4 — multi-engine cross-venue inventory aggregation
+    /// round-trips through the `CrossVenuePortfolio` owned by
+    /// `DashboardState`. Two different `(symbol, venue)` tuples
+    /// for the same base asset sum into a single net delta
+    /// readable by both `Portfolio.CrossVenueNetDelta` and the
+    /// `/api/v1/portfolio/cross_venue` HTTP handler.
     #[test]
     fn cross_venue_inventory_aggregates_by_base_asset() {
         let ds = DashboardState::new();
-        // Engine A: long 0.5 BTC on Binance spot.
-        ds.publish_inventory("BTCUSDT", "binance", dec!(0.5));
-        // Engine B: short 0.2 BTC on Bybit perp.
-        ds.publish_inventory("BTCUSDC", "bybit", dec!(-0.2));
+        // Engine A: long 0.5 BTC on Binance spot, marked at 50k.
+        ds.publish_inventory("BTC-USDT", "binance", dec!(0.5), Some(dec!(50_000)));
+        // Engine B: short 0.2 BTC on Bybit perp, marked at 49k.
+        ds.publish_inventory("BTC-USDC", "bybit", dec!(-0.2), Some(dec!(49_000)));
         // Engine C: flat ETH on Binance — shouldn't leak into BTC sum.
-        ds.publish_inventory("ETHUSDT", "binance", dec!(3));
+        ds.publish_inventory("ETH-USDT", "binance", dec!(3), Some(dec!(3_000)));
 
         assert_eq!(ds.cross_venue_net_delta("BTC"), dec!(0.3));
         assert_eq!(ds.cross_venue_net_delta("ETH"), dec!(3));
         assert_eq!(ds.cross_venue_net_delta("SOL"), dec!(0));
 
+        // Grouped view sorts base assets + legs deterministically.
+        let grouped = ds.cross_venue_by_asset();
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].base, "BTC");
+        assert_eq!(grouped[0].legs.len(), 2);
+        assert_eq!(grouped[0].legs[0].venue, "binance");
+        assert_eq!(grouped[0].legs[1].venue, "bybit");
+        assert_eq!(
+            grouped[0].net_notional_quote,
+            dec!(0.5) * dec!(50_000) + dec!(-0.2) * dec!(49_000)
+        );
+
         // Second publish for engine A replaces, not appends.
-        ds.publish_inventory("BTCUSDT", "binance", dec!(0.9));
+        ds.publish_inventory("BTC-USDT", "binance", dec!(0.9), Some(dec!(51_000)));
         assert_eq!(ds.cross_venue_net_delta("BTC"), dec!(0.7));
     }
 

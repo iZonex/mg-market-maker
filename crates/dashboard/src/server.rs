@@ -466,15 +466,30 @@ struct CrossVenueLeg {
     venue: String,
     symbol: String,
     inventory: rust_decimal::Decimal,
+    /// Mark price in the leg's native quote currency. `null`
+    /// while the engine's book is still warming up.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mark_price: Option<rust_decimal::Decimal>,
+    /// `inventory × mark` in the leg's native quote currency.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notional_quote: Option<rust_decimal::Decimal>,
+    updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(serde::Serialize)]
 struct CrossVenueAsset {
-    /// Best-effort base asset guess (first 3 chars of symbol,
-    /// truncated to where digits start). Coarse but matches how
-    /// `cross_venue_net_delta(base)` works.
+    /// Inferred base asset (e.g. `BTC` for `BTCUSDT` /
+    /// `BTC-USDT` / `BTCUSDC`). Matches the aggregator's own
+    /// bucketing so the `net_delta` figure lines up with
+    /// `Portfolio.CrossVenueNetDelta` evaluated on the same
+    /// asset string.
     base: String,
     net_delta: rust_decimal::Decimal,
+    /// Sum of each leg's `notional_quote`. Mixes quote
+    /// currencies if the same base trades against different
+    /// quotes across venues — the frontend renders this raw
+    /// and leaves FX to the caller.
+    net_notional_quote: rust_decimal::Decimal,
     legs: Vec<CrossVenueLeg>,
 }
 
@@ -483,41 +498,28 @@ struct CrossVenuePortfolioResponse {
     assets: Vec<CrossVenueAsset>,
 }
 
-/// Best-effort base-asset inference from a symbol — matches
-/// the `starts_with` logic the aggregator uses.
-fn infer_base_asset(symbol: &str) -> String {
-    // Walk until we hit a digit or run out of letters. Works
-    // for BTCUSDT, BTC-USDT, BTC_USD, BTCUSDC etc.; fails
-    // gracefully for odd tickers by returning the whole
-    // symbol.
-    let boundary = symbol
-        .chars()
-        .position(|c| c.is_ascii_digit() || c == '-' || c == '_' || c == '/')
-        .unwrap_or(symbol.len());
-    symbol[..boundary].to_string()
-}
-
 async fn portfolio_cross_venue(
     State(state): State<DashboardState>,
 ) -> Json<CrossVenuePortfolioResponse> {
-    use std::collections::BTreeMap;
-    let rows = state.engine_inventory_all();
-    // Group by inferred base.
-    let mut by_base: BTreeMap<String, Vec<CrossVenueLeg>> = BTreeMap::new();
-    for (symbol, venue, inv) in rows {
-        let base = infer_base_asset(&symbol);
-        by_base.entry(base).or_default().push(CrossVenueLeg {
-            venue,
-            symbol,
-            inventory: inv,
-        });
-    }
-    let assets = by_base
+    let assets = state
+        .cross_venue_by_asset()
         .into_iter()
-        .map(|(base, mut legs)| {
-            legs.sort_by(|a, b| a.venue.cmp(&b.venue).then(a.symbol.cmp(&b.symbol)));
-            let net = legs.iter().map(|l| l.inventory).sum();
-            CrossVenueAsset { base, net_delta: net, legs }
+        .map(|agg| CrossVenueAsset {
+            base: agg.base,
+            net_delta: agg.net_delta,
+            net_notional_quote: agg.net_notional_quote,
+            legs: agg
+                .legs
+                .into_iter()
+                .map(|l| CrossVenueLeg {
+                    venue: l.venue,
+                    symbol: l.symbol,
+                    inventory: l.inventory,
+                    mark_price: l.mark_price,
+                    notional_quote: l.notional_quote,
+                    updated_at: l.updated_at,
+                })
+                .collect(),
         })
         .collect();
     Json(CrossVenuePortfolioResponse { assets })

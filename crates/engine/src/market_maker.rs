@@ -3848,9 +3848,12 @@ impl MarketMakerEngine {
             dash.publish_active_plans(&self.symbol, plans);
         }
 
-        // INV-3 — publish this engine's inventory to the
+        // INV-4 — publish this engine's inventory + mark to the
         // cross-venue aggregator so graph nodes on sibling
-        // engines can read `Portfolio.CrossVenueNetDelta`.
+        // engines can read `Portfolio.CrossVenueNetDelta` and
+        // the UI panel renders per-leg notional. Mark is the
+        // current book mid; `None` while the book is still
+        // warming up.
         if let Some(dash) = self.dashboard.as_ref() {
             let venue = format!("{:?}", self.config.exchange.exchange_type)
                 .to_lowercase();
@@ -3858,6 +3861,7 @@ impl MarketMakerEngine {
                 &self.symbol,
                 &venue,
                 self.inventory_manager.inventory(),
+                self.book_keeper.book.mid_price(),
             );
         }
     }

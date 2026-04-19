@@ -25,6 +25,11 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 
+pub mod cross_venue;
+pub use cross_venue::{
+    infer_base_asset, AssetAggregate, CrossVenuePortfolio, VenueInventory,
+};
+
 /// A single asset position with weighted-average cost basis.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Position {

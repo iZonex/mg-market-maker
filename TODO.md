@@ -1,6 +1,6 @@
 # MM — Open Work Tracker
 
-Last updated: 2026-04-19
+Last updated: 2026-04-19 (post-INV-4)
 
 Tracking debt not yet closed. Closed items live in git history.
 Each row is a concrete deliverable; bigger initiatives are
@@ -43,10 +43,15 @@ Legend:
 - [ ] **INV-2** Per-trade drawdown + holding-time on
   `InventoryManager`. Track peak-to-trough inventory within a
   single trade; track seconds-since-open.
-- [ ] **INV-4** Dedicated portfolio aggregator struct.
-  `CrossVenuePortfolio` in `crates/portfolio/` that owns every
-  engine's live inventory snapshot (not just the aggregator on
-  DashboardState). Graph + UI read from this single source.
+- [x] **INV-4** Dedicated portfolio aggregator struct.
+  `CrossVenuePortfolio` in `crates/portfolio/src/cross_venue.rs`
+  owns every engine's `(symbol, venue) → inventory + mark`
+  snapshot with per-leg notional and update timestamp. Graph
+  source `Portfolio.CrossVenueNetDelta`, HTTP endpoint
+  `/api/v1/portfolio/cross_venue`, and the MV-UI-1 panel all
+  read through `DashboardState` delegators that funnel into the
+  single aggregator. Engine publishes book mid alongside
+  inventory so the UI shows live notional per venue.
 
 ### Kill-switch teardown
 - [ ] **KILL-L5** Real Disconnect teardown. Level 5 is
