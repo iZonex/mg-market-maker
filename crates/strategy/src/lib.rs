@@ -22,6 +22,7 @@ pub mod inventory_skew;
 pub mod learned_microprice;
 pub mod market_resilience;
 pub mod momentum;
+pub mod campaign_orchestrator;
 pub mod paired_unwind;
 pub mod pump_and_dump;
 pub mod spoof;

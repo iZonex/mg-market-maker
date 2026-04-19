@@ -586,6 +586,54 @@ impl ExchangeConnector for BybitConnector {
     /// (ms). Spot and inverse/linear-without-funding return
     /// `NotSupported` before hitting the wire so the engine
     /// never burns a call on a non-perp category.
+    async fn get_open_interest(
+        &self,
+        symbol: &str,
+    ) -> anyhow::Result<Option<mm_exchange_core::connector::OpenInterestInfo>> {
+        // R6.3 — `/v5/market/open-interest?category=linear&symbol=BTCUSDT
+        // &intervalTime=5min&limit=1` returns the most recent OI
+        // point. `openInterest` is contract count; `openInterestValue`
+        // is USD notional.
+        if !self.category.has_funding() {
+            return Ok(None);
+        }
+        let params = format!(
+            "category={}&symbol={symbol}&intervalTime=5min&limit=1",
+            self.category.as_str()
+        );
+        let url = format!("{}/v5/market/open-interest?{params}", self.base_url);
+        let resp: Value = self.client.get(&url).send().await?.json().await?;
+        let list = resp
+            .get("result")
+            .and_then(|r| r.get("list"))
+            .and_then(|l| l.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let Some(row) = list.first() else {
+            return Ok(None);
+        };
+        let contracts = row
+            .get("openInterest")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Decimal>().ok());
+        let oi_usd = row
+            .get("openInterestValue")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Decimal>().ok());
+        let ts_ms = row
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        Ok(Some(mm_exchange_core::connector::OpenInterestInfo {
+            symbol: symbol.to_string(),
+            oi_contracts: contracts,
+            oi_usd,
+            timestamp: chrono::DateTime::from_timestamp_millis(ts_ms)
+                .unwrap_or_else(chrono::Utc::now),
+        }))
+    }
+
     async fn get_funding_rate(&self, symbol: &str) -> Result<FundingRate, FundingRateError> {
         if !self.category.has_funding() {
             return Err(FundingRateError::NotSupported);

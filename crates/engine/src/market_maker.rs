@@ -432,6 +432,12 @@ pub struct MarketMakerEngine {
     /// `MarketEvent::Liquidation` arrivals, read by
     /// `Surveillance.LiquidationHeatmap` + `Strategy.LiquidationHunt`.
     liquidation_heatmap: mm_risk::liquidation_heatmap::LiquidationHeatmap,
+    /// R6.4 — last polled open-interest value for the running
+    /// symbol. Refreshed on the funding-rate cadence when the
+    /// connector supports both. `None` on spot / unsupported
+    /// venues; graph source falls back to the liquidation-feed
+    /// proxy in that case.
+    last_open_interest: Option<rust_decimal::Decimal>,
     /// Regulatory OTR counter: `(adds + 2·updates + cancels) /
     /// max(trades, 1) - 1`. Exported into the audit trail and
     /// Prometheus. Market-quality / spoofing proxy tracked for
@@ -931,6 +937,7 @@ impl MarketMakerEngine {
                 })
             },
             liquidation_heatmap: mm_risk::liquidation_heatmap::LiquidationHeatmap::new(),
+            last_open_interest: None,
             otr: OrderToTradeRatio::new(),
             tiered_otr: mm_risk::otr::TieredOtrTracker::new(),
             inventory_drift: InventoryDriftReconciler::new(
@@ -2003,6 +2010,57 @@ impl MarketMakerEngine {
         out
     }
 
+    /// ⚠ R6.2 — scan the graph for `Strategy.LeverageBuilder`
+    /// nodes and call `connector.set_leverage(symbol, lev)` on
+    /// each via a one-shot task. Capabilities-gated; spot /
+    /// unsupported venues log a warn!-skip instead of blocking
+    /// the swap. Failures warn!-skip so a bad leverage value
+    /// doesn't brick the whole graph deploy.
+    fn spawn_leverage_setup(
+        graph: &mm_strategy_graph::Graph,
+        connector: &std::sync::Arc<dyn mm_exchange_core::connector::ExchangeConnector>,
+        symbol: &str,
+    ) {
+        if !connector.capabilities().supports_set_leverage {
+            // Spot / custom / coinbase-prime — leverage is not
+            // a venue concept here. Skip silently; operator
+            // would have seen the capability flag on graph
+            // compile.
+            return;
+        }
+        for n in &graph.nodes {
+            if n.kind != "Strategy.LeverageBuilder" {
+                continue;
+            }
+            let leverage = n
+                .config
+                .get("leverage")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5) as u32;
+            let c = connector.clone();
+            let s = symbol.to_string();
+            tokio::spawn(async move {
+                match c.set_leverage(&s, leverage).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            sym = %s,
+                            leverage = leverage,
+                            "⚠ Strategy.LeverageBuilder set account leverage — pentest venue only"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            sym = %s,
+                            leverage = leverage,
+                            error = %e,
+                            "Strategy.LeverageBuilder set_leverage failed; will quote with existing account leverage"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
     fn build_strategy_pool(
         graph: &mm_strategy_graph::Graph,
     ) -> std::collections::HashMap<
@@ -2412,22 +2470,54 @@ impl MarketMakerEngine {
                         mm_strategy::ignite::IgniteStrategy::with_config(cfg_lev),
                     ))
                 }
-                // ⚠ R4.1 — CampaignOrchestrator V1 stub. A
-                // proper implementation needs its own
-                // multi-phase FSM in mm-strategy; for this
-                // sprint we expose the node so templates can
-                // reference it, and the engine logs a warning
-                // on build telling the operator the phase FSM
-                // is advisory-only.
+                // ⚠ R6.1 — CampaignOrchestrator real FSM.
+                // Replaces Sprint 10's advisory stub with a
+                // time-based phase machine: operator configures
+                // per-phase seconds, FSM stamps first-tick
+                // timestamp and transitions phases by wall
+                // clock. See docs/guides/pentest.md.
                 "Strategy.CampaignOrchestrator" => {
-                    warn!(
-                        node_id = %n.id,
-                        "⚠ Strategy.CampaignOrchestrator is ADVISORY-ONLY in this \
-                        build — phase transitions are not wired to sub-strategies yet. \
-                        Use the explicit `Strategy.PumpAndDump` + `Strategy.LiquidationHunt` \
-                        + `Strategy.LeverageBuilder` nodes in parallel for now."
-                    );
-                    Some(Box::new(mm_strategy::ignite::IgniteStrategy::default()))
+                    let cfg = &n.config;
+                    let parse_dec = |k: &str, default: rust_decimal::Decimal| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(default)
+                    };
+                    let parse_u64 = |k: &str, default: u64| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(default)
+                    };
+                    let parse_u32 = |k: &str, default: u32| {
+                        cfg.get(k)
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32)
+                            .unwrap_or(default)
+                    };
+                    let parse_bool = |k: &str, default: bool| {
+                        cfg.get(k).and_then(|v| v.as_bool()).unwrap_or(default)
+                    };
+                    let oc = mm_strategy::campaign_orchestrator::CampaignOrchestratorConfig {
+                        accumulate_secs: parse_u64("accumulate_secs", 600),
+                        pump_secs: parse_u64("pump_secs", 120),
+                        distribute_secs: parse_u64("distribute_secs", 600),
+                        dump_secs: parse_u64("dump_secs", 120),
+                        accumulate_size: parse_dec("accumulate_size", dec!(0.002)),
+                        accumulate_offset_bps: parse_dec("accumulate_offset_bps", dec!(5)),
+                        pump_size: parse_dec("pump_size", dec!(0.002)),
+                        pump_depth_bps: parse_dec("pump_depth_bps", dec!(50)),
+                        distribute_size: parse_dec("distribute_size", dec!(0.001)),
+                        distribute_offset_bps: parse_dec("distribute_offset_bps", dec!(20)),
+                        distribute_rungs: parse_u32("distribute_rungs", 4),
+                        distribute_step_bps: parse_dec("distribute_step_bps", dec!(15)),
+                        dump_size: parse_dec("dump_size", dec!(0.002)),
+                        dump_depth_bps: parse_dec("dump_depth_bps", dec!(60)),
+                        loop_cycle: parse_bool("loop_cycle", false),
+                    };
+                    Some(Box::new(
+                        mm_strategy::campaign_orchestrator::CampaignOrchestratorStrategy::with_config(oc),
+                    ))
                 }
                 "Strategy.PumpAndDump" => {
                     let cfg = &n.config;
@@ -2513,6 +2603,9 @@ impl MarketMakerEngine {
         // consume a stale bundle and place quotes the new graph
         // never authored.
         self.graph_quotes_override = None;
+        // ⚠ R6.2 — honour `Strategy.LeverageBuilder` on first
+        // deploy too (same as swap). See `spawn_leverage_setup`.
+        Self::spawn_leverage_setup(graph, &self.connectors.primary, &self.symbol);
         mm_dashboard::metrics::STRATEGY_GRAPH_DEPLOYS_TOTAL
             .with_label_values(&["accepted"])
             .inc();
@@ -2557,6 +2650,12 @@ impl MarketMakerEngine {
         // consume a stale bundle and place quotes the new graph
         // never authored.
         self.graph_quotes_override = None;
+        // ⚠ R6.2 — honour `Strategy.LeverageBuilder` on swap.
+        // Scan the graph for leverage nodes; for each, spawn a
+        // one-shot task that calls `connector.set_leverage`.
+        // Capabilities-gated — spot / unsupported venues log a
+        // warn! and skip instead of blocking the swap.
+        Self::spawn_leverage_setup(graph, &self.connectors.primary, &self.symbol);
         self.audit.risk_event(
             &self.symbol,
             mm_risk::audit::AuditEventType::StrategyGraphDeployed,
@@ -3979,17 +4078,22 @@ impl MarketMakerEngine {
                         }
                     }
                 }
-                // R4.4 — Signal.OpenInterest. Proxy derived
-                // from the liquidation-feed total notional when
-                // the connector doesn't expose OI directly.
-                // Missing when no events yet — don't gate on
-                // silence.
+                // R4.4 / R6.4 — Signal.OpenInterest. Prefer the
+                // real value from `connector.get_open_interest`
+                // (polled on the funding-rate cadence); fall
+                // back to the liquidation-feed total as a
+                // lower-bound proxy when the venue doesn't
+                // expose OI or we haven't polled yet.
                 "Signal.OpenInterest" => {
-                    let total = self.liquidation_heatmap.total_notional();
-                    let v = if total.is_zero() {
-                        Value::Missing
+                    let v = if let Some(oi) = self.last_open_interest {
+                        Value::Number(oi)
                     } else {
-                        Value::Number(total)
+                        let total = self.liquidation_heatmap.total_notional();
+                        if total.is_zero() {
+                            Value::Missing
+                        } else {
+                            Value::Number(total)
+                        }
                     };
                     src.insert((*id, "value".into()), v);
                 }
@@ -6959,6 +7063,21 @@ impl MarketMakerEngine {
             }
             Err(e) => {
                 warn!(symbol = %self.symbol, error = %e, "funding rate poll failed");
+            }
+        }
+        // R6.4 — piggy-back an OI poll on the same cadence.
+        // Cheap (one REST round-trip per funding refresh ≈ 30s);
+        // the result lands on `last_open_interest` for the
+        // `Signal.OpenInterest` source overlay to emit. Fail-
+        // open: any error leaves the last good value in place.
+        if self.connectors.primary.capabilities().supports_funding_rate {
+            if let Ok(Some(oi)) = self
+                .connectors
+                .primary
+                .get_open_interest(&self.symbol)
+                .await
+            {
+                self.last_open_interest = oi.oi_usd.or(oi.oi_contracts);
             }
         }
     }

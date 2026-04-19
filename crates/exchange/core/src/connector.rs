@@ -267,6 +267,19 @@ pub struct VenueCapabilities {
     pub supports_set_leverage: bool,
 }
 
+/// R6.3 — per-symbol open-interest snapshot. `oi_contracts` is
+/// the raw contract / coin count; `oi_usd` is the notional when
+/// the venue reports it. One of the two may be `None` —
+/// Binance returns both, Bybit returns both, HL derives from
+/// `clearinghouseState`. Timestamp is venue-side when provided.
+#[derive(Debug, Clone)]
+pub struct OpenInterestInfo {
+    pub symbol: String,
+    pub oi_contracts: Option<rust_decimal::Decimal>,
+    pub oi_usd: Option<rust_decimal::Decimal>,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
 /// Account-level margin snapshot (Epic 40.4). One per venue; the
 /// engine polls it every ~5 s and feeds the result through
 /// `MarginGuard` into `kill_switch::update_margin_ratio`.
@@ -606,6 +619,18 @@ pub trait ExchangeConnector: Send + Sync {
     ///
     /// `from_wallet` and `to_wallet` are venue-specific strings
     /// (e.g. "SPOT", "LINEAR", "FUNDING" for Bybit).
+    /// R6.3 — open interest for `symbol` on the connector's
+    /// product. Returns `Ok(None)` when the venue exposes an
+    /// OI endpoint but the response was empty; `Err` when the
+    /// call failed. Spot connectors override to return `None`
+    /// directly — OI is a perp concept.
+    async fn get_open_interest(
+        &self,
+        _symbol: &str,
+    ) -> anyhow::Result<Option<OpenInterestInfo>> {
+        Ok(None)
+    }
+
     async fn internal_transfer(
         &self,
         _asset: &str,

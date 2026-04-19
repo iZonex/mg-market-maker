@@ -190,6 +190,36 @@ impl ExchangeConnector for BinanceFuturesConnector {
         VenueProduct::LinearPerp
     }
 
+    async fn get_open_interest(
+        &self,
+        symbol: &str,
+    ) -> anyhow::Result<Option<mm_exchange_core::connector::OpenInterestInfo>> {
+        // R6.3 — `/fapi/v1/openInterest?symbol=BTCUSDT` returns
+        // `{"openInterest":"123.456","symbol":"BTCUSDT","time":1700000000000}`.
+        self.rate_limiter.acquire(1).await;
+        let url = format!("{}/fapi/v1/openInterest?symbol={symbol}", self.base_url);
+        let body: Value = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .json()
+            .await?;
+        let contracts_s = body.get("openInterest").and_then(|v| v.as_str());
+        let contracts = contracts_s.and_then(|s| s.parse::<Decimal>().ok());
+        let ts_ms = body.get("time").and_then(|v| v.as_i64()).unwrap_or_else(|| {
+            chrono::Utc::now().timestamp_millis()
+        });
+        let timestamp = chrono::DateTime::from_timestamp_millis(ts_ms)
+            .unwrap_or_else(chrono::Utc::now);
+        Ok(contracts.map(|c| mm_exchange_core::connector::OpenInterestInfo {
+            symbol: symbol.to_string(),
+            oi_contracts: Some(c),
+            oi_usd: None,
+            timestamp,
+        }))
+    }
+
     async fn get_funding_rate(&self, symbol: &str) -> Result<FundingRate, FundingRateError> {
         // `/fapi/v1/premiumIndex` returns current mark price,
         // funding rate, and next funding time for the symbol.

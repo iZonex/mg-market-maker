@@ -1,6 +1,6 @@
 # MM — Open Work Tracker
 
-Last updated: 2026-04-19 (post-Sprint 11)
+Last updated: 2026-04-19 (post-Sprint 12)
 
 Tracking debt not yet closed. Closed items live in git history.
 Each row is a concrete deliverable; bigger initiatives are
@@ -684,6 +684,43 @@ Sprint 12 picks up: `Strategy.CampaignOrchestrator` real FSM
 calls (currently proxied via liquidation total), and
 `Strategy.BasketPush` + `Strategy.IndexPush` for the remaining
 RAVE-pattern pentest vectors.
+
+## Sprint 12 — Sprint 11 deferral closeout (landed Apr 19)
+
+Converted the three "advisory only" pieces from Sprint 10/11 into
+real implementations. Campaign orchestration, leverage setup, and
+open-interest data now work end-to-end without "stage-2 TBD"
+caveats.
+
+- [x] **R6.1** `CampaignOrchestratorStrategy` real FSM in
+  `mm-strategy::campaign_orchestrator`. Time-based 4-phase +
+  idle machine (accumulate → pump → distribute → dump → idle).
+  Engine `build_strategy_pool` parses the config and hands the
+  real strategy to the pool instead of the old advisory
+  IgniteStrategy stub. Three unit tests pin the phase timeline,
+  loop wrap, and zero-duration edge case. Node config schema
+  exposes phase-seconds + size / depth knobs.
+- [x] **R6.2** `Strategy.LeverageBuilder` actually calls
+  `connector.set_leverage`. Engine's `swap_strategy_graph` and
+  `with_strategy_graph` now sweep the graph for leverage nodes
+  and spawn one-shot tasks per match.
+  `VenueCapabilities::supports_set_leverage` gates the call —
+  spot / custom venues log a warn!-skip, perp venues (Binance
+  futures, Bybit linear, HL perp) set leverage for real.
+  Failures warn!-skip so a bad leverage value doesn't brick
+  the whole deploy.
+- [x] **R6.3** `ExchangeConnector::get_open_interest` trait
+  method + `OpenInterestInfo { oi_contracts, oi_usd, ts }`
+  struct. Binance USDⓈ-M impl uses `/fapi/v1/openInterest`;
+  Bybit impl uses `/v5/market/open-interest?intervalTime=5min`;
+  HyperLiquid returns the default `Ok(None)` (deferred —
+  `clearinghouseState` aggregation is a separate crate-level
+  change, documented in pentest.md).
+- [x] **R6.4** `Signal.OpenInterest` reads real OI first,
+  falls back to the liquidation-feed total as a proxy when
+  `last_open_interest` is unset. Engine polls OI on the
+  funding-rate cadence so no new timer task — one `get_open_interest`
+  call per funding refresh (≈ every 30 s on perp symbols).
 
 ## Graph system audit — Apr 19 follow-ups
 
