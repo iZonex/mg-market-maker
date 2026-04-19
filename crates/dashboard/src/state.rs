@@ -56,6 +56,15 @@ pub enum ConfigOverride {
     /// breach. The engine multiplies its size-multiplier
     /// stack by this value (composes via min()).
     PortfolioVarMult(Decimal),
+    /// 22W-3 — register a client-side emulated order
+    /// (StopMarket / StopLimit / TrailingStop / OcoLeg /
+    /// GtdCancel). Spec serialised as a JSON blob so the
+    /// dashboard crate doesn't need to reach into
+    /// `mm-risk::order_emulator` for the enum.
+    RegisterEmulatedOrder(String),
+    /// 22W-3 — cancel a previously-registered emulated order
+    /// by id.
+    CancelEmulatedOrder(u64),
     /// Manually escalate the kill switch to a specific level.
     /// `level` maps onto `mm_risk::KillLevel` (1..=5); `reason`
     /// is recorded to the audit trail. Emitted by the dashboard

@@ -23,6 +23,9 @@ use mm_risk::kill_switch::{KillLevel, KillSwitch, KillSwitchConfig};
 use mm_risk::lead_lag_guard::LeadLagGuard;
 use mm_risk::margin_guard::{MarginGuard, MarginGuardThresholds};
 use mm_risk::news_retreat::{NewsRetreatState, NewsRetreatStateMachine, NewsRetreatTransition};
+use mm_risk::order_emulator::{
+    EmulatorAction, EmulatorOrder, EmulatorOrderId, EmulatorOrderSpec, OrderEmulator,
+};
 use mm_risk::otr::OrderToTradeRatio;
 use mm_risk::pnl::PnlTracker;
 use mm_risk::protections::{
@@ -414,6 +417,13 @@ pub struct MarketMakerEngine {
     /// exactly one "stop event" for StoplossGuard + CooldownPeriod,
     /// not one per tick.
     protections_last_kill_level: KillLevel,
+    /// 22W-3 — client-side order emulator (StopMarket,
+    /// StopLimit, TrailingStop, OcoLeg, GtdCancel). Ticked
+    /// every `refresh_quotes`; emitted actions dispatch
+    /// through the primary connector. Operators register
+    /// orders via `ConfigOverride::RegisterEmulatorOrder` +
+    /// cancel via `CancelEmulatorOrder`.
+    order_emulator: OrderEmulator,
     audit: Arc<AuditLog>,
     balance_cache: BalanceCache,
     order_id_map: OrderIdMap,
@@ -968,6 +978,7 @@ impl MarketMakerEngine {
             }),
             protections_last_status: ProtectionStatus::Clear,
             protections_last_kill_level: KillLevel::Normal,
+            order_emulator: OrderEmulator::new(),
             audit,
             balance_cache: if paper_mode {
                 BalanceCache::new_paper_for(mm_common::types::WalletType::Spot)
@@ -7703,6 +7714,22 @@ impl MarketMakerEngine {
         self.sweep_atomic_bundle_acks();
         let _rolled = self.tick_atomic_bundle_watchdog();
 
+        // 22W-3 — order emulator tick. Feeds the current mid
+        // into every registered stop / trailing / OCO / GTD
+        // order; dispatches emitted actions via the primary
+        // connector. Cheap when empty. Skipped when no mid is
+        // available (pre-snapshot boot).
+        if !self.order_emulator.is_empty() {
+            if let Some(mid) = self.book_keeper.book.mid_price() {
+                let actions = self
+                    .order_emulator
+                    .on_tick(mid, std::time::Instant::now());
+                for action in actions {
+                    self.dispatch_emulator_action(action).await;
+                }
+            }
+        }
+
         // Per-client loss circuit (Epic 6). When the aggregate
         // daily PnL across this client's symbols has breached
         // the configured limit, STOP quoting everywhere for that
@@ -8901,6 +8928,127 @@ impl MarketMakerEngine {
         }]
     }
 
+    /// 22W-3 — fire one emulator action via the primary
+    /// connector. Failures are logged + audited but don't
+    /// unregister the triggering order — the emulator has
+    /// already removed it from its map (see `on_tick`
+    /// `triggered` bookkeeping), so a failed dispatch is
+    /// a regrettable one-shot miss, not a runaway retry.
+    async fn dispatch_emulator_action(&mut self, action: EmulatorAction) {
+        use mm_exchange_core::connector::NewOrder;
+        use mm_common::types::{OrderType, TimeInForce};
+        let new_order = match &action {
+            EmulatorAction::PlaceMarket { side, qty, emulator_id } => NewOrder {
+                symbol: self.symbol.clone(),
+                side: *side,
+                order_type: OrderType::Market,
+                price: None,
+                qty: *qty,
+                time_in_force: Some(TimeInForce::Ioc),
+                client_order_id: Some(format!("emu-{}", emulator_id)),
+            },
+            EmulatorAction::PlaceLimit { side, price, qty, emulator_id } => NewOrder {
+                symbol: self.symbol.clone(),
+                side: *side,
+                order_type: OrderType::Limit,
+                price: Some(*price),
+                qty: *qty,
+                time_in_force: Some(TimeInForce::Gtc),
+                client_order_id: Some(format!("emu-{}", emulator_id)),
+            },
+            EmulatorAction::CancelVenue { venue_order_id, emulator_id } => {
+                let parsed = match uuid::Uuid::parse_str(venue_order_id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::warn!(
+                            symbol = %self.symbol,
+                            emulator_id,
+                            venue_order_id = %venue_order_id,
+                            error = %e,
+                            "emulator GTD cancel skipped — non-UUID venue id"
+                        );
+                        return;
+                    }
+                };
+                match self
+                    .connectors
+                    .primary
+                    .cancel_order(&self.symbol, parsed)
+                    .await
+                {
+                    Ok(_) => {
+                        tracing::info!(
+                            symbol = %self.symbol,
+                            emulator_id,
+                            venue_order_id = %venue_order_id,
+                            "emulator fired GTD cancel"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            symbol = %self.symbol,
+                            emulator_id,
+                            venue_order_id = %venue_order_id,
+                            error = %e,
+                            "emulator GTD cancel failed"
+                        );
+                    }
+                }
+                return;
+            }
+        };
+        let emulator_id = match &action {
+            EmulatorAction::PlaceMarket { emulator_id, .. }
+            | EmulatorAction::PlaceLimit { emulator_id, .. } => *emulator_id,
+            EmulatorAction::CancelVenue { .. } => unreachable!(),
+        };
+        match self.connectors.primary.place_order(&new_order).await {
+            Ok(order_id) => {
+                tracing::info!(
+                    symbol = %self.symbol,
+                    emulator_id,
+                    venue_order_id = %order_id,
+                    side = ?new_order.side,
+                    order_type = ?new_order.order_type,
+                    qty = %new_order.qty,
+                    "emulator fired order"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    symbol = %self.symbol,
+                    emulator_id,
+                    side = ?new_order.side,
+                    error = %e,
+                    "emulator order placement failed"
+                );
+            }
+        }
+    }
+
+    /// 22W-3 — register an emulated order and return its id.
+    /// Operator-facing via `ConfigOverride::RegisterEmulatorOrder`
+    /// + the `POST /api/v1/ops/emulator/{symbol}` HTTP endpoint.
+    pub fn register_emulator_order(&mut self, order: EmulatorOrder) -> EmulatorOrderId {
+        let id = self.order_emulator.register(order);
+        tracing::info!(
+            symbol = %self.symbol,
+            emulator_id = id,
+            "emulated order registered"
+        );
+        id
+    }
+
+    /// 22W-3 — cancel a registered emulated order.
+    pub fn cancel_emulator_order(&mut self, id: EmulatorOrderId) {
+        self.order_emulator.cancel(id);
+        tracing::info!(
+            symbol = %self.symbol,
+            emulator_id = id,
+            "emulated order cancelled"
+        );
+    }
+
     /// Apply a hot config override from the admin API.
     fn apply_config_override(&mut self, ovr: mm_dashboard::state::ConfigOverride) {
         use mm_dashboard::state::ConfigOverride;
@@ -8964,6 +9112,27 @@ impl MarketMakerEngine {
             ConfigOverride::PortfolioVarMult(v) => {
                 info!(symbol = %self.symbol, mult = %v, "hot-reload: portfolio VaR size multiplier");
                 self.portfolio_var_mult = v;
+            }
+            ConfigOverride::RegisterEmulatedOrder(spec_json) => {
+                match serde_json::from_str::<EmulatorOrderSpec>(&spec_json) {
+                    Ok(spec) => {
+                        let order = spec.to_emulator_order();
+                        let id = self.register_emulator_order(order);
+                        info!(
+                            symbol = %self.symbol,
+                            emulator_id = id,
+                            "ops: registered emulated order"
+                        );
+                    }
+                    Err(e) => warn!(
+                        symbol = %self.symbol,
+                        error = %e,
+                        "ops: bad RegisterEmulatedOrder JSON"
+                    ),
+                }
+            }
+            ConfigOverride::CancelEmulatedOrder(id) => {
+                self.cancel_emulator_order(id);
             }
             ConfigOverride::ManualKillSwitch { level, reason } => {
                 let kl = match level {

@@ -138,6 +138,14 @@ pub async fn start(
         .route("/api/v1/ops/disconnect/{symbol}", post(ops_disconnect))
         .route("/api/v1/ops/reset/{symbol}", post(ops_kill_reset))
         .route("/api/v1/ops/client-reset/{client_id}", post(ops_client_reset))
+        .route(
+            "/api/v1/ops/emulator/{symbol}",
+            post(ops_register_emulated_order),
+        )
+        .route(
+            "/api/v1/ops/emulator/{symbol}/{id}",
+            axum::routing::delete(ops_cancel_emulated_order),
+        )
         .route("/api/admin/config/{symbol}", post(admin_config_override))
         .route("/api/admin/config", post(admin_config_broadcast))
         .route("/api/admin/config/bulk", post(admin_config_bulk))
@@ -1302,6 +1310,41 @@ async fn admin_config_bulk(
         matched_symbols: matched,
         applied,
     })
+}
+
+/// 22W-3 — register a client-side emulated order
+/// (stop/trailing/OCO/GTD) against the per-symbol engine. The
+/// body is the `EmulatorOrderSpec` JSON from
+/// `mm-risk::order_emulator`; we pass it through as an opaque
+/// string so this crate stays free of the `mm-risk` dependency.
+/// The engine's `apply_config_override` path parses + registers.
+///
+/// Example body:
+/// ```json
+/// {"kind":"stop_market","side":"sell","trigger_price":"99.5","qty":"0.1"}
+/// ```
+async fn ops_register_emulated_order(
+    State(state): State<DashboardState>,
+    Path(symbol): Path<String>,
+    body: axum::body::Bytes,
+) -> Json<ConfigOverrideResponse> {
+    // Keep payload as a raw JSON string — parse is the engine's
+    // concern so the dashboard doesn't pull mm-risk types in.
+    let spec_json = String::from_utf8(body.to_vec()).unwrap_or_default();
+    let ok = state.send_config_override(
+        &symbol,
+        ConfigOverride::RegisterEmulatedOrder(spec_json),
+    );
+    Json(ConfigOverrideResponse { symbol, applied: ok })
+}
+
+/// 22W-3 — cancel a previously-registered emulated order.
+async fn ops_cancel_emulated_order(
+    State(state): State<DashboardState>,
+    Path((symbol, id)): Path<(String, u64)>,
+) -> Json<ConfigOverrideResponse> {
+    let ok = state.send_config_override(&symbol, ConfigOverride::CancelEmulatedOrder(id));
+    Json(ConfigOverrideResponse { symbol, applied: ok })
 }
 
 async fn admin_pause_symbol(

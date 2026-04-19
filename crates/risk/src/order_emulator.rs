@@ -28,11 +28,97 @@
 //! updates and the current time, collect actions, done.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 use mm_common::types::Side;
+
+/// TOML / HTTP-facing spec for a new emulated order. Flat
+/// discriminated-enum shape so operators can POST one JSON
+/// blob per order. Duration knobs land as `deadline_in_secs`
+/// so the wire format stays human-typable.
+///
+/// `Instant` is process-relative and cannot serialise — the
+/// GTD deadline is expressed as "seconds from now" and the
+/// engine converts to an `Instant` at register time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EmulatorOrderSpec {
+    StopMarket {
+        side: Side,
+        trigger_price: Decimal,
+        qty: Decimal,
+    },
+    StopLimit {
+        side: Side,
+        trigger_price: Decimal,
+        limit_price: Decimal,
+        qty: Decimal,
+    },
+    TrailingStop {
+        side: Side,
+        trail_amount: Decimal,
+        qty: Decimal,
+        /// Seed the high-water / low-water mark; typically the
+        /// current mid when the operator registers.
+        watermark: Decimal,
+    },
+    OcoLeg {
+        side: Side,
+        trigger_price: Decimal,
+        qty: Decimal,
+        sibling: EmulatorOrderId,
+    },
+    GtdCancel {
+        venue_order_id: String,
+        deadline_in_secs: u64,
+    },
+}
+
+impl EmulatorOrderSpec {
+    /// Convert the wire spec into a runtime [`EmulatorOrder`].
+    /// `GtdCancel` computes its `Instant` from `Instant::now() +
+    /// deadline_in_secs`.
+    pub fn to_emulator_order(self) -> EmulatorOrder {
+        match self {
+            Self::StopMarket { side, trigger_price, qty } => {
+                EmulatorOrder::StopMarket { side, trigger_price, qty }
+            }
+            Self::StopLimit { side, trigger_price, limit_price, qty } => {
+                EmulatorOrder::StopLimit {
+                    side,
+                    trigger_price,
+                    limit_price,
+                    qty,
+                }
+            }
+            Self::TrailingStop { side, trail_amount, qty, watermark } => {
+                EmulatorOrder::TrailingStop {
+                    side,
+                    trail_amount,
+                    qty,
+                    watermark,
+                }
+            }
+            Self::OcoLeg { side, trigger_price, qty, sibling } => {
+                EmulatorOrder::OcoLeg {
+                    side,
+                    trigger_price,
+                    qty,
+                    sibling,
+                }
+            }
+            Self::GtdCancel { venue_order_id, deadline_in_secs } => {
+                EmulatorOrder::GtdCancel {
+                    venue_order_id,
+                    deadline: Instant::now() + Duration::from_secs(deadline_in_secs),
+                }
+            }
+        }
+    }
+}
 
 /// Unique id for an emulated order. Separate from exchange order ids
 /// because the order does not yet exist on the venue.
@@ -452,5 +538,66 @@ mod tests {
         assert!(em.is_empty());
         // Cancelled order does not fire.
         assert!(em.on_tick(dec!(101), Instant::now()).is_empty());
+    }
+
+    /// 22W-3 — EmulatorOrderSpec → EmulatorOrder round trip for
+    /// each variant so the HTTP endpoint's JSON parse path lands
+    /// the right runtime shape.
+    #[test]
+    fn spec_round_trip_stop_market() {
+        let spec = EmulatorOrderSpec::StopMarket {
+            side: Side::Sell,
+            trigger_price: dec!(99.5),
+            qty: dec!(0.1),
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        let parsed: EmulatorOrderSpec = serde_json::from_str(&json).unwrap();
+        match parsed.to_emulator_order() {
+            EmulatorOrder::StopMarket {
+                side: Side::Sell,
+                trigger_price,
+                qty,
+            } => {
+                assert_eq!(trigger_price, dec!(99.5));
+                assert_eq!(qty, dec!(0.1));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spec_gtd_cancel_computes_deadline_from_secs() {
+        let spec = EmulatorOrderSpec::GtdCancel {
+            venue_order_id: "ord-123".into(),
+            deadline_in_secs: 60,
+        };
+        let before = Instant::now();
+        let order = spec.to_emulator_order();
+        let after = Instant::now();
+        match order {
+            EmulatorOrder::GtdCancel { venue_order_id, deadline } => {
+                assert_eq!(venue_order_id, "ord-123");
+                // Deadline is now + 60s, bounded by wall-clock
+                // jitter between before / after snaps.
+                assert!(deadline >= before + Duration::from_secs(60));
+                assert!(deadline <= after + Duration::from_secs(61));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// 22W-3 — the wire JSON uses snake_case `kind` discriminator.
+    /// Pin the format so a rename on either side surfaces in tests
+    /// rather than in a silent 400 at runtime.
+    #[test]
+    fn spec_json_uses_kind_discriminator() {
+        let spec = EmulatorOrderSpec::StopLimit {
+            side: Side::Buy,
+            trigger_price: dec!(50),
+            limit_price: dec!(49.9),
+            qty: dec!(1),
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(json.contains(r#""kind":"stop_limit""#), "got {json}");
     }
 }
