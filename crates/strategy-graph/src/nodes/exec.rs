@@ -87,6 +87,25 @@ impl NodeKind for TwapConfig {
     fn output_ports(&self) -> &[Port] {
         &POLICY_OUTPUT
     }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![
+            ConfigField {
+                name: "duration_secs",
+                label: "Duration (s)",
+                hint: Some("Total schedule window"),
+                default: serde_json::json!(120),
+                widget: ConfigWidget::Integer { min: Some(1), max: Some(86_400) },
+            },
+            ConfigField {
+                name: "slice_count",
+                label: "Slices",
+                hint: Some("Number of equal-time slices (1-1000)"),
+                default: serde_json::json!(5),
+                widget: ConfigWidget::Integer { min: Some(1), max: Some(1000) },
+            },
+        ]
+    }
     fn evaluate(
         &self,
         _ctx: &EvalCtx,
@@ -145,6 +164,16 @@ impl NodeKind for VwapConfig {
     fn output_ports(&self) -> &[Port] {
         &POLICY_OUTPUT
     }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![ConfigField {
+            name: "duration_secs",
+            label: "Duration (s)",
+            hint: Some("Schedule window for the volume-weighted slicer"),
+            default: serde_json::json!(300),
+            widget: ConfigWidget::Integer { min: Some(1), max: Some(86_400) },
+        }]
+    }
     fn evaluate(
         &self,
         _ctx: &EvalCtx,
@@ -197,6 +226,16 @@ impl NodeKind for PovConfig {
     }
     fn output_ports(&self) -> &[Port] {
         &POLICY_OUTPUT
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![ConfigField {
+            name: "target_pct",
+            label: "Target % of volume",
+            hint: Some("1-100 — how much of market volume to capture"),
+            default: serde_json::json!(10),
+            widget: ConfigWidget::Integer { min: Some(1), max: Some(100) },
+        }]
     }
     fn evaluate(
         &self,
@@ -254,6 +293,16 @@ impl NodeKind for IcebergConfig {
     }
     fn output_ports(&self) -> &[Port] {
         &POLICY_OUTPUT
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigField, ConfigWidget};
+        vec![ConfigField {
+            name: "display_qty",
+            label: "Display quantity",
+            hint: Some("Base-asset slice shown on the book (the iceberg tip)"),
+            default: serde_json::json!("0.1"),
+            widget: ConfigWidget::Text,
+        }]
     }
     fn evaluate(
         &self,

@@ -2370,15 +2370,11 @@ impl MarketMakerEngine {
         )> = Vec::new();
         // Pre-compute values so the closure loop is cheap.
         let book = &self.book_keeper.book;
-        // `Book.best_{bid,ask}()` return top-of-book prices. Qty at
-        // the top touch isn't on the common orderbook accessor (yet),
-        // so we surface Missing — the UI catalog doc flags the gap
-        // and a follow-up can plumb qty through the book snapshot.
         let (bid_px, bid_qty, ask_px, ask_qty, mid, spread_bps) = (
             book.best_bid().map(Value::Number).unwrap_or(Value::Missing),
-            Value::Missing,
+            book.best_bid_qty().map(Value::Number).unwrap_or(Value::Missing),
             book.best_ask().map(Value::Number).unwrap_or(Value::Missing),
-            Value::Missing,
+            book.best_ask_qty().map(Value::Number).unwrap_or(Value::Missing),
             book.mid_price()
                 .map(Value::Number)
                 .unwrap_or(Value::Missing),

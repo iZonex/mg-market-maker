@@ -206,6 +206,28 @@ Legend:
 
 ---
 
+## Graph system audit — Apr 19 follow-ups
+
+Surfaced during the post-batch audit at
+`docs/research/graph-system-audit-apr19.md`. Each entry names
+a concrete extension point.
+
+- [ ] **GR-3** Per-node `Strategy.*` config override (γ / κ /
+  σ / size / num_levels). Catalog already accepts per-node
+  config; engine doesn't read it. Requires a per-node
+  strategy-instance pool keyed on NodeId. Scope: medium
+  (~100-200 LoC).
+- [ ] **GR-4** `config_schema()` on `Risk.ToxicityWiden`,
+  `Risk.InventoryUrgency`, `Risk.CircuitBreaker`. Mechanical —
+  same shape as the Exec schemas landed this pass.
+- [ ] **GR-5** Sentiment source asset resolution on non-symbol
+  scopes. Either add a `asset` config field or document that
+  sentiment requires a Symbol-scoped graph.
+- [ ] **GR-6** Catalog-vs-engine source-coverage test. Walk
+  every `kinds()` entry; refuse to CI-pass if a source kind
+  has no match arm in `tick_strategy_graph`. Blocks the
+  "added to catalog, forgot to wire" regression.
+
 ## P3 — hardening / polish
 
 - [x] **HARD-1** Audit complete: all 40 `unwrap`/`expect` calls
