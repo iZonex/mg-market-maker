@@ -1,6 +1,6 @@
 # MM — Open Work Tracker
 
-Last updated: 2026-04-19 (post-Sprint 15)
+Last updated: 2026-04-19 (post-Sprint 16)
 
 Tracking debt not yet closed. Closed items live in git history.
 Each row is a concrete deliverable; bigger initiatives are
@@ -827,6 +827,35 @@ visible.
 
 Sprint 16 backlog extended with the prioritised Axum
 TestClient harness + env-var gate handler test items.
+
+## Sprint 16 — HTTP-layer E2E + env-var gate test (landed Apr 19)
+
+Sprint 15 matrix pointed at three cluster weaknesses; this sprint
+closes two of three. The third (REST-poll connector integration)
+deferred to Sprint 17+ because mocking the 20-method
+`ExchangeConnector` trait is bigger than the sprint budget.
+
+- [x] **R11.1** Axum TestClient harness at
+  `crates/dashboard/tests/http_handlers_e2e.rs` using
+  `tower::ServiceExt::oneshot` on a minimal Router (no auth /
+  rate-limit layers — those are tested separately).
+- [x] **R11.2** Six endpoint tests through the harness:
+  `/health`, `/api/v1/rebalance/recommendations`,
+  `/api/v1/rebalance/log`, `/api/v1/manipulation/scores`,
+  `/api/v1/active-graphs`, `/api/v1/onchain/scores`. Each
+  asserts on status + body shape; default / published /
+  skipped-on-None semantics pinned.
+- [x] **R11.3** Deploy env-var gate test —
+  `restricted_env_gate_only_accepts_exact_literal` compiles a
+  restricted template under `MM_ALLOW_RESTRICTED=1` (fails) +
+  `=yes-pentest-mode` (succeeds). Directly guards the Sprint
+  14 BUG #1 regression zone.
+- [ ] **R11.4 DEFERRED** Engine REST-poll integration (mock
+  connector → tick → verify state populated). Trait has 20+
+  methods; honest-sized mock needs its own fixture crate.
+  Added to Sprint 17 backlog.
+
+Dev-dep additions: `tower = "0.5"` + `http-body-util = "0.1"`.
 
 ## Renumbered — Sprint 15 "deferred research" → now Sprint 17
 ## Renumbered — Sprint 16 "honest MM side" → now Sprint 18

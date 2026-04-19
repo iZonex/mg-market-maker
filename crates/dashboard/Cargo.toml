@@ -59,3 +59,9 @@ aws-smithy-types = "1.3"
 # Block C — in-memory zip assembler for the /api/v1/export/bundle
 # endpoint. `zip` is pure-Rust, no deflate-external dependencies.
 zip = { version = "2.2", default-features = false, features = ["deflate-flate2", "flate2"] }
+
+[dev-dependencies]
+# Sprint 16 R11.1 — Axum TestClient for handler E2E tests. Only
+# needed at test time; keeps the production build slim.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

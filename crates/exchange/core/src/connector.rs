@@ -823,3 +823,4 @@ mod withdraw_whitelist_tests {
         assert!(validate_withdraw_address(Some(&list), "0xaabb").is_err());
     }
 }
+
