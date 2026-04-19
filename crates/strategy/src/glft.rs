@@ -339,6 +339,78 @@ impl Strategy for GlftStrategy {
         }
         cal.recalibrate(Some(now_ms));
     }
+
+    /// 22B-1 — serialise the fitted (A, k) + fill depth buffer
+    /// + last-recalibrated stamp so a restart doesn't nuke the
+    /// 50+ samples of accumulated calibration. Without this,
+    /// every restart runs at defaults `a=1.0, k=1.5` for the
+    /// first 50+ fills before the filter re-warms. Returns
+    /// `None` only if the mutex is poisoned — the checkpoint
+    /// writer falls through to "no state" rather than spamming
+    /// errors on a pathological poisoning.
+    fn checkpoint_state(&self) -> Option<serde_json::Value> {
+        let cal = self.calibration.lock().ok()?;
+        Some(serde_json::json!({
+            "schema_version": 1,
+            "a": cal.a.to_string(),
+            "k": cal.k.to_string(),
+            "fill_depths": cal.fill_depths.iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>(),
+            "last_recalibrated_ms": cal.last_recalibrated_ms,
+        }))
+    }
+
+    /// 22B-1 — restore the fitted (A, k) + fill depth buffer
+    /// from a previously captured checkpoint. Schema-versioned
+    /// so a breaking change flips the gate without crashing.
+    /// `max_samples` is a constructor-time constant (500) and
+    /// is NOT persisted — a checkpoint with more samples than
+    /// the current cap is silently truncated.
+    fn restore_state(&self, state: &serde_json::Value) -> Result<(), String> {
+        let schema = state.get("schema_version").and_then(|v| v.as_u64());
+        if schema != Some(1) {
+            return Err(format!(
+                "glft checkpoint has unsupported schema_version {schema:?}"
+            ));
+        }
+        let a = state
+            .get("a")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Decimal>().ok())
+            .ok_or_else(|| "glft: missing/invalid field `a`".to_string())?;
+        let k = state
+            .get("k")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Decimal>().ok())
+            .ok_or_else(|| "glft: missing/invalid field `k`".to_string())?;
+        let last_recal = state
+            .get("last_recalibrated_ms")
+            .and_then(|v| v.as_i64());
+        let depths: VecDeque<Decimal> = state
+            .get("fill_depths")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "glft: missing/invalid field `fill_depths`".to_string())?
+            .iter()
+            .filter_map(|d| d.as_str()?.parse::<Decimal>().ok())
+            .collect();
+
+        let mut cal = self
+            .calibration
+            .lock()
+            .map_err(|_| "glft: calibration mutex poisoned".to_string())?;
+        cal.a = a;
+        cal.k = k;
+        cal.last_recalibrated_ms = last_recal;
+        cal.fill_depths = depths;
+        // Truncate if the on-disk buffer is larger than the
+        // current cap (supports future max_samples tuning
+        // without rejecting legacy checkpoints).
+        while cal.fill_depths.len() > cal.max_samples {
+            cal.fill_depths.pop_front();
+        }
+        Ok(())
+    }
 }
 
 /// Natural log for positive Decimal values.
@@ -1198,5 +1270,72 @@ mod tests {
         strat.recalibrate_if_due(ts2 + 30_000);
         let s4 = strat.calibration_state().unwrap();
         assert_eq!(s4.last_recalibrated_ms, Some(ts2 + 30_000));
+    }
+
+    /// 22B-1 — checkpoint_state → restore_state round trip. Feed
+    /// 80 synthetic fills to warm the calibration past the 50-
+    /// sample retune threshold, snapshot, restore into a fresh
+    /// strategy, and assert (A, k) + sample count + timestamp
+    /// all survive.
+    #[test]
+    fn checkpoint_round_trip_preserves_calibration() {
+        let src = GlftStrategy::new();
+        let mid = dec!(50_000);
+        for i in 0..80 {
+            let depth = Decimal::from(i) / dec!(10); // 0.0 .. 7.9
+            src.on_fill(&FillObservation {
+                side: Side::Buy,
+                price: mid + depth,
+                qty: dec!(1),
+                depth_from_mid: depth,
+                mid,
+                is_maker: true,
+                ts_ms: 1_000 * i as i64,
+            });
+        }
+        src.recalibrate_if_due(10_000_000);
+
+        let snap = src.checkpoint_state().expect("snapshot");
+        let before = src.calibration_state().unwrap();
+
+        let dst = GlftStrategy::new();
+        dst.restore_state(&snap).unwrap();
+        let after = dst.calibration_state().unwrap();
+
+        assert_eq!(after.a, before.a);
+        assert_eq!(after.k, before.k);
+        assert_eq!(after.samples, before.samples);
+        assert_eq!(after.last_recalibrated_ms, before.last_recalibrated_ms);
+    }
+
+    /// 22B-1 — unsupported schema_version returns Err; the
+    /// strategy keeps its defaults unchanged.
+    #[test]
+    fn restore_rejects_wrong_schema_version() {
+        let s = GlftStrategy::new();
+        let before = s.calibration_state().unwrap();
+        let bogus = serde_json::json!({
+            "schema_version": 999,
+            "a": "1.0",
+            "k": "1.5",
+            "fill_depths": [],
+            "last_recalibrated_ms": null,
+        });
+        let err = s.restore_state(&bogus).unwrap_err();
+        assert!(err.contains("schema_version"), "{err}");
+        let after = s.calibration_state().unwrap();
+        assert_eq!(after.a, before.a);
+        assert_eq!(after.k, before.k);
+    }
+
+    /// 22B-1 — a stateless strategy returns `None` from
+    /// checkpoint_state (default trait impl). Regression guard
+    /// against accidentally making every strategy spam state
+    /// into the checkpoint.
+    #[test]
+    fn stateless_strategy_returns_no_checkpoint() {
+        use crate::AvellanedaStoikov;
+        let s = AvellanedaStoikov;
+        assert!(s.checkpoint_state().is_none());
     }
 }
