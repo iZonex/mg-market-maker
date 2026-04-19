@@ -24,6 +24,8 @@ pub mod pnl;
 pub mod portfolio_balance;
 pub mod session_calendar;
 pub mod portfolio_risk;
+pub mod portfolio_var;
+pub mod protections;
 pub mod rebalancer;
 pub mod reconciliation;
 pub mod sla;
@@ -41,6 +43,10 @@ pub use margin_guard::{MarginGuard, MarginGuardDecision, MarginGuardThresholds};
 pub use otr::OrderToTradeRatio;
 pub use per_client_circuit::{ClientLossState, PerClientLossCircuit};
 pub use pnl::PnlTracker;
+pub use protections::{
+    CooldownConfig, LowProfitPairsConfig, MaxDrawdownConfig, ProtectionStatus, Protections,
+    ProtectionsConfig, StoplossGuardConfig,
+};
 pub use sla::{SlaConfig, SlaTracker};
 pub use toxicity::{AdverseSelectionTracker, KyleLambda, VpinEstimator};
 pub use volume_limit::VolumeLimitTracker;
