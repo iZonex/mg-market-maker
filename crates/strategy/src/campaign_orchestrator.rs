@@ -263,6 +263,41 @@ impl Strategy for CampaignOrchestratorStrategy {
             CampaignPhase::Idle => Vec::new(),
         }
     }
+
+    /// 22B-5 — persist `first_tick_at` so a crash mid-campaign
+    /// doesn't rewind the timeline to Accumulate. Operators
+    /// running a 4-phase attack simulation need the FSM to
+    /// resume at the same wall-clock offset after a restart —
+    /// otherwise the detectors downstream see a fresh
+    /// Accumulate and the detection→kill loop fires against an
+    /// already-completed phase.
+    fn checkpoint_state(&self) -> Option<serde_json::Value> {
+        let start = self.first_tick_at.lock().ok().and_then(|g| *g);
+        Some(serde_json::json!({
+            "schema_version": 1,
+            // Epoch millis — serialisable and round-trips
+            // cleanly via chrono's from_timestamp_millis.
+            "first_tick_ms": start.map(|t| t.timestamp_millis()),
+        }))
+    }
+
+    fn restore_state(&self, state: &serde_json::Value) -> Result<(), String> {
+        let schema = state.get("schema_version").and_then(|v| v.as_u64());
+        if schema != Some(1) {
+            return Err(format!(
+                "campaign_orchestrator checkpoint has unsupported schema_version {schema:?}"
+            ));
+        }
+        let first_ms = state.get("first_tick_ms").and_then(|v| v.as_i64());
+        let first = first_ms
+            .and_then(chrono::DateTime::<Utc>::from_timestamp_millis);
+        let mut g = self
+            .first_tick_at
+            .lock()
+            .map_err(|_| "campaign_orchestrator: mutex poisoned".to_string())?;
+        *g = first;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -325,5 +360,44 @@ mod tests {
         });
         assert_eq!(s.phase_at(0), CampaignPhase::Idle);
         assert_eq!(s.phase_at(9999), CampaignPhase::Idle);
+    }
+
+    /// 22B-5 — first_tick_at survives round trip through the
+    /// checkpoint. The restored strategy returns the same
+    /// `current_phase(now)` as the source at the same `now`.
+    #[test]
+    fn first_tick_round_trip() {
+        let src = CampaignOrchestratorStrategy::new();
+        let t0 = Utc::now();
+        {
+            let mut g = src.first_tick_at.lock().unwrap();
+            *g = Some(t0);
+        }
+        let snap = src.checkpoint_state().expect("has state");
+
+        let dst = CampaignOrchestratorStrategy::new();
+        dst.restore_state(&snap).unwrap();
+        let got = dst.first_tick_at.lock().unwrap().map(|t| t.timestamp_millis());
+        assert_eq!(got, Some(t0.timestamp_millis()));
+    }
+
+    /// 22B-5 — None first_tick_at round-trips as null.
+    #[test]
+    fn unset_first_tick_round_trip() {
+        let src = CampaignOrchestratorStrategy::new();
+        let snap = src.checkpoint_state().expect("has state");
+        let dst = CampaignOrchestratorStrategy::new();
+        dst.restore_state(&snap).unwrap();
+        assert!(dst.first_tick_at.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn restore_rejects_wrong_schema() {
+        let s = CampaignOrchestratorStrategy::new();
+        let bogus = serde_json::json!({
+            "schema_version": 77,
+            "first_tick_ms": null,
+        });
+        assert!(s.restore_state(&bogus).is_err());
     }
 }

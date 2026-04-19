@@ -259,6 +259,35 @@ impl Strategy for PumpAndDumpStrategy {
             }
         }
     }
+
+    /// 22B-5 — persist the FSM tick counter so a crash mid-attack
+    /// resumes at the same phase instead of rewinding to
+    /// Accumulate. Operators running a coordinated 4-phase
+    /// pentest against their own venue can't afford to restart
+    /// the cycle — the detectors expect the canonical
+    /// accumulate→pump→distribute→dump arc.
+    fn checkpoint_state(&self) -> Option<serde_json::Value> {
+        let tick = self.tick.load(Ordering::Relaxed);
+        Some(serde_json::json!({
+            "schema_version": 1,
+            "tick": tick,
+        }))
+    }
+
+    fn restore_state(&self, state: &serde_json::Value) -> Result<(), String> {
+        let schema = state.get("schema_version").and_then(|v| v.as_u64());
+        if schema != Some(1) {
+            return Err(format!(
+                "pump_and_dump checkpoint has unsupported schema_version {schema:?}"
+            ));
+        }
+        let tick = state
+            .get("tick")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| "pump_and_dump: missing tick".to_string())?;
+        self.tick.store(tick, Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -448,5 +477,36 @@ mod tests {
         let ctx = tick_ctx(&book, &product, &cfg);
         assert!(s.compute_quotes(&ctx).is_empty());
         assert_eq!(s.current_phase(), None);
+    }
+
+    /// 22B-5 — tick counter survives checkpoint/restore.
+    #[test]
+    fn tick_counter_round_trip() {
+        let src = PumpAndDumpStrategy::new();
+        let product = test_product();
+        let cfg = test_cfg();
+        let book = test_book();
+        let ctx = tick_ctx(&book, &product, &cfg);
+        // Advance 25 ticks — mid-Pump for the default cycle
+        // (5+5+5+5 = 20; 25 % 20 = 5 → Pump).
+        for _ in 0..25 {
+            let _ = src.compute_quotes(&ctx);
+        }
+        let before_phase = src.current_phase();
+        let snap = src.checkpoint_state().expect("has state");
+
+        let dst = PumpAndDumpStrategy::new();
+        dst.restore_state(&snap).unwrap();
+        assert_eq!(dst.current_phase(), before_phase);
+    }
+
+    #[test]
+    fn restore_rejects_wrong_schema() {
+        let s = PumpAndDumpStrategy::new();
+        let bogus = serde_json::json!({
+            "schema_version": 2,
+            "tick": 0,
+        });
+        assert!(s.restore_state(&bogus).is_err());
     }
 }
