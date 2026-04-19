@@ -451,6 +451,134 @@ impl MomentumSignals {
         }
         Some(predicted_delta / mid)
     }
+
+    /// 22B-4 + 22B-6 — snapshot the tracker's persistent state.
+    /// Covers:
+    ///   * `signed_volumes` — rolling trade-flow window (22B-6)
+    ///   * `ofi_ewma` / `ofi_ewma_sq` — OFI EWMA state (22B-6)
+    ///   * Stoikov learned-microprice `g_matrix` + spread edges
+    ///     (already Serialize via `LearnedMicroprice`) (22B-4)
+    ///   * `online_mp_ring` horizon + snapshots (22B-4) — the
+    ///     struct is `#[serde(skip)]` on the LearnedMicroprice
+    ///     side so we explicitly capture it here.
+    ///
+    /// Without this, a restart drops all momentum history and
+    /// the learned-microprice model reverts to its offline fit,
+    /// needing 500+ live observations to catch the ring back up.
+    /// Returns `None` iff every optional component is `None` and
+    /// the rolling `signed_volumes` window is empty — nothing
+    /// worth persisting.
+    pub fn snapshot_state(&self) -> Option<serde_json::Value> {
+        let nothing = self.signed_volumes.is_empty()
+            && self.ofi_ewma.is_none()
+            && self.learned_mp.is_none()
+            && self.online_mp_ring.is_none();
+        if nothing {
+            return None;
+        }
+        let online_ring = self.online_mp_ring.as_ref().map(|r| {
+            let snapshots: Vec<(String, String, String)> = r
+                .snapshots
+                .iter()
+                .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()))
+                .collect();
+            serde_json::json!({
+                "horizon": r.horizon,
+                "snapshots": snapshots,
+            })
+        });
+        Some(serde_json::json!({
+            "schema_version": 1,
+            "window": self.window,
+            "signed_volumes": self.signed_volumes.iter()
+                .map(|d| d.to_string()).collect::<Vec<_>>(),
+            "ofi_ewma": self.ofi_ewma.as_ref().map(|d| d.to_string()),
+            "ofi_ewma_sq": self.ofi_ewma_sq.as_ref().map(|d| d.to_string()),
+            "learned_mp": self.learned_mp.as_ref()
+                .map(|m| serde_json::to_value(m).ok()).flatten(),
+            "online_mp_ring": online_ring,
+        }))
+    }
+
+    /// 22B-4 + 22B-6 — restore a previously captured state. See
+    /// [`Self::snapshot_state`] for what's persisted. Schema
+    /// version gate keeps future breaking changes behind a
+    /// loud failure. `learned_mp`, `online_mp_ring`, and the
+    /// EWMA fields are only restored when the destination
+    /// tracker has the corresponding component already attached
+    /// (via `with_*` builders) — restoring into a bare tracker
+    /// without OFI / learned-mp would silently re-enable those
+    /// subsystems, which the caller didn't ask for.
+    pub fn restore_state(&mut self, state: &serde_json::Value) -> Result<(), String> {
+        let schema = state.get("schema_version").and_then(|v| v.as_u64());
+        if schema != Some(1) {
+            return Err(format!(
+                "momentum checkpoint has unsupported schema_version {schema:?}"
+            ));
+        }
+        let signed_volumes: VecDeque<Decimal> = state
+            .get("signed_volumes")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "momentum: missing signed_volumes".to_string())?
+            .iter()
+            .filter_map(|v| v.as_str()?.parse::<Decimal>().ok())
+            .collect();
+
+        let ofi_ewma = state
+            .get("ofi_ewma")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Decimal>().ok());
+        let ofi_ewma_sq = state
+            .get("ofi_ewma_sq")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Decimal>().ok());
+
+        // Truncate if the on-disk window is longer than the
+        // current cap — supports future window-tuning without
+        // rejecting legacy checkpoints.
+        let mut trimmed = signed_volumes;
+        while trimmed.len() > self.window {
+            trimmed.pop_front();
+        }
+        self.signed_volumes = trimmed;
+
+        // Only restore optional components when the caller has
+        // already attached them via the builders — silently
+        // skipping otherwise preserves the "config drives
+        // subsystem shape" invariant.
+        if self.ofi.is_some() {
+            self.ofi_ewma = ofi_ewma;
+            self.ofi_ewma_sq = ofi_ewma_sq;
+        }
+        if let Some(model_json) = state.get("learned_mp").filter(|v| !v.is_null()) {
+            if self.learned_mp.is_some() {
+                let model: LearnedMicroprice =
+                    serde_json::from_value(model_json.clone())
+                        .map_err(|e| format!("momentum: bad learned_mp: {e}"))?;
+                self.learned_mp = Some(model);
+            }
+        }
+        if let Some(ring_json) = state.get("online_mp_ring").filter(|v| !v.is_null()) {
+            if let Some(ring) = self.online_mp_ring.as_mut() {
+                let snapshots_json = ring_json
+                    .get("snapshots")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| "momentum: missing online_mp_ring.snapshots".to_string())?;
+                let snaps: VecDeque<(Decimal, Decimal, Decimal)> = snapshots_json
+                    .iter()
+                    .filter_map(|t| {
+                        let arr = t.as_array()?;
+                        let a = arr.first()?.as_str()?.parse().ok()?;
+                        let b = arr.get(1)?.as_str()?.parse().ok()?;
+                        let c = arr.get(2)?.as_str()?.parse().ok()?;
+                        Some((a, b, c))
+                    })
+                    .collect();
+                ring.snapshots = snaps;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -867,5 +995,87 @@ mod tests {
             let _ = MomentumSignals::new(10).with_learned_microprice_online(model, 0);
         }));
         assert!(result.is_err(), "horizon=0 must panic");
+    }
+
+    /// 22B-6 — basic snapshot_state returns None on empty tracker.
+    #[test]
+    fn empty_tracker_returns_none() {
+        let m = MomentumSignals::new(10);
+        assert!(m.snapshot_state().is_none());
+    }
+
+    fn mk_trade(qty: Decimal, taker_side: Side, id: u64) -> Trade {
+        Trade {
+            trade_id: id,
+            symbol: "BTCUSDT".into(),
+            price: dec!(100),
+            qty,
+            taker_side,
+            timestamp: Utc::now(),
+        }
+    }
+
+    /// 22B-6 — signed_volumes round-trips through snapshot/restore.
+    #[test]
+    fn signed_volumes_round_trip() {
+        let mut src = MomentumSignals::new(10);
+        // Drive a few trades to populate signed_volumes.
+        src.on_trade(&mk_trade(dec!(1), Side::Buy, 1));
+        src.on_trade(&mk_trade(dec!(2), Side::Sell, 2));
+        let snap = src.snapshot_state().expect("has data");
+
+        let mut dst = MomentumSignals::new(10);
+        dst.restore_state(&snap).unwrap();
+        assert_eq!(dst.signed_volumes.len(), 2);
+        // on_trade signs notional (price * qty): +100 buy, -200 sell.
+        assert_eq!(dst.signed_volumes[0], dec!(100));
+        assert_eq!(dst.signed_volumes[1], dec!(-200));
+    }
+
+    /// 22B-6 — window cap truncates oversize signed_volumes
+    /// buffer during restore.
+    #[test]
+    fn restore_truncates_oversize_window() {
+        let mut src = MomentumSignals::new(100);
+        for i in 0..80 {
+            src.on_trade(&mk_trade(Decimal::from(i + 1), Side::Buy, i as u64));
+        }
+        let snap = src.snapshot_state().expect("has data");
+
+        let mut dst = MomentumSignals::new(10); // smaller cap
+        dst.restore_state(&snap).unwrap();
+        assert_eq!(dst.signed_volumes.len(), 10);
+    }
+
+    /// 22B-4 — learned_mp round-trips through snapshot/restore
+    /// when both sides have the subsystem attached.
+    #[test]
+    fn learned_mp_round_trip() {
+        use crate::learned_microprice::{LearnedMicroprice, LearnedMicropriceConfig};
+        let cfg = LearnedMicropriceConfig::default();
+        let src_model = LearnedMicroprice::empty(cfg.clone());
+        let dst_model = LearnedMicroprice::empty(cfg);
+        let src = MomentumSignals::new(10)
+            .with_learned_microprice(src_model);
+        let mut dst = MomentumSignals::new(10)
+            .with_learned_microprice(dst_model);
+        let snap = src.snapshot_state().expect("has data");
+        dst.restore_state(&snap).unwrap();
+        assert!(dst.learned_mp.is_some());
+    }
+
+    #[test]
+    fn restore_rejects_wrong_schema() {
+        let mut m = MomentumSignals::new(10);
+        let bogus = serde_json::json!({
+            "schema_version": 999,
+            "window": 10,
+            "signed_volumes": [],
+            "ofi_ewma": null,
+            "ofi_ewma_sq": null,
+            "learned_mp": null,
+            "online_mp_ring": null,
+        });
+        assert!(m.restore_state(&bogus).is_err());
     }
 }

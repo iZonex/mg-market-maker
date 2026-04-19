@@ -1367,6 +1367,19 @@ impl MarketMakerEngine {
                 ),
             }
         }
+        if let Some(v) = checkpoint.engine_state.get("momentum") {
+            match self.momentum.restore_state(v) {
+                Ok(()) => tracing::info!(
+                    symbol = %self.symbol,
+                    "momentum signals restored from checkpoint"
+                ),
+                Err(e) => tracing::warn!(
+                    symbol = %self.symbol,
+                    error = %e,
+                    "momentum restore_state failed — starting fresh"
+                ),
+            }
+        }
 
         self.audit.risk_event(
             &self.symbol,
@@ -1417,6 +1430,9 @@ impl MarketMakerEngine {
             "autotune".to_string(),
             self.auto_tuner.regime_detector.snapshot_state(),
         );
+        if let Some(v) = self.momentum.snapshot_state() {
+            map.insert("momentum".to_string(), v);
+        }
         map
     }
 
