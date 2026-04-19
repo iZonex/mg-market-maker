@@ -25,6 +25,10 @@ use mm_risk::margin_guard::{MarginGuard, MarginGuardThresholds};
 use mm_risk::news_retreat::{NewsRetreatState, NewsRetreatStateMachine, NewsRetreatTransition};
 use mm_risk::otr::OrderToTradeRatio;
 use mm_risk::pnl::PnlTracker;
+use mm_risk::protections::{
+    CooldownConfig, LowProfitPairsConfig, MaxDrawdownConfig, ProtectionStatus, Protections,
+    ProtectionsConfig, StoplossGuardConfig,
+};
 use mm_risk::sla::{SlaConfig, SlaTracker};
 use mm_risk::toxicity::{
     AdverseSelectionTracker, BvcBarAggregator, BvcClassifier, KyleLambda, VpinEstimator,
@@ -390,6 +394,21 @@ pub struct MarketMakerEngine {
 
     // Risk.
     kill_switch: KillSwitch,
+    /// 22W-1 — per-pair protections stack (StoplossGuard,
+    /// CooldownPeriod, MaxDrawdownPause, LowProfitPairs).
+    /// When locked, `refresh_quotes` short-circuits before
+    /// emitting any orders for this symbol. `None` when the
+    /// operator didn't configure `[protections]`.
+    protections: Option<Protections>,
+    /// 22W-1 — most recent protections lock reason, threaded
+    /// into audit events on state transitions so the trail
+    /// shows exactly which guard tripped.
+    protections_last_status: ProtectionStatus,
+    /// 22W-1 — track the previous observed kill-switch level
+    /// so a rising edge to StopNewOrders/CancelAll counts as
+    /// exactly one "stop event" for StoplossGuard + CooldownPeriod,
+    /// not one per tick.
+    protections_last_kill_level: KillLevel,
     audit: Arc<AuditLog>,
     balance_cache: BalanceCache,
     order_id_map: OrderIdMap,
@@ -918,6 +937,31 @@ impl MarketMakerEngine {
             circuit_breaker: CircuitBreaker::new(),
             volatility_estimator: vol_est,
             kill_switch: KillSwitch::new(ks_config),
+            protections: config.protections.as_ref().map(|cfg| {
+                Protections::new(ProtectionsConfig {
+                    stoploss_guard: cfg.stoploss_guard.as_ref().map(|g| StoplossGuardConfig {
+                        window: std::time::Duration::from_secs(g.window_secs),
+                        max_stops: g.max_stops,
+                        lockout: std::time::Duration::from_secs(g.lockout_secs),
+                    }),
+                    cooldown: cfg.cooldown.as_ref().map(|c| CooldownConfig {
+                        duration: std::time::Duration::from_secs(c.duration_secs),
+                    }),
+                    max_drawdown: cfg.max_drawdown.as_ref().map(|m| MaxDrawdownConfig {
+                        max_drawdown_quote: m.max_drawdown_quote,
+                        lockout: std::time::Duration::from_secs(m.lockout_secs),
+                        recovery_fraction: m.recovery_fraction,
+                    }),
+                    low_profit_pairs: cfg.low_profit_pairs.as_ref().map(|l| LowProfitPairsConfig {
+                        window: std::time::Duration::from_secs(l.window_secs),
+                        min_pnl_quote: l.min_pnl_quote,
+                        lockout: std::time::Duration::from_secs(l.lockout_secs),
+                        min_trades: l.min_trades,
+                    }),
+                })
+            }),
+            protections_last_status: ProtectionStatus::Clear,
+            protections_last_kill_level: KillLevel::Normal,
             audit,
             balance_cache: if paper_mode {
                 BalanceCache::new_paper_for(mm_common::types::WalletType::Spot)
@@ -7155,6 +7199,21 @@ impl MarketMakerEngine {
 
                 if let Some(mid) = self.book_keeper.book.mid_price() {
                     self.pnl_tracker.on_fill(fill, mid);
+                    // 22W-1 — LowProfitPairs feeds on realised
+                    // per-fill PnL (signed): for a maker sell we
+                    // earned (price - entry) × qty; for a buy we
+                    // paid the same. pnl_tracker's per-fill
+                    // realised delta is the closest honest signal
+                    // without reconstructing the FIFO lot here,
+                    // so we read it after the update and push the
+                    // delta into Protections.
+                    if let Some(p) = self.protections.as_mut() {
+                        let delta = self.pnl_tracker.attribution.spread_pnl
+                            - self.var_guard_last_total_pnl;
+                        if !delta.is_zero() {
+                            p.record_trade_pnl(&self.symbol, delta, std::time::Instant::now());
+                        }
+                    }
                     self.adverse_selection.on_fill(fill.price, fill.side, mid);
                     // MM-2 — notify every strategy (legacy slot +
                     // graph pool) so stateful strategies can update
@@ -7580,6 +7639,54 @@ impl MarketMakerEngine {
     async fn refresh_quotes(&mut self) -> Result<()> {
         self.tick_count += 1;
 
+        // 22W-1 — protections stack gate. Before we do ANY
+        // work this tick, check whether a per-pair guard has
+        // locked us out (too many stops, cooldown, drawdown
+        // pause, or low-profit demotion). A locked status
+        // short-circuits the quote loop — existing orders
+        // stay (they'll be cancelled via the normal pathway
+        // when the operator escalates); no new quotes emit.
+        // Guard-state transitions land one audit event so the
+        // operator can grep the trail for "when did we pause".
+        if let Some(protections) = self.protections.as_mut() {
+            // Equity hook — feeds MaxDrawdownPause on every
+            // tick with the current unrealised + realised PnL.
+            let equity = self.pnl_tracker.attribution.total_pnl();
+            protections.update_equity(&self.symbol, equity, std::time::Instant::now());
+            let status = protections.is_locked(&self.symbol, std::time::Instant::now());
+            if self.protections_last_status != status {
+                match &status {
+                    ProtectionStatus::Locked { reason, .. } => {
+                        self.audit.risk_event(
+                            &self.symbol,
+                            AuditEventType::ProtectionsLocked,
+                            reason,
+                        );
+                        tracing::warn!(
+                            symbol = %self.symbol,
+                            reason = %reason,
+                            "protections guard locked pair"
+                        );
+                    }
+                    ProtectionStatus::Clear => {
+                        self.audit.risk_event(
+                            &self.symbol,
+                            AuditEventType::ProtectionsCleared,
+                            "all guards clear",
+                        );
+                        tracing::info!(
+                            symbol = %self.symbol,
+                            "protections guards cleared"
+                        );
+                    }
+                }
+                self.protections_last_status = status.clone();
+            }
+            if status.is_locked() {
+                return Ok(());
+            }
+        }
+
         // MV-2 — run the atomic-bundle ack sweep + rollback
         // watchdog BEFORE the quote pipeline so (a) ack state
         // merged this tick influences any graph evaluator that
@@ -7928,6 +8035,21 @@ impl MarketMakerEngine {
 
         // Kill switch multipliers.
         let effective_level = self.effective_kill_level();
+
+        // 22W-1 — edge-detect kill-level rise to L2+ and feed
+        // it as a "stop event" to the protections stack. This
+        // is how StoplossGuard accumulates — N escalations in
+        // `window` → lock the pair. CooldownPeriod fires on the
+        // same trigger. Downgrade transitions don't count.
+        if effective_level > self.protections_last_kill_level
+            && effective_level >= KillLevel::StopNewOrders
+        {
+            if let Some(p) = self.protections.as_mut() {
+                p.record_stop(&self.symbol, std::time::Instant::now());
+            }
+        }
+        self.protections_last_kill_level = effective_level;
+
         let ks_spread = effective_level.spread_multiplier();
         // Base size multiplier from the kill switch, then
         // composed with the VaR guard's per-strategy throttle

@@ -74,6 +74,16 @@ pub struct AppConfig {
     #[serde(default)]
     pub stat_arb: Option<StatArbCfg>,
 
+    /// Protections stack (22W-1). Freqtrade-inspired rate-limit
+    /// guards that pause pairs without tripping the full kill
+    /// switch — N-stops-in-window StoplossGuard, CooldownPeriod,
+    /// MaxDrawdownPause (per-pair equity drawdown),
+    /// LowProfitPairs (rolling PnL demotion). Each sub-guard is
+    /// independently optional. When `protections = None` no
+    /// guards are built.
+    #[serde(default)]
+    pub protections: Option<ProtectionsCfg>,
+
     /// Record live market data to JSONL for offline backtesting.
     /// When `true`, each engine writes BookSnapshot + Trade events
     /// to `data/recorded/{symbol}.jsonl`. Data accumulates across
@@ -677,6 +687,62 @@ fn default_stat_arb_r() -> Decimal {
 }
 fn default_stat_arb_notional() -> Decimal {
     dec!(1000)
+}
+
+/// TOML-facing protections stack config (22W-1). Mirrors
+/// `mm_risk::protections::ProtectionsConfig` but with
+/// `Duration` replaced by `*_secs: u64` so operators can write
+/// `[protections.stoploss_guard]` blocks in TOML. Every
+/// sub-guard is independently optional — a missing block
+/// disables that guard without disabling the whole stack.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProtectionsCfg {
+    #[serde(default)]
+    pub stoploss_guard: Option<StoplossGuardCfg>,
+    #[serde(default)]
+    pub cooldown: Option<CooldownCfg>,
+    #[serde(default)]
+    pub max_drawdown: Option<MaxDrawdownPauseCfg>,
+    #[serde(default)]
+    pub low_profit_pairs: Option<LowProfitPairsCfg>,
+}
+
+/// Halt a pair after `max_stops` stop events within `window_secs`.
+/// Lock lifts after `lockout_secs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoplossGuardCfg {
+    pub window_secs: u64,
+    pub max_stops: usize,
+    pub lockout_secs: u64,
+}
+
+/// Mandatory pause of `duration_secs` after any stop event
+/// before the pair can re-quote.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CooldownCfg {
+    pub duration_secs: u64,
+}
+
+/// Equity-peak-to-trough pause in quote currency. Per-pair.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaxDrawdownPauseCfg {
+    pub max_drawdown_quote: Decimal,
+    pub lockout_secs: u64,
+    /// Fraction of peak that equity must recover to before the
+    /// lockout clears early. `1.0` requires full recovery.
+    /// `0.95` lets the pair re-quote after a 5% bounce.
+    pub recovery_fraction: Decimal,
+}
+
+/// Rolling-window PnL demotion. Below `min_pnl_quote` over
+/// `window_secs` (need ≥ `min_trades`), pair is paused for
+/// `lockout_secs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LowProfitPairsCfg {
+    pub window_secs: u64,
+    pub min_pnl_quote: Decimal,
+    pub lockout_secs: u64,
+    pub min_trades: usize,
 }
 
 /// Hedge-leg exchange + instrument pair config.
@@ -2418,6 +2484,7 @@ impl Default for AppConfig {
             hedge: None,
             funding_arb: None,
             stat_arb: None,
+            protections: None,
             record_market_data: false,
             paper_fill: None,
             rebalancer: None,

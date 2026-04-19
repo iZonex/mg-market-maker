@@ -134,6 +134,16 @@ pub enum AuditEventType {
     /// tolerance; reset on manual intervention.
     InventoryDriftDetected,
 
+    /// 22W-1 — protections stack tripped a per-pair guard
+    /// (StoplossGuard / CooldownPeriod / MaxDrawdownPause /
+    /// LowProfitPairs). `detail` carries the guard name + reason
+    /// string so the operator can tell which rule fired.
+    ProtectionsLocked,
+    /// 22W-1 — all protections guards cleared for the pair
+    /// (lock expired or recovery trigger). Paired with a prior
+    /// `ProtectionsLocked` event.
+    ProtectionsCleared,
+
     // Cross-product pair dispatch (funding arb / basis trade).
     /// Atomic pair dispatch succeeded — both legs placed.
     PairDispatchEntered,

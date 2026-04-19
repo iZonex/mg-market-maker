@@ -326,6 +326,69 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
         }
     }
 
+    // --- Protections (22W-1) ---
+    if let Some(p) = &config.protections {
+        if let Some(g) = &p.stoploss_guard {
+            if g.max_stops == 0 {
+                errors.push("protections.stoploss_guard.max_stops must be > 0".to_string());
+            }
+            if g.window_secs == 0 {
+                errors.push("protections.stoploss_guard.window_secs must be > 0".to_string());
+            }
+            if g.lockout_secs == 0 {
+                errors.push("protections.stoploss_guard.lockout_secs must be > 0".to_string());
+            }
+        }
+        if let Some(c) = &p.cooldown {
+            if c.duration_secs == 0 {
+                errors.push("protections.cooldown.duration_secs must be > 0".to_string());
+            }
+        }
+        if let Some(m) = &p.max_drawdown {
+            if m.max_drawdown_quote <= dec!(0) {
+                errors.push(
+                    "protections.max_drawdown.max_drawdown_quote must be > 0".to_string(),
+                );
+            }
+            if m.lockout_secs == 0 {
+                errors.push("protections.max_drawdown.lockout_secs must be > 0".to_string());
+            }
+            if m.recovery_fraction <= dec!(0) || m.recovery_fraction > dec!(1) {
+                errors.push(
+                    "protections.max_drawdown.recovery_fraction must be in (0, 1]".to_string(),
+                );
+            }
+        }
+        if let Some(l) = &p.low_profit_pairs {
+            if l.window_secs == 0 {
+                errors.push("protections.low_profit_pairs.window_secs must be > 0".to_string());
+            }
+            if l.lockout_secs == 0 {
+                errors.push("protections.low_profit_pairs.lockout_secs must be > 0".to_string());
+            }
+            if l.min_trades == 0 {
+                warnings.push(
+                    "protections.low_profit_pairs.min_trades=0 will trigger on the \
+                     first trade — set at least 3 to get a rolling-window signal"
+                        .to_string(),
+                );
+            }
+        }
+        // Fully-empty protections block is a noop — warn so
+        // operators don't think the stack is active.
+        if p.stoploss_guard.is_none()
+            && p.cooldown.is_none()
+            && p.max_drawdown.is_none()
+            && p.low_profit_pairs.is_none()
+        {
+            warnings.push(
+                "[protections] is configured but every sub-guard is unset — \
+                 the stack is effectively disabled"
+                    .to_string(),
+            );
+        }
+    }
+
     // --- VaR guard ---
     if mm.var_guard_enabled {
         if mm.var_guard_limit_95.is_none() && mm.var_guard_limit_99.is_none() {
