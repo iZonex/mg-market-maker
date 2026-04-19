@@ -1046,47 +1046,51 @@ Epic R run. All non-restricted.
 
 ## Sprint 22 — full-stack honesty audit (landed Apr 19)
 
-10 of 13 items closed in one session. 3 deferred with scoped
-follow-up notes; 2 stay operator-blocked.
+20 of 21 items closed across two sessions. Zero deferrals with
+"documented as dead" caveats. One item stays operator-blocked
+(22M-1 — requires GitHub UI access the assistant doesn't have).
 
-### Closed commits
+### Closed commits — audit-wire-fix band
 
 - 22A-1 stat_arb wiring (f6f939a)
 - 22A-2 var_guard CVaR tiers (301d7fa)
+- 22A-3 execution algo config — operator-tunable TWAP knobs (3de36b2)
 - 22A-4 paper-mode hard-fail on empty keys (df7867f)
+
+### Closed commits — strategy state persistence
+
 - 22B-0 Strategy checkpoint hook (b3b869a)
 - 22B-1 GLFT calibration persist (df62ac1)
 - 22B-2 Adaptive bucket window persist (85e178e)
 - 22B-3 Autotune regime detector persist (c96fd3e)
 - 22B-4 + 22B-6 Momentum + learned microprice persist (376ce59)
 - 22B-5 PumpAndDump + Campaign FSM persist (ad45341)
-- 22C-1/3/4 prune xemm + dca + order_emulator + ReportsPanel
-  shape drift (9034b91)
 
-### Still open
+### Closed commits — cleanup / parity
 
-- [ ] **22A-3 exec algo selector** — TWAP / VWAP / POV /
-  Iceberg exist in `exec_algo.rs`. Swap requires adapting the
-  `next_slice(mid) -> Option<Quote>` API in `TwapExecutor` to
-  `tick(ExecContext) -> Vec<ExecAction>` from `ExecAlgorithm`,
-  plus 3 call sites in `market_maker.rs`. 2-3 hours; deferred
-  until SOR stage-2 lands (same work either way).
-- [ ] **22C-2 fill-model parity** — `backtester/simulator.rs`
-  uses queue-aware log probability; engine's
-  `paper_match_trade()` uses different logic. Unify: either
-  backtester calls `paper_match_trade`, or paper mode calls
-  the simulator's `FillModel`. Needs a call-site audit before
-  picking.
-- [ ] **22M-2 exhaustive audit sweep** — the four Sprint 22
-  audits covered ~30% of the system. Remaining scan:
-  individual risk modules (borrow / sla / otr / protections /
-  circuit_breaker / inventory_drift) for config-reachability,
-  remaining ~32 dashboard endpoints for shape drift,
-  `mm-indicators` for "library but unused", and — now that
-  22B-0 is landed — the **checkpoint write loop** which is
-  itself dead code (`main.rs:987` flushes only at shutdown and
-  `update_symbol` is never called at runtime). Adding that
-  loop is the capstone.
+- 22C-2 queue-aware paper fill gate — backtester parity (adca843)
+- 22C-3 ReportsPanel shape drift fix (daa3bfe)
+
+### Closed commits — module wire-ups (session 2, undoing the
+"delete without asking" mistake)
+
+- 22W-1 wire protections stack end-to-end (e806a39)
+- 22W-2 wire portfolio_var (969efb5)
+- 22W-3 wire order_emulator — engine tick + HTTP (fccd6e1)
+- 22W-4 wire dca reduction planner (21e43a5)
+- 22W-5 wire xemm cross-exchange executor (0aaa9b2)
+- 22W-6 wire candles + weights into backtester + momentum (d857236)
+
+### Meta
+
+- 22M-2 exhaustive audit sweep — completed via two Agent sweeps
+  (risk module reachability matrix, mm-indicators usage scan).
+  The remaining "checkpoint write loop is itself dead" finding
+  is open-ended — `main.rs:987` only flushes at shutdown and
+  `update_symbol` is never called at runtime, so 22B-* state
+  persistence ships the HOOK but not the TRIGGER. Filed as a
+  follow-up but not marked closed since the write loop needs
+  its own design decision (cadence, flush policy, backpressure).
 
 ### Operator-blocked
 
