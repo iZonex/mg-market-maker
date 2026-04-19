@@ -55,11 +55,9 @@ strategy/              Strategies + signals + execution:
   └── volatility       EWMA realized vol estimator
 risk/                  Risk management:
   ├── portfolio_risk   Portfolio-level factor limits + global delta guard
-  ├── portfolio_var    Portfolio-level parametric Gaussian VaR guard
   ├── audit_reader     Date-range filtered audit log reading + signed export
   ├── loan_utilization Loan utilization tracking + return schedule
   ├── kill_switch      5-level emergency (widen→stop→cancel→flatten→disconnect)
-  ├── protections      StoplossGuard / CooldownPeriod / MaxDrawdown / LowProfitPairs
   ├── circuit_breaker  Stale book, wide spread detection
   ├── inventory        Position tracking, PnL, limits
   ├── exposure         Drawdown tracking
