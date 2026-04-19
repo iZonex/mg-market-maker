@@ -98,6 +98,7 @@ pub async fn start(
         .route("/api/v1/calibration/status", get(calibration_status))
         .route("/api/v1/active-graphs", get(active_graphs_snapshot))
         .route("/api/v1/manipulation/scores", get(manipulation_scores))
+        .route("/api/v1/onchain/scores", get(onchain_scores))
         .merge(crate::client_api::client_routes())
         .merge(crate::client_portal::client_portal_routes())
         .route_layer(middleware::from_fn_with_state(
@@ -977,6 +978,21 @@ struct ManipulationScoreRow {
 #[derive(Debug, serde::Serialize)]
 struct ManipulationScoresResponse {
     rows: Vec<ManipulationScoreRow>,
+}
+
+/// R3.8 — per-symbol on-chain surveillance snapshot: holder
+/// concentration + CEX inflow from suspect wallets.
+#[derive(Debug, serde::Serialize)]
+struct OnchainScoresResponse {
+    rows: Vec<crate::state::OnchainSnapshot>,
+}
+
+async fn onchain_scores(
+    State(state): State<DashboardState>,
+) -> Json<OnchainScoresResponse> {
+    Json(OnchainScoresResponse {
+        rows: state.onchain_snapshots(),
+    })
 }
 
 async fn manipulation_scores(

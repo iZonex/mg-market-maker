@@ -1069,6 +1069,72 @@ fn cross_venue_config_fields(
 /// ratio, median order lifetime, and biggest-open-vs-avg-trade size.
 /// Pair with `Cast.ToBool(>=0.8)` + `Out.KillEscalate` to stand
 /// down when the detector flags us.
+/// R3.8 — on-chain holder-concentration signal. Output `value`
+/// is the fraction of total supply held by the top-N holders
+/// (default N = 10), clamped to [0, 1]. Populated by the
+/// engine's onchain-poller overlay.
+#[derive(Debug, Default)]
+pub struct OnchainHolderConcentration;
+
+static ONCHAIN_HOLDER_OUTPUTS: Lazy<Vec<Port>> =
+    Lazy::new(|| vec![Port::new("value", PortType::Number)]);
+
+impl NodeKind for OnchainHolderConcentration {
+    fn kind(&self) -> &'static str {
+        "Onchain.HolderConcentration"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &ONCHAIN_HOLDER_OUTPUTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
+/// R3.8 — on-chain CEX-inflow signal. Output `value` is the
+/// raw token notional the operator's suspect-wallet list
+/// deposited to known-CEX addresses over the tracker window.
+/// Paired with `value_events` (count of discrete deposits in
+/// the same window) so the graph can distinguish "one big
+/// known OTC transfer" from "twelve small loads".
+#[derive(Debug, Default)]
+pub struct OnchainSuspectInflowRate;
+
+static ONCHAIN_INFLOW_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
+    vec![
+        Port::new("value", PortType::Number),
+        Port::new("events", PortType::Number),
+    ]
+});
+
+impl NodeKind for OnchainSuspectInflowRate {
+    fn kind(&self) -> &'static str {
+        "Onchain.SuspectInflowRate"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &ONCHAIN_INFLOW_OUTPUTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing; 2])
+    }
+}
+
 /// R2.7 — CEX-side manipulation detector graph source.
 /// Outputs four numbers matching the
 /// `ManipulationScoreAggregator` snapshot shape: the combined

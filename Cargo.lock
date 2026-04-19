@@ -3108,6 +3108,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "mm-onchain"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "reqwest",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "mm-persistence"
 version = "0.4.0"
 dependencies = [
@@ -3217,6 +3234,7 @@ dependencies = [
  "mm-exchange-core",
  "mm-exchange-hyperliquid",
  "mm-hyperopt",
+ "mm-onchain",
  "mm-persistence",
  "mm-portfolio",
  "mm-risk",

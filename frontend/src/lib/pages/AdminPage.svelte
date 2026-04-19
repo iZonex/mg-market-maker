@@ -10,6 +10,7 @@
   import AdverseSelection from '../components/AdverseSelection.svelte'
   import CalibrationStatus from '../components/CalibrationStatus.svelte'
   import ManipulationScores from '../components/ManipulationScores.svelte'
+  import OnchainScores from '../components/OnchainScores.svelte'
   let { ws, auth } = $props()
 </script>
 
@@ -50,6 +51,9 @@
     </Card>
     <Card title="Manipulation detector" subtitle="CEX-side pump / wash / thin-book" span={3}>
       {#snippet children()}<ManipulationScores {auth} />{/snippet}
+    </Card>
+    <Card title="On-chain surveillance" subtitle="holder concentration + CEX inflow" span={3}>
+      {#snippet children()}<OnchainScores {auth} />{/snippet}
     </Card>
     <Card title="Config surfaces" subtitle="webhooks · alerts · loans · sentiment" span={3}>
       {#snippet children()}<AdminConfigPanels {auth} />{/snippet}

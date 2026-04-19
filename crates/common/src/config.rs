@@ -84,6 +84,12 @@ pub struct AppConfig {
     #[serde(default)]
     pub rebalancer: Option<RebalancerCfg>,
 
+    /// R3.7 — on-chain surveillance configuration. `None`
+    /// disables the whole feature (no poller task, no graph
+    /// sources populated). See [`OnchainCfg`].
+    #[serde(default)]
+    pub onchain: Option<OnchainCfg>,
+
     /// Portfolio-level risk configuration (Epic 3).
     /// When `Some`, the server spawns a background task that
     /// evaluates portfolio risk on a 30-second interval and
@@ -2017,6 +2023,63 @@ fn default_rebalancer_cooldown() -> u64 {
     600
 }
 
+/// R3.7 — on-chain surveillance config. Operators wire this
+/// when they want the engine to consult an on-chain API for
+/// holder concentration and suspect-wallet CEX deposit flow.
+/// Provider choice is a string so adding a fifth provider is
+/// a one-line workspace addition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OnchainCfg {
+    /// Primary provider: `"goldrush"`, `"etherscan"`,
+    /// `"moralis"`, or `"alchemy"`. API key is supplied via
+    /// the matching `MM_{PROVIDER}_KEY` env var — never in
+    /// config.
+    pub provider: String,
+    /// Fallback provider used when the primary returns
+    /// `UnsupportedChain` or repeatedly rate-limits. Same
+    /// enum of names; `None` disables fallback.
+    #[serde(default)]
+    pub fallback: Option<String>,
+    /// Per-symbol chain + token + suspect wallet list. Key
+    /// is symbol (matches `config.symbols`), value is the
+    /// on-chain context for that symbol's base token.
+    #[serde(default)]
+    pub symbols: std::collections::HashMap<String, OnchainSymbolCfg>,
+    /// Known CEX deposit address allowlist for the tracker
+    /// (lowercase hex). Transfers from a suspect wallet to
+    /// an address in this set count as CEX inflow events.
+    #[serde(default)]
+    pub cex_deposit_addresses: Vec<String>,
+    /// Holder concentration refresh interval (seconds).
+    /// Default 3600 — 1 hour; distribution moves slowly for
+    /// most symbols.
+    #[serde(default = "default_onchain_holder_refresh")]
+    pub holder_refresh_secs: u64,
+    /// Suspect wallet inflow poll interval (seconds).
+    /// Default 300 — 5 min; tight enough to catch pre-dump
+    /// loading, loose enough to stay in the free tier.
+    #[serde(default = "default_onchain_inflow_poll")]
+    pub inflow_poll_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OnchainSymbolCfg {
+    /// Chain slug (`"eth-mainnet"`, `"bsc-mainnet"`, …).
+    pub chain: String,
+    /// Token contract address on that chain.
+    pub token: String,
+    /// Per-symbol suspect wallet list. Team + known whales.
+    #[serde(default)]
+    pub suspect_wallets: Vec<String>,
+}
+
+fn default_onchain_holder_refresh() -> u64 {
+    3600
+}
+fn default_onchain_inflow_poll() -> u64 {
+    300
+}
+
 /// Per-client report branding (Epic 5 item 5.6).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ReportBranding {
@@ -2246,6 +2309,7 @@ impl Default for AppConfig {
             record_market_data: false,
             paper_fill: None,
             rebalancer: None,
+            onchain: None,
             portfolio_risk: None,
             clients: Vec::new(),
             margin: None,

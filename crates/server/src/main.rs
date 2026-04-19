@@ -365,6 +365,164 @@ async fn main() -> Result<()> {
                 "transfer log open failed; /api/v1/rebalance/execute disabled");
         }
     }
+
+    // R3.7 — on-chain surveillance poller. Spawns one task that
+    // loops over every configured symbol, refreshes holder
+    // concentration on `holder_refresh_secs` cadence and
+    // suspect-wallet inflow on `inflow_poll_secs` cadence, and
+    // publishes the result via `dashboard_state.publish_onchain`.
+    if let Some(oc) = config.onchain.as_ref() {
+        let provider: Option<std::sync::Arc<dyn mm_onchain::OnchainProvider>> = match oc
+            .provider
+            .to_lowercase()
+            .as_str()
+        {
+            "goldrush" => std::env::var("MM_GOLDRUSH_KEY")
+                .ok()
+                .and_then(|k| {
+                    mm_onchain::goldrush::GoldRushProvider::new(
+                        mm_onchain::goldrush::GoldRushConfig::new(k),
+                    )
+                    .ok()
+                })
+                .map(|p| std::sync::Arc::new(p) as _),
+            "etherscan" => std::env::var("MM_ETHERSCAN_KEY")
+                .ok()
+                .and_then(|k| {
+                    mm_onchain::etherscan::EtherscanFamilyProvider::new(
+                        mm_onchain::etherscan::EtherscanFamilyConfig::new(k),
+                    )
+                    .ok()
+                })
+                .map(|p| std::sync::Arc::new(p) as _),
+            "moralis" => std::env::var("MM_MORALIS_KEY")
+                .ok()
+                .and_then(|k| {
+                    mm_onchain::moralis::MoralisProvider::new(
+                        mm_onchain::moralis::MoralisConfig::new(k),
+                    )
+                    .ok()
+                })
+                .map(|p| std::sync::Arc::new(p) as _),
+            "alchemy" => std::env::var("MM_ALCHEMY_KEY")
+                .ok()
+                .and_then(|k| {
+                    mm_onchain::alchemy::AlchemyProvider::new(
+                        mm_onchain::alchemy::AlchemyConfig::new(k),
+                    )
+                    .ok()
+                })
+                .map(|p| std::sync::Arc::new(p) as _),
+            other => {
+                warn!(provider = %other,
+                    "unknown onchain provider; skipping poller");
+                None
+            }
+        };
+
+        if let Some(provider) = provider {
+            let cache = std::sync::Arc::new(
+                mm_onchain::cache::HolderConcentrationCache::new(
+                    provider.clone(),
+                    mm_onchain::cache::HolderConcentrationConfig {
+                        top_n: 10,
+                        ttl: chrono::Duration::seconds(oc.holder_refresh_secs as i64),
+                    },
+                ),
+            );
+            let suspects: std::collections::HashMap<String, Vec<String>> = oc
+                .symbols
+                .iter()
+                .map(|(sym, s)| (sym.clone(), s.suspect_wallets.clone()))
+                .collect();
+            let cex_set: std::collections::HashSet<String> = oc
+                .cex_deposit_addresses
+                .iter()
+                .map(|s| s.to_lowercase())
+                .collect();
+            let tracker = std::sync::Arc::new(
+                mm_onchain::tracker::SuspectWalletTracker::new(
+                    provider.clone(),
+                    mm_onchain::tracker::SuspectWalletConfig {
+                        suspects_per_symbol: suspects,
+                        cex_deposit_addresses: cex_set,
+                        window: chrono::Duration::seconds(
+                            (oc.inflow_poll_secs * 12) as i64,
+                        ),
+                    },
+                ),
+            );
+            let dashboard_for_poller = dashboard_state.clone();
+            let per_symbol = oc.symbols.clone();
+            let symbol_count = per_symbol.len();
+            let holder_poll = oc.holder_refresh_secs.max(60);
+            let inflow_poll = oc.inflow_poll_secs.max(30);
+            let poll_interval = inflow_poll.min(holder_poll);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(
+                    poll_interval,
+                ));
+                let mut last_holder_poll: std::collections::HashMap<String, i64> =
+                    std::collections::HashMap::new();
+                loop {
+                    tick.tick().await;
+                    let now = chrono::Utc::now().timestamp();
+                    for (symbol, cfg) in &per_symbol {
+                        // Holder concentration on the slower cadence.
+                        let due_holder = last_holder_poll
+                            .get(symbol)
+                            .map(|t| now - t >= holder_poll as i64)
+                            .unwrap_or(true);
+                        let mut conc = rust_decimal::Decimal::ZERO;
+                        let mut top_n = 0u32;
+                        if due_holder {
+                            match cache.get(&cfg.chain, &cfg.token).await {
+                                Ok(s) => {
+                                    conc = s.concentration_pct;
+                                    top_n = s.top_n;
+                                    last_holder_poll.insert(symbol.clone(), now);
+                                }
+                                Err(e) => {
+                                    warn!(sym = %symbol, error = %e,
+                                        "onchain holder fetch failed");
+                                }
+                            }
+                        } else if let Some(s) = cache.peek(&cfg.chain, &cfg.token).await {
+                            conc = s.concentration_pct;
+                            top_n = s.top_n;
+                        }
+                        // Inflow every tick.
+                        let (inflow_total, events) =
+                            match tracker.refresh(symbol, &cfg.chain).await {
+                                Ok(s) => (s.inflow_total, s.event_count),
+                                Err(e) => {
+                                    warn!(sym = %symbol, error = %e,
+                                        "onchain inflow refresh failed");
+                                    (rust_decimal::Decimal::ZERO, 0)
+                                }
+                            };
+                        dashboard_for_poller.publish_onchain(
+                            mm_dashboard::state::OnchainSnapshot {
+                                symbol: symbol.clone(),
+                                chain: cfg.chain.clone(),
+                                concentration_pct: conc,
+                                top_n,
+                                inflow_total,
+                                inflow_events: events,
+                                computed_at_ms: chrono::Utc::now().timestamp_millis(),
+                            },
+                        );
+                    }
+                }
+            });
+            info!(provider = %oc.provider, symbols = symbol_count,
+                "onchain poller started");
+        } else {
+            warn!(provider = %oc.provider,
+                "onchain provider not configured (missing env key); poller disabled");
+        }
+    }
+
     // UX-5 — publish the effective AppConfig so operators can
     // inspect which features are configured vs on defaults from
     // the dashboard. Secrets live in env, not in `AppConfig`.

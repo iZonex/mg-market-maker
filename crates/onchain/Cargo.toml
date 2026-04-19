@@ -1,0 +1,26 @@
+[package]
+name = "mm-onchain"
+edition.workspace = true
+version.workspace = true
+
+# Epic R3 — multi-provider on-chain surveillance.
+#
+# CEX-only manipulation detection (Epic R2) catches the price
+# pattern; this crate catches the *structural* precondition —
+# 9 wallets controlling 95% of supply, team-to-CEX deposit
+# flows right before a pump. Four provider impls share one
+# `OnchainProvider` trait so operators pick whichever free tier
+# fits their chain coverage needs.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }

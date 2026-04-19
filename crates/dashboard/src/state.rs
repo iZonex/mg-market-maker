@@ -329,6 +329,12 @@ struct StateInner {
     /// missing entry means the active strategy is stateless
     /// (grid, basis, Avellaneda).
     calibration_snapshots: HashMap<String, CalibrationSnapshot>,
+    /// R3.8 — per-symbol on-chain snapshot. Populated by the
+    /// server-side `OnchainPoller` task on the operator's
+    /// configured refresh cadence. `None` / missing entry
+    /// means onchain is disabled or the poller hasn't filled
+    /// this symbol yet.
+    onchain_snapshots: HashMap<String, OnchainSnapshot>,
 }
 
 impl std::fmt::Debug for StateInner {
@@ -770,6 +776,32 @@ pub struct ManipulationScoreSnapshot {
     pub wash: Decimal,
     pub thin_book: Decimal,
     pub combined: Decimal,
+}
+
+/// R3.8 — per-symbol on-chain surveillance snapshot. Mirror of
+/// the aggregated output of `mm-onchain` cache + tracker so the
+/// dashboard stays free of the `mm-onchain` dependency. The
+/// server-side poller fills this on its refresh cadence.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OnchainSnapshot {
+    pub symbol: String,
+    pub chain: String,
+    /// Top-N holder concentration, clamped to [0, 1]. A RAVE-
+    /// style rug sits at 0.8-0.95 on day one.
+    pub concentration_pct: Decimal,
+    /// Number of top holders the cache fetched.
+    pub top_n: u32,
+    /// Inflow into known-CEX addresses from operator-listed
+    /// suspect wallets, raw token units over the tracker
+    /// window.
+    pub inflow_total: Decimal,
+    /// Number of distinct CEX deposit events in-window.
+    pub inflow_events: u32,
+    /// When the snapshot was last refreshed on the
+    /// poller-task's tick. Exposed to the UI so operators
+    /// see whether the numbers are stale after a rate-limit
+    /// incident.
+    pub computed_at_ms: i64,
 }
 
 /// S6.1 — per-symbol active-graph descriptor. Fields mirror the
@@ -1814,6 +1846,24 @@ impl DashboardState {
             .map(|s| s.kill_level)
             .max()
             .unwrap_or(0)
+    }
+
+    /// R3.8 — server-side poller publishes the latest on-chain
+    /// view for a symbol. Overwrites any prior entry.
+    pub fn publish_onchain(&self, snap: OnchainSnapshot) {
+        let mut g = self.inner.write().unwrap();
+        g.onchain_snapshots.insert(snap.symbol.clone(), snap);
+    }
+
+    pub fn onchain_snapshots(&self) -> Vec<OnchainSnapshot> {
+        let g = self.inner.read().unwrap();
+        let mut out: Vec<_> = g.onchain_snapshots.values().cloned().collect();
+        out.sort_by(|a, b| b.concentration_pct.cmp(&a.concentration_pct));
+        out
+    }
+
+    pub fn onchain_snapshot(&self, symbol: &str) -> Option<OnchainSnapshot> {
+        self.inner.read().unwrap().onchain_snapshots.get(symbol).cloned()
     }
 
     /// S5.4 — engine-side hook: publish a calibration snapshot

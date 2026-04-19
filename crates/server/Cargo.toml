@@ -13,6 +13,7 @@ mm-exchange-hyperliquid = { workspace = true }
 mm-strategy = { workspace = true }
 mm-risk = { workspace = true }
 mm-sentiment = { workspace = true }
+mm-onchain = { path = "../onchain" }
 mm-strategy-graph = { path = "../strategy-graph" }
 mm-engine = { workspace = true }
 mm-dashboard = { workspace = true }

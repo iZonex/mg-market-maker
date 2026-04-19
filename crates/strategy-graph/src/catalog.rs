@@ -149,6 +149,8 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         }
         // Epic R — surveillance detectors (engine overlays per tick)
         "Surveillance.ManipulationScore" => Some(Box::new(sources::ManipulationScore)),
+        "Onchain.HolderConcentration" => Some(Box::new(sources::OnchainHolderConcentration)),
+        "Onchain.SuspectInflowRate" => Some(Box::new(sources::OnchainSuspectInflowRate)),
         "Surveillance.SpoofingScore" => Some(Box::new(sources::SpoofingScore)),
         "Surveillance.LayeringScore" => Some(Box::new(sources::LayeringScore)),
         "Surveillance.QuoteStuffingScore" => Some(Box::new(sources::QuoteStuffingScore)),
@@ -304,6 +306,8 @@ pub fn meta(kind: &str) -> NodeMeta {
 
         // Epic R — surveillance detectors (safe, defaults-on)
         "Surveillance.ManipulationScore" => NodeMeta { label: "Manipulation score", summary: "CEX-side pump-dump + wash + thin-book aggregated manipulation score [0..1] — the RAVE rug-pull detector", group: "Surveillance" },
+        "Onchain.HolderConcentration" => NodeMeta { label: "Onchain holder concentration", summary: "Fraction of total supply held by the top-N on-chain holders [0..1]. ~0.9 is a RAVE-style rug precondition", group: "Surveillance" },
+        "Onchain.SuspectInflowRate" => NodeMeta { label: "Onchain CEX inflow rate", summary: "Notional flowing from operator-listed suspect wallets to known-CEX addresses over the tracker window", group: "Surveillance" },
         "Surveillance.SpoofingScore" => NodeMeta { label: "Spoofing score", summary: "Likelihood our own flow looks like spoofing [0..1] + cancel_ratio + lifetime", group: "Surveillance" },
         "Surveillance.LayeringScore" => NodeMeta { label: "Layering score", summary: "Multi-order structured pressure + synchronous cancels [0..1]", group: "Surveillance" },
         "Surveillance.QuoteStuffingScore" => NodeMeta { label: "Quote stuffing score", summary: "High orders/sec + high cancel ratio + near-zero fill rate [0..1]", group: "Surveillance" },
@@ -473,6 +477,8 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Borrow.MaxAvailable",
         "Borrow.CarryBps",
         "Surveillance.ManipulationScore",
+        "Onchain.HolderConcentration",
+        "Onchain.SuspectInflowRate",
         "Surveillance.SpoofingScore",
         "Surveillance.LayeringScore",
         "Surveillance.QuoteStuffingScore",
@@ -567,10 +573,10 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_111_nodes_after_r2_manipulation_score() {
-        // 109 after S4.3 + 1 (R2.9: Strategy.PumpAndDump)
-        // + 1 (R2.7: Surveillance.ManipulationScore) = 111.
-        assert_eq!(kinds().len(), 111, "catalog drift");
+    fn catalog_has_113_nodes_after_r3_onchain_sources() {
+        // 111 after R2.7 + 2 (R3.8: Onchain.HolderConcentration,
+        // Onchain.SuspectInflowRate) = 113.
+        assert_eq!(kinds().len(), 113, "catalog drift");
     }
 
     /// GR-1 — every indicator with a `period` config field must

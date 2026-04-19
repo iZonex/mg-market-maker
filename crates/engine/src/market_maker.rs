@@ -3811,6 +3811,36 @@ impl MarketMakerEngine {
                     src.insert((*id, "wash".into()), Value::Number(snap.wash));
                     src.insert((*id, "thin_book".into()), Value::Number(snap.thin_book));
                 }
+                // R3.8 — on-chain source overlays. The engine
+                // reads `dashboard.onchain_snapshot(symbol)` —
+                // the poller task filled it on its own cadence,
+                // so here we only translate the snapshot into
+                // graph Values. `None` → `Missing` (fail-open:
+                // provider down ⇒ graph doesn't fire).
+                "Onchain.HolderConcentration" => {
+                    let v = self
+                        .dashboard
+                        .as_ref()
+                        .and_then(|d| d.onchain_snapshot(&self.symbol))
+                        .map(|s| Value::Number(s.concentration_pct))
+                        .unwrap_or(Value::Missing);
+                    src.insert((*id, "value".into()), v);
+                }
+                "Onchain.SuspectInflowRate" => {
+                    let snap = self
+                        .dashboard
+                        .as_ref()
+                        .and_then(|d| d.onchain_snapshot(&self.symbol));
+                    let (val, events) = match snap {
+                        Some(s) => (
+                            Value::Number(s.inflow_total),
+                            Value::Number(rust_decimal::Decimal::from(s.inflow_events)),
+                        ),
+                        None => (Value::Missing, Value::Missing),
+                    };
+                    src.insert((*id, "value".into()), val);
+                    src.insert((*id, "events".into()), events);
+                }
                 "Surveillance.SpoofingScore" |
                 "Surveillance.LayeringScore" |
                 "Surveillance.QuoteStuffingScore" => {

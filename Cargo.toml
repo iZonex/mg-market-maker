@@ -16,6 +16,7 @@ members = [
     "crates/strategy",
     "crates/risk",
     "crates/sentiment",
+    "crates/onchain",
     "crates/strategy-graph",
     "crates/engine",
     "crates/backtester",

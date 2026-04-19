@@ -1,6 +1,6 @@
 # MM — Open Work Tracker
 
-Last updated: 2026-04-19 (post-Sprint 7)
+Last updated: 2026-04-19 (post-Sprint 8)
 
 Tracking debt not yet closed. Closed items live in git history.
 Each row is a concrete deliverable; bigger initiatives are
@@ -500,6 +500,66 @@ Phase 2 deferred (on-chain holder-concentration tracker, CEX
 deposit flow monitor, market-cap vs liquidation ratio guard) —
 those need a new chain indexer / external API integration, out
 of scope for a CEX-data-only sprint.
+
+## Sprint 8 — Epic R3: on-chain surveillance (landed Apr 19)
+
+New `mm-onchain` crate wires 4 free-tier on-chain providers
+behind one `OnchainProvider` trait so operators pick whichever
+chain coverage / rate budget fits. Closes the RAVE-style
+pre-dump signal gap: ZachXBT's key signal was "9 wallets hold
+95% + CEX deposits before peak" — both halves now surface on
+the dashboard + graph sources.
+
+- [x] **R3.1** `mm-onchain` foundation — `OnchainProvider`
+  trait (`get_top_holders`, `get_address_transfers`,
+  `get_token_metadata`), shared types (`HolderEntry`,
+  `TransferEntry`, `TokenMetadata`, `ChainId`), `OnchainError`
+  enum (RateLimited / Auth / Network / Decode /
+  UnsupportedChain). Fail-open contract — a rate-limited
+  provider never halts the engine.
+- [x] **R3.2** `GoldRushProvider` — Covalent / GoldRush REST
+  (`/v1/{chain}/tokens/{token}/token_holders/` +
+  `/v1/{chain}/address/{addr}/transactions_v3/`). ~50 chains
+  (EVM + Solana + Cosmos), ~1000 req/day free tier, auth via
+  `MM_GOLDRUSH_KEY` env.
+- [x] **R3.3** `EtherscanFamilyProvider` — one impl covers
+  Etherscan + BscScan + PolygonScan + ArbiScan +
+  OptimisticEtherscan by per-chain base URL. Free-tier
+  token-holder endpoint is PRO-gated → returns
+  `UnsupportedChain` so the fallback provider picks up.
+- [x] **R3.4** `MoralisProvider` — EVM-only, ~40k CU/day free,
+  auth via `MM_MORALIS_KEY`.
+  `/api/v2.2/erc20/{token}/owners` + `/wallets/{addr}/history`.
+- [x] **R3.5** `AlchemyProvider` — JSON-RPC
+  (`alchemy_getAssetTransfers`, `alchemy_getTokenMetadata`).
+  EVM-only, 300M CU/month free. No holder-list endpoint →
+  returns `UnsupportedChain` for that op; fallback provider
+  fills the gap.
+- [x] **R3.6** Cache + tracker.
+  `HolderConcentrationCache` (per-token TTL cache, serves
+  stale snapshot on provider error so the graph never emits
+  `Missing` because of a transient rate-limit) +
+  `SuspectWalletTracker` (walks operator-supplied wallet
+  lists, filters transfers whose destination matches the CEX
+  deposit allowlist, sums notional).
+- [x] **R3.7** Config + boot. New `[onchain]` section with
+  `provider` + optional `fallback` + per-symbol
+  `{chain, token, suspect_wallets}` map +
+  `cex_deposit_addresses` allowlist. Server boot reads the
+  matching `MM_{PROVIDER}_KEY` env, spawns one poller task
+  for all configured symbols on `min(holder_refresh_secs,
+  inflow_poll_secs)` cadence, publishes via
+  `DashboardState::publish_onchain`.
+- [x] **R3.8** Graph sources + dashboard.
+  `Onchain.HolderConcentration` (1 Number: value) and
+  `Onchain.SuspectInflowRate` (2 Numbers: value + events).
+  Engine overlay at `tick_strategy_graph` reads from
+  `dashboard.onchain_snapshot(symbol)` and translates to
+  `Value::Number` / `Value::Missing` on the fail-open path.
+  `GET /api/v1/onchain/scores` endpoint +
+  `OnchainScores.svelte` panel on AdminPage highlights
+  concentration ≥ 0.8 in red, inflow events > 0 in red.
+  Catalog 111 → 113.
 
 ## Graph system audit — Apr 19 follow-ups
 
