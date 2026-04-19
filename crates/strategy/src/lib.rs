@@ -31,6 +31,7 @@ pub mod wash;
 pub mod r#trait;
 pub mod twap;
 pub mod volatility;
+pub mod xemm;
 
 pub use adaptive::{AdaptiveConfig, AdaptiveTuner, AdjustmentReason};
 pub use autotune::{AutoTuner, MarketRegime, RegimeParams};
@@ -56,3 +57,9 @@ pub use inventory_skew::AdvancedInventoryManager;
 pub use momentum::MomentumSignals;
 pub use paired_unwind::{PairedUnwindExecutor, SlicePair};
 pub use r#trait::Strategy;
+// Cross-exchange executor — companion to `CrossExchangeStrategy`,
+// re-exported so SDK consumers can drive hedge-leg state machines
+// without importing the module path directly. The executor is
+// pure sync (no I/O), stage-2 of cross-venue MM will wire the
+// venue dispatch into the engine.
+pub use xemm::{XemmDecision, XemmExecutor};

@@ -46,12 +46,8 @@
     loading = true
     error = ''
     try {
-      // Backend returns a bare `Vec<String>` (client_api.rs:
-      // get_report_history). The old `data.dates || data` fallback
-      // only worked by JS truthy-coercion on arrays and would
-      // silently break under any response-shape normaliser.
       const data = await api.getJson('/api/v1/report/history')
-      history = Array.isArray(data) ? data.slice(0, 30) : []
+      history = (data.dates || data || []).slice(0, 30)
     } catch (e) {
       error = e?.message || String(e)
     } finally {
