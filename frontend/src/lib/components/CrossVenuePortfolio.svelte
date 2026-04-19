@@ -8,9 +8,22 @@
    * "BTC = +0.3 (Binance +0.5 · Bybit -0.2)" at a glance.
    */
   import { createApiClient } from '../api.svelte.js'
+  import LegDetailModal from './LegDetailModal.svelte'
 
   let { auth } = $props()
   const api = createApiClient(auth)
+
+  // 23-UX-7 — click-through leg detail modal state.
+  let modalOpen = $state(false)
+  let modalVenue = $state('')
+  let modalSymbol = $state('')
+  let modalInv = $state(0)
+  function openLeg(leg) {
+    modalVenue = leg.venue
+    modalSymbol = leg.symbol
+    modalInv = leg.inventory
+    modalOpen = true
+  }
 
   const REFRESH_MS = 4_000
 
@@ -76,13 +89,14 @@
           </div>
           <div class="legs">
             {#each a.legs as leg}
-              <div class="leg">
+              <!-- 23-UX-7 — clickable leg opens the detail modal. -->
+              <button type="button" class="leg leg-btn" onclick={() => openLeg(leg)}>
                 <span class="venue">{leg.venue}</span>
                 <span class="sym">{leg.symbol}</span>
                 <span class="leg-val mono" style:color={deltaColour(leg.inventory)}>
                   {leg.inventory > 0 ? '+' : ''}{leg.inventory}
                 </span>
-              </div>
+              </button>
             {/each}
           </div>
         </div>
@@ -90,6 +104,15 @@
     </div>
   {/if}
 </div>
+
+<LegDetailModal
+  open={modalOpen}
+  venue={modalVenue}
+  symbol={modalSymbol}
+  inventory={modalInv}
+  {auth}
+  onClose={() => (modalOpen = false)}
+/>
 
 <style>
   .cvp { display: flex; flex-direction: column; gap: var(--s-3); }
@@ -151,7 +174,21 @@
     gap: var(--s-2);
     font-size: var(--fs-xs);
     align-items: baseline;
-    padding-left: var(--s-2);
+    padding: var(--s-1) var(--s-2);
+    border-radius: var(--r-sm);
+  }
+  /* 23-UX-7 clickable-leg affordance. */
+  .leg-btn {
+    background: transparent;
+    border: 1px solid transparent;
+    cursor: pointer;
+    text-align: left;
+    transition: background var(--dur-fast) var(--ease-out),
+                border-color var(--dur-fast) var(--ease-out);
+  }
+  .leg-btn:hover {
+    background: var(--bg-chip);
+    border-color: var(--border-subtle);
   }
   .venue { font-family: var(--font-mono); color: var(--fg-secondary); }
   .sym { font-family: var(--font-mono); color: var(--fg-muted); font-size: 10px; }
