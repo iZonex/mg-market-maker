@@ -144,6 +144,14 @@ pub enum AuditEventType {
     /// `ProtectionsLocked` event.
     ProtectionsCleared,
 
+    /// 22W-5 — XEMM executor rejected a hedge because adverse
+    /// slippage on the hedge venue's top-of-book exceeded the
+    /// configured `max_slippage_bps`. The primary-leg fill
+    /// already landed; the operator now owns a one-sided
+    /// inventory and must decide (retry, cancel maker quote,
+    /// manual unwind).
+    XemmHedgeRejected,
+
     // Cross-product pair dispatch (funding arb / basis trade).
     /// Atomic pair dispatch succeeded — both legs placed.
     PairDispatchEntered,

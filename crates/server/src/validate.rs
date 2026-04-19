@@ -326,6 +326,34 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
         }
     }
 
+    // --- XEMM executor (22W-5) ---
+    if let Some(x) = &config.xemm {
+        if x.enabled {
+            if !matches!(mm.strategy, StrategyType::CrossExchange) {
+                warnings.push(
+                    "xemm.enabled=true but strategy != cross_exchange — the executor \
+                     is only wired under StrategyType::CrossExchange and will remain \
+                     uninitialised".to_string(),
+                );
+            }
+            if config.hedge.is_none() {
+                errors.push(
+                    "xemm.enabled=true requires a [hedge] section — the executor \
+                     dispatches hedge orders on the hedge-leg connector".to_string(),
+                );
+            }
+            if x.max_slippage_bps <= dec!(0) {
+                errors.push("xemm.max_slippage_bps must be > 0".to_string());
+            }
+            if x.min_edge_bps < dec!(0) {
+                errors.push(
+                    "xemm.min_edge_bps must be >= 0 — negative edge would flag every \
+                     cross as profitable regardless".to_string(),
+                );
+            }
+        }
+    }
+
     // --- Protections (22W-1) ---
     if let Some(p) = &config.protections {
         if let Some(g) = &p.stoploss_guard {

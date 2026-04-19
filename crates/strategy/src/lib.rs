@@ -31,6 +31,10 @@ pub mod wash;
 pub mod r#trait;
 pub mod twap;
 pub mod volatility;
+/// Cross-exchange executor (22W-5 wire-in). Consumes maker-leg
+/// fills from `CrossExchangeStrategy`, emits hedge-leg market
+/// orders via the engine's spawned XEMM dispatch. Opt-in via
+/// `[xemm]` AppConfig section.
 pub mod xemm;
 
 pub use adaptive::{AdaptiveConfig, AdaptiveTuner, AdjustmentReason};

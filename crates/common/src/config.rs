@@ -94,6 +94,17 @@ pub struct AppConfig {
     #[serde(default)]
     pub portfolio_var: Option<PortfolioVarCfg>,
 
+    /// Cross-exchange executor config (22W-5). Opt-in upgrade
+    /// for `StrategyType::CrossExchange`: when enabled, every
+    /// primary-venue maker fill routes through `XemmExecutor`
+    /// which re-checks the hedge book's top-of-book, rejects
+    /// the hedge if adverse slippage exceeds `max_slippage_bps`,
+    /// and flags unfavourable crosses below `min_edge_bps` for
+    /// operator audit. `None` falls through to the legacy
+    /// profit-floor-only pattern.
+    #[serde(default)]
+    pub xemm: Option<XemmCfg>,
+
     /// Record live market data to JSONL for offline backtesting.
     /// When `true`, each engine writes BookSnapshot + Trade events
     /// to `data/recorded/{symbol}.jsonl`. Data accumulates across
@@ -785,6 +796,47 @@ impl Default for PortfolioVarCfg {
             var_limit_99: None,
             max_samples: default_portfolio_var_max_samples(),
             min_samples: default_portfolio_var_min_samples(),
+        }
+    }
+}
+
+/// XEMM executor config (22W-5). Mirrors
+/// `mm_strategy::xemm::XemmConfig` with an `enabled` flag and
+/// sensible defaults. Only takes effect under
+/// `StrategyType::CrossExchange` with a configured hedge
+/// connector.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct XemmCfg {
+    /// Master switch. `false` → executor never built, engine
+    /// stays on the legacy CrossExchangeStrategy profit-floor
+    /// path.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Max adverse slippage on the hedge leg, in bps of the
+    /// maker fill price. Over this, the hedge is rejected.
+    /// Default 20 bps matches the Hummingbot V2 reference.
+    #[serde(default = "default_xemm_max_slippage_bps")]
+    pub max_slippage_bps: Decimal,
+    /// Minimum expected edge on the cross. Below this, the
+    /// executor still hedges but flags the round-trip for
+    /// audit. Default 0 — no flag.
+    #[serde(default = "default_xemm_min_edge_bps")]
+    pub min_edge_bps: Decimal,
+}
+
+fn default_xemm_max_slippage_bps() -> Decimal {
+    dec!(20)
+}
+fn default_xemm_min_edge_bps() -> Decimal {
+    dec!(0)
+}
+
+impl Default for XemmCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_slippage_bps: default_xemm_max_slippage_bps(),
+            min_edge_bps: default_xemm_min_edge_bps(),
         }
     }
 }
@@ -2530,6 +2582,7 @@ impl Default for AppConfig {
             stat_arb: None,
             protections: None,
             portfolio_var: None,
+            xemm: None,
             record_market_data: false,
             paper_fill: None,
             rebalancer: None,

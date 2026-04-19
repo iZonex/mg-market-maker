@@ -39,6 +39,7 @@ use mm_risk::toxicity::{
 };
 use mm_risk::var_guard::{VarGuard, VarGuardConfig};
 use mm_strategy::autotune::AutoTuner;
+use mm_strategy::xemm::{XemmConfig, XemmDecision, XemmExecutor};
 use mm_strategy::funding_arb_driver::{DriverEvent, FundingArbDriver};
 use mm_strategy::inventory_skew::AdvancedInventoryManager;
 use mm_strategy::market_resilience::{MarketResilienceCalculator, MrConfig};
@@ -435,6 +436,15 @@ pub struct MarketMakerEngine {
     /// Paired with `pending_dca`; both are reset to empty /
     /// None when the schedule completes.
     dca_started_at: Option<std::time::Instant>,
+    /// 22W-5 — cross-exchange executor. Instantiated only when
+    /// `StrategyType::CrossExchange` is selected, a hedge
+    /// connector is configured, AND `[xemm].enabled = true`.
+    /// On every primary-venue maker fill the engine calls
+    /// `on_maker_fill` with the hedge book's top-of-book; the
+    /// resulting `XemmDecision::Hedge` fires an IOC market
+    /// order on the hedge connector. `None` falls back to the
+    /// legacy CrossExchangeStrategy profit-floor-only flow.
+    xemm_executor: Option<XemmExecutor>,
     audit: Arc<AuditLog>,
     balance_cache: BalanceCache,
     order_id_map: OrderIdMap,
@@ -992,6 +1002,20 @@ impl MarketMakerEngine {
             order_emulator: OrderEmulator::new(),
             pending_dca: Vec::new(),
             dca_started_at: None,
+            xemm_executor: {
+                let is_cross_exchange = matches!(
+                    config.market_maker.strategy,
+                    mm_common::config::StrategyType::CrossExchange
+                );
+                let hedge_ready = connectors.hedge.is_some();
+                match (&config.xemm, is_cross_exchange, hedge_ready) {
+                    (Some(cfg), true, true) if cfg.enabled => Some(XemmExecutor::new(XemmConfig {
+                        max_slippage_bps: cfg.max_slippage_bps,
+                        min_edge_bps: cfg.min_edge_bps,
+                    })),
+                    _ => None,
+                }
+            },
             audit,
             balance_cache: if paper_mode {
                 BalanceCache::new_paper_for(mm_common::types::WalletType::Spot)
@@ -7253,6 +7277,62 @@ impl MarketMakerEngine {
                     // second book lookup.
                     let obs = mm_strategy::r#trait::FillObservation::from_fill(fill, mid);
                     self.strategy.on_fill(&obs);
+
+                    // 22W-5 — route every primary-leg maker fill
+                    // through the XEMM executor when it's
+                    // active. The executor re-checks the hedge
+                    // book's top-of-book against the maker fill
+                    // price and either emits a hedge order,
+                    // rejects on adverse slippage, or hedges with
+                    // a warning flag. Dispatch is fire-and-forget
+                    // on a spawned task — `handle_ws_event` is
+                    // sync and we can't await from here.
+                    if self.xemm_executor.is_some() {
+                        if let (Some(hedge_book), Some(hedge_conn)) = (
+                            self.hedge_book.as_ref(),
+                            self.connectors.hedge.as_ref().cloned(),
+                        ) {
+                            if let (Some(hb_bid), Some(hb_ask)) = (
+                                hedge_book.book.best_bid(),
+                                hedge_book.book.best_ask(),
+                            ) {
+                                let decision = self
+                                    .xemm_executor
+                                    .as_mut()
+                                    .expect("is_some")
+                                    .on_maker_fill(
+                                        fill.side,
+                                        fill.qty,
+                                        fill.price,
+                                        hb_bid,
+                                        hb_ask,
+                                    );
+                                let symbol = self.symbol.clone();
+                                let hedge_symbol = self
+                                    .config
+                                    .hedge
+                                    .as_ref()
+                                    .map(|h| h.pair.hedge_symbol.clone())
+                                    .unwrap_or_else(|| symbol.clone());
+                                let audit = self.audit.clone();
+                                tokio::spawn(async move {
+                                    Self::dispatch_xemm_decision(
+                                        decision,
+                                        hedge_conn,
+                                        symbol,
+                                        hedge_symbol,
+                                        audit,
+                                    )
+                                    .await;
+                                });
+                            } else {
+                                tracing::warn!(
+                                    symbol = %self.symbol,
+                                    "xemm skipped fill — hedge book has no TOB yet"
+                                );
+                            }
+                        }
+                    }
                     for strat in self.strategy_pool.values() {
                         strat.on_fill(&obs);
                     }
@@ -9044,6 +9124,76 @@ impl MarketMakerEngine {
                     error = %e,
                     "emulator order placement failed"
                 );
+            }
+        }
+    }
+
+    /// 22W-5 — turn an `XemmDecision` into a live hedge-leg
+    /// order on the hedge connector. `RejectSlippage` and
+    /// `HedgeWithWarning` log + audit but only the Hedge and
+    /// HedgeWithWarning variants actually place orders.
+    /// Failures warn-log; the primary fill has already landed,
+    /// so leaving the inventory one-sided is the operator's
+    /// call (escalate or retry later).
+    async fn dispatch_xemm_decision(
+        decision: XemmDecision,
+        hedge_conn: std::sync::Arc<dyn mm_exchange_core::connector::ExchangeConnector>,
+        symbol: String,
+        hedge_symbol: String,
+        audit: std::sync::Arc<AuditLog>,
+    ) {
+        use mm_common::types::{OrderType, TimeInForce};
+        use mm_exchange_core::connector::NewOrder;
+        match decision {
+            XemmDecision::RejectSlippage { reason, adverse_bps } => {
+                audit.risk_event(
+                    &symbol,
+                    AuditEventType::XemmHedgeRejected,
+                    &format!("xemm rejected hedge: {reason} ({adverse_bps} bps)"),
+                );
+                tracing::warn!(
+                    symbol = %symbol,
+                    adverse_bps = %adverse_bps,
+                    reason = %reason,
+                    "xemm rejected hedge on adverse slippage"
+                );
+            }
+            XemmDecision::Hedge { side, qty, expected_price }
+            | XemmDecision::HedgeWithWarning { side, qty, expected_price, .. } => {
+                let order = NewOrder {
+                    symbol: hedge_symbol,
+                    side,
+                    order_type: OrderType::Market,
+                    price: None,
+                    qty,
+                    time_in_force: Some(TimeInForce::Ioc),
+                    client_order_id: Some(format!(
+                        "xemm-{}-{}",
+                        chrono::Utc::now().timestamp_millis(),
+                        expected_price
+                    )),
+                };
+                match hedge_conn.place_order(&order).await {
+                    Ok(order_id) => {
+                        tracing::info!(
+                            symbol = %symbol,
+                            venue_order_id = %order_id,
+                            hedge_side = ?side,
+                            qty = %qty,
+                            expected = %expected_price,
+                            "xemm hedge fired"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            symbol = %symbol,
+                            hedge_side = ?side,
+                            qty = %qty,
+                            error = %e,
+                            "xemm hedge placement failed"
+                        );
+                    }
+                }
             }
         }
     }
