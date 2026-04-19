@@ -6754,14 +6754,25 @@ impl MarketMakerEngine {
                             &format!("Kill switch L4: paired unwind {} base (delay {}s)", inv.abs(), start_delay),
                         );
                     } else {
+                        // 22A-3 — read TwapExecutor knobs from
+                        // the operator's [execution] section.
+                        // Defaults match the pre-config values
+                        // (60 s / 10 slices / 5 bps) so
+                        // deployments without the section see
+                        // zero behaviour change.
+                        let exec = self
+                            .config
+                            .execution
+                            .clone()
+                            .unwrap_or_default();
                         self.twap = Some(
                             TwapExecutor::new(
                                 self.symbol.clone(),
                                 side,
                                 inv.abs(),
-                                60,      // 60 seconds.
-                                10,      // 10 slices.
-                                dec!(5), // 5 bps aggressive.
+                                exec.duration_secs,
+                                exec.num_slices,
+                                exec.aggressiveness_bps,
                             )
                             .with_start_delay(start_delay),
                         );

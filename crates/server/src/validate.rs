@@ -326,6 +326,39 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
         }
     }
 
+    // --- Execution algorithm (22A-3) ---
+    if let Some(e) = &config.execution {
+        let algo = e.algo.to_ascii_lowercase();
+        match algo.as_str() {
+            "twap" => {
+                if e.duration_secs == 0 {
+                    errors.push("execution.duration_secs must be > 0".to_string());
+                }
+                if e.num_slices == 0 {
+                    errors.push("execution.num_slices must be > 0".to_string());
+                }
+                if e.aggressiveness_bps < dec!(0) {
+                    errors.push("execution.aggressiveness_bps must be >= 0".to_string());
+                }
+            }
+            "vwap" | "pov" | "iceberg" => {
+                errors.push(format!(
+                    "execution.algo=\"{algo}\" is library-complete in mm-strategy::exec_algo \
+                     but the engine's kill-switch L4 dispatch loop still consumes the \
+                     TwapExecutor API surface. Use execution.algo=\"twap\" for now; a \
+                     follow-up commit will add the ExecAlgorithm→TwapExecutor adapter so \
+                     VWAP / POV / Iceberg become live selectors."
+                ));
+            }
+            other => {
+                errors.push(format!(
+                    "execution.algo=\"{other}\" — expected one of twap / vwap / pov / \
+                     iceberg"
+                ));
+            }
+        }
+    }
+
     // --- XEMM executor (22W-5) ---
     if let Some(x) = &config.xemm {
         if x.enabled {
@@ -660,7 +693,9 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mm_common::config::{AppConfig, FundingArbCfg, HedgeConfig, HedgePairConfig, StatArbCfg};
+    use mm_common::config::{
+        AppConfig, ExecutionCfg, FundingArbCfg, HedgeConfig, HedgePairConfig, StatArbCfg,
+    };
 
     fn base_config() -> AppConfig {
         // Tests exercise strategy/hedge/client logic on the
@@ -1160,6 +1195,61 @@ mod tests {
         cfg.stat_arb = Some(sa);
         let err = validate_config(&cfg).unwrap_err().to_string();
         assert!(err.contains("y_symbol"), "{err}");
+    }
+
+    /// 22A-3 — default execution config (algo=twap) is accepted.
+    #[test]
+    fn execution_twap_default_accepts() {
+        let mut cfg = base_config();
+        cfg.execution = Some(ExecutionCfg::default());
+        validate_config(&cfg).unwrap();
+    }
+
+    /// 22A-3 — non-twap algos are rejected with a pointer to
+    /// the follow-up adapter work. Regression guard against
+    /// operators silently "enabling" VWAP and finding TWAP
+    /// behaviour at runtime.
+    #[test]
+    fn execution_vwap_pov_iceberg_rejected_with_pointer() {
+        for algo in ["vwap", "pov", "iceberg"] {
+            let mut cfg = base_config();
+            cfg.execution = Some(ExecutionCfg {
+                algo: algo.to_string(),
+                ..ExecutionCfg::default()
+            });
+            let err = validate_config(&cfg).unwrap_err().to_string();
+            assert!(err.contains(algo), "{err}");
+            assert!(
+                err.contains("library-complete") || err.contains("follow-up"),
+                "{err}"
+            );
+        }
+    }
+
+    /// 22A-3 — unknown algo strings surface clearly.
+    #[test]
+    fn execution_unknown_algo_rejected() {
+        let mut cfg = base_config();
+        cfg.execution = Some(ExecutionCfg {
+            algo: "random".to_string(),
+            ..ExecutionCfg::default()
+        });
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("expected one of"), "{err}");
+    }
+
+    /// 22A-3 — zero slices or duration are errors on the TWAP
+    /// path.
+    #[test]
+    fn execution_twap_zero_slices_rejected() {
+        let mut cfg = base_config();
+        cfg.execution = Some(ExecutionCfg {
+            algo: "twap".to_string(),
+            num_slices: 0,
+            ..ExecutionCfg::default()
+        });
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("num_slices"), "{err}");
     }
 
     #[test]

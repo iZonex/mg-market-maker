@@ -105,6 +105,19 @@ pub struct AppConfig {
     #[serde(default)]
     pub xemm: Option<XemmCfg>,
 
+    /// Execution algorithm config for the kill-switch L4
+    /// flatten path (22A-3). Exposes the `TwapExecutor` knobs
+    /// that were previously hardcoded (60 s / 10 slices / 5
+    /// bps). The `algo` discriminator currently accepts only
+    /// `"twap"` — the other ExecAlgorithm variants (`vwap`,
+    /// `pov`, `iceberg`) are library-complete in
+    /// `mm_strategy::exec_algo` but require an ExecAlgorithm→
+    /// TwapExecutor adapter before the engine's L4 dispatch
+    /// loop can consume them. Validate refuses non-twap with a
+    /// clear pointer to that follow-up work.
+    #[serde(default)]
+    pub execution: Option<ExecutionCfg>,
+
     /// Record live market data to JSONL for offline backtesting.
     /// When `true`, each engine writes BookSnapshot + Trade events
     /// to `data/recorded/{symbol}.jsonl`. Data accumulates across
@@ -837,6 +850,57 @@ impl Default for XemmCfg {
             enabled: false,
             max_slippage_bps: default_xemm_max_slippage_bps(),
             min_edge_bps: default_xemm_min_edge_bps(),
+        }
+    }
+}
+
+/// Execution algorithm config for the kill-switch L4 flatten
+/// path. Operator-tunable replacement for the three hardcoded
+/// constants that previously lived at
+/// `market_maker.rs:6762-6764`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionCfg {
+    /// Algorithm discriminator. Currently accepts `"twap"` only
+    /// — validate refuses other values with a pointer to the
+    /// mm-strategy::exec_algo follow-up work.
+    #[serde(default = "default_exec_algo")]
+    pub algo: String,
+    /// Total flatten duration in seconds. Hardcoded 60 before
+    /// this knob; operators with larger inventory or thinner
+    /// venues typically want 300–1800.
+    #[serde(default = "default_exec_duration_secs")]
+    pub duration_secs: u64,
+    /// Number of slices over `duration_secs`. Hardcoded 10
+    /// before this knob.
+    #[serde(default = "default_exec_num_slices")]
+    pub num_slices: u32,
+    /// Aggressiveness in bps from mid. 0 = at mid (aggressive,
+    /// often a taker), 10+ = passive limit (maker, slower
+    /// fill). Hardcoded 5 before this knob.
+    #[serde(default = "default_exec_aggressiveness_bps")]
+    pub aggressiveness_bps: Decimal,
+}
+
+fn default_exec_algo() -> String {
+    "twap".to_string()
+}
+fn default_exec_duration_secs() -> u64 {
+    60
+}
+fn default_exec_num_slices() -> u32 {
+    10
+}
+fn default_exec_aggressiveness_bps() -> Decimal {
+    dec!(5)
+}
+
+impl Default for ExecutionCfg {
+    fn default() -> Self {
+        Self {
+            algo: default_exec_algo(),
+            duration_secs: default_exec_duration_secs(),
+            num_slices: default_exec_num_slices(),
+            aggressiveness_bps: default_exec_aggressiveness_bps(),
         }
     }
 }
@@ -2583,6 +2647,7 @@ impl Default for AppConfig {
             protections: None,
             portfolio_var: None,
             xemm: None,
+            execution: None,
             record_market_data: false,
             paper_fill: None,
             rebalancer: None,
