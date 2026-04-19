@@ -149,6 +149,9 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         }
         // Epic R — surveillance detectors (engine overlays per tick)
         "Surveillance.ManipulationScore" => Some(Box::new(sources::ManipulationScore)),
+        "Surveillance.ListingAge" => Some(Box::new(sources::ListingAgeSource)),
+        "Surveillance.MarketCapRatio" => Some(Box::new(sources::MarketCapRatioSource)),
+        "Surveillance.RugScore" => Some(Box::new(sources::RugScoreSource)),
         "Onchain.HolderConcentration" => Some(Box::new(sources::OnchainHolderConcentration)),
         "Onchain.SuspectInflowRate" => Some(Box::new(sources::OnchainSuspectInflowRate)),
         "Surveillance.SpoofingScore" => Some(Box::new(sources::SpoofingScore)),
@@ -306,6 +309,9 @@ pub fn meta(kind: &str) -> NodeMeta {
 
         // Epic R — surveillance detectors (safe, defaults-on)
         "Surveillance.ManipulationScore" => NodeMeta { label: "Manipulation score", summary: "CEX-side pump-dump + wash + thin-book aggregated manipulation score [0..1] — the RAVE rug-pull detector", group: "Surveillance" },
+        "Surveillance.ListingAge" => NodeMeta { label: "Listing age score", summary: "Newness score: peaks at 1.0 for a fresh listing, decays to 0 at mature_days. RAVE hit top-15 cap in 10 days", group: "Surveillance" },
+        "Surveillance.MarketCapRatio" => NodeMeta { label: "Market-cap / volume ratio", summary: "supply × mid / recent-volume. Saturates at 1.0 past the RAVE threshold (~100×). Needs symbol_circulating_supply in config", group: "Surveillance" },
+        "Surveillance.RugScore" => NodeMeta { label: "Composite rug score", summary: "Weighted sum of every rug signal into one [0..1]. Pipe through Cast.ToBool(>=0.6) → Out.KillEscalate for a one-node RAVE defender", group: "Surveillance" },
         "Onchain.HolderConcentration" => NodeMeta { label: "Onchain holder concentration", summary: "Fraction of total supply held by the top-N on-chain holders [0..1]. ~0.9 is a RAVE-style rug precondition", group: "Surveillance" },
         "Onchain.SuspectInflowRate" => NodeMeta { label: "Onchain CEX inflow rate", summary: "Notional flowing from operator-listed suspect wallets to known-CEX addresses over the tracker window", group: "Surveillance" },
         "Surveillance.SpoofingScore" => NodeMeta { label: "Spoofing score", summary: "Likelihood our own flow looks like spoofing [0..1] + cancel_ratio + lifetime", group: "Surveillance" },
@@ -477,6 +483,9 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Borrow.MaxAvailable",
         "Borrow.CarryBps",
         "Surveillance.ManipulationScore",
+        "Surveillance.ListingAge",
+        "Surveillance.MarketCapRatio",
+        "Surveillance.RugScore",
         "Onchain.HolderConcentration",
         "Onchain.SuspectInflowRate",
         "Surveillance.SpoofingScore",
@@ -573,10 +582,10 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_113_nodes_after_r3_onchain_sources() {
-        // 111 after R2.7 + 2 (R3.8: Onchain.HolderConcentration,
-        // Onchain.SuspectInflowRate) = 113.
-        assert_eq!(kinds().len(), 113, "catalog drift");
+    fn catalog_has_116_nodes_after_r2_phase2_rug_sources() {
+        // 113 after R3.8 + 3 (R2.11 ListingAge, R2.12
+        // MarketCapRatio, R2.13 RugScore) = 116.
+        assert_eq!(kinds().len(), 116, "catalog drift");
     }
 
     /// GR-1 — every indicator with a `period` config field must

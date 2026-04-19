@@ -34,6 +34,8 @@ static AVELLANEDA_VIA_GRAPH: &str = include_str!("../templates/avellaneda-via-gr
 static BASIS_CARRY_SPOT_PERP: &str = include_str!("../templates/basis-carry-spot-perp.json");
 static PENTEST_SPOOF_CLASSIC: &str = include_str!("../templates/pentest/spoof-classic.json");
 static PENTEST_PUMP_AND_DUMP: &str = include_str!("../templates/pentest/pump-and-dump.json");
+static PENTEST_RAVE_CYCLE: &str = include_str!("../templates/pentest/rave-cycle.json");
+static RUG_DETECTOR_COMPOSITE: &str = include_str!("../templates/rug-detector-composite.json");
 static FUNDING_AWARE_QUOTER: &str = include_str!("../templates/funding-aware-quoter.json");
 static LIQUIDITY_BURN_GUARD: &str = include_str!("../templates/liquidity-burn-guard.json");
 static COST_GATED_QUOTER: &str = include_str!("../templates/cost-gated-quoter.json");
@@ -111,6 +113,27 @@ const BUILTIN: &[BuiltinTemplate] = &[
         name: "cross-exchange-basic",
         description: "CrossExchange make-A / hedge-B single-strategy starter (mirror of legacy strategy=cross_exchange).",
         body: CROSS_EXCHANGE_BASIC,
+    },
+    // R2.14 — operator-ready composite rug detector. Wraps the
+    // engine's Avellaneda quoter with a Surveillance.RugScore
+    // guard that trips kill-switch L2 (WidenSpreads → stop new
+    // orders) on combined ≥ 0.6. Clone-and-deploy for any
+    // symbol; pair with `symbol_circulating_supply` + `[onchain]`
+    // config to activate every sub-signal.
+    BuiltinTemplate {
+        name: "rug-detector-composite",
+        description: "Avellaneda quoter + Surveillance.RugScore guard → Cast.ToBool(≥0.6) → Out.KillEscalate(WidenSpreads). One-click deploy for any symbol; feeds off manipulation + on-chain + listing-age + mcap proxy signals aggregated by the engine.",
+        body: RUG_DETECTOR_COMPOSITE,
+    },
+    // R2.15 — exploit + guard pentest template. Runs the
+    // PumpAndDump FSM under `MM_RESTRICTED_ALLOW=1` AND checks
+    // if the defensive RugScore catches its own attack —
+    // mirror image of what the user's "other agent" will do to
+    // stress-test their own exchange's surveillance stack.
+    BuiltinTemplate {
+        name: "pentest-rave-cycle",
+        description: "⚠ PENTEST ONLY — Strategy.PumpAndDump runs the RAVE 4-phase cycle; Surveillance.RugScore watches the tape and trips kill L4 if combined ≥ 0.5. Requires MM_RESTRICTED_ALLOW=1.",
+        body: PENTEST_RAVE_CYCLE,
     },
 ];
 

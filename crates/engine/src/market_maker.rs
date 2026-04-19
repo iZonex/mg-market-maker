@@ -419,6 +419,15 @@ pub struct MarketMakerEngine {
     /// snapshot is published to the dashboard and piped into
     /// `Surveillance.ManipulationScore` for graph consumers.
     manipulation: mm_risk::manipulation::ManipulationScoreAggregator,
+    /// R2.11 — tracks first-seen timestamp + decaying newness
+    /// score so a fresh listing that pumps into the top-15
+    /// market-cap bracket lights up without the operator
+    /// needing to know when the venue first carried it.
+    listing_age_guard: mm_risk::manipulation::ListingAgeGuard,
+    /// R2.12 — `None` until the operator configures
+    /// `symbol_circulating_supply`. Absence means the mcap
+    /// proxy signal stays at zero (neutral, not suspicious).
+    mcap_proxy_guard: Option<mm_risk::manipulation::MarketCapProxyGuard>,
     /// Regulatory OTR counter: `(adds + 2·updates + cancels) /
     /// max(trades, 1) - 1`. Exported into the audit trail and
     /// Prometheus. Market-quality / spoofing proxy tracked for
@@ -910,6 +919,13 @@ impl MarketMakerEngine {
             adverse_selection: AdverseSelectionTracker::new(200),
             market_resilience: MarketResilienceCalculator::new(MrConfig::default()),
             manipulation: mm_risk::manipulation::ManipulationScoreAggregator::new(),
+            listing_age_guard: mm_risk::manipulation::ListingAgeGuard::new(),
+            mcap_proxy_guard: {
+                let supplies = &config.market_maker.symbol_circulating_supply;
+                supplies.get(&symbol).copied().map(|supply| {
+                    mm_risk::manipulation::MarketCapProxyGuard::new(supply)
+                })
+            },
             otr: OrderToTradeRatio::new(),
             tiered_otr: mm_risk::otr::TieredOtrTracker::new(),
             inventory_drift: InventoryDriftReconciler::new(
@@ -3811,6 +3827,58 @@ impl MarketMakerEngine {
                     src.insert((*id, "wash".into()), Value::Number(snap.wash));
                     src.insert((*id, "thin_book".into()), Value::Number(snap.thin_book));
                 }
+                // R2.11 — listing-age score.
+                "Surveillance.ListingAge" => {
+                    let v = self.listing_age_guard.score(chrono::Utc::now());
+                    src.insert((*id, "value".into()), Value::Number(v));
+                }
+                // R2.12 — mcap proxy ratio score. `Missing` when
+                // the operator hasn't configured a circulating
+                // supply for this symbol (guard is `None`).
+                "Surveillance.MarketCapRatio" => {
+                    let v = self
+                        .mcap_proxy_guard
+                        .as_ref()
+                        .map(|g| Value::Number(g.score()))
+                        .unwrap_or(Value::Missing);
+                    src.insert((*id, "value".into()), v);
+                }
+                // R2.13 — composite rug score. Reads the
+                // dashboard snapshot the tick just published so
+                // downstream graph consumers see the same numbers
+                // the panel renders.
+                "Surveillance.RugScore" => {
+                    let snap = self
+                        .dashboard
+                        .as_ref()
+                        .and_then(|d| d.get_symbol(&self.symbol))
+                        .and_then(|s| s.rug_score);
+                    match snap {
+                        Some(s) => {
+                            src.insert((*id, "value".into()), Value::Number(s.combined));
+                            src.insert((*id, "manipulation".into()), Value::Number(s.manipulation));
+                            src.insert(
+                                (*id, "holder_concentration".into()),
+                                Value::Number(s.holder_concentration),
+                            );
+                            src.insert((*id, "cex_inflow".into()), Value::Number(s.cex_inflow));
+                            src.insert((*id, "listing_age".into()), Value::Number(s.listing_age));
+                            src.insert((*id, "mcap_ratio".into()), Value::Number(s.mcap_ratio));
+                        }
+                        None => {
+                            for port in &[
+                                "value",
+                                "manipulation",
+                                "holder_concentration",
+                                "cex_inflow",
+                                "listing_age",
+                                "mcap_ratio",
+                            ] {
+                                src.insert((*id, (*port).into()), Value::Missing);
+                            }
+                        }
+                    }
+                }
                 // R3.8 — on-chain source overlays. The engine
                 // reads `dashboard.onchain_snapshot(symbol)` —
                 // the poller task filled it on its own cadence,
@@ -6161,6 +6229,12 @@ impl MarketMakerEngine {
                 // bookkeeping; snapshot is published each tick
                 // later in `refresh_quotes`.
                 self.manipulation.on_trade(trade);
+                // R2.12 — feed the market-cap proxy guard too.
+                // Guard is `None` when the operator hasn't set a
+                // circulating supply for this symbol.
+                if let Some(g) = self.mcap_proxy_guard.as_mut() {
+                    g.on_trade(trade);
+                }
                 // BOOK-1 — route the trade to every tracker
                 // sitting at the same price level and bump the
                 // per-symbol trade-rate EWMA. Cheap (two map
@@ -8488,6 +8562,62 @@ impl MarketMakerEngine {
                     pump_dump: snap.pump_dump,
                     wash: snap.wash,
                     thin_book: snap.thin_book,
+                    combined: snap.combined,
+                }
+            }),
+            // R2.13 — composite rug score. Weighted sum of the
+            // manipulation + on-chain + listing-age + mcap
+            // proxy signals; the dashboard panel + graph source
+            // both read this one number.
+            rug_score: Some({
+                let now = chrono::Utc::now();
+                self.listing_age_guard.stamp(now);
+                if let Some(g) = self.mcap_proxy_guard.as_mut() {
+                    g.on_mid(self.last_mid);
+                }
+                let manip = self.manipulation.snapshot().combined;
+                let (holder, inflow) = self
+                    .dashboard
+                    .as_ref()
+                    .and_then(|d| d.onchain_snapshot(&self.symbol))
+                    .map(|s| {
+                        // Saturate inflow at 1M raw token
+                        // units by default — operator tunes
+                        // via future config if needed.
+                        let inflow_sat =
+                            rust_decimal_macros::dec!(1_000_000);
+                        (
+                            s.concentration_pct,
+                            mm_risk::manipulation::inflow_score(
+                                s.inflow_total,
+                                inflow_sat,
+                            ),
+                        )
+                    })
+                    .unwrap_or((
+                        rust_decimal::Decimal::ZERO,
+                        rust_decimal::Decimal::ZERO,
+                    ));
+                let age = self.listing_age_guard.score(now);
+                let mcap = self
+                    .mcap_proxy_guard
+                    .as_ref()
+                    .map(|g| g.score())
+                    .unwrap_or(rust_decimal::Decimal::ZERO);
+                let snap = mm_risk::manipulation::compute_rug_score(
+                    manip,
+                    holder,
+                    inflow,
+                    age,
+                    mcap,
+                    &mm_risk::manipulation::RugWeights::default(),
+                );
+                mm_dashboard::state::RugScoreSnapshot {
+                    manipulation: snap.manipulation,
+                    holder_concentration: snap.holder_concentration,
+                    cex_inflow: snap.cex_inflow_score,
+                    listing_age: snap.listing_age,
+                    mcap_ratio: snap.mcap_ratio,
                     combined: snap.combined,
                 }
             }),

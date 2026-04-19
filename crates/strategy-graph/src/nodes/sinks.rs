@@ -78,7 +78,11 @@ impl NodeKind for SizeMult {
 static KILL_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
     vec![
         Port::new("trigger", PortType::Bool),
-        Port::new("level", PortType::KillLevel),
+        // R2.14 — level accepts Number (1..5). Operators
+        // typically pipe a `Math.Const(3)` or `Math.Const(4)`
+        // directly; the evaluator coerces into `KillLevel`
+        // with a clamp.
+        Port::new("level", PortType::Number),
         Port::new("reason", PortType::String),
     ]
 });

@@ -327,10 +327,18 @@ impl Evaluator {
                 "Out.KillEscalate" => {
                     let trigger = input_vec.first().and_then(Value::as_bool).unwrap_or(false);
                     if trigger {
+                        use rust_decimal::prelude::ToPrimitive;
                         let level = input_vec
                             .get(1)
                             .and_then(|v| match v {
                                 Value::KillLevel(l) => Some(*l),
+                                // R2.14 — accept plain Number
+                                // so operators pipe Math.Const
+                                // into `level` directly. Clamp
+                                // to the 1..=5 KillLevel range.
+                                Value::Number(n) => n
+                                    .to_u8()
+                                    .map(|u| u.clamp(1, 5)),
                                 _ => None,
                             })
                             .unwrap_or(2);

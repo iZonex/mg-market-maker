@@ -1,6 +1,6 @@
 # MM — Open Work Tracker
 
-Last updated: 2026-04-19 (post-Sprint 8)
+Last updated: 2026-04-19 (post-Sprint 9)
 
 Tracking debt not yet closed. Closed items live in git history.
 Each row is a concrete deliverable; bigger initiatives are
@@ -560,6 +560,50 @@ the dashboard + graph sources.
   `OnchainScores.svelte` panel on AdminPage highlights
   concentration ≥ 0.8 in red, inflow events > 0 in red.
   Catalog 111 → 113.
+
+## Sprint 9 — Epic R2 Phase 2 + composite rug detector (landed Apr 19)
+
+Closes the RAVE-pattern surveillance loop: every signal ZachXBT
+called out on 2026-04-18 now has a graph source operators can
+route into a kill-switch gate, and two bundled templates stand
+them up end-to-end in one click — one defensive, one pentest.
+
+- [x] **R2.11** `ListingAgeGuard`: per-symbol first-seen
+  stamp, emits `[0,1]` newness score decaying linearly over
+  `mature_days` (default 30). Fresh listing = 1.0; 30-day-old
+  symbol contributes nothing. Graph source
+  `Surveillance.ListingAge`.
+- [x] **R2.12** `MarketCapProxyGuard`: uses operator-supplied
+  `symbol_circulating_supply` config to compute
+  `mcap_proxy = supply × mid`, compares to trailing notional,
+  saturates the score at `mcap / volume ≥ 100` (matches
+  ZachXBT's $6B/$52M RAVE litmus test). Graph source
+  `Surveillance.MarketCapRatio`; `Missing` when supply is
+  unset for that symbol.
+- [x] **R2.13** `RugCompositeAggregator` — stateless
+  `compute_rug_score` + `RugWeights` (defaults 0.35 manip /
+  0.3 concentration / 0.15 inflow / 0.1 age / 0.1 mcap,
+  sum = 1.0). Engine tick builds the snapshot from the
+  existing signals, publishes `SymbolState.rug_score`.
+  `Surveillance.RugScore` graph source exposes combined +
+  5 sub-scores.
+- [x] **R2.14** `rug-detector-composite` template. Avellaneda
+  quoter + `Surveillance.RugScore` → `Cast.ToBool(≥0.6)` →
+  `Out.KillEscalate(WidenSpreads)`. One-click defender for
+  any symbol — pair with `[onchain]` config for full
+  coverage.
+- [x] **R2.15** `pentest-rave-cycle` template
+  (`MM_RESTRICTED_ALLOW=1` gated). `Strategy.PumpAndDump`
+  runs the 4-phase attack; `Surveillance.RugScore` guard
+  trips kill L4 when the engine catches its own pattern —
+  proves the detect ↔ exploit loop in one deploy.
+- [x] **Port fix**: `Out.KillEscalate.level` port type
+  changed from `KillLevel` to `Number` so operators pipe
+  `Math.Const(N)` directly without a cast helper. Evaluator
+  clamps to 1..=5. Unblocks both the pentest and
+  rug-detector-composite templates.
+- [x] **Catalog**: 113 → 116 kinds (ListingAge +
+  MarketCapRatio + RugScore).
 
 ## Graph system audit — Apr 19 follow-ups
 

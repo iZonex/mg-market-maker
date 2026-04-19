@@ -1097,6 +1097,16 @@ pub struct MarketMakerConfig {
     #[serde(default)]
     pub strategy_capital_budget: std::collections::HashMap<String, Decimal>,
 
+    /// R2.12 — operator-supplied circulating supply per symbol
+    /// used by `MarketCapProxyGuard` to compute a `mcap_proxy
+    /// = supply × mid` ratio against recent traded notional.
+    /// Missing entries disable the guard for that symbol
+    /// (signal stays at zero — neutral, not suspicious).
+    /// Supply values are in base-asset units (e.g. `1_000_000_000`
+    /// for a token with 1B circulating).
+    #[serde(default)]
+    pub symbol_circulating_supply: std::collections::HashMap<String, Decimal>,
+
     /// Enable the Binance listen-key user-data stream. When
     /// `true` (the default), the server spawns a background
     /// task that opens a signed WebSocket against
@@ -2276,6 +2286,7 @@ impl Default for AppConfig {
                 sor_trade_rate_window_secs: default_sor_trade_rate_window_secs(),
                 sor_queue_refresh_secs: default_sor_queue_refresh_secs(),
                 strategy_capital_budget: std::collections::HashMap::new(),
+            symbol_circulating_supply: std::collections::HashMap::new(),
                 cross_exchange_min_profit_bps: dec!(5),
                 max_cross_venue_divergence_pct: None,
             },

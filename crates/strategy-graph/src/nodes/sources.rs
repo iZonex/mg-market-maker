@@ -36,6 +36,8 @@ static BOOK_L1_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
     ]
 });
 static EMPTY_INPUTS: Lazy<Vec<Port>> = Lazy::new(Vec::new);
+static VALUE_NUMBER: Lazy<Vec<Port>> =
+    Lazy::new(|| vec![Port::new("value", PortType::Number)]);
 
 impl NodeKind for BookL1 {
     fn kind(&self) -> &'static str {
@@ -1132,6 +1134,102 @@ impl NodeKind for OnchainSuspectInflowRate {
         _state: &mut NodeState,
     ) -> Result<Vec<Value>> {
         Ok(vec![Value::Missing; 2])
+    }
+}
+
+/// R2.11 — listing-age signal. Output `value` is a `[0, 1]`
+/// newness score that peaks at 1.0 for a fresh listing and
+/// decays linearly to 0 at the guard's `mature_days`. Useful
+/// as a multiplier on any detector that should fire harder
+/// on new symbols.
+#[derive(Debug, Default)]
+pub struct ListingAgeSource;
+
+impl NodeKind for ListingAgeSource {
+    fn kind(&self) -> &'static str {
+        "Surveillance.ListingAge"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &VALUE_NUMBER
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
+/// R2.12 — market-cap / recent-volume ratio. Output `value` is
+/// the `[0, 1]` saturated score from `MarketCapProxyGuard`;
+/// saturates at 1.0 when the raw ratio exceeds
+/// `saturation_ratio` (default 100 — matches the $6B / $52M
+/// RAVE litmus test).
+#[derive(Debug, Default)]
+pub struct MarketCapRatioSource;
+
+impl NodeKind for MarketCapRatioSource {
+    fn kind(&self) -> &'static str {
+        "Surveillance.MarketCapRatio"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &VALUE_NUMBER
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing])
+    }
+}
+
+/// R2.13 — aggregated rug score. Six outputs: the five
+/// sub-scores already available as standalone sources plus the
+/// weighted `combined` score. Most operator graphs read
+/// `combined` and pipe it through `Cast.ToBool(>= 0.6) →
+/// Out.KillEscalate`; the sub-scores are exposed so advanced
+/// graphs can ignore one signal they distrust.
+#[derive(Debug, Default)]
+pub struct RugScoreSource;
+
+static RUG_SCORE_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
+    vec![
+        Port::new("value", PortType::Number),
+        Port::new("manipulation", PortType::Number),
+        Port::new("holder_concentration", PortType::Number),
+        Port::new("cex_inflow", PortType::Number),
+        Port::new("listing_age", PortType::Number),
+        Port::new("mcap_ratio", PortType::Number),
+    ]
+});
+
+impl NodeKind for RugScoreSource {
+    fn kind(&self) -> &'static str {
+        "Surveillance.RugScore"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &RUG_SCORE_OUTPUTS
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Missing; 6])
     }
 }
 

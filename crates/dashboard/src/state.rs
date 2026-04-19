@@ -764,6 +764,26 @@ pub struct SymbolState {
     /// `Surveillance.ManipulationScore` graph source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manipulation_score: Option<ManipulationScoreSnapshot>,
+    /// R2.13 — composite rug score aggregating CEX manipulation,
+    /// on-chain concentration + inflow, listing age and mcap
+    /// proxy signals into one `[0, 1]` number.
+    /// `Surveillance.RugScore` graph source reads this; the
+    /// AdminPage panel renders per-symbol rows with the
+    /// sub-scores expanded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rug_score: Option<RugScoreSnapshot>,
+}
+
+/// R2.13 — mirror of `mm_risk::manipulation::RugScoreSnapshot`
+/// so the dashboard stays free of mm-risk's internal types.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RugScoreSnapshot {
+    pub manipulation: Decimal,
+    pub holder_concentration: Decimal,
+    pub cex_inflow: Decimal,
+    pub listing_age: Decimal,
+    pub mcap_ratio: Decimal,
+    pub combined: Decimal,
 }
 
 /// R2.6 — per-symbol manipulation detector snapshot. Mirror of
@@ -2629,6 +2649,7 @@ mod tests {
             open_orders: vec![],
             active_graph: None,
             manipulation_score: None,
+            rug_score: None,
         }
     }
 

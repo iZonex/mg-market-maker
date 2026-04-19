@@ -533,6 +533,350 @@ pub fn score_to_f64(score: Decimal) -> f64 {
     score.to_f64().unwrap_or(0.0)
 }
 
+// ────────────────────────────────────────────────────────────
+// R2.11 ListingAgeGuard
+// ────────────────────────────────────────────────────────────
+
+/// Configuration for [`ListingAgeGuard`].
+#[derive(Debug, Clone)]
+pub struct ListingAgeConfig {
+    /// Days of age that saturate the score at zero. Default 30 —
+    /// a symbol older than a month is considered "established"
+    /// and this guard contributes nothing. RAVE hit top-15
+    /// market cap in 10 days, well inside this window.
+    pub mature_days: u32,
+}
+
+impl Default for ListingAgeConfig {
+    fn default() -> Self {
+        Self { mature_days: 30 }
+    }
+}
+
+/// Tracks the first-seen timestamp per symbol and emits a
+/// monotonically-decaying "newness" score. A fresh listing
+/// (age = 0) scores 1.0 and decays linearly to 0 at
+/// `mature_days`.
+#[derive(Debug)]
+pub struct ListingAgeGuard {
+    config: ListingAgeConfig,
+    first_seen: Option<DateTime<Utc>>,
+}
+
+impl ListingAgeGuard {
+    pub fn new() -> Self {
+        Self::with_config(ListingAgeConfig::default())
+    }
+
+    pub fn with_config(config: ListingAgeConfig) -> Self {
+        Self { config, first_seen: None }
+    }
+
+    /// Stamp the first-seen timestamp if unset. Safe to call
+    /// every tick — subsequent calls are no-ops.
+    pub fn stamp(&mut self, now: DateTime<Utc>) {
+        if self.first_seen.is_none() {
+            self.first_seen = Some(now);
+        }
+    }
+
+    /// Age in seconds since first_seen. `None` pre-stamp.
+    pub fn age_secs(&self, now: DateTime<Utc>) -> Option<i64> {
+        self.first_seen
+            .map(|ts| (now - ts).num_seconds().max(0))
+    }
+
+    pub fn score(&self, now: DateTime<Utc>) -> Decimal {
+        let Some(ts) = self.first_seen else {
+            return dec!(1); // Missing first_seen → fresh (conservative).
+        };
+        let mature_secs = Decimal::from(self.config.mature_days as i64 * 86_400);
+        if mature_secs.is_zero() {
+            return Decimal::ZERO;
+        }
+        let age = Decimal::from((now - ts).num_seconds().max(0));
+        let score = dec!(1) - age / mature_secs;
+        score.max(Decimal::ZERO).min(dec!(1))
+    }
+}
+
+impl Default for ListingAgeGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ────────────────────────────────────────────────────────────
+// R2.12 MarketCapProxyGuard
+// ────────────────────────────────────────────────────────────
+
+/// Configuration for [`MarketCapProxyGuard`].
+#[derive(Debug, Clone)]
+pub struct MarketCapProxyConfig {
+    /// Rolling window (seconds) the recent-volume baseline uses.
+    /// Default 3600 — one hour of traded notional.
+    pub volume_window_secs: i64,
+    /// mcap / volume ratio that saturates the score at 1.0.
+    /// Default 100 — ZachXBT's RAVE litmus test hit 115 (see
+    /// docs). 100+ is deep manipulation territory.
+    pub saturation_ratio: Decimal,
+}
+
+impl Default for MarketCapProxyConfig {
+    fn default() -> Self {
+        Self {
+            volume_window_secs: 3600,
+            saturation_ratio: dec!(100),
+        }
+    }
+}
+
+/// Compares a symbol's market-cap proxy (`circulating_supply ×
+/// mid`) against recent traded notional. The higher the ratio,
+/// the less real interest is backing the displayed valuation —
+/// RAVE's classic tell.
+#[derive(Debug)]
+pub struct MarketCapProxyGuard {
+    config: MarketCapProxyConfig,
+    circulating_supply: Decimal,
+    window: VecDeque<(i64, Decimal)>,
+    last_mid: Decimal,
+}
+
+impl MarketCapProxyGuard {
+    pub fn new(circulating_supply: Decimal) -> Self {
+        Self::with_config(circulating_supply, MarketCapProxyConfig::default())
+    }
+
+    pub fn with_config(
+        circulating_supply: Decimal,
+        config: MarketCapProxyConfig,
+    ) -> Self {
+        Self {
+            config,
+            circulating_supply,
+            window: VecDeque::new(),
+            last_mid: Decimal::ZERO,
+        }
+    }
+
+    pub fn on_trade(&mut self, trade: &Trade) {
+        let ts_ms = trade.timestamp.timestamp_millis();
+        self.window.push_back((ts_ms, trade.price * trade.qty));
+        self.last_mid = trade.price;
+        let cutoff = ts_ms - self.config.volume_window_secs * 1000;
+        while let Some(&(t, _)) = self.window.front() {
+            if t < cutoff {
+                self.window.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn on_mid(&mut self, mid: Decimal) {
+        if mid > Decimal::ZERO {
+            self.last_mid = mid;
+        }
+    }
+
+    pub fn mcap_proxy(&self) -> Decimal {
+        self.circulating_supply * self.last_mid
+    }
+
+    pub fn mcap_to_volume_ratio(&self) -> Decimal {
+        let volume: Decimal = self.window.iter().map(|(_, n)| *n).sum();
+        if volume.is_zero() {
+            return Decimal::ZERO;
+        }
+        self.mcap_proxy() / volume
+    }
+
+    pub fn score(&self) -> Decimal {
+        if self.config.saturation_ratio.is_zero() {
+            return Decimal::ZERO;
+        }
+        (self.mcap_to_volume_ratio() / self.config.saturation_ratio)
+            .min(dec!(1))
+            .max(Decimal::ZERO)
+    }
+}
+
+// ────────────────────────────────────────────────────────────
+// R2.13 RugCompositeAggregator
+// ────────────────────────────────────────────────────────────
+
+/// Weights combining every individual signal into one
+/// rug-score. Defaults sum to 1.0 so the composite stays in
+/// [0, 1]; the aggregator clamps either way.
+#[derive(Debug, Clone)]
+pub struct RugWeights {
+    pub manipulation: Decimal,
+    pub holder_concentration: Decimal,
+    pub cex_inflow: Decimal,
+    pub listing_age: Decimal,
+    pub mcap_ratio: Decimal,
+}
+
+impl Default for RugWeights {
+    fn default() -> Self {
+        // Manipulation + concentration carry the heaviest
+        // weight — directly tied to operator-loss and the
+        // structural rug precondition. Inflow + listing-age
+        // + mcap ratio are corroborating warnings.
+        Self {
+            manipulation: dec!(0.35),
+            holder_concentration: dec!(0.3),
+            cex_inflow: dec!(0.15),
+            listing_age: dec!(0.1),
+            mcap_ratio: dec!(0.1),
+        }
+    }
+}
+
+/// Snapshot of every input and the combined rug score. Mirror
+/// struct lives on `mm-dashboard` to avoid the circular
+/// dependency; the engine does the conversion.
+#[derive(Debug, Clone)]
+pub struct RugScoreSnapshot {
+    pub manipulation: Decimal,
+    pub holder_concentration: Decimal,
+    pub cex_inflow_score: Decimal,
+    pub listing_age: Decimal,
+    pub mcap_ratio: Decimal,
+    pub combined: Decimal,
+}
+
+/// Stateless helper. Takes five `[0, 1]` sub-scores (already
+/// normalised by their respective guards) and returns the
+/// weighted composite.
+pub fn compute_rug_score(
+    manipulation: Decimal,
+    holder_concentration: Decimal,
+    cex_inflow_score: Decimal,
+    listing_age: Decimal,
+    mcap_ratio: Decimal,
+    weights: &RugWeights,
+) -> RugScoreSnapshot {
+    let combined = (manipulation * weights.manipulation
+        + holder_concentration * weights.holder_concentration
+        + cex_inflow_score * weights.cex_inflow
+        + listing_age * weights.listing_age
+        + mcap_ratio * weights.mcap_ratio)
+        .min(dec!(1))
+        .max(Decimal::ZERO);
+    RugScoreSnapshot {
+        manipulation,
+        holder_concentration,
+        cex_inflow_score,
+        listing_age,
+        mcap_ratio,
+        combined,
+    }
+}
+
+/// Normalise a raw CEX-inflow notional into a `[0, 1]` score.
+/// `saturation_notional` is the inflow above which the score
+/// saturates — operator-tunable since what "big" looks like
+/// varies by symbol.
+pub fn inflow_score(inflow_total: Decimal, saturation_notional: Decimal) -> Decimal {
+    if saturation_notional.is_zero() {
+        return Decimal::ZERO;
+    }
+    (inflow_total / saturation_notional)
+        .min(dec!(1))
+        .max(Decimal::ZERO)
+}
+
+#[cfg(test)]
+mod phase2_tests {
+    use super::*;
+    use chrono::{Duration, TimeZone};
+
+    #[test]
+    fn listing_age_score_decays_linearly() {
+        let now = Utc.timestamp_millis_opt(1_000_000_000_000).single().unwrap();
+        let mut g = ListingAgeGuard::with_config(ListingAgeConfig { mature_days: 10 });
+        // Pre-stamp → conservative (fresh).
+        assert_eq!(g.score(now), dec!(1));
+        g.stamp(now);
+        // Day 0 → 1.0.
+        assert_eq!(g.score(now), dec!(1));
+        // Day 5 → ~0.5.
+        let s5 = g.score(now + Duration::days(5));
+        assert!(s5 > dec!(0.49) && s5 < dec!(0.51));
+        // Day 10 → 0.
+        assert_eq!(g.score(now + Duration::days(10)), Decimal::ZERO);
+        // Day 15 → still 0 (floor).
+        assert_eq!(g.score(now + Duration::days(15)), Decimal::ZERO);
+    }
+
+    #[test]
+    fn mcap_proxy_fires_on_high_ratio() {
+        // Supply = 1B, mid = 10 → mcap = 10B.
+        let mut g = MarketCapProxyGuard::with_config(
+            Decimal::from(1_000_000_000u64),
+            MarketCapProxyConfig {
+                volume_window_secs: 60,
+                saturation_ratio: dec!(100),
+            },
+        );
+        g.on_mid(dec!(10));
+        // Trade $50M over 60s: per-window volume = $50M.
+        for i in 0..10 {
+            let ts = Utc.timestamp_millis_opt(i * 1_000).single().unwrap();
+            let trade = Trade {
+                trade_id: i as u64,
+                symbol: "RAVEUSDT".into(),
+                price: dec!(10),
+                qty: Decimal::from(500_000u64), // notional = 5M each
+                taker_side: Side::Buy,
+                timestamp: ts,
+            };
+            g.on_trade(&trade);
+        }
+        // mcap_to_volume = 10B / 50M = 200 → saturates score at 1.0.
+        let r = g.mcap_to_volume_ratio();
+        assert!(r > dec!(100), "expected > 100, got {r}");
+        assert_eq!(g.score(), dec!(1));
+    }
+
+    #[test]
+    fn mcap_proxy_zero_volume_scores_zero() {
+        let g = MarketCapProxyGuard::new(Decimal::from(1_000_000u64));
+        assert_eq!(g.score(), Decimal::ZERO);
+    }
+
+    #[test]
+    fn rug_composite_weighted_sum_clamps() {
+        let w = RugWeights::default();
+        // All signals at 1.0 → combined = 1.0.
+        let s = compute_rug_score(dec!(1), dec!(1), dec!(1), dec!(1), dec!(1), &w);
+        assert_eq!(s.combined, dec!(1));
+        // All at 0 → combined = 0.
+        let s0 = compute_rug_score(
+            Decimal::ZERO, Decimal::ZERO, Decimal::ZERO,
+            Decimal::ZERO, Decimal::ZERO, &w,
+        );
+        assert_eq!(s0.combined, Decimal::ZERO);
+        // Manipulation alone at 1.0 → combined = 0.35 (the weight).
+        let sm = compute_rug_score(
+            dec!(1), Decimal::ZERO, Decimal::ZERO,
+            Decimal::ZERO, Decimal::ZERO, &w,
+        );
+        assert_eq!(sm.combined, dec!(0.35));
+    }
+
+    #[test]
+    fn inflow_score_saturates() {
+        let sat = dec!(1000);
+        assert_eq!(inflow_score(Decimal::ZERO, sat), Decimal::ZERO);
+        assert_eq!(inflow_score(dec!(500), sat), dec!(0.5));
+        assert_eq!(inflow_score(dec!(1000), sat), dec!(1));
+        assert_eq!(inflow_score(dec!(5000), sat), dec!(1));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
