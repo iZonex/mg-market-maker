@@ -1,6 +1,6 @@
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 use self::volatility_helper::decimal_sqrt;
@@ -9,7 +9,7 @@ use self::volatility_helper::decimal_sqrt;
 ///
 /// These are the metrics institutional clients and exchanges use
 /// to evaluate MM quality.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerformanceMetrics {
     /// Annualized Sharpe ratio.
     pub sharpe_ratio: Decimal,

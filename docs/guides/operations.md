@@ -210,6 +210,73 @@ Key gauges to monitor:
 | `mm_sla_presence_pct_24h` | < 95% |
 | `mm_portfolio_var_95` | Breaching limit |
 
+### Shipped alert rules
+
+`deploy/prometheus/mm-alerts.yml` carries the three-tier alert
+set — `critical` (page: kill-switch L3+, archive broken, atomic
+rollbacks), `warning` (notify: SLA slip, book-update p95 > 250 ms,
+SOR error rate > 10 %, surveillance trip), `info` (ticket:
+sustained drawdown, VPIN > 0.75, avg slippage > 2 bps). The main
+`config/prometheus.yml` already references it via `rule_files`,
+and `docker-compose.yml` mounts it into the Prometheus container
+at `/etc/prometheus/mm-alerts.yml:ro`. Tune thresholds per
+deployment by editing the YAML in-tree, then `SIGHUP` Prometheus:
+
+```bash
+docker compose kill -s SIGHUP prometheus
+```
+
+### Alertmanager routing
+
+`deploy/alertmanager/alertmanager.yml` routes the three severity
+tiers to separate Telegram channels + optional PagerDuty /
+generic webhook sinks. Group-by covers
+`(alertname, severity, symbol, venue)` so one incident produces
+one notification, not twenty; inhibit rules suppress downstream
+noise (kill-switch L5 Disconnect silences the warning tier for
+the same symbol).
+
+Configure via env vars (docker-compose reads them from the host,
+Helm/K8s surface them via Secret):
+
+| Variable | Purpose |
+|----------|---------|
+| `TELEGRAM_BOT_TOKEN_CRITICAL` / `TELEGRAM_CHAT_ID_CRITICAL` | Pager channel — wakes on-call on kill-switch L3+ / archive dead / atomic rollbacks |
+| `TELEGRAM_BOT_TOKEN_OPS` / `TELEGRAM_CHAT_ID_OPS` | Ops channel — warnings (SLA slip, latency, SOR errors) |
+| `PAGERDUTY_SERVICE_KEY` *(optional)* | Uncomment `pagerduty_configs` block to enable |
+| `GENERIC_WEBHOOK_URL` *(optional)* | Generic webhook (Slack / Discord / custom) |
+
+Container `entrypoint` runs `envsubst` over the YAML before
+Alertmanager starts, so `$VAR` references resolve to the
+injected values. Leaving a token blank turns that receiver into
+a no-op so a fresh install never fails to start.
+
+The docker-compose stack now ships Alertmanager at `:9093`;
+`config/prometheus.yml` forwards alerts via the `alerting:`
+block.
+
+### Shipped Grafana dashboard
+
+`deploy/grafana/dashboards/mm-overview.json` auto-provisions via
+`deploy/grafana/provisioning/` on `docker compose up`. Opens
+under **Dashboards → Market Maker → MM Overview** and covers:
+
+1. Kill-switch state per symbol (stat card with severity colours)
+2. SLA uptime gauge (thresholds at 95 / 98 / 99.5 %)
+3. Live order count per symbol
+4. Total PnL timeseries
+5. PnL attribution stacked (spread / inventory / rebates / funding)
+6. Inventory (base-asset)
+7. Spread (bps)
+8. VPIN (thresholds at 0.5 / 0.7 / 0.85)
+9. Realised volatility
+10. SOR dispatch rate success vs errors per venue
+11. Book-update latency p50 / p95 / p99 per venue
+12. Surveillance scores per pattern × symbol
+
+Datasource is pinned to `uid: prometheus` so the dashboard
+survives a `docker compose down -v` without manual re-linking.
+
 ## Dashboard Auth & Network Exposure
 
 The dashboard must never be bound to a public interface without
@@ -290,3 +357,78 @@ volume. Instrumented spans currently cover `run_with_hedge`,
 `dispatch_route` — the hot engine paths operators care about
 when tracing a symbol's pipeline latency. Unset the env var (or
 build without `--features otel`) to get zero-network behaviour.
+
+## Helm chart
+
+`deploy/helm/mm/` is the canonical k8s install path. Wraps the
+reference `deploy/k8s/deployment.yaml` with templated image
+reference, resource quotas, secret injection mode, PVC sizing,
+PDB, ServiceMonitor toggle, and a safe `Recreate` strategy (no
+rolling update — two pods on the same symbol double-book).
+
+### Install
+
+```bash
+# Dev / smoke — inline secret from values-dev.yaml (no real creds)
+helm install mm-dev ./deploy/helm/mm \
+  -f ./deploy/helm/mm/values.yaml \
+  -f ./deploy/helm/mm/values-dev.yaml \
+  --namespace mm-dev --create-namespace
+
+# Prod — secret managed by ESO / SealedSecrets / SOPS,
+# referenced by name via `secret.existingSecretName`
+helm install mm-prod ./deploy/helm/mm \
+  -f ./deploy/helm/mm/values.yaml \
+  -f ./deploy/helm/mm/values-prod.yaml \
+  --namespace mm --create-namespace
+```
+
+### Key values
+
+| Path | Purpose |
+|------|---------|
+| `image.repository` / `image.tag` | Pinned image — never `latest` in prod |
+| `replicaCount` | **Always 1.** Hard invariant per symbol |
+| `env.MM_MODE` | `paper` / `live` / `smoke` |
+| `secret.create` | `true` for dev (inline), `false` for prod (ESO/Vault-managed) |
+| `secret.existingSecretName` | Prod: pre-provisioned Secret name |
+| `config.body` | Inline TOML. Copy from `config/default.toml` and trim |
+| `persistence.size` | Checkpoint / audit-log PVC size (default 20Gi) |
+| `serviceMonitor.enabled` | Prometheus-Operator integration; off for docker-compose stacks |
+| `pdb.enabled` / `pdb.minAvailable` | Block evictions during drains |
+
+### Upgrade + rollback
+
+```bash
+# Confirm the diff before applying
+helm diff upgrade mm-prod ./deploy/helm/mm \
+  -f ./deploy/helm/mm/values.yaml \
+  -f ./deploy/helm/mm/values-prod.yaml
+
+helm upgrade mm-prod ./deploy/helm/mm \
+  -f ./deploy/helm/mm/values.yaml \
+  -f ./deploy/helm/mm/values-prod.yaml
+
+# Rollback to a prior revision if the new deploy misbehaves —
+# the engine restores from the last checkpoint on the PVC so
+# inventory / PnL survive the flip.
+helm rollback mm-prod <revision>
+```
+
+Pod restarts automatically on any ConfigMap / Secret change
+because the Deployment annotates `checksum/config` +
+`checksum/secret` off the rendered templates.
+
+### Secrets — production-safe wiring
+
+`secret.create: true` is for local / dev ONLY. Inline values end
+up in `helm history` and the backing store (etcd for the release
+ledger), which is not a credential-grade safe. For production:
+
+1. Pre-provision the Secret via External Secrets Operator,
+   SealedSecrets, SOPS+KSOPS, or Vault Agent.
+2. Set `secret.create: false` and `secret.existingSecretName:
+   <name>` in `values-prod.yaml`.
+3. The Deployment's `envFrom.secretRef` pulls every key into
+   the container env at pod start — no secret ever touches
+   Helm.

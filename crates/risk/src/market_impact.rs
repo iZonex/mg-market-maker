@@ -22,7 +22,7 @@
 
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 /// Number of mid-price ticks to wait before measuring impact.
@@ -40,7 +40,7 @@ struct ImpactPending {
 }
 
 /// Aggregated market impact statistics for the dashboard.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketImpactReport {
     /// Number of fills with completed impact measurement.
     pub measured_fills: usize,

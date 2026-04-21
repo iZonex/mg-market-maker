@@ -2,11 +2,18 @@
   /*
    * R2.6 — CEX-side manipulation detector panel.
    *
-   * Polls /api/v1/manipulation/scores. Each row is a symbol
-   * with four sub-scores: pump_dump, wash, thin_book, combined.
-   * Combined > 0.5 highlights the row — that's where the
-   * RAVE-style rug pattern is forming and the engine should
-   * widen / pause on its own via the graph gate.
+   * Source: `/api/v1/surveillance/fleet` (fleet aggregate).
+   * Each returned row is one deployment with pump_dump, wash,
+   * thin_book, and combined sub-scores. We group by symbol so
+   * an operator running the same pair on multiple agents still
+   * sees one line — taking max per score across agents because
+   * any single agent reporting > 0.5 warrants attention.
+   *
+   * LEGACY-1 (2026-04-21) — was polling `/api/v1/manipulation/scores`
+   * which reads controller-local DashboardState. In distributed
+   * mode nothing writes to that store, so the panel stayed empty
+   * even when per-agent detectors were firing. Switched to the
+   * fleet endpoint which fans out per-deployment.
    */
   import { createApiClient } from '../api.svelte.js'
 
@@ -20,10 +27,41 @@
   let lastFetch = $state(null)
   let loading = $state(true)
 
+  function groupBySymbol(fleetRows) {
+    const bySym = new Map()
+    for (const r of fleetRows) {
+      const key = r.symbol
+      const existing = bySym.get(key)
+      const num = (v) => {
+        const n = Number(v)
+        return Number.isFinite(n) ? n : 0
+      }
+      const next = {
+        symbol: key,
+        pump_dump: num(r.pump_dump),
+        wash: num(r.wash),
+        thin_book: num(r.thin_book),
+        combined: num(r.combined),
+      }
+      if (!existing) {
+        bySym.set(key, next)
+      } else {
+        bySym.set(key, {
+          symbol: key,
+          pump_dump: Math.max(existing.pump_dump, next.pump_dump),
+          wash: Math.max(existing.wash, next.wash),
+          thin_book: Math.max(existing.thin_book, next.thin_book),
+          combined: Math.max(existing.combined, next.combined),
+        })
+      }
+    }
+    return Array.from(bySym.values()).sort((a, b) => b.combined - a.combined)
+  }
+
   async function refresh() {
     try {
-      const data = await api.getJson('/api/v1/manipulation/scores')
-      rows = data?.rows ?? []
+      const data = await api.getJson('/api/v1/surveillance/fleet')
+      rows = groupBySymbol(Array.isArray(data) ? data : [])
       error = null
       lastFetch = new Date()
       loading = false

@@ -108,14 +108,22 @@ impl DispatchOutcome {
     }
 }
 
-/// Look up the first connector in the bundle whose `venue_id()`
-/// matches `venue`. Returns `None` when the decision references a
-/// venue the bundle does not carry.
+/// Look up a connector in the bundle by `(venue, product)`.
+/// Returns `None` when the decision references a combination the
+/// bundle does not carry. When `product` is `None` we return the
+/// FIRST connector matching `venue` — legacy single-product-per-
+/// venue deployments (every route today) get byte-identical
+/// behaviour; multi-product deployments (Binance spot + Binance
+/// perp in the same process) pass `Some(product)` to disambiguate.
 pub fn connector_for(
     bundle: &ConnectorBundle,
     venue: VenueId,
+    product: Option<mm_exchange_core::connector::VenueProduct>,
 ) -> Option<&Arc<dyn ExchangeConnector>> {
-    bundle.all_connectors().find(|c| c.venue_id() == venue)
+    bundle.all_connectors().find(|c| {
+        c.venue_id() == venue
+            && product.map(|p| c.product() == p).unwrap_or(true)
+    })
 }
 
 /// Core dispatch helper. Walks the decision's legs, picks the
@@ -187,7 +195,7 @@ async fn dispatch_single_leg(
     product: &ProductSpec,
     symbol: &str,
 ) -> LegOutcome {
-    let Some(connector) = connector_for(bundle, leg.venue) else {
+    let Some(connector) = connector_for(bundle, leg.venue, leg.venue_product) else {
         return LegOutcome {
             venue: leg.venue,
             target_qty: leg.qty,
@@ -262,6 +270,7 @@ async fn dispatch_single_leg(
             qty,
             time_in_force: Some(TimeInForce::PostOnly),
             client_order_id: None,
+            reduce_only: false,
         };
         match connector.place_order(&new_order).await {
             Ok(_order_id) => LegOutcome {
@@ -332,6 +341,7 @@ mod tests {
             is_complete: true,
             legs: vec![RouteLeg {
                 venue,
+                venue_product: None,
                 qty,
                 is_taker,
                 expected_cost_bps: dec!(5),
@@ -348,12 +358,14 @@ mod tests {
             legs: vec![
                 RouteLeg {
                     venue: VenueId::Binance,
+                    venue_product: None,
                     qty: dec!(1),
                     is_taker,
                     expected_cost_bps: dec!(3),
                 },
                 RouteLeg {
                     venue: VenueId::Bybit,
+                    venue_product: None,
                     qty: dec!(1),
                     is_taker,
                     expected_cost_bps: dec!(5),
@@ -500,8 +512,8 @@ mod tests {
     async fn connector_for_returns_none_when_venue_not_in_bundle() {
         let binance = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
         let bundle = ConnectorBundle::single(binance.clone() as Arc<dyn ExchangeConnector>);
-        assert!(connector_for(&bundle, VenueId::Binance).is_some());
-        assert!(connector_for(&bundle, VenueId::Bybit).is_none());
+        assert!(connector_for(&bundle, VenueId::Binance, None).is_some());
+        assert!(connector_for(&bundle, VenueId::Bybit, None).is_none());
     }
 
     #[tokio::test]

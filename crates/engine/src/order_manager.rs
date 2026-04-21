@@ -489,6 +489,7 @@ impl OrderManager {
                     qty: quote.qty,
                     time_in_force: Some(TimeInForce::PostOnly),
                     client_order_id: None,
+                    reduce_only: false,
                 })
                 .collect();
             match connector.place_orders_batch(&orders).await {
@@ -598,6 +599,7 @@ impl OrderManager {
             qty: quote.qty,
             time_in_force: Some(TimeInForce::PostOnly),
             client_order_id: None,
+            reduce_only: false,
         };
         match connector.place_order(&order).await {
             Ok(order_id) => {
@@ -805,6 +807,37 @@ impl OrderManager {
         product: &ProductSpec,
         connector: &Arc<dyn ExchangeConnector>,
     ) -> Result<()> {
+        self.execute_unwind_slice_flagged(symbol, quote, product, connector, false)
+            .await
+    }
+
+    /// Perp-safe unwind slice. Same shape as `execute_unwind_slice`
+    /// but sets `reduce_only` on the venue request so the fill can
+    /// ONLY lower position. Callers who genuinely want to reduce
+    /// (MarginGuard `Reduce` band, kill-switch L4 flatten,
+    /// funding-arb compensating close) must use this path — the
+    /// plain `execute_unwind_slice` leaves the flag off, matching
+    /// legacy behaviour and staying safe on spot venues that
+    /// refuse the flag.
+    pub async fn execute_reduce_slice(
+        &mut self,
+        symbol: &str,
+        quote: &Quote,
+        product: &ProductSpec,
+        connector: &Arc<dyn ExchangeConnector>,
+    ) -> Result<()> {
+        self.execute_unwind_slice_flagged(symbol, quote, product, connector, true)
+            .await
+    }
+
+    async fn execute_unwind_slice_flagged(
+        &mut self,
+        symbol: &str,
+        quote: &Quote,
+        product: &ProductSpec,
+        connector: &Arc<dyn ExchangeConnector>,
+        reduce_only: bool,
+    ) -> Result<()> {
         let price = product.round_price(quote.price);
         let qty = product.round_qty(quote.qty);
         if qty.is_zero() {
@@ -817,6 +850,7 @@ impl OrderManager {
                 side = ?quote.side,
                 %price,
                 %qty,
+                reduce_only,
                 "[PAPER] placed unwind slice (simulated)"
             );
             self.track_order(LiveOrder {
@@ -839,6 +873,7 @@ impl OrderManager {
             qty,
             time_in_force: Some(TimeInForce::Ioc),
             client_order_id: None,
+            reduce_only,
         };
         match connector.place_order(&order).await {
             Ok(order_id) => {
@@ -1075,7 +1110,14 @@ impl OrderManager {
     /// here we just want "something fills" so the pipeline
     /// exercises the real fill path.
     pub fn paper_match_trade(&mut self, trade_price: Price, taker_side: Side) -> Vec<Fill> {
-        self.paper_match_trade_filtered(trade_price, taker_side, |_| true)
+        // Build an id → price lookup so the filter can return the
+        // original quote price as the fill price (no slippage).
+        let prices: HashMap<OrderId, Price> = self
+            .live_orders
+            .values()
+            .map(|o| (o.order_id, o.price))
+            .collect();
+        self.paper_match_trade_filtered(trade_price, taker_side, |id| prices.get(&id).copied())
     }
 
     /// 22C-2 — queue-aware paper fill path. Same shape as
@@ -1098,12 +1140,17 @@ impl OrderManager {
         &mut self,
         trade_price: Price,
         taker_side: Side,
-        should_fill: impl Fn(OrderId) -> bool,
+        mut should_fill: impl FnMut(OrderId) -> Option<Price>,
     ) -> Vec<Fill> {
         if !self.paper_mode {
             return Vec::new();
         }
-        let to_fill: Vec<OrderId> = self
+        // Collect (id, override_price) for each candidate. `should_fill`
+        // returning `None` means the candidate is rejected (queue gate,
+        // probability gate, etc.). `Some(p)` means fill at `p` — the
+        // override lets the caller apply slippage or other price
+        // perturbations (23-P1-5 PaperFillCfg wiring).
+        let candidates: Vec<(OrderId, Price)> = self
             .live_orders
             .values()
             .filter(|o| match (taker_side, o.side) {
@@ -1112,10 +1159,10 @@ impl OrderManager {
                 _ => false,
             })
             .map(|o| o.order_id)
-            .filter(|id| should_fill(*id))
+            .filter_map(|id| should_fill(id).map(|p| (id, p)))
             .collect();
-        let mut fills = Vec::with_capacity(to_fill.len());
-        for id in to_fill {
+        let mut fills = Vec::with_capacity(candidates.len());
+        for (id, fill_price) in candidates {
             if let Some(order) = self.live_orders.remove(&id) {
                 self.price_index.remove(&(order.side, order.price));
                 fills.push(Fill {
@@ -1123,7 +1170,7 @@ impl OrderManager {
                     order_id: order.order_id,
                     symbol: order.symbol.clone(),
                     side: order.side,
-                    price: order.price,
+                    price: fill_price,
                     qty: order.qty - order.filled_qty,
                     is_maker: true,
                     timestamp: chrono::Utc::now(),
@@ -1787,29 +1834,99 @@ mod tests {
         let front = live(Side::Sell, dec!(76_100), dec!(0.001));
         let deep = live(Side::Sell, dec!(76_050), dec!(0.001));
         let front_id = front.order_id;
+        let front_price = front.price;
         let deep_id = deep.order_id;
         mgr.track_order(front);
         mgr.track_order(deep);
         let fills = mgr.paper_match_trade_filtered(
             dec!(76_150),
             Side::Buy,
-            |id| id == front_id, // deep skipped
+            |id| if id == front_id { Some(front_price) } else { None },
         );
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].order_id, front_id);
+        assert_eq!(fills[0].price, front_price);
         // Deep order still live — queue gate said "not yet".
         assert!(mgr.live_orders.contains_key(&deep_id));
     }
 
-    /// 22C-2 — closure returning true for all callers replicates
-    /// the legacy unconditional-fill behaviour exactly.
+    /// 22C-2 — closure returning Some(order.price) for all callers
+    /// replicates the legacy unconditional-fill behaviour exactly.
     #[test]
     fn paper_match_trade_filtered_fires_all_when_gate_open() {
         let mut mgr = OrderManager::new_paper();
-        mgr.track_order(live(Side::Sell, dec!(76_100), dec!(0.001)));
-        mgr.track_order(live(Side::Sell, dec!(76_050), dec!(0.001)));
-        let fills = mgr.paper_match_trade_filtered(dec!(76_150), Side::Buy, |_| true);
+        let a = live(Side::Sell, dec!(76_100), dec!(0.001));
+        let b = live(Side::Sell, dec!(76_050), dec!(0.001));
+        let a_id = a.order_id;
+        let b_id = b.order_id;
+        mgr.track_order(a);
+        mgr.track_order(b);
+        let prices = std::collections::HashMap::from([
+            (a_id, dec!(76_100)),
+            (b_id, dec!(76_050)),
+        ]);
+        let fills = mgr.paper_match_trade_filtered(
+            dec!(76_150),
+            Side::Buy,
+            |id| prices.get(&id).copied(),
+        );
         assert_eq!(fills.len(), 2);
+    }
+
+    /// Phase IV — `execute_reduce_slice` sets `reduce_only: true`
+    /// on the venue request so the fill cannot flip position
+    /// through zero on a fast mover. Plain `execute_unwind_slice`
+    /// leaves the flag off for spot / open-position paths.
+    #[tokio::test]
+    async fn execute_reduce_slice_sets_reduce_only_flag() {
+        let mut mgr = OrderManager::new();
+        let conn = mock_connector(20);
+        let quote = Quote {
+            side: Side::Sell,
+            price: dec!(50_000),
+            qty: dec!(0.1),
+        };
+        mgr.execute_reduce_slice("BTCUSDT", &quote, &product_btcusdt(), &conn)
+            .await
+            .unwrap();
+        let placed = as_mock(&conn).placed.lock().unwrap();
+        assert_eq!(placed.len(), 1, "one reduce slice sent");
+        assert!(placed[0].reduce_only, "reduce_only flag threaded through");
+    }
+
+    #[tokio::test]
+    async fn execute_unwind_slice_leaves_reduce_only_off() {
+        let mut mgr = OrderManager::new();
+        let conn = mock_connector(20);
+        let quote = Quote {
+            side: Side::Sell,
+            price: dec!(50_000),
+            qty: dec!(0.1),
+        };
+        mgr.execute_unwind_slice("BTCUSDT", &quote, &product_btcusdt(), &conn)
+            .await
+            .unwrap();
+        let placed = as_mock(&conn).placed.lock().unwrap();
+        assert_eq!(placed.len(), 1);
+        assert!(!placed[0].reduce_only, "plain unwind leaves flag off");
+    }
+
+    /// 23-P1-5 — overridden fill price (e.g. slippage) flows through
+    /// the Fill output so PaperFillCfg.slippage_bps is observable.
+    #[test]
+    fn paper_match_trade_filtered_respects_price_override() {
+        let mut mgr = OrderManager::new_paper();
+        let ord = live(Side::Sell, dec!(76_100), dec!(0.001));
+        mgr.track_order(ord);
+        // Slipped price = original - 7.61 (≈ 1 bps worse for the seller).
+        let slipped = dec!(76_092.39);
+        let fills = mgr.paper_match_trade_filtered(
+            dec!(76_150),
+            Side::Buy,
+            |_| Some(slipped),
+        );
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].price, slipped);
     }
 
     #[test]

@@ -203,6 +203,45 @@ impl NodeKind for VenueQuotes {
     }
 }
 
+/// Phase IV — `Out.VenueQuotesIf`. Same shape as `Out.VenueQuotes`
+/// but gated on a `trigger: Bool` input — the sink emits ONLY when
+/// the trigger is `true`. Missing / false → no-op.
+///
+/// Closes the reactive-hedge gap: pair `Trade.OwnFill.fired`
+/// (or any composite bool guard — slippage band, risk state,
+/// inventory cap) with this sink to hedge on fill events without
+/// painting every tick's book. Keeps the legacy `Out.VenueQuotes`
+/// untouched so existing templates continue to behave byte-for-byte.
+#[derive(Debug, Default)]
+pub struct VenueQuotesIf;
+
+static VENUE_QUOTES_IF_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
+    vec![
+        Port::new("trigger", PortType::Bool),
+        Port::new("quotes", PortType::Quotes),
+    ]
+});
+
+impl NodeKind for VenueQuotesIf {
+    fn kind(&self) -> &'static str {
+        "Out.VenueQuotesIf"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &VENUE_QUOTES_IF_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &UNIT_OUT
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Unit])
+    }
+}
+
 /// Phase 4 — `Out.Quotes`. The graph took full authorship of the
 /// quoting pipeline: every tick the incoming `Quotes` bundle is
 /// what the engine places, replacing the built-in strategy.tick()

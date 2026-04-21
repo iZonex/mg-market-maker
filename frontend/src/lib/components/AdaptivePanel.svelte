@@ -1,119 +1,143 @@
 <script>
-  // Adaptive-calibration state (Epic 30 + 31).
-  //
-  // Reads `SymbolState.adaptive_state` published every symbol-status
-  // tick. Shows pair-class badge, online-tuner status, current γ
-  // factor with a bipolar bar (0.25× → 4×), and last adjustment
-  // reason as a coloured pill.
+  /*
+   * Adaptive-state panel — drilldown edition.
+   *
+   * Shape contract: { row: DeploymentStateRow }
+   *
+   * Surfaces the trio the adaptive calibration loop publishes via
+   * Prometheus gauges + the agent's telemetry harvest:
+   *   - regime             (volatility regime label)
+   *   - adaptive_gamma     (γ the tuner landed on, decimal string)
+   *   - adaptive_reason    (one-line why of the last adjustment)
+   *
+   * Falls back to a warming-up placeholder while any of the
+   * fields is unpopulated — agents sample these at engine cadence
+   * so a freshly-started deployment legitimately has "—" for a
+   * few seconds before the gauges write.
+   */
 
-  let { data } = $props()
-  const s = $derived(data.state)
-  const sym = $derived(s.activeSymbol || s.symbols[0] || '')
-  const d = $derived(s.data[sym] || {})
-  const a = $derived(d.adaptive_state || null)
+  let { row } = $props()
 
-  const pairClass = $derived(a?.pair_class || 'unclassified')
-  const enabled = $derived(!!a?.enabled)
-  const gammaFactor = $derived(parseFloat(a?.gamma_factor || '1'))
-  const reason = $derived(a?.last_reason || 'no_op')
+  const regime = $derived(row?.regime || '')
+  const gammaStr = $derived(row?.adaptive_gamma || '')
+  const reason = $derived(row?.adaptive_reason || '')
+  const killLevel = $derived(row?.kill_level ?? 0)
 
-  // Geometric bar: log2(factor) mapped to [-1, 1] across 0.25..4.
-  const barPct = $derived((() => {
-    const f = Math.max(0.25, Math.min(4.0, gammaFactor))
-    const normalised = Math.log2(f) / 2
-    return normalised * 50
-  })())
+  const gammaValue = $derived.by(() => {
+    const n = parseFloat(gammaStr)
+    return Number.isFinite(n) && n > 0 ? n : null
+  })
 
-  const reasonLabel = $derived(reason.replace(/_/g, ' '))
-  const reasonSeverity = $derived((() => {
-    switch (reason) {
-      case 'tighten_for_fills': return 'pos'
-      case 'rate_limited':      return 'info'
-      case 'clamped':           return 'warn'
-      case 'widen_for_inventory':
-      case 'widen_for_negative_edge':
-      case 'widen_for_adverse': return 'neg'
-      default:                  return 'muted'
+  const hasAny = $derived(Boolean(regime) || gammaValue !== null || Boolean(reason))
+
+  // Geometric bar: log2(γ / 1) mapped to [-1, 1] across 0.25..4×,
+  // which covers the adaptive tuner's typical clamp band.
+  const barPct = $derived.by(() => {
+    if (gammaValue === null) return 0
+    const ref = 1.0
+    const f = Math.max(0.25, Math.min(4.0, gammaValue / ref))
+    return (Math.log2(f) / 2) * 50
+  })
+
+  const regimeTone = $derived.by(() => {
+    switch ((regime || '').toLowerCase()) {
+      case 'quiet': return 'muted'
+      case 'trending': return 'info'
+      case 'volatile': return 'warn'
+      case 'meanreverting': case 'mean-reverting': return 'pos'
+      default: return 'muted'
     }
-  })())
+  })
+
+  const reasonTone = $derived.by(() => {
+    const r = (reason || '').toLowerCase()
+    if (r.includes('tighten') || r.includes('fill')) return 'pos'
+    if (r.includes('clamp') || r.includes('rate')) return 'warn'
+    if (r.includes('widen') || r.includes('adverse') || r.includes('toxic')) return 'neg'
+    return 'muted'
+  })
 </script>
 
-{#if !a}
-  <div class="empty-state">
-    <span class="empty-state-icon">
-      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-        <circle cx="12" cy="12" r="9"/>
-        <polyline points="12 7 12 12 15 14"/>
-      </svg>
+{#if !hasAny}
+  <div class="empty">
+    <span class="empty-title">Adaptive state warming up</span>
+    <span class="empty-hint">
+      The engine publishes regime + γ + reason every tick. Give it
+      a few seconds after spawn.
     </span>
-    <span class="empty-state-title">Adaptive state warming up</span>
-    <span class="empty-state-hint">The engine will publish a snapshot on the next refresh tick.</span>
   </div>
 {:else}
   <div class="adaptive">
     <div class="row">
-      <span class="label">Pair class</span>
-      <span class="chip chip-pc" data-pc={pairClass}>
-        {pairClass.replace(/_/g, ' ')}
-      </span>
+      <span class="label">Regime</span>
+      <span class="chip tone-{regimeTone}">{regime || '—'}</span>
     </div>
 
     <div class="row">
-      <span class="label">Online tuner</span>
-      <span class="chip" class:chip-pos={enabled} class:chip-muted={!enabled}>
-        {enabled ? 'ENABLED' : 'DISABLED'}
-      </span>
+      <span class="label">Kill level</span>
+      {#if killLevel === 0}
+        <span class="chip tone-muted">NORMAL</span>
+      {:else}
+        <span class="chip tone-danger">LEVEL {killLevel}</span>
+      {/if}
     </div>
 
     <div class="gamma-block">
       <div class="row">
-        <span class="label">γ factor</span>
+        <span class="label">γ (adaptive)</span>
         <span class="val num"
-              class:pos={gammaFactor < 1}
-              class:neg={gammaFactor > 1}>
-          {gammaFactor.toFixed(3)}×
+              class:pos={gammaValue !== null && gammaValue < 1}
+              class:neg={gammaValue !== null && gammaValue > 1}>
+          {gammaValue !== null ? gammaValue.toFixed(4) : '—'}
         </span>
       </div>
-      <div class="bar-track" aria-hidden="true">
-        <div class="bar-center"></div>
-        <div
-          class="bar-fill"
-          class:widen={gammaFactor >= 1}
-          class:tighten={gammaFactor < 1}
-          style="
-            width: {Math.abs(barPct)}%;
-            {gammaFactor >= 1 ? 'left: 50%' : 'right: 50%'};
-          "></div>
-      </div>
-      <div class="bar-scale">
-        <span>0.25×</span>
-        <span>1.0×</span>
-        <span>4.0×</span>
-      </div>
+      {#if gammaValue !== null}
+        <div class="bar-track" aria-hidden="true">
+          <div class="bar-center"></div>
+          <div
+            class="bar-fill"
+            class:widen={gammaValue >= 1}
+            class:tighten={gammaValue < 1}
+            style="
+              width: {Math.abs(barPct)}%;
+              {gammaValue >= 1 ? 'left: 50%' : 'right: 50%'};
+            "></div>
+        </div>
+        <div class="bar-scale">
+          <span>0.25×</span>
+          <span>1.0×</span>
+          <span>4.0×</span>
+        </div>
+      {/if}
     </div>
 
     <div class="row">
       <span class="label">Last reason</span>
-      <span class="chip chip-{reasonSeverity}">{reasonLabel}</span>
+      <span class="chip tone-{reasonTone}">{reason || 'no_op'}</span>
     </div>
 
     <p class="hint">
-      γ multiplies the base from config on top of the regime-based
-      <code>AutoTuner</code> factor. 1.0 = neutral.
+      γ is multiplicative on top of the regime-based baseline. Live
+      tuning overrides from ParamTuner flow through the same
+      channel.
     </p>
   </div>
 {/if}
 
 <style>
-  .adaptive {
-    display: flex;
-    flex-direction: column;
-    gap: var(--s-3);
+  .empty {
+    display: flex; flex-direction: column; gap: 2px;
+    padding: var(--s-3);
+    background: var(--bg-base);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--r-sm);
   }
+  .empty-title { font-size: var(--fs-xs); color: var(--fg-primary); font-weight: 500; }
+  .empty-hint  { font-size: var(--fs-2xs); color: var(--fg-muted); line-height: var(--lh-snug); }
+
+  .adaptive { display: flex; flex-direction: column; gap: var(--s-2); }
   .row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
+    display: flex; justify-content: space-between; align-items: center;
     gap: var(--s-3);
   }
   .label {
@@ -122,25 +146,38 @@
     font-weight: 500;
   }
   .val {
-    font-size: var(--fs-md);
+    font-size: var(--fs-sm);
     font-weight: 600;
     color: var(--fg-primary);
+    font-family: var(--font-mono); font-variant-numeric: tabular-nums;
   }
   .pos { color: var(--pos); }
   .neg { color: var(--neg); }
+  .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+
+  .chip {
+    font-family: var(--font-mono); font-size: 10px;
+    text-transform: uppercase; letter-spacing: var(--tracking-label);
+    font-weight: 600; padding: 2px 6px; border-radius: var(--r-sm);
+    border: 1px solid currentColor;
+  }
+  .tone-pos { color: var(--pos); }
+  .tone-neg { color: var(--neg); }
+  .tone-danger { color: var(--neg); }
+  .tone-warn { color: var(--warn); }
+  .tone-info { color: var(--accent); }
+  .tone-muted { color: var(--fg-muted); }
 
   .gamma-block {
-    display: flex;
-    flex-direction: column;
-    gap: var(--s-1);
+    display: flex; flex-direction: column; gap: 4px;
+    margin-top: var(--s-1);
   }
   .bar-track {
     position: relative;
     height: 6px;
-    background: var(--bg-chip);
+    background: var(--bg-base);
     border-radius: var(--r-pill);
-    overflow: visible;
-    margin-top: var(--s-2);
+    margin-top: var(--s-1);
   }
   .bar-center {
     position: absolute;
@@ -161,33 +198,16 @@
   .bar-scale {
     display: flex;
     justify-content: space-between;
-    margin-top: var(--s-1);
-    font-size: var(--fs-2xs);
+    margin-top: 2px;
+    font-size: 10px;
     font-family: var(--font-mono);
-    font-variant-numeric: tabular-nums;
-    color: var(--fg-faint);
+    color: var(--fg-muted);
   }
-
-  .chip-muted { color: var(--fg-muted); }
-
-  .chip-pc[data-pc^='major']  { color: var(--pc-major-perp); background: rgba(96, 165, 250, 0.14); border-color: rgba(96, 165, 250, 0.35); }
-  .chip-pc[data-pc^='alt']    { color: var(--pc-alt-perp);   background: rgba(251, 191, 36, 0.14); border-color: rgba(251, 191, 36, 0.35); }
-  .chip-pc[data-pc^='meme']   { color: var(--pc-meme-spot);  background: rgba(236, 72, 153, 0.14); border-color: rgba(236, 72, 153, 0.35); }
-  .chip-pc[data-pc^='stable'] { color: var(--pc-stable-stable); background: rgba(16, 185, 129, 0.14); border-color: rgba(16, 185, 129, 0.35); }
-  .chip-pc[data-pc='unclassified'] { color: var(--fg-muted); }
 
   .hint {
     margin: 0;
     font-size: var(--fs-2xs);
     line-height: var(--lh-snug);
     color: var(--fg-muted);
-  }
-  .hint code {
-    font-family: var(--font-mono);
-    font-size: var(--fs-2xs);
-    padding: 1px 4px;
-    background: var(--bg-chip);
-    border-radius: var(--r-sm);
-    color: var(--fg-secondary);
   }
 </style>

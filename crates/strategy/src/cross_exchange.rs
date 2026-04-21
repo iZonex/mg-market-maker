@@ -30,6 +30,15 @@ pub struct CrossExchangeStrategy {
     pub maker_fee: Decimal,
     /// Minimum profit margin in bps after fees.
     pub min_profit_bps: Decimal,
+    /// Investigate #15 — stand down entirely when the hedge
+    /// book is older than this. Cross-venue feeds jitter under
+    /// load and a hedge WS drop is a loud failure mode: better
+    /// to skip a refresh than keep quoting primary against a
+    /// stale reference — that path silently builds unhedged
+    /// exposure. `None` = legacy behaviour (no gate); tests and
+    /// paper runs often set it to `None` explicitly. Config
+    /// default: 5000ms.
+    pub max_hedge_staleness_ms: Option<i64>,
 }
 
 impl CrossExchangeStrategy {
@@ -39,6 +48,7 @@ impl CrossExchangeStrategy {
             hedge_taker_fee: dec!(0.001), // Default 0.1% taker on hedge.
             maker_fee: dec!(-0.0005),     // Default -0.05% rebate on our venue.
             min_profit_bps,
+            max_hedge_staleness_ms: Some(5_000),
         }
     }
 
@@ -71,6 +81,35 @@ impl Strategy for CrossExchangeStrategy {
     }
 
     fn compute_quotes(&self, ctx: &StrategyContext) -> Vec<QuotePair> {
+        // Investigate #15 — hedge-book staleness gate. The
+        // engine threads `hedge_book_age_ms` from the last
+        // hedge-WS update; if the hedge venue dropped, the
+        // cached mid is meaningless and continuing to quote
+        // primary against it is how you build unhedged
+        // exposure in a silent failure. Same pattern as
+        // basis.rs. We only apply the gate when the engine
+        // is actually driving ref_price from a live hedge
+        // book — unit tests construct a strategy with a
+        // static `hedge_mid` and `hedge_book_age_ms = None`;
+        // that path keeps working because the gate only fires
+        // when `ctx.ref_price` is Some (i.e. engine wired).
+        if let (Some(gate), Some(_)) = (self.max_hedge_staleness_ms, ctx.ref_price) {
+            let stale = match ctx.hedge_book_age_ms {
+                Some(age) => age > gate,
+                // Engine provided `ref_price` but not `age` —
+                // inconsistent plumbing, safer to refuse.
+                None => true,
+            };
+            if stale {
+                debug!(
+                    strategy = "cross-exchange",
+                    age_ms = ?ctx.hedge_book_age_ms,
+                    gate_ms = gate,
+                    "hedge book stale — quoting disabled"
+                );
+                return vec![];
+            }
+        }
         // Prefer the engine-threaded hedge book mid (`ctx.ref_price`,
         // populated from `hedge_book.book.mid_price()` in
         // market_maker::refresh_quotes) so the strategy sees live
@@ -313,6 +352,67 @@ mod tests {
         // Spread should cover fees + min profit.
         let spread = ask.price - bid.price;
         assert!(spread > dec!(50), "spread should cover fees");
+    }
+
+    /// Investigate #15 — when the engine threads a live hedge
+    /// `ref_price` AND the hedge-book age exceeds the gate, the
+    /// strategy must stand down entirely. Without this the
+    /// strategy would quote primary against a stale reference
+    /// and silently accumulate unhedged fills.
+    #[test]
+    fn xexch_stale_hedge_book_disables_quoting() {
+        let (product, config, book, mut strategy) = xexch_setup();
+        strategy.max_hedge_staleness_ms = Some(2000);
+        let ctx = StrategyContext {
+            book: &book,
+            product: &product,
+            config: &config,
+            inventory: dec!(0),
+            volatility: dec!(0.02),
+            time_remaining: dec!(1),
+            mid_price: book.mid_price().unwrap(),
+            // Engine IS driving ref_price — this is the live
+            // path, and age > gate means hedge WS dropped.
+            ref_price: Some(dec!(50000)),
+            hedge_book: None,
+            borrow_cost_bps: None,
+            hedge_book_age_ms: Some(10_000),
+            as_prob: None,
+            as_prob_bid: None,
+            as_prob_ask: None,
+        };
+        let quotes = strategy.compute_quotes(&ctx);
+        assert!(
+            quotes.is_empty(),
+            "stale hedge book must disable cross-exchange quoting"
+        );
+    }
+
+    /// Companion — same shape but fresh hedge book → quotes fire.
+    #[test]
+    fn xexch_fresh_hedge_book_allows_quoting() {
+        let (product, config, book, mut strategy) = xexch_setup();
+        strategy.max_hedge_staleness_ms = Some(2000);
+        let ctx = StrategyContext {
+            book: &book,
+            product: &product,
+            config: &config,
+            inventory: dec!(0),
+            volatility: dec!(0.02),
+            time_remaining: dec!(1),
+            mid_price: book.mid_price().unwrap(),
+            ref_price: Some(dec!(50000)),
+            hedge_book: None,
+            borrow_cost_bps: None,
+            hedge_book_age_ms: Some(500),
+            as_prob: None,
+            as_prob_bid: None,
+            as_prob_ask: None,
+        };
+        assert!(
+            !strategy.compute_quotes(&ctx).is_empty(),
+            "fresh hedge book must NOT disable quoting"
+        );
     }
 
     // ---- Epic D stage-3 — Cartea AS + per-side ρ on CrossExchange ----

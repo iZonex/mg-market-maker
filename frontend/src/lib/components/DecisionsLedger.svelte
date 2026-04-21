@@ -19,39 +19,34 @@
   let onlyResolved = $state(false)
   let loading = $state(true)
 
+  // Decisions live in each engine's DecisionLedger. The engine
+  // mirrors its recent-N snapshot into a shared process-global
+  // store on every publish tick; agents expose the snapshot
+  // over the per-deployment details endpoint. We fan out across
+  // the fleet and flatten results here.
   async function refresh() {
-    const base = '/api/v1/decisions/recent?limit=200'
-    const q = symbol ? `${base}&symbol=${encodeURIComponent(symbol)}` : base
     try {
-      const data = await api.getJson(q)
+      const fleet = await api.getJson('/api/v1/fleet')
+      const fetches = []
+      for (const a of Array.isArray(fleet) ? fleet : []) {
+        for (const d of a.deployments || []) {
+          if (!d.running) continue
+          if (symbol && d.symbol !== symbol) continue
+          const path = `/api/v1/agents/${encodeURIComponent(a.agent_id)}`
+            + `/deployments/${encodeURIComponent(d.deployment_id)}`
+            + `/details/decisions_recent`
+          fetches.push(
+            api.getJson(path)
+              .then(resp => ((resp.payload?.decisions || []).map(r => ({ row: r, sym: d.symbol }))))
+              .catch(() => []),
+          )
+        }
+      }
+      const all = (await Promise.all(fetches)).flat()
       const flat = []
-      for (const [sym, rows] of Object.entries(data?.symbols ?? {})) {
-        for (const r of rows) {
-          // One row per resolved fill; when no fills, emit one placeholder
-          // row so operators see the decision exists.
-          if (r.resolved && r.resolved.length > 0) {
-            for (const f of r.resolved) {
-              flat.push({
-                symbol: sym,
-                id: r.id,
-                tick_ms: r.tick_ms,
-                side: r.side,
-                target_qty: Number(r.target_qty),
-                mid: Number(r.mid_at_decision),
-                expected_bps: r.expected_cost_bps !== null && r.expected_cost_bps !== undefined
-                  ? Number(r.expected_cost_bps)
-                  : null,
-                fill_ts: f.tick_ms,
-                fill_price: Number(f.fill_price),
-                fill_qty: Number(f.fill_qty),
-                realized_bps: Number(f.realized_cost_bps),
-                vs_expected_bps: f.vs_expected_bps !== null && f.vs_expected_bps !== undefined
-                  ? Number(f.vs_expected_bps)
-                  : null,
-                resolved: true,
-              })
-            }
-          } else {
+      for (const { row: r, sym } of all) {
+        if (r.resolved && r.resolved.length > 0) {
+          for (const f of r.resolved) {
             flat.push({
               symbol: sym,
               id: r.id,
@@ -62,13 +57,33 @@
               expected_bps: r.expected_cost_bps !== null && r.expected_cost_bps !== undefined
                 ? Number(r.expected_cost_bps)
                 : null,
-              resolved: false,
+              fill_ts: f.tick_ms,
+              fill_price: Number(f.fill_price),
+              fill_qty: Number(f.fill_qty),
+              realized_bps: Number(f.realized_cost_bps),
+              vs_expected_bps: f.vs_expected_bps !== null && f.vs_expected_bps !== undefined
+                ? Number(f.vs_expected_bps)
+                : null,
+              resolved: true,
             })
           }
+        } else {
+          flat.push({
+            symbol: sym,
+            id: r.id,
+            tick_ms: r.tick_ms,
+            side: r.side,
+            target_qty: Number(r.target_qty),
+            mid: Number(r.mid_at_decision),
+            expected_bps: r.expected_cost_bps !== null && r.expected_cost_bps !== undefined
+              ? Number(r.expected_cost_bps)
+              : null,
+            resolved: false,
+          })
         }
       }
       flat.sort((a, b) => (b.fill_ts ?? b.tick_ms) - (a.fill_ts ?? a.tick_ms))
-      decisions = flat
+      decisions = flat.slice(0, 200)
       error = null
       lastFetch = new Date()
       loading = false

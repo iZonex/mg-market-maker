@@ -1,0 +1,11 @@
+{{- if .Values.config.create -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mm.configMapName" . }}
+  labels:
+    {{- include "mm.labels" . | nindent 4 }}
+data:
+  default.toml: |-
+{{ .Values.config.body | indent 4 }}
+{{- end -}}

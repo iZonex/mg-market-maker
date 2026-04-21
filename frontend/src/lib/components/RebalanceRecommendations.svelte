@@ -22,8 +22,35 @@
 
   async function refresh() {
     try {
-      const data = await api.getJson('/api/v1/rebalance/recommendations')
-      recs = data?.recommendations ?? []
+      const fleet = await api.getJson('/api/v1/fleet')
+      const fetches = []
+      for (const a of Array.isArray(fleet) ? fleet : []) {
+        for (const d of a.deployments || []) {
+          if (!d.running) continue
+          const path = `/api/v1/agents/${encodeURIComponent(a.agent_id)}`
+            + `/deployments/${encodeURIComponent(d.deployment_id)}`
+            + `/details/rebalance_recommendations`
+          fetches.push(
+            api.getJson(path)
+              .then(resp => resp.payload?.recommendations || [])
+              .catch(() => []),
+          )
+        }
+      }
+      const all = (await Promise.all(fetches)).flat()
+      // Rebalance advisories are portfolio-wide so multiple
+      // deployments may emit the same advisory. Dedup by
+      // (from, to, asset) and keep the largest qty — operator
+      // sees the biggest recommended transfer once.
+      const byKey = new Map()
+      for (const r of all) {
+        const key = `${r.from_venue}>${r.to_venue}:${r.asset}`
+        const prev = byKey.get(key)
+        if (!prev || Number(r.qty) > Number(prev.qty)) {
+          byKey.set(key, r)
+        }
+      }
+      recs = Array.from(byKey.values())
       error = null
       lastFetch = new Date()
       loading = false

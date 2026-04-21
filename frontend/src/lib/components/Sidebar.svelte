@@ -11,22 +11,30 @@
     {
       label: 'Live',
       items: [
-        { id: 'overview',    label: 'Overview',    icon: 'overview',    roles: ['admin','operator','viewer'] },
-        { id: 'orderbook',   label: 'Orderbook',   icon: 'orderbook',   roles: ['admin','operator','viewer'] },
-        { id: 'history',     label: 'History',     icon: 'history',     roles: ['admin','operator','viewer'] },
+        { id: 'overview',       label: 'Overview',       icon: 'overview',    roles: ['admin','operator','viewer'] },
+        { id: 'fleet',          label: 'Fleet',          icon: 'pulse',       roles: ['admin','operator','viewer'] },
+        { id: 'clients',        label: 'Clients',        icon: 'users',       roles: ['admin','operator','viewer'] },
+        { id: 'reconciliation', label: 'Reconciliation', icon: 'shield',      roles: ['admin','operator','viewer'] },
+        { id: 'orderbook',      label: 'Orderbook',      icon: 'orderbook',   roles: ['admin','operator','viewer'] },
+        { id: 'history',        label: 'History',        icon: 'history',     roles: ['admin','operator','viewer'] },
       ],
     },
+    // Wave F3 — Compliance / Surveillance moved back into the
+    // sidebar as dedicated sections. Both exist as Svelte pages
+    // that fleet-aggregate via fleet-wide endpoints. Calibration
+    // is still best served from a per-deployment drilldown and
+    // stays out of the top-level nav until that drilldown lands.
     {
-      label: 'Operations',
+      label: 'Compliance',
       items: [
-        { id: 'compliance',   label: 'Compliance',   icon: 'compliance', roles: ['admin','operator'] },
-        { id: 'surveillance', label: 'Surveillance', icon: 'compliance', roles: ['admin','operator'] },
+        { id: 'compliance',   label: 'Compliance',   icon: 'doc',     roles: ['admin','operator','viewer'] },
+        { id: 'surveillance', label: 'Surveillance', icon: 'alert',   roles: ['admin','operator'] },
+        { id: 'incidents',    label: 'Incidents',    icon: 'alert',   roles: ['admin','operator'] },
       ],
     },
     {
       label: 'Configure',
       items: [
-        { id: 'calibration', label: 'Calibration', icon: 'calibration', roles: ['admin','operator'] },
         { id: 'strategy',    label: 'Strategy',    icon: 'graph',       roles: ['admin','operator'] },
         { id: 'settings',    label: 'Settings',    icon: 'settings',    roles: ['admin','operator'] },
       ],
@@ -34,8 +42,20 @@
     {
       label: 'Admin',
       items: [
+        { id: 'platform', label: 'Platform', icon: 'settings', roles: ['admin'] },
+        { id: 'vault', label: 'Vault', icon: 'shield', roles: ['admin'] },
         { id: 'users', label: 'Users', icon: 'users', roles: ['admin'] },
+        { id: 'login-audit', label: 'Auth audit', icon: 'history', roles: ['admin'] },
         { id: 'admin', label: 'Admin', icon: 'admin', roles: ['admin'] },
+      ],
+    },
+    // Wave F3 — Profile accessible from every role. Needs its
+    // own nav entry: operators change their password + enroll
+    // 2FA from here, no admin involvement.
+    {
+      label: 'Account',
+      items: [
+        { id: 'profile', label: 'My account', icon: 'users', roles: ['admin','operator','viewer'] },
       ],
     },
   ]

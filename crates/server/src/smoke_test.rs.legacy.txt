@@ -145,6 +145,7 @@ pub async fn run_smoke_test(
             qty,
             time_in_force: None,
             client_order_id: None,
+            reduce_only: false,
         };
         match connector.place_order(&order).await {
             Ok(order_id) => {

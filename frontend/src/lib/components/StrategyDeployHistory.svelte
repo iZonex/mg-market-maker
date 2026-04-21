@@ -9,13 +9,38 @@
   import { createApiClient } from '../api.svelte.js'
   import Icon from './Icon.svelte'
 
-  let { auth, onReload, onRollback } = $props()
+  let { auth, onReload, onRollback, onRollbackToDeployment } = $props()
   const api = createApiClient(auth)
 
   let entries = $state([])
   let open = $state(false)
   let error = $state('')
   let listed = $state([])
+  // Fleet snapshot — refreshed on open so each history row can
+  // show a chip "running now on N deployment(s)" when any
+  // accepted agent has a deployment with matching active_graph
+  // hash. Gives the operator immediate answer to "is anyone
+  // still on the old hash I want to roll back to?".
+  let fleet = $state([])
+
+  // Map hash → [{agent_id, deployment_id, symbol}, …] derived
+  // from fleet rows. Used to annotate history rows.
+  const runningByHash = $derived.by(() => {
+    const out = new Map()
+    for (const a of fleet || []) {
+      for (const d of a.deployments || []) {
+        const h = d.active_graph?.hash
+        if (!h) continue
+        if (!out.has(h)) out.set(h, [])
+        out.get(h).push({
+          agent_id: a.agent_id,
+          deployment_id: d.deployment_id,
+          symbol: d.symbol,
+        })
+      }
+    }
+    return out
+  })
   // UI-5 — when the operator clicks Diff on a history row
   // we fetch both that deploy's graph body and the previous
   // deploy of the SAME name and render a side-by-side view.
@@ -28,6 +53,7 @@
     try {
       entries = await api.getJson('/api/v1/strategy/deploys')
       listed = await api.getJson('/api/v1/strategy/graphs')
+      fleet = await api.getJson('/api/v1/fleet').catch(() => [])
       error = ''
     } catch (e) {
       error = String(e)
@@ -148,10 +174,18 @@
               </thead>
               <tbody>
                 {#each entries.slice().reverse() as rec (rec.hash + rec.deployed_at)}
+                  {@const runningOn = runningByHash.get(rec.hash) || []}
                   <tr>
                     <td class="num">{fmtTs(rec.deployed_at)}</td>
                     <td><code>{rec.name}</code></td>
-                    <td class="num">{rec.hash.slice(0, 12)}…</td>
+                    <td class="num">
+                      {rec.hash.slice(0, 12)}…
+                      {#if runningOn.length > 0}
+                        <span class="running-chip" title={runningOn.map(r => `${r.agent_id}/${r.deployment_id} (${r.symbol})`).join('\n')}>
+                          running × {runningOn.length}
+                        </span>
+                      {/if}
+                    </td>
                     <td>{rec.operator}</td>
                     <td><code class="small">{rec.scope}</code></td>
                     <td class="actions">
@@ -163,9 +197,19 @@
                       >
                         Diff
                       </button>
-                      <button type="button" class="rb-btn" onclick={() => onRollback?.(rec.name, rec.hash)} title="Load this version and redeploy">
-                        Rollback
+                      <button type="button" class="rb-btn" onclick={() => onRollback?.(rec.name, rec.hash)} title="Load this version onto canvas, then pick targets">
+                        Load
                       </button>
+                      {#if onRollbackToDeployment}
+                        <button
+                          type="button"
+                          class="rb-btn primary"
+                          onclick={() => onRollbackToDeployment(rec.name, rec.hash)}
+                          title="Load this version and open the deploy modal in one click"
+                        >
+                          Rollback
+                        </button>
+                      {/if}
                     </td>
                   </tr>
                 {/each}
@@ -261,7 +305,17 @@
     font-size: var(--fs-2xs); cursor: pointer;
   }
   .rb-btn:hover { border-color: var(--warn); color: var(--warn); }
+  .rb-btn.primary { border-color: var(--accent); color: var(--accent); }
+  .rb-btn.primary:hover { background: color-mix(in srgb, var(--accent) 15%, transparent); }
   .actions { display: flex; gap: var(--s-2); }
+  .running-chip {
+    display: inline-block;
+    padding: 1px 6px; margin-left: 6px;
+    font-size: 10px; font-family: var(--font-mono);
+    background: color-mix(in srgb, var(--ok) 15%, transparent);
+    color: var(--ok);
+    border-radius: var(--r-sm);
+  }
 
   .diff-backdrop {
     position: fixed; inset: 0;

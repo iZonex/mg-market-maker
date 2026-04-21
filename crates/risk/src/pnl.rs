@@ -39,6 +39,14 @@ pub struct PnlAttribution {
     pub funding_pnl_mtm: Decimal,
     /// Number of round-trips completed.
     pub round_trips: u64,
+    /// PNL-COUNTER-1 (2026-04-21) — raw fill count (increments
+    /// on every `record_fill`, regardless of round-trip state).
+    /// `round_trips` counts buy↔sell cycles where inventory
+    /// returns to zero — useful for PnL attribution accuracy
+    /// but not what a tenant means by "how many trades have I
+    /// done". The tenant portal surfaces `fill_count`.
+    #[serde(default)]
+    pub fill_count: u64,
     /// Total volume traded (both sides).
     pub total_volume: Decimal,
 }
@@ -163,6 +171,7 @@ impl PnlTracker {
 
         // Volume tracking.
         self.attribution.total_volume += fill_value;
+        self.attribution.fill_count += 1;
 
         // Round trip detection (simplified: inventory crosses zero).
         if ((self.inventory.is_zero())
@@ -415,6 +424,28 @@ mod tests {
         tracker.on_fill(&fill(Side::Buy, "49990", "0.01", true), mid);
         tracker.on_fill(&fill(Side::Sell, "50010", "0.01", true), mid);
 
+        assert_eq!(tracker.attribution.round_trips, 1);
+    }
+
+    /// PNL-COUNTER-1 regression — `fill_count` increments on
+    /// every fill regardless of whether inventory returns to
+    /// zero. `round_trips` only advances on full cycles.
+    /// Tenants read `fill_count` for "how many trades have I
+    /// done".
+    #[test]
+    fn fill_count_tracks_raw_fills_independent_of_round_trips() {
+        let mut tracker = PnlTracker::new(dec!(-0.001), dec!(0.002));
+        let mid = dec!(50000);
+
+        // Two buys in a row — no round trip, but two fills.
+        tracker.on_fill(&fill(Side::Buy, "49990", "0.01", true), mid);
+        tracker.on_fill(&fill(Side::Buy, "49985", "0.005", true), mid);
+        assert_eq!(tracker.attribution.fill_count, 2);
+        assert_eq!(tracker.attribution.round_trips, 0);
+
+        // Sell that closes the position — round trip + fill +1.
+        tracker.on_fill(&fill(Side::Sell, "50010", "0.015", true), mid);
+        assert_eq!(tracker.attribution.fill_count, 3);
         assert_eq!(tracker.attribution.round_trips, 1);
     }
 

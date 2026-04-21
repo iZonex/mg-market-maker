@@ -428,7 +428,16 @@
     }
   }
 
-  async function deploy(ackToken = null) {
+  // Unified deploy modal (Wave A3). Operator clicks Deploy once:
+  // modal opens pre-filled with the fleet, multi-select targets,
+  // Confirm fires save + parallel graph-swap to every selected
+  // (agent, deployment). No implicit broadcast — operator always
+  // names what they're affecting. Two-step (save-first) flow
+  // removed so the dispatch phase can show a single progress
+  // bar instead of "saved … now pick" limbo.
+  let deployTargetModal = $state(null)
+
+  async function saveGraph(ackToken = null) {
     deployBusy = true
     deployStatus = ''
     try {
@@ -454,32 +463,141 @@
           error: '',
         }
         deployStatus = 'restricted deploy — operator ack required'
-        return
+        return null
       }
       if (!resp.ok) {
         const text = await resp.text().catch(() => '')
         throw new Error(`${resp.status} ${text}`)
       }
       const r = await resp.json().catch(() => ({}))
-      deployStatus = rollbackFrom
-        ? `rolled back · hash ${r.hash?.slice(0, 12)}… · ${r.recipients} engines`
-        : `deployed · hash ${r.hash?.slice(0, 12)}… · ${r.recipients} engines`
+      deployStatus = `saved · hash ${r.hash?.slice(0, 12)}… — pick a deployment to apply`
       rollbackFrom = null
       restrictedAck = null
+      return { hash: r.hash, body }
     } catch (e) {
-      deployStatus = `deploy failed: ${e}`
+      deployStatus = `save failed: ${e}`
+      return null
     } finally {
       deployBusy = false
     }
   }
 
+  // Open the unified deploy modal. Fetches fleet, renders a
+  // multi-select target list. "Confirm" saves the graph and
+  // fan-outs graph-swap to every selected (agent, deployment)
+  // in parallel. One confirmation = one deploy.
+  async function deploy(_ackToken = null) {
+    try {
+      const fleet = await api.getJson('/api/v1/fleet')
+      const rows = []
+      for (const a of Array.isArray(fleet) ? fleet : []) {
+        if (a.approval_state && a.approval_state !== 'accepted') continue
+        for (const d of a.deployments || []) {
+          const key = `${a.agent_id}/${d.deployment_id}`
+          rows.push({
+            agent: a,
+            deployment: d,
+            key,
+            running: !!d.running,
+            current_hash: d.active_graph?.hash || null,
+          })
+        }
+      }
+      deployTargetModal = {
+        rows,
+        selected: {},
+        phase: 'select',  // 'select' | 'dispatching' | 'done'
+        results: [],       // [{ key, phase: 'ok' | 'err', detail }]
+        status: rows.length === 0
+          ? 'No running deployments on any accepted agent. Launch one via Fleet → Deploy first.'
+          : '',
+        ackToken: null,
+      }
+    } catch (e) {
+      deployStatus = `fleet fetch failed: ${e.message || e}`
+    }
+  }
+
+  function toggleTarget(key) {
+    if (!deployTargetModal) return
+    const next = { ...deployTargetModal.selected }
+    if (next[key]) delete next[key]
+    else next[key] = true
+    deployTargetModal = { ...deployTargetModal, selected: next }
+  }
+
+  function selectedRows() {
+    if (!deployTargetModal) return []
+    return deployTargetModal.rows.filter(r => deployTargetModal.selected[r.key])
+  }
+
+  // Confirm action — saves once, then fan-outs graph-swap per
+  // selected row. Each dispatch is independent; failures on one
+  // row don't block the rest. The results table shows status
+  // per target so the operator sees exactly what landed.
+  async function confirmDeploy(ackToken = null) {
+    const targets = selectedRows()
+    if (!deployTargetModal || targets.length === 0) return
+    deployTargetModal = {
+      ...deployTargetModal,
+      phase: 'dispatching',
+      results: targets.map(r => ({ key: r.key, phase: 'pending', detail: '' })),
+      status: 'saving graph…',
+    }
+    const saved = await saveGraph(ackToken)
+    if (!saved) {
+      deployTargetModal = {
+        ...deployTargetModal,
+        phase: 'select',
+        status: deployStatus || 'save failed',
+      }
+      return
+    }
+    const hash = saved.hash
+    deployTargetModal = {
+      ...deployTargetModal,
+      status: `graph saved · ${hash?.slice(0, 12)}… · dispatching to ${targets.length} target${targets.length === 1 ? '' : 's'}`,
+    }
+    const settled = await Promise.all(targets.map(async (row) => {
+      try {
+        const path = `/api/v1/agents/${encodeURIComponent(row.agent.agent_id)}`
+          + `/deployments/${encodeURIComponent(row.deployment.deployment_id)}/ops/graph-swap`
+        const r = await api.authedFetch(path, {
+          method: 'POST',
+          body: JSON.stringify({ graph: saved.body }),
+        })
+        if (!r.ok) {
+          const text = await r.text().catch(() => '')
+          return { key: row.key, phase: 'err', detail: `${r.status} ${text}` }
+        }
+        return { key: row.key, phase: 'ok', detail: '' }
+      } catch (e) {
+        return { key: row.key, phase: 'err', detail: e?.message || String(e) }
+      }
+    }))
+    const okCount = settled.filter(s => s.phase === 'ok').length
+    deployStatus = `graph ${hash?.slice(0, 12)}… · ${okCount}/${targets.length} target(s) applied`
+    deployTargetModal = {
+      ...deployTargetModal,
+      phase: 'done',
+      results: settled,
+      status: deployStatus,
+    }
+  }
+
+  function closeDeployTargetModal() {
+    deployTargetModal = null
+  }
+
+  // Restricted-graph ack path: saveGraph returned 412 inside
+  // confirmDeploy, flipped `restrictedAck`. Operator ticks the
+  // checkbox + confirms, we re-run confirmDeploy with the
+  // pentest-mode token on the same already-selected targets.
   async function confirmRestrictedDeploy() {
     if (!restrictedAck?.acknowledged) return
     restrictedAck = { ...restrictedAck, busy: true, error: '' }
-    await deploy('yes-pentest-mode')
+    await confirmDeploy('yes-pentest-mode')
     if (restrictedAck) {
-      // deploy() cleared it on success; if we're here, leave
-      // the modal open so the operator can read the error.
       restrictedAck = { ...restrictedAck, busy: false, error: deployStatus }
     }
   }
@@ -656,6 +774,12 @@
       <span class="v-hint">drag a node from the palette to start</span>
     {:else if validation.valid}
       <span class="v-pill ok"><span class="dot"></span> ready</span>
+      {#if rollbackFrom}
+        <span class="v-pill rollback" title={`Deploy will be recorded as a rollback to ${rollbackFrom}`}>
+          <span class="dot"></span> rollback → @{rollbackFrom.slice(0, 8)}
+          <button type="button" class="v-pill-clear" onclick={() => { rollbackFrom = null; deployStatus = 'rollback cleared' }} aria-label="Clear rollback">×</button>
+        </span>
+      {/if}
       <span class="v-stats">
         {validation.node_count} nodes · {validation.edge_count} edges · {validation.sink_count} sinks
       </span>
@@ -766,6 +890,38 @@
   <StrategyDeployHistory
     {auth}
     onReload={(n) => loadGraph(n)}
+    onRollbackToDeployment={async (name, hash) => {
+      // Load the historical graph onto the canvas and open the
+      // deploy modal scoped to the deployments that are currently
+      // NOT on this hash — letting operator pick which specific
+      // ones to roll back without cluttering the list with rows
+      // that are already on the target version.
+      try {
+        const g = await api.getJson(
+          `/api/v1/strategy/graphs/${encodeURIComponent(name)}/history/${encodeURIComponent(hash)}`
+        )
+        graphName = g.name
+        scopeKind = g.scope.kind
+        scopeValue = g.scope.value ?? ''
+        nodes = g.nodes.map((n) => ({
+          id: n.id,
+          type: 'graphNode',
+          position: { x: n.pos?.[0] ?? 0, y: n.pos?.[1] ?? 0 },
+          data: nodeData(n.kind, n.config),
+        }))
+        edges = g.edges.map((e, i) => ({
+          id: `e${i}`,
+          source: e.from.node,
+          sourceHandle: e.from.port,
+          target: e.to.node,
+          targetHandle: e.to.port,
+        }))
+        rollbackFrom = hash
+        await deploy()
+      } catch (e) {
+        deployStatus = `rollback-to-deployment failed: ${e}`
+      }
+    }}
     onRollback={async (name, hash) => {
       try {
         const g = await api.getJson(
@@ -798,6 +954,87 @@
   <div class="plans-footer">
     <ActivePlans {auth} />
   </div>
+
+  {#if deployTargetModal}
+    {@const targets = deployTargetModal.rows.filter(r => deployTargetModal.selected[r.key])}
+    {@const phase = deployTargetModal.phase}
+    <div class="ack-backdrop">
+      <div class="ack-card">
+        <div class="ack-title">
+          {#if phase === 'select'}Deploy graph — pick target(s)
+          {:else if phase === 'dispatching'}Dispatching graph…
+          {:else}Deploy result
+          {/if}
+        </div>
+        <div class="ack-body">
+          {#if phase === 'select'}
+            <p class="ack-lead">
+              Check every (agent · deployment) that should run this graph.
+              Save + swap fire in a single action; each target is dispatched
+              in parallel. Already-running graph hashes are shown for comparison.
+            </p>
+          {:else}
+            <p class="ack-lead">
+              {deployTargetModal.status}
+            </p>
+          {/if}
+          {#if deployTargetModal.rows.length === 0}
+            <div class="ack-error">No running deployments on any accepted agent. Launch one via Fleet → Deploy strategy first.</div>
+          {:else}
+            <div class="deploy-rows">
+              {#each deployTargetModal.rows as row (row.key)}
+                {@const res = deployTargetModal.results.find(x => x.key === row.key)}
+                <label class="deploy-row-label" class:disabled={phase !== 'select'}>
+                  <input
+                    type="checkbox"
+                    checked={!!deployTargetModal.selected[row.key]}
+                    onchange={() => toggleTarget(row.key)}
+                    disabled={phase !== 'select'}
+                  />
+                  <span class="deploy-row-inner">
+                    <span class="deploy-title mono">{row.deployment.template || 'deployment'} · {row.deployment.symbol}</span>
+                    <span class="deploy-sub mono">
+                      {row.agent.agent_id}
+                      {#if row.deployment.venue}· {row.deployment.venue}{/if}
+                      {#if row.deployment.product}· {row.deployment.product}{/if}
+                      {#if row.current_hash}· current @{row.current_hash.slice(0, 8)}{/if}
+                      · <span class="faint">{row.deployment.deployment_id}</span>
+                    </span>
+                    {#if res}
+                      <span class="deploy-res res-{res.phase}">
+                        {#if res.phase === 'pending'}dispatching…
+                        {:else if res.phase === 'ok'}✓ applied
+                        {:else}✗ {res.detail}
+                        {/if}
+                      </span>
+                    {/if}
+                  </span>
+                </label>
+              {/each}
+            </div>
+          {/if}
+          {#if deployTargetModal.status && phase === 'select' && deployTargetModal.rows.length > 0}
+            <div class="ack-hint">{deployTargetModal.status}</div>
+          {/if}
+        </div>
+        <div class="ack-actions">
+          <button type="button" class="btn ghost" onclick={closeDeployTargetModal}>
+            {phase === 'done' ? 'Close' : 'Cancel'}
+          </button>
+          {#if phase === 'select'}
+            <button
+              type="button"
+              class="btn ok"
+              disabled={targets.length === 0 || deployBusy}
+              onclick={() => confirmDeploy()}
+            >
+              Deploy to {targets.length} target{targets.length === 1 ? '' : 's'}
+            </button>
+          {/if}
+        </div>
+      </div>
+    </div>
+  {/if}
 
   {#if restrictedAck}
     <div class="ack-backdrop">
@@ -982,6 +1219,37 @@
     display: flex; justify-content: flex-end; gap: var(--s-2);
   }
 
+  .deploy-rows {
+    display: flex; flex-direction: column; gap: 4px;
+    max-height: 320px; overflow-y: auto;
+  }
+  .deploy-row-label {
+    display: flex; align-items: flex-start; gap: var(--s-2);
+    padding: var(--s-2) var(--s-3);
+    background: var(--bg-chip);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--r-sm);
+    cursor: pointer;
+    font-family: var(--font-sans);
+  }
+  .deploy-row-label:hover { border-color: var(--accent); }
+  .deploy-row-label.disabled { cursor: default; opacity: 0.85; }
+  .deploy-row-label input[type="checkbox"] { margin-top: 4px; }
+  .deploy-row-inner { display: flex; flex-direction: column; gap: 2px; flex: 1; }
+  .deploy-title { font-size: var(--fs-sm); color: var(--fg-primary); font-weight: 500; }
+  .deploy-sub { font-size: 10px; color: var(--fg-muted); }
+  .deploy-sub .faint { color: var(--fg-faint); }
+  .deploy-row-label .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .deploy-res {
+    font-size: 10px; font-family: var(--font-mono);
+    padding: 2px 6px; border-radius: var(--r-sm);
+    margin-top: 2px; align-self: flex-start;
+  }
+  .deploy-res.res-pending { background: var(--bg-raised); color: var(--fg-muted); }
+  .deploy-res.res-ok { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+  .deploy-res.res-err { background: color-mix(in srgb, var(--danger) 18%, transparent); color: var(--danger); }
+  .ack-hint { font-size: 11px; color: var(--fg-muted); margin-top: var(--s-2); }
+
   /* Validation strip — sits between the top bar and the canvas,
    * always present (even when empty) so the bar's height doesn't
    * jitter when issues come or go. */
@@ -1010,6 +1278,16 @@
   .v-pill.ok    { color: var(--pos); border-color: color-mix(in srgb, var(--pos) 60%, transparent); }
   .v-pill.bad   { color: var(--neg); border-color: color-mix(in srgb, var(--neg) 60%, transparent); }
   .v-pill.muted { color: var(--fg-muted); }
+  .v-pill.rollback {
+    color: var(--warn);
+    border-color: color-mix(in srgb, var(--warn) 60%, transparent);
+    background: color-mix(in srgb, var(--warn) 12%, transparent);
+  }
+  .v-pill-clear {
+    margin-left: 4px; padding: 0 4px; background: transparent; border: 0;
+    color: inherit; cursor: pointer; font-size: var(--fs-sm); line-height: 1;
+  }
+  .v-pill-clear:hover { color: var(--fg-primary); }
   .v-stats { font-family: var(--font-mono); font-size: 11px; color: var(--fg-muted); }
   .v-status { font-family: var(--font-mono); font-size: 11px; color: var(--fg-muted); margin-left: auto; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .v-hint { color: var(--fg-muted); font-size: 11px; }

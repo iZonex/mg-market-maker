@@ -29,8 +29,33 @@
 
   async function refresh() {
     try {
-      const data = await api.getJson('/api/v1/onchain/scores')
-      rows = data?.rows ?? []
+      const fleet = await api.getJson('/api/v1/fleet')
+      const fetches = []
+      for (const a of Array.isArray(fleet) ? fleet : []) {
+        for (const d of a.deployments || []) {
+          if (!d.running) continue
+          const path = `/api/v1/agents/${encodeURIComponent(a.agent_id)}`
+            + `/deployments/${encodeURIComponent(d.deployment_id)}`
+            + `/details/onchain_scores`
+          fetches.push(
+            api.getJson(path)
+              .then(resp => resp.payload?.snapshots || [])
+              .catch(() => []),
+          )
+        }
+      }
+      const all = (await Promise.all(fetches)).flat()
+      // Dedup by symbol (same chain data may appear on multiple
+      // deployments). Keep the latest-fetched entry.
+      const bySymbol = new Map()
+      for (const r of all) {
+        const key = r.symbol
+        const prev = bySymbol.get(key)
+        if (!prev || (r.fetched_at_ms || 0) > (prev.fetched_at_ms || 0)) {
+          bySymbol.set(key, r)
+        }
+      }
+      rows = Array.from(bySymbol.values())
       error = null
       lastFetch = new Date()
       now = Date.now()

@@ -6,13 +6,17 @@
   import ClientCircuitPanel from '../components/ClientCircuitPanel.svelte'
   import ReportsPanel from '../components/ReportsPanel.svelte'
   import SentimentPanel from '../components/SentimentPanel.svelte'
+  import ViolationsPanel from '../components/ViolationsPanel.svelte'
   let { ws, auth } = $props()
 </script>
 
 <div class="page scroll">
   <div class="grid">
+    <Card title="Open violations" subtitle="fleet rollup · SLA · kill · recon · manipulation" span={3}>
+      {#snippet children()}<ViolationsPanel {auth} />{/snippet}
+    </Card>
     <Card title="Alerts" subtitle="live" span={2}>
-      {#snippet children()}<AlertLog data={ws} />{/snippet}
+      {#snippet children()}<AlertLog data={ws} {auth} />{/snippet}
     </Card>
     <Card title="Connectivity" subtitle="venues" span={1}>
       {#snippet children()}<ConnectivityPanel {auth} />{/snippet}

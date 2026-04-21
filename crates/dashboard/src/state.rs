@@ -7,6 +7,76 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+/// Distributed audit fetcher — an async closure that returns
+/// audit events across the whole fleet for a given time range.
+/// Set by the server binary at boot when a controller is wired
+/// in; `build_monthly_report` calls it in place of the local
+/// file reader so MiCA exports include audit events from every
+/// agent, not just the controller process's empty audit file.
+///
+/// The closure is Arc'd so it can be stored on DashboardState
+/// and called from any handler thread. The returned future is
+/// `Send + 'static` so it can cross task boundaries freely.
+pub type AuditRangeFetcher = Arc<
+    dyn Fn(
+            i64,
+            i64,
+            usize,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Vec<serde_json::Value>>
+                    + Send
+                    + 'static,
+            >,
+        > + Send
+        + Sync,
+>;
+
+/// Wave B1 — fleet-aware client-metrics fetcher. Returns one
+/// JSON row per live deployment in the fleet, shaped as the
+/// agent's `client_metrics` details topic emits it (symbol,
+/// venue, product, decimal-string PnL fields, SLA scalars,
+/// book-depth sums, etc.). Optionally filters by `client_id`
+/// — when `Some`, the closure fans out only to deployments
+/// whose owning agent's `profile.client_id` matches.
+///
+/// Installed at server boot when a controller is wired in.
+/// `get_positions`, `get_pnl`, `get_sla`, and `/client/{id}/*`
+/// handlers call it in place of the controller's local
+/// DashboardState (which only receives the scalar slice from
+/// `DeploymentStateRow` — the agent's full state is only ever
+/// reachable through a details round-trip).
+pub type FleetClientMetricsFetcher = Arc<
+    dyn Fn(
+            Option<String>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Vec<serde_json::Value>>
+                    + Send
+                    + 'static,
+            >,
+        > + Send
+        + Sync,
+>;
+
+/// Wave B5 — fan-out broadcaster for fleet-wide dashboard-state
+/// commands. Today the only payload is "register this tenant
+/// on every agent's local DashboardState" but the shape is
+/// deliberately generic so future hot-onboarding commands
+/// (e.g. `AddSymbol`) can ride the same rail without
+/// plumbing new closures. Installed by server boot when
+/// `mm-controller::AgentRegistry` is available; absent in
+/// dashboard-only unit tests.
+pub type FleetAddClientBroadcaster = Arc<
+    dyn Fn(
+            String,
+            Vec<String>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = usize> + Send + 'static>,
+        > + Send
+        + Sync,
+>;
+
 /// Shared state for the dashboard — updated by engines, read by HTTP handlers.
 #[derive(Debug, Clone, Default)]
 pub struct DashboardState {
@@ -133,6 +203,16 @@ pub struct ClientState {
     pub recent_fills: std::collections::VecDeque<FillRecord>,
     pub webhook_dispatcher: Option<crate::webhooks::WebhookDispatcher>,
     pub config_overrides: HashMap<String, tokio::sync::mpsc::UnboundedSender<ConfigOverride>>,
+    /// I3 (2026-04-21) — timestamp of the last fill we fanned out
+    /// to this tenant's webhook dispatcher. The fan-out loop
+    /// queries fleet client-fills every tick; anything newer
+    /// fires a `WebhookEvent::Fill`, everything older is skipped
+    /// so a restart of the loop doesn't replay the ring buffer.
+    /// `None` on first launch — first pass initialises to the
+    /// newest fill timestamp to avoid a flood of synthetic
+    /// notifications for fills that predate the webhook
+    /// registration.
+    pub webhook_fill_cursor: Option<chrono::DateTime<Utc>>,
 }
 
 #[derive(Default)]
@@ -194,6 +274,26 @@ struct StateInner {
     /// period. `None` until the server has registered the path
     /// at startup (tests / headless callers can skip it).
     audit_log_path: Option<std::path::PathBuf>,
+    /// Distributed audit fetcher — set by `mm-server` at boot
+    /// when a controller is present. `build_monthly_report`
+    /// prefers this over reading the local `data/audit.jsonl`
+    /// so in-process MiCA exports reach across every agent's
+    /// disk, not just the (empty) local path. Dashboard-only
+    /// tests leave it `None` and the export falls back to
+    /// reading the file directly.
+    audit_range_fetcher: Option<crate::state::AuditRangeFetcher>,
+    /// Wave B1 — fleet-aware client-metrics fan-out. When set,
+    /// `/positions`, `/pnl`, `/sla`, `/client/{id}/*` handlers
+    /// prefer this over local `symbols` state so the controller
+    /// serves fleet-aggregated data instead of the narrow slice
+    /// `adapter.rs` projects from `DeploymentStateRow`.
+    fleet_client_metrics_fetcher: Option<crate::state::FleetClientMetricsFetcher>,
+    /// Wave B5 — broadcaster that pushes `AddClient` to every
+    /// accepted agent. `create_client` calls it on success so
+    /// per-client report endpoints start working immediately
+    /// (no agent restart). Absent in unit tests — handler
+    /// degrades to a local-only register.
+    fleet_add_client_broadcaster: Option<crate::state::FleetAddClientBroadcaster>,
     /// A1 — HMAC-SHA256 secret used when signing monthly-report
     /// manifests served via `/api/v1/report/monthly.*`. Falls
     /// back to the `AppConfig`-derived default when unset; never
@@ -294,6 +394,15 @@ struct StateInner {
     /// maps to a Vec of snapshots, one per (venue, wallet, asset)
     /// the bundle of connectors reports.
     venue_balances: HashMap<String, Vec<VenueBalanceSnapshot>>,
+    /// 23-UX-6 — per-venue kill-switch state. `HashMap<venue, level>`
+    /// layered on top of the existing symbol-scoped `KillSwitch`:
+    /// when a venue entry is elevated to L3+ the engine short-
+    /// circuits order placement + cancels open orders on THAT venue
+    /// only, leaving other venues quoting. Operators set via the
+    /// admin HTTP endpoint; the engine reads on every
+    /// `place`/`cancel` dispatch through the primary/hedge
+    /// connectors. Absent venue = L0 (Normal).
+    venue_kill_levels: HashMap<String, u8>,
     /// Epic 33 — pending hyperopt calibrations awaiting operator
     /// approval. Keyed by symbol; at most one per symbol at a
     /// time (a new trigger overwrites the previous suggestion).
@@ -336,6 +445,24 @@ struct StateInner {
     /// answers "what's the driver doing right now, has it tripped
     /// yet" without tailing logs.
     funding_arb_pairs: HashMap<String, FundingArbPairState>,
+    /// Wave C1 — latest order/balance reconciliation outcome per
+    /// symbol. Engine's periodic `reconcile()` pushes after every
+    /// cycle so operators can see drift without tailing logs.
+    reconciliation: HashMap<String, ReconciliationSnapshot>,
+    /// Wave D4 — rolling ring of the last `ALERTS_CAP` alerts
+    /// emitted on this DashboardState. Agent's
+    /// `alerts_recent` details topic reads from here; the
+    /// controller fans out across the fleet and dedupes on
+    /// `(severity, title_hash)` inside a 60s window so the
+    /// UI + future Telegram bridge avoid alert storms.
+    alerts_buffer: std::collections::VecDeque<AlertRecord>,
+    /// Wave G2/G4 — operator-opened incidents keyed by their
+    /// generated id. Fed via `open_incident` when an operator
+    /// clicks on a ViolationsPanel row; transitions through
+    /// `ack_incident` / `resolve_incident`. In-memory; restart
+    /// clears. Distinct from `incidents` above (legacy
+    /// auto-logged report entries).
+    open_incidents: HashMap<String, OpenIncident>,
     /// S6.4 — per-venue connector handles for the rebalancer
     /// execute endpoint. Populated at boot by the server from
     /// its `ConnectorBundle`; the endpoint looks the sender
@@ -507,6 +634,62 @@ pub struct FundingArbPairState {
     pub input_unavailable: u64,
 }
 
+/// Wave C1 — per-symbol reconciliation outcome. Engine pushes
+/// this after every `reconcile()` cycle; operators read from
+/// `/api/v1/reconciliation/fleet` which fans out + aggregates.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReconciliationSnapshot {
+    /// Symbol this cycle inspected.
+    pub symbol: String,
+    /// Monotonically-increasing reconcile cycle counter. Helps
+    /// spot agents where the cycle has stalled.
+    pub cycle: u64,
+    /// Epoch millis when this cycle completed.
+    pub last_cycle_ms: i64,
+    /// Order IDs tracked locally but absent on venue — they were
+    /// removed from our tracker. Empty on clean cycle.
+    pub ghost_orders: Vec<String>,
+    /// Order IDs live on venue but not tracked locally — they
+    /// were recovered into the tracker. Empty on clean cycle.
+    pub phantom_orders: Vec<String>,
+    /// `(asset, internal_available, exchange_available)` triples
+    /// where the pct delta breached the tolerance configured for
+    /// this deployment.
+    pub balance_mismatches: Vec<BalanceMismatch>,
+    /// Count of internal orders at cycle start (pre-reconcile).
+    pub internal_orders: u32,
+    /// Count of venue orders at cycle start.
+    pub venue_orders: u32,
+    /// `true` when this cycle's `get_open_orders` call failed —
+    /// order-side reconciliation was skipped. Balance side may
+    /// still have run.
+    pub orders_fetch_failed: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BalanceMismatch {
+    pub asset: String,
+    pub internal: String,
+    pub exchange: String,
+}
+
+/// Wave D4 — agent-local alert record mirrored from the
+/// engine's `AlertManager`. One entry per alert emission
+/// (the per-agent manager already dedups on a 5-minute
+/// window; the controller adds a second 60-second window
+/// across the fleet). Stored in `alerts_buffer` on
+/// DashboardState.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertRecord {
+    pub ts_ms: i64,
+    pub severity: String,
+    pub title: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+}
+
+const ALERTS_CAP: usize = 200;
 const MAX_SOR_DECISIONS: usize = 256;
 const MAX_DAILY_REPORTS: usize = 90;
 /// 23-UX-1 — ring buffer size for PnL / spread / inventory
@@ -684,6 +867,50 @@ pub struct IncidentRecord {
     pub description: String,
     pub duration_secs: u64,
     pub resolved: bool,
+}
+
+/// Wave G2/G4 — operator-opened incident with full lifecycle
+/// (open → acknowledged → resolved). Distinct from the
+/// auto-logged `IncidentRecord` above which is a pure
+/// append-log entry for the daily report; this one carries
+/// ownership + post-mortem fields so on-call actually has a
+/// workflow.
+///
+/// In-memory only in this revision — restart clears the list.
+/// Persistent JSONL is a follow-up (same pattern as the audit
+/// log) once the operator surface stabilises.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenIncident {
+    pub id: String,
+    pub opened_at_ms: i64,
+    pub opened_by: String,
+    /// Which ViolationsPanel row triggered this incident (e.g.
+    /// `sla#BTCUSDT`, `manip#eu-01/btc-1`). Used for dedup — a
+    /// second "open" on the same key updates the existing open
+    /// incident instead of spawning a duplicate row.
+    pub violation_key: String,
+    pub severity: String,
+    pub category: String,
+    pub target: String,
+    pub metric: String,
+    pub detail: String,
+    /// Current lifecycle state: `"open"`, `"acked"`, `"resolved"`.
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acked_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acked_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at_ms: Option<i64>,
+    /// Post-mortem fields — populated on resolve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_cause: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_taken: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preventive: Option<String>,
 }
 
 /// Per-symbol state snapshot.
@@ -892,7 +1119,7 @@ pub struct OnchainSnapshot {
 /// canonical `mm_strategy_graph::Graph` identifiers so operators
 /// can cross-reference the /api/admin/strategy/graphs history
 /// record by hash if needed.
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ActiveGraphSnapshot {
     /// Graph name as authored in the deployed JSON
     /// (`graph.name`). Human-friendly identifier.
@@ -1011,7 +1238,7 @@ pub struct BookDepthLevel {
 /// Populated each refresh tick from the `OrderManager`'s live
 /// order book so the UI does not need to poll a separate
 /// REST endpoint.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderSnapshot {
     /// Client-assigned order ID (UUID stringified).
     pub client_order_id: String,
@@ -1057,6 +1284,12 @@ pub struct PnlSnapshot {
     #[serde(default)]
     pub funding_mtm: Decimal,
     pub round_trips: u64,
+    /// PNL-COUNTER-1 — raw count of individual fills.
+    /// `round_trips` only moves when inventory returns to
+    /// zero, so tenants / operators looking at "how many
+    /// trades have we done" get this value instead.
+    #[serde(default)]
+    pub fill_count: u64,
     pub volume: Decimal,
 }
 
@@ -1099,6 +1332,54 @@ impl DashboardState {
     /// chained JSONL. Absent in headless callers.
     pub fn set_audit_log_path(&self, path: std::path::PathBuf) {
         self.inner.write().unwrap().audit_log_path = Some(path);
+    }
+
+    /// Wire the distributed audit fetcher. Called once from
+    /// `mm-server` boot after both FleetState and AgentRegistry
+    /// are available.
+    pub fn set_audit_range_fetcher(&self, fetcher: AuditRangeFetcher) {
+        self.inner.write().unwrap().audit_range_fetcher = Some(fetcher);
+    }
+
+    pub fn audit_range_fetcher(&self) -> Option<AuditRangeFetcher> {
+        self.inner.read().unwrap().audit_range_fetcher.clone()
+    }
+
+    /// Wave B1 — wire the fleet-aware client-metrics fetcher.
+    /// Called once from server boot after both FleetState and
+    /// AgentRegistry are available.
+    pub fn set_fleet_client_metrics_fetcher(
+        &self,
+        fetcher: FleetClientMetricsFetcher,
+    ) {
+        self.inner.write().unwrap().fleet_client_metrics_fetcher = Some(fetcher);
+    }
+
+    pub fn fleet_client_metrics_fetcher(&self) -> Option<FleetClientMetricsFetcher> {
+        self.inner
+            .read()
+            .unwrap()
+            .fleet_client_metrics_fetcher
+            .clone()
+    }
+
+    /// Wave B5 — wire the fleet add-client broadcaster. Called
+    /// once from server boot. Admin's `create_client` invokes
+    /// it so a newly-registered tenant immediately propagates
+    /// to every accepted agent.
+    pub fn set_fleet_add_client_broadcaster(
+        &self,
+        broadcaster: FleetAddClientBroadcaster,
+    ) {
+        self.inner.write().unwrap().fleet_add_client_broadcaster = Some(broadcaster);
+    }
+
+    pub fn fleet_add_client_broadcaster(&self) -> Option<FleetAddClientBroadcaster> {
+        self.inner
+            .read()
+            .unwrap()
+            .fleet_add_client_broadcaster
+            .clone()
     }
 
     /// A1 — resolve the audit log path.
@@ -1889,6 +2170,53 @@ impl DashboardState {
         inner.venue_balances.clone()
     }
 
+    // ── Venue-scoped kill switch (23-UX-6) ──────────────────
+
+    /// Set the kill-switch level for a single venue. `level` uses
+    /// the same 0..=5 scale as the primary `KillSwitch` so
+    /// consumers can compare against the same thresholds:
+    ///   0 — Normal     (no action)
+    ///   1 — WidenQuotes
+    ///   2 — StopNewOrders
+    ///   3 — CancelAll
+    ///   4 — Flatten
+    ///   5 — Disconnect
+    /// A WS push is emitted so panels update without polling.
+    pub fn set_venue_kill_level(&self, venue: &str, level: u8) {
+        let mut inner = self.inner.write().unwrap();
+        inner
+            .venue_kill_levels
+            .insert(venue.to_string(), level);
+        if let Some(bc) = &inner.ws_broadcast {
+            if let Ok(payload) = serde_json::to_string(&serde_json::json!({
+                "type": "venue_kill_level",
+                "venue": venue,
+                "level": level,
+            })) {
+                bc.send(&payload);
+            }
+        }
+    }
+
+    /// Fetch the kill-switch level for a single venue. Returns 0
+    /// (Normal) when the venue has never been escalated — absent
+    /// entry is treated the same as an explicit Normal write.
+    pub fn venue_kill_level(&self, venue: &str) -> u8 {
+        let inner = self.inner.read().unwrap();
+        inner
+            .venue_kill_levels
+            .get(venue)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Fetch the full venue → kill level map. Used by the
+    /// `/api/v1/kill/venues` endpoint and the dashboard panel.
+    pub fn all_venue_kill_levels(&self) -> HashMap<String, u8> {
+        let inner = self.inner.read().unwrap();
+        inner.venue_kill_levels.clone()
+    }
+
     /// S5.2 — record a funding-arb driver event against a
     /// `(pair_key)` bucket. `event_tag` is the lowercase
     /// `DriverEvent` variant name (`"entered"`, `"exited"`,
@@ -2066,6 +2394,141 @@ impl DashboardState {
         let mut out: Vec<_> = g.funding_arb_pairs.values().cloned().collect();
         out.sort_by(|a, b| a.pair.cmp(&b.pair));
         out
+    }
+
+    /// Wave C1 — replace the reconciliation snapshot for a
+    /// symbol. Engine calls after every `reconcile()` cycle.
+    pub fn push_reconciliation(&self, snap: ReconciliationSnapshot) {
+        let mut g = self.inner.write().unwrap();
+        g.reconciliation.insert(snap.symbol.clone(), snap);
+    }
+
+    /// Wave C1 — read the last reconciliation outcome for a
+    /// symbol. Returns `None` if no cycle has completed yet.
+    pub fn get_reconciliation(&self, symbol: &str) -> Option<ReconciliationSnapshot> {
+        self.inner
+            .read()
+            .unwrap()
+            .reconciliation
+            .get(symbol)
+            .cloned()
+    }
+
+    /// Wave C1 — every reconciliation snapshot, sorted by symbol.
+    /// The agent's `reconciliation_snapshot` details topic reads
+    /// from here; the controller fans out across the fleet.
+    pub fn reconciliation_snapshots(&self) -> Vec<ReconciliationSnapshot> {
+        let g = self.inner.read().unwrap();
+        let mut out: Vec<_> = g.reconciliation.values().cloned().collect();
+        out.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+        out
+    }
+
+    /// Wave D4 — push an alert record onto the agent-local
+    /// ring. Engine's `AlertManager` already dedupes on 5-min
+    /// windows per agent; the controller applies a second
+    /// pass across the fleet.
+    pub fn push_alert(&self, record: AlertRecord) {
+        let mut g = self.inner.write().unwrap();
+        if g.alerts_buffer.len() >= ALERTS_CAP {
+            g.alerts_buffer.pop_front();
+        }
+        g.alerts_buffer.push_back(record);
+    }
+
+    /// Wave D4 — newest-first snapshot of the agent's alert
+    /// buffer. Capped at `ALERTS_CAP` on the wire.
+    pub fn alerts_recent(&self, limit: usize) -> Vec<AlertRecord> {
+        let g = self.inner.read().unwrap();
+        let cap = limit.min(ALERTS_CAP);
+        g.alerts_buffer
+            .iter()
+            .rev()
+            .take(cap)
+            .cloned()
+            .collect()
+    }
+
+    /// Wave G2 — open a new incident OR refresh an existing
+    /// open/acked incident with the same `violation_key`. This
+    /// dedup is what lets operators click "Open incident" from
+    /// any row without worrying about spamming duplicates — if
+    /// the SLA breach keeps firing, we just touch the existing
+    /// entry's metric/detail.
+    pub fn open_incident(&self, inc: OpenIncident) -> OpenIncident {
+        let mut g = self.inner.write().unwrap();
+        // Find an existing non-resolved incident on the same key.
+        let existing_id = g
+            .open_incidents
+            .values()
+            .find(|i| i.violation_key == inc.violation_key && i.state != "resolved")
+            .map(|i| i.id.clone());
+        if let Some(id) = existing_id {
+            if let Some(rec) = g.open_incidents.get_mut(&id) {
+                rec.metric = inc.metric;
+                rec.detail = inc.detail;
+                rec.severity = inc.severity;
+                return rec.clone();
+            }
+        }
+        g.open_incidents.insert(inc.id.clone(), inc.clone());
+        inc
+    }
+
+    /// Wave G2 — mark an incident acknowledged. Transition
+    /// allowed only from `open`. Returns None if the incident
+    /// doesn't exist or is already acked / resolved.
+    pub fn ack_incident(&self, id: &str, by: &str) -> Option<OpenIncident> {
+        let mut g = self.inner.write().unwrap();
+        let rec = g.open_incidents.get_mut(id)?;
+        if rec.state != "open" {
+            return None;
+        }
+        rec.state = "acked".into();
+        rec.acked_by = Some(by.to_string());
+        rec.acked_at_ms = Some(chrono::Utc::now().timestamp_millis());
+        Some(rec.clone())
+    }
+
+    /// Wave G4 — resolve with post-mortem fields. Transition
+    /// allowed from open OR acked (operator can skip ack for
+    /// obvious cases). The post-mortem text is stamped onto
+    /// the record and the state flips to `resolved`.
+    pub fn resolve_incident(
+        &self,
+        id: &str,
+        by: &str,
+        root_cause: Option<String>,
+        action_taken: Option<String>,
+        preventive: Option<String>,
+    ) -> Option<OpenIncident> {
+        let mut g = self.inner.write().unwrap();
+        let rec = g.open_incidents.get_mut(id)?;
+        if rec.state == "resolved" {
+            return None;
+        }
+        rec.state = "resolved".into();
+        rec.resolved_by = Some(by.to_string());
+        rec.resolved_at_ms = Some(chrono::Utc::now().timestamp_millis());
+        rec.root_cause = root_cause;
+        rec.action_taken = action_taken;
+        rec.preventive = preventive;
+        Some(rec.clone())
+    }
+
+    /// List incidents sorted newest-first by `opened_at_ms`.
+    pub fn list_incidents(&self) -> Vec<OpenIncident> {
+        let g = self.inner.read().unwrap();
+        let mut out: Vec<_> = g.open_incidents.values().cloned().collect();
+        out.sort_by(|a, b| b.opened_at_ms.cmp(&a.opened_at_ms));
+        out
+    }
+
+    pub fn get_incident(&self, id: &str) -> Option<OpenIncident> {
+        self.inner
+            .read()
+            .ok()
+            .and_then(|g| g.open_incidents.get(id).cloned())
     }
 
     /// S5.1 — register the rebalancer config at server boot.
@@ -2255,6 +2718,43 @@ impl DashboardState {
             .clients
             .get(client_id)
             .and_then(|c| c.webhook_dispatcher.clone())
+    }
+
+    /// I3 — client_ids that currently have a webhook dispatcher
+    /// registered. The fan-out loop walks these every tick so we
+    /// don't do work for tenants with no endpoint.
+    pub fn client_ids_with_webhooks(&self) -> Vec<String> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .clients
+            .iter()
+            .filter_map(|(id, c)| c.webhook_dispatcher.as_ref().map(|_| id.clone()))
+            .collect()
+    }
+
+    /// I3 — read the last fill timestamp we've already fanned
+    /// out for a given tenant.
+    pub fn webhook_fill_cursor(
+        &self,
+        client_id: &str,
+    ) -> Option<chrono::DateTime<Utc>> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .clients
+            .get(client_id)
+            .and_then(|c| c.webhook_fill_cursor)
+    }
+
+    /// I3 — advance the cursor after a successful fan-out batch.
+    pub fn set_webhook_fill_cursor(
+        &self,
+        client_id: &str,
+        ts: chrono::DateTime<Utc>,
+    ) {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(c) = inner.clients.get_mut(client_id) {
+            c.webhook_fill_cursor = Some(ts);
+        }
     }
 
     /// Get the webhook dispatcher (legacy — returns first found).
@@ -2967,6 +3467,47 @@ mod tests {
         assert_eq!(ids, vec!["alice", "bob"]);
     }
 
+    /// I3 regression — webhook cursor is per-client and survives
+    /// re-reads. First pass returns None (so the fan-out loop
+    /// knows to initialise instead of firing); subsequent
+    /// advances only move forward in time.
+    #[test]
+    fn webhook_fill_cursor_is_per_client_and_advances() {
+        use chrono::{Duration as CDuration, Utc};
+        let ds = DashboardState::new();
+        ds.register_client("alice", &["BTCUSDT".into()]);
+        ds.register_client("bob", &["ETHUSDT".into()]);
+        assert!(ds.webhook_fill_cursor("alice").is_none());
+        assert!(ds.webhook_fill_cursor("bob").is_none());
+
+        let t0 = Utc::now();
+        ds.set_webhook_fill_cursor("alice", t0);
+        assert_eq!(ds.webhook_fill_cursor("alice"), Some(t0));
+        assert!(ds.webhook_fill_cursor("bob").is_none(), "per-client");
+
+        let t1 = t0 + CDuration::seconds(5);
+        ds.set_webhook_fill_cursor("alice", t1);
+        assert_eq!(ds.webhook_fill_cursor("alice"), Some(t1));
+    }
+
+    /// I3 regression — `client_ids_with_webhooks` only returns
+    /// tenants who actually registered a dispatcher; empty for
+    /// tenants that were just created.
+    #[test]
+    fn client_ids_with_webhooks_filters_correctly() {
+        let ds = DashboardState::new();
+        ds.register_client("alice", &["BTCUSDT".into()]);
+        ds.register_client("bob", &["ETHUSDT".into()]);
+        assert!(ds.client_ids_with_webhooks().is_empty());
+
+        let wh = crate::webhooks::WebhookDispatcher::new();
+        wh.add_url("https://alice.example/hook".into());
+        ds.set_client_webhook_dispatcher("alice", wh);
+
+        let ids = ds.client_ids_with_webhooks();
+        assert_eq!(ids, vec!["alice".to_string()]);
+    }
+
     #[test]
     fn webhook_dispatcher_per_client() {
         let ds = DashboardState::new();
@@ -3036,6 +3577,30 @@ mod tests {
         // Second update replaces, not appends.
         ds.update_venue_balances("BTCUSDT", vec![]);
         assert!(ds.venue_balances("BTCUSDT").is_empty());
+    }
+
+    /// 23-UX-6 — venue-kill state round-trips through the setter
+    /// and is visible via both the single-venue and all-venues
+    /// accessors. Absent venue reads as 0 (Normal).
+    #[test]
+    fn venue_kill_level_roundtrip() {
+        let ds = DashboardState::new();
+        assert_eq!(ds.venue_kill_level("binance"), 0);
+        assert!(ds.all_venue_kill_levels().is_empty());
+
+        ds.set_venue_kill_level("binance", 3);
+        assert_eq!(ds.venue_kill_level("binance"), 3);
+
+        ds.set_venue_kill_level("bybit", 1);
+        let all = ds.all_venue_kill_levels();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.get("binance").copied(), Some(3));
+        assert_eq!(all.get("bybit").copied(), Some(1));
+
+        // Reset to 0 keeps the entry at 0 — HTTP layer treats
+        // absent and 0 interchangeably.
+        ds.set_venue_kill_level("binance", 0);
+        assert_eq!(ds.venue_kill_level("binance"), 0);
     }
 
     /// S5.1 — rebalance recommendations read through

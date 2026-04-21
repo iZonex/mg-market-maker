@@ -10,6 +10,9 @@ members = [
     "crates/exchange/coinbase-prime-fix",
     "crates/protocols/fix",
     "crates/protocols/ws_rpc",
+    "crates/control",
+    "crates/controller",
+    "crates/agent",
     "crates/hyperopt",
     "crates/indicators",
     "crates/portfolio",
@@ -33,12 +36,17 @@ version = "0.4.0"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rustls-pemfile = "2"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+semver = "1"
 futures-util = "0.3"
 
 # HTTP
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 axum = { version = "0.8", features = ["json", "ws"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -98,6 +106,9 @@ mm-exchange-hyperliquid = { path = "crates/exchange/hyperliquid" }
 mm-exchange-coinbase-prime-fix = { path = "crates/exchange/coinbase-prime-fix" }
 mm-protocols-fix = { path = "crates/protocols/fix" }
 mm-protocols-ws-rpc = { path = "crates/protocols/ws_rpc" }
+mm-control = { path = "crates/control" }
+mm-controller = { path = "crates/controller" }
+mm-agent = { path = "crates/agent" }
 mm-hyperopt = { path = "crates/hyperopt" }
 mm-indicators = { path = "crates/indicators" }
 mm-portfolio = { path = "crates/portfolio" }

@@ -1,0 +1,52 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  MG Market Maker — {{ .Release.Name }} deployed to namespace "{{ .Release.Namespace }}"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Mode: {{ .Values.env.MM_MODE }}    Image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+
+Resources created:
+  • Deployment  {{ include "mm.fullname" . }}  (replicas={{ .Values.replicaCount }})
+  • Service     {{ include "mm.serviceName" . }}  ({{ .Values.service.type }}:{{ .Values.service.port }})
+  {{- if .Values.persistence.enabled }}
+  • PVC         {{ include "mm.pvcName" . }}  ({{ .Values.persistence.size }})
+  {{- end }}
+  {{- if .Values.pdb.enabled }}
+  • PDB         {{ include "mm.fullname" . }}
+  {{- end }}
+  {{- if .Values.serviceMonitor.enabled }}
+  • ServiceMonitor  {{ include "mm.fullname" . }}
+  {{- end }}
+  {{- if .Values.config.create }}
+  • ConfigMap   {{ include "mm.configMapName" . }}
+  {{- end }}
+  {{- if .Values.secret.create }}
+  • Secret      {{ include "mm.secretName" . }}   ⚠ INLINE SECRETS — do not commit values.yaml in prod
+  {{- end }}
+
+Quick ops:
+
+  kubectl -n {{ .Release.Namespace }} rollout status deployment/{{ include "mm.fullname" . }}
+  kubectl -n {{ .Release.Namespace }} logs -f deployment/{{ include "mm.fullname" . }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "mm.serviceName" . }} 9090:{{ .Values.service.port }}
+  # then open http://localhost:9090
+
+{{- if eq .Values.env.MM_MODE "live" }}
+
+⚠ LIVE MODE is enabled. Confirm:
+  1. Secret {{ include "mm.secretName" . }} holds real API credentials.
+  2. MM_AUTH_SECRET + MM_CHECKPOINT_SECRET are 32-byte random values.
+  3. Preflight checklist in docs/guides/operations.md is green.
+  4. A rollback plan exists (`helm rollback {{ .Release.Name }}`).
+
+{{- else if eq .Values.env.MM_MODE "paper" }}
+
+ℹ PAPER MODE — no real orders placed. Flip `env.MM_MODE=live` only
+  after you've walked docs/guides/paper-smoke-two-venue.md end-to-end.
+
+{{- end }}
+
+Alerts + dashboard:
+  • Alert rules ship separately at deploy/prometheus/mm-alerts.yml
+  • Grafana dashboard at deploy/grafana/dashboards/mm-overview.json
+  • Alertmanager at deploy/alertmanager/alertmanager.yml
+  See docs/guides/operations.md § "Alertmanager routing" for wire-up.

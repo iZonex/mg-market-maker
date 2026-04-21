@@ -17,10 +17,17 @@ mm-onchain = { path = "../onchain" }
 mm-strategy-graph = { path = "../strategy-graph" }
 mm-engine = { workspace = true }
 mm-dashboard = { workspace = true }
+tower-http = { workspace = true }
+axum = { workspace = true }
 mm-persistence = { workspace = true }
 mm-portfolio = { workspace = true }
 mm-backtester = { workspace = true }
 mm-hyperopt = { workspace = true }
+# Controller library — WS accept loop, fleet state, credential
+# push, HTTP endpoints backing the UI's controller views. Loaded
+# when server runs in `--mode controller` or `--mode both`.
+mm-control = { workspace = true }
+mm-controller = { workspace = true }
 # Sentry error aggregation — activates only when MM_SENTRY_DSN
 # is set at runtime. The sentry crate has no side effects until
 # `sentry::init()` is called, so the always-on dep is cheap.
@@ -39,6 +46,22 @@ rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 prometheus = { workspace = true }
 chrono = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
+# Telegram bridge (Fix #6) — POSTs alert messages to Telegram
+# bot API. Same client behaviour as mm-dashboard / mm-sentiment
+# already use; workspace-pinned reqwest.
+reqwest = { workspace = true }
+
+# rustls 0.23 requires an explicit CryptoProvider install at
+# process start when multiple providers are in the dep graph
+# (aws-smithy brings aws-lc-rs, reqwest might bring ring — the
+# panic "Could not automatically determine the process-level
+# CryptoProvider" fires without this). Pinning aws-lc-rs here
+# and calling `install_default()` in main() resolves the
+# ambiguity once, for every crate that uses rustls downstream.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 
 # OpenTelemetry OTLP tracing — opt-in via `--features otel`. Pulls
 # tonic + async runtime glue; keeping it optional holds the default

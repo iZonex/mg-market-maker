@@ -462,6 +462,14 @@ impl ExchangeConnector for BinanceFuturesConnector {
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         params.push_str(&format!("&newClientOrderId={cloid}"));
+        // Perp-only reduceOnly gate. Binance USDⓈ-M accepts
+        // `reduceOnly=true` on LIMIT + MARKET orders and refuses
+        // the order when the fill would grow the position. Leaving
+        // the param off when false so legacy order paths stay
+        // byte-identical for regression.
+        if order.reduce_only {
+            params.push_str("&reduceOnly=true");
+        }
 
         let t0 = Instant::now();
         let rest_result = self.signed_post("/fapi/v1/order", &params).await;
@@ -527,6 +535,9 @@ impl ExchangeConnector for BinanceFuturesConnector {
                 if let Some(p) = o.price {
                     entry["price"] = Value::String(p.to_string());
                 }
+            }
+            if o.reduce_only {
+                entry["reduceOnly"] = Value::String("true".into());
             }
             batch.push(entry);
         }

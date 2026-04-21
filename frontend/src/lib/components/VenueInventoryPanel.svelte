@@ -15,7 +15,37 @@
     if (!sym) return
     loading = true
     try {
-      httpRows = await api.getJson(`/api/v1/inventory/venues/${encodeURIComponent(sym)}`)
+      // Per-deployment details fan-out: find every deployment
+      // running `sym` across the fleet and pull its `venue_inventory`
+      // topic. Merge legs — same (venue, product, asset, wallet)
+      // key may appear on multiple deployments (same agent
+      // reports same spot balance through different bundles).
+      const fleet = await api.getJson('/api/v1/fleet')
+      const fetches = []
+      for (const a of Array.isArray(fleet) ? fleet : []) {
+        for (const d of a.deployments || []) {
+          if (!d.running) continue
+          if (d.symbol !== sym) continue
+          const path = `/api/v1/agents/${encodeURIComponent(a.agent_id)}`
+            + `/deployments/${encodeURIComponent(d.deployment_id)}`
+            + `/details/venue_inventory`
+          fetches.push(
+            api.getJson(path)
+              .then(resp => resp.payload?.legs || [])
+              .catch(() => []),
+          )
+        }
+      }
+      const all = (await Promise.all(fetches)).flat()
+      const byKey = new Map()
+      for (const r of all) {
+        const key = `${r.venue}:${r.product}:${r.asset}:${r.wallet}`
+        const prev = byKey.get(key)
+        if (!prev || (r.ts_ms || 0) > (prev.ts_ms || 0)) {
+          byKey.set(key, r)
+        }
+      }
+      httpRows = Array.from(byKey.values())
       lastError = ''
     } catch (e) {
       lastError = String(e?.message || e)

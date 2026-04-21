@@ -821,3 +821,112 @@ pub static SOCIAL_SIZE_MULT: Lazy<GaugeVec> = Lazy::new(|| {
     )
     .unwrap()
 });
+
+// ── Calibration (GLFT IntensityCalibration) ─────────────────
+//
+// Surfaces the live GLFT fit per symbol. Updated on each
+// `recalibrate_if_due` call inside the engine refresh loop.
+// Drilldown UI reads these back through the agent's telemetry
+// scrape so operators can see whether calibration is learning
+// or stuck.
+
+pub static CALIBRATION_A: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_calibration_a",
+        "GLFT IntensityCalibration `a` constant (arrival rate baseline)",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
+pub static CALIBRATION_K: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_calibration_k",
+        "GLFT IntensityCalibration `k` coefficient (depth sensitivity)",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
+pub static CALIBRATION_SAMPLES: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_calibration_samples",
+        "Number of fill samples currently in the GLFT calibration window",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
+// ── Manipulation detectors (risk/manipulation.rs) ───────────
+//
+// Four per-symbol scores in [0,1]: pump_dump, wash, thin_book,
+// combined. The engine already publishes snapshots to
+// DashboardState; we mirror them to Prometheus so the agent
+// telemetry scrape picks them up and the drilldown renders the
+// current detector pulse.
+
+pub static MANIPULATION_PUMP_DUMP: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_manipulation_pump_dump",
+        "Pump-and-dump detector score in [0,1]",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
+pub static MANIPULATION_WASH: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_manipulation_wash",
+        "Wash-trading detector score in [0,1]",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
+pub static MANIPULATION_THIN_BOOK: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_manipulation_thin_book",
+        "Thin-book detector score in [0,1]",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
+pub static MANIPULATION_COMBINED: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_manipulation_combined",
+        "Combined manipulation score in [0,1] (aggregator over sub-detectors)",
+        &["symbol"]
+    )
+    .unwrap()
+});
+
+// ── Funding-arb driver transitions ──────────────────────────
+//
+// Counter per DriverEvent outcome (Entered / Exited / Hold /
+// TakerRejected / PairBreak / PairBreakUncompensated /
+// InputUnavailable). The `outcome` label is the snake-case
+// variant name so the UI can render an ordered table without
+// hard-coding the enum shape here. Implementation: a new
+// DriverEventSink adapter increments the appropriate label.
+
+pub static FUNDING_ARB_TRANSITIONS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "mm_funding_arb_transitions_total",
+        "Funding-arb driver state transitions, labelled by symbol and outcome",
+        &["symbol", "outcome"]
+    )
+    .unwrap()
+});
+
+/// `1` while the funding-arb driver has the symbol actively
+/// engaged (between `Entered` and `Exited` / `PairBreak`),
+/// `0` otherwise. Cheap "is this pair live?" readout.
+pub static FUNDING_ARB_ACTIVE: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "mm_funding_arb_active",
+        "1 if the funding-arb driver has this symbol actively engaged, else 0",
+        &["symbol"]
+    )
+    .unwrap()
+});

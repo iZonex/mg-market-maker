@@ -1,0 +1,26 @@
+apiVersion: v2
+name: mm
+description: |
+  MG Market Maker — single-symbol engine Helm chart. Wraps the
+  reference k8s manifest (deploy/k8s/deployment.yaml) with
+  values-driven templating for image reference, replica count,
+  resource quotas, secret injection, and ServiceMonitor toggle.
+  One Helm release per symbol or client; never set replicas > 1
+  on the same release.
+type: application
+version: 0.1.0
+appVersion: "0.4.0"
+kubeVersion: ">=1.24.0"
+keywords:
+  - market-maker
+  - trading
+  - crypto
+  - prometheus
+home: https://github.com/your-org/market-maker
+sources:
+  - https://github.com/your-org/market-maker
+maintainers:
+  - name: Market Maker Ops
+annotations:
+  category: Finance
+  licenses: Apache-2.0

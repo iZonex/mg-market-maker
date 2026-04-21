@@ -1,6 +1,458 @@
 # MM — Open Work Tracker
 
-Last updated: 2026-04-19 (post-Sprint 22)
+Last updated: 2026-04-20 (post-distributed-control-plane audit)
+
+---
+
+## Distributed architecture audit (2026-04-20)
+
+Pre-refactor mm-server ran a single in-process engine and the
+dashboard read its state directly. Post-refactor engines live in
+remote `mm-agent` processes; controller + dashboard receive
+everything via fleet telemetry. A lot of dashboard code still
+assumes the old model. This audit tags every artefact as:
+
+- **OK** — works with the new architecture, no action needed
+- **LEGACY** — artefact is architecturally dead (reads / writes
+  something that doesn't exist in the new model); remove or
+  replace
+- **PARTIAL** — works but surfaces defaults for metrics that
+  aren't propagated through fleet telemetry yet; needs
+  per-deployment wire-up
+- **REWIRE** — functionality belongs in the new model but the
+  current implementation targets the wrong layer (e.g. pushes
+  to server-embedded engine instead of `POST /agents/{id}/deployments`)
+
+### Frontend pages (14)
+
+| Page | Status | Notes |
+|---|---|---|
+| Overview | OK (2026-04-21) | Adapter fills SymbolState from extended DeploymentStateRow. Mid/spread/VPIN/Kyle/adverse/volatility + SLA uptime/presence/two-sided + hourly presence + market-impact + performance + open orders + active-graph now flow through. Agent reads from shared DashboardState each snapshot tick. |
+| Orderbook | PARTIAL | Book-display wires through WS; per-symbol state works if at least one deployment trades that symbol; otherwise empty |
+| History | OK (2026-04-21) | per-leg inventory populated via adapter.publish_inventory; AuditStream fans out to each deployment's `audit_tail` details topic; DecisionsLedger fans out to `decisions_recent` details topic. 401 log-flood fixed via auth_middleware 60s dedup. |
+| Calibration | LEGACY | `CalibrationStatus` reads engine-side GLFT calibration; engine is in agents → need per-deployment endpoint or move this to StrategyPage drill-down |
+| Compliance | OK (2026-04-21) | AuditStream works via per-deployment `audit_tail` topic (with from_ms/until_ms/limit args). MiCA monthly report now fleet-aware — server boot wires an `AuditRangeFetcher` closure into DashboardState that fans out `audit_tail` per deployment and merges with cap 50k; `build_monthly_report` picks it up and falls back to local file only when no fetcher is set (test deploys). |
+| Surveillance | LEGACY | Detector scores come from engine-internal state; global "surveillance" page is meaningless in distributed model (flagged as UX-SURV-1) |
+| Strategy | REWIRE | Graph editor deploys through old `/api/admin/strategy/graph` (server-embedded engine); in new model graph → variables in `DesiredStrategy` → `POST /agents/{id}/deployments`. Needs integration with DeployDialog or replacement |
+| Settings | LEGACY | FeatureStatusPanel + ParamTuner + ConfigViewer + AdaptivePanel all assume single-process engine. CONFIG-ONLY panel flags (momentum_ofi_enabled, bvc_enabled, etc.) belong in per-deployment variables now |
+| Users | OK | Users live on controller via AuthState + users.json |
+| Admin | PARTIAL | Kill switch + SOR + atomic bundles + funding-arb + manipulation + onchain panels assume engine-side state; only VenuesHealth still makes sense via fleet adapter. AdminConfigPanels (webhooks / alerts / loans / sentiment) reference server-side stores that are legacy |
+| Fleet | OK | Fully distributed-native — agents, approvals, per-agent credentials, deploy dialog |
+| Vault | OK | Unified encrypted secret store, admin-only |
+| Platform | OK | Controller-level runtime tunables |
+| Profile | OK | User self-service (password, 2FA) |
+
+### Frontend components (61) — highlights of LEGACY / REWIRE
+
+- `FeatureStatusPanel` — CONFIG-ONLY breadcrumb list of engine flags; **delete**
+- `ParamTuner` — writes to engine via `/api/admin/config/{symbol}` which targets server-embedded engine; **rewire** to per-deployment variables via a future "Live tune" drawer on a deployment drilldown
+- `ConfigViewer` — reads `/api/v1/config/effective` (server config); **delete** in favour of Platform page + Vault + Deploy dialog variables
+- `AdaptivePanel` — reads γ / pair_class from `DashboardState.tunable_config` which is a default in `adapter.rs`; **delete** until per-deployment adaptive state is propagated
+- `CalibrationStatus` — engine-internal; **rewire** to pull from a deployment's current calibration state (new endpoint needed)
+- `SorDecisions`, `AtomicBundles`, `RebalanceRecommendations`, `FundingArbPairs` — all engine-internal; **rewire** or **delete**
+- `ManipulationScores`, `OnchainScores`, `AdverseSelection` — engine-internal; **rewire** to per-deployment or per-symbol drill-downs
+- `InventoryPanel`, `InventoryChart`, `PnlChart`, `OpenOrders`, `FillHistory`, `SpreadChart` — read through `DashboardState` fed by adapter; mostly work but fields filled with defaults for metrics not in telemetry
+- `AdminConfigPanels` (webhooks / alerts / loans / sentiment) — server-side stores, **mostly legacy** once alert / webhook wiring moves to controller telemetry
+- `ClientOnboardingPanel`, `ClientCircuitPanel` — per-client features; still valid but need controller-side client store equivalent to what was in dashboard
+
+### Backend endpoints
+
+Controller routes (15) — all distributed-native, **OK**:
+- `/api/v1/fleet`, `/api/v1/approvals*`, `/api/v1/agents/{id}/*`, `/api/v1/vault*`, `/api/v1/templates`, `/api/v1/tunables*`
+
+Dashboard routes (64) — audit:
+- Auth (`/api/auth/*`) — **OK** (post-bootstrap refactor)
+- WS `/ws` — **PARTIAL** (broadcasts `DashboardState`; works but many fields stale)
+- Per-symbol ops (`/api/v1/ops/*/{symbol}`) — **REWIRE** to `/api/v1/agents/{id}/deployments/{dep_id}/ops/*` — in new model you kill/widen a specific deployment on a specific agent, not a "global symbol"
+- `/api/admin/config/*` — **LEGACY**, tunes server engine that doesn't exist
+- `/api/admin/strategy/graph` — **REWIRE** to `POST /agents/{id}/deployments` via DeployDialog
+- `/api/admin/webhooks`, `/api/admin/alerts`, `/api/admin/loans`, `/api/admin/sentiment/*` — **LEGACY-ish**, these server-side stores should move to controller or be removed
+- `/api/admin/optimize/*` — **LEGACY**, hyperopt assumed in-process
+- `/api/v1/surveillance/scores`, `/api/v1/manipulation/scores`, `/api/v1/onchain/scores`, `/api/v1/calibration/status`, `/api/v1/adverse-selection`, `/api/v1/funding-arb/pairs`, `/api/v1/sor/decisions/recent`, `/api/v1/atomic-bundles/inflight`, `/api/v1/rebalance/*`, `/api/v1/decisions/recent`, `/api/v1/plans/active`, `/api/v1/otr/tiered`, `/api/v1/basis` — **LEGACY / PARTIAL**, all depend on engine-internal state that now lives in agents
+- `/api/v1/venues/status`, `/api/v1/venues/latency_p95`, `/api/v1/venues/book_state`, `/api/v1/venues/funding_state`, `/api/v1/portfolio/cross_venue`, `/api/v1/clients/loss-state`, `/api/v1/active-graphs`, `/api/v1/kill/venues` — **PARTIAL**, work via adapter when deployments exist, but fields incomplete
+
+### Proposed clean-up waves
+
+**Wave 1 Reshape (DONE — 2026-04-20): Restore-not-delete**
+
+Fixing the earlier deletion framing. Each item reshaped onto
+the distributed architecture instead of deleted:
+
+- `FeatureStatusPanel` / `ParamTuner` / `ConfigViewer` /
+  `AdaptivePanel` → moved into `DeploymentDrilldown` in Wave 2
+  Phase C (already landed). No longer "dead".
+- `SettingsPage` — reshaped into a fleet-wide live-deployment
+  summary + navigation tiles. Shows rollup (running / stopped /
+  kill-escalated / live-orders), mode/regime/template chips,
+  and a clickable row per deployment that navigates to Fleet
+  for drilldown.
+- `/api/admin/config/{symbol}` — restored as a controller thin-
+  proxy. Translates the legacy `{field, value}` shape into a
+  variables-PATCH and forwards to the matching deployment
+  (resolved by symbol from the fleet snapshot). Old tools +
+  hyperopt scripts keep working. Handlers:
+  `post_admin_config_proxy`, `legacy_config_to_variable`.
+- `DeploymentStateRow` gained 4 execution-layer scalars
+  (`sor_filled_qty`, `sor_dispatch_success`,
+  `atomic_bundles_inflight`, `atomic_bundles_completed`). Agent
+  scrapes the existing `mm_sor_*` + `mm_atomic_bundles_*`
+  Prometheus gauges/counters. Drilldown renders them in a
+  new "Execution" section.
+
+**Engine gauge emission (DONE — 2026-04-20, step (1) above):**
+- `mm_calibration_a/k/samples` — emitted from the engine's
+  refresh-quotes tick alongside `recalibrate_if_due`.
+- `mm_manipulation_pump_dump/wash/thin_book/combined` —
+  emitted from the same tick off the aggregator's snapshot;
+  fires regardless of whether a dashboard is attached (colo
+  agents publish to Prometheus).
+- `mm_funding_arb_transitions_total{outcome}` +
+  `mm_funding_arb_active` — emitted from
+  `MarketMakerEngine::handle_driver_event` so every DriverEvent
+  bumps a counter and (for Entered/Exited/PairBreak) flips the
+  active gauge.
+- `DeploymentStateRow` carries 13 new scalar fields; agent
+  scrapes via `read_gauge_by_symbol` / `read_counter_by_symbol`
+  / `read_counter_by_symbol_outcome`; `DeploymentDrilldown`
+  renders Calibration + Manipulation + Funding-arb sections
+  (Funding-arb section hidden when all counters are zero).
+
+**Detail endpoints (DONE — 2026-04-20):**
+- New wire commands `CommandPayload::FetchDeploymentDetails`
+  + `TelemetryPayload::DetailsReply` with `request_id`
+  correlation. Controller parks a oneshot in the
+  `AgentRegistry.pending_details` map, agent replies with a
+  topic-shaped JSON payload, HTTP handler enforces a 5s timeout.
+- Shared `mm_dashboard::details_store` with a 20-entry ring
+  buffer per symbol. Engine's `handle_driver_event` pushes on
+  every DriverEvent; agent reads on `FetchDeploymentDetails`.
+- Controller route
+  `GET /api/v1/agents/{id}/deployments/{dep}/details/{topic}`
+  forwards to agent and streams the reply back. Topic
+  `funding_arb_recent_events` wired end-to-end.
+- `DeploymentDrilldown` funding-arb section gained a "Recent
+  events" table that auto-loads when any driver counter is
+  non-zero.
+
+**SurveillancePage fleet-aggregate (DONE — 2026-04-20):**
+- New controller endpoint `GET /api/v1/surveillance/fleet`
+  rolls up every live deployment's `manipulation_*` fields
+  (added in the prior engine-gauge pass) into a single array
+  sorted by combined risk score.
+- `SurveillancePage` reshaped from the old 16-pattern
+  speculative board into a fleet-wide table: one row per
+  deployment, four category columns (combined, pump_dump,
+  wash, thin_book), watch / alert thresholds at 0.5 / 0.8,
+  rollup counters across the top.
+
+**Follow-up topics for details endpoint:**
+- `sor_decisions_recent` — add a ring buffer in
+  `engine::sor` alongside the existing SOR gauges.
+- `atomic_bundles_inflight` — surface the in-flight list
+  from `AtomicBundleManager` so the UI can show leg status.
+- `calibration_history` — recent `(a, k, samples)` tuples
+  from the calibration walker.
+- `CompliancePage` audit aggregation — controller endpoint
+  that proxies to each agent's JSONL audit log and concatenates.
+- `/api/admin/strategy/graph` thin-proxy — wrap graph JSON in
+  `variables.strategy_graph` and forward via `POST .../deployments`.
+- Admin stores migration: `webhooks`, `alerts`, `loans`,
+  `sentiment` from dashboard to controller.
+
+**Wave 2b (DONE — 2026-04-20): Tenant-isolation hardening**
+
+Closed the cross-tenant credential leak risk. Delivered:
+- `VaultEntry.client_id: Option<String>` top-level field
+  (shared-infra = `None`). Serde-back-compat with old vault
+  files. Surfaced through `VaultSummary`, `CredentialDescriptor`,
+  and `VaultCreate` request body. (`crates/controller/src/vault.rs`)
+- `can_exchange_access(cred_id, agent_id, agent_tenant)` now
+  runs three-gate compose: kind → tenant → `allowed_agents`
+  whitelist. New `CredentialCheck::TenantMismatch` variant.
+- Controller `pre_validate_deploy` resolves the agent's tenant
+  via approvals lookup on fingerprint, blocks cross-tenant
+  mismatch AND cross-tenant mix within a single deployment's
+  credential set. (`crates/controller/src/http.rs`)
+- Agent catalog gains `resolve_for(cred_id, allowlist)` that
+  refuses credentials outside `desired.credentials` even if the
+  catalog happens to hold them for another deployment.
+  `engine_runner.rs` uses it on primary / hedge / extras.
+- `DeployDialog.svelte` shows `client_id` chip on each
+  credential, disables submit + shows reason on tenant
+  mismatch / cross-tenant mix.
+
+New tests: 4 in `vault.rs` (shared-infra pass, cross-tenant
+refuse, untagged-agent-refuse-for-tagged-cred, tenant-then-
+whitelist), 1 in `catalog.rs` (resolve_for enforcement), 1 in
+`engine_runner.rs` (allowlist bypass attempt yields no-op).
+
+Skipped from original plan:
+- Full per-deployment catalog split (one runner can't see
+  another's keys even in-process). The `resolve_for` gate
+  covers the same threat model at the boundary and doesn't
+  require restructuring the catalog. Reopen if threat model
+  tightens (e.g. we add strategy-level untrusted plugins).
+
+**Wave 2 (medium — 2-3 days): Per-deployment drill-down** ← NEXT
+
+Preserved from earlier deletion attempt:
+- `FeatureStatusPanel.svelte`, `ParamTuner.svelte`, `AdaptivePanel.svelte`,
+  `ConfigViewer.svelte` are back in the repo, unused, waiting for this
+  wave to re-mount them into a Fleet → deployment drilldown panel.
+
+Deliverables:
+- New agent-side telemetry payload `DeploymentStatus` with
+  strategy-visible state: current γ, regime, adaptive_reason,
+  feature flags bag, effective variables snapshot, last N decisions.
+- Controller endpoint `GET /api/v1/agents/{id}/deployments/{dep_id}/status`
+  → returns the latest pushed `DeploymentStatus` for that deployment.
+- Controller endpoint `PATCH /api/v1/agents/{id}/deployments/{dep_id}/variables`
+  → merges an operator edit into the live `variables` map; agent
+  reconciles the running engine without a restart (bumps γ, toggles
+  features, etc). Validates: agent is Accepted + deployment exists.
+- `DeploymentDrilldown.svelte` — expandable panel on FleetPage below
+  each deployment row, mounts the 4 preserved components reading from
+  the new endpoints.
+- Remove legacy server-engine config routes (`/api/admin/config/*`)
+  once the new path is live — already deleted in Wave 1.
+- Add `POST /api/v1/agents/{id}/deployments/{dep_id}/ops/widen|stop|cancel|flatten` — replaces global `/api/v1/ops/{symbol}`
+- Agent implements a deployment-ops command channel
+- Dashboard `Overview` + per-symbol views read deployment telemetry from fleet view
+- Move ParamTuner to a per-deployment drilldown modal — edit variables live via a new `PATCH /agents/{id}/deployments/{dep_id}/variables` path
+- StrategyPage: replace `/api/admin/strategy/graph` path with `POST /agents/{id}/deployments` using graph JSON as `variables.graph`
+
+**Wave 3 (big — a week): Telemetry uplift**
+- Extend `DeploymentStateRow` with full metric set (VPIN, Kyle λ, adverse bps, regime, kill_level, spread_compliance, venue/product, mode, fills, volume, etc.)
+- Agent populates these from MarketMakerRunner state on its telemetry cadence
+- `adapter.rs` maps them into `SymbolState` instead of filling defaults
+- Overview, AdaptivePanel, AdverseSelection, ManipulationScores, SurveillancePage (per-symbol) all come back online with real data
+- Calibration page rewires to pull per-deployment calibration
+
+**Wave 4 (big — 3-5 days): Audit + compliance aggregation**
+- Agents stream audit events to controller (new telemetry kind)
+- Controller aggregates into a fleet-wide audit log
+- MiCA report endpoints read aggregated log instead of single engine's
+- HistoryPage reads from aggregated log
+
+**Wave 5 (polish — day): Kill-switch rewire**
+- Kill switch currently a global /symbol op. Rewire to per-deployment (multiple deployments can have same symbol on different agents)
+- Controls.svelte gains agent+deployment selector
+
+Pick-up in any order depending on which operator pain is sharpest.
+
+---
+
+## Stabilization plan — 2026-04-21 (post-distributed audit)
+
+Triple-agent audit (graph system, UI flow, compliance surface)
+after the monolith→distributed port uncovered a set of gaps that
+block a clean end-to-end "login → author → deploy → monitor →
+report" flow. Four waves below, **execute in order**.
+
+**Wave A — deploy flow unification (highest impact, ~2 days)**
+
+Operator today can't answer "what graph is running on agent X?"
+and has to save + pick + swap in two pages. Fix that first.
+
+- [ ] **A1** Agent echoes `graph_hash: Option<String>` +
+  `template: Option<String>` in `DeploymentStateRow`. Populated
+  on engine start from the resolved template/graph; updated on
+  `StrategyGraphSwap` override. Fleet readback shows it.
+- [ ] **A2** Add `GET /api/v1/agents/{id}/deployments/{dep}/variables`
+  returning the currently-applied variables map (agent serves
+  from its own DesiredStrategy state). Mirror of the existing
+  PATCH — no introspection today.
+- [ ] **A3** `StrategyPage` gains a single "Deploy" action that
+  combines save-graph + pick-agent + dispatch into one modal.
+  Current three-step flow (save → open picker → swap) becomes
+  one confirmation dialog with fleet selector + variable form.
+- [ ] **A4** `DeployDialog` gains a "Custom graph" tab next to
+  "Template". Same modal, two modes. Graph mode imports from
+  StrategyPage draft or file.
+- [ ] **A5** `StrategyPage` rollback surface: list graph history
+  (`/api/v1/strategy/graphs/{name}/history`) + one-click
+  "rollback to hash X on deployment Y". `rollbackFrom` state
+  already exists (line 50) — just needs the button.
+- [ ] **A6** Graph preview: wire `POST /api/v1/strategy/preview`
+  to StrategyPage — dry-run the evaluator with sample inputs,
+  show emitted quotes without touching the fleet.
+
+**Wave B — fleet-aware client reports (~3 days)**
+
+Today `/api/v1/pnl`, `/sla`, `/positions`, `/client/{id}/*` read
+a local `DashboardState` on the controller that never gets
+populated (engines live on agents). Only MiCA monthly export is
+fleet-aware, via the `AuditRangeFetcher` pattern landed
+2026-04-21. Reuse that pattern.
+
+- [ ] **B1** Generalize the fetcher-closure pattern: introduce
+  `FleetClientReportFetcher` on `DashboardState` which fans out
+  per-deployment detail queries to all accepted agents with a
+  matching `profile.client_id` and merges into the existing
+  client-portal response shapes.
+- [ ] **B2** Wire `/api/v1/pnl`, `/api/v1/pnl/timeseries`,
+  `/api/v1/sla`, `/api/v1/sla/certificate`, `/api/v1/positions`,
+  `/api/v1/client/{id}/*` through the new fetcher. Fallback to
+  local state only when no deployments exist (test mode).
+- [ ] **B3** New details topics the agents must publish (engine
+  already tracks these, just needs the topic registration):
+  `pnl_snapshot`, `positions_snapshot`, `sla_snapshot`,
+  `reconciliation_snapshot`.
+- [ ] **B4** Per-client drilldown page:
+  `frontend/src/lib/pages/ClientPage.svelte`. Joins fleet rows
+  by `profile.client_id` → shows positions per venue, PnL
+  attribution per strategy, SLA certificate, open fills,
+  webhook delivery log. Renders the fleet-aware endpoints.
+- [ ] **B5** Hot client-onboarding: registering a client in
+  ClientOnboardingPanel currently requires agent restart. Send
+  an `AddClient` command to every accepted agent so new-client
+  state (`ClientConfig` slot, PnL row, SLA tracker) spawns
+  without restart.
+
+**Wave C — missing operator surfaces (~3 days)**
+
+Gaps that are silent footguns: operator can't see
+reconciliation drift, can't pause the whole fleet at once, can
+revoke an agent that still has live deployments, can't rotate
+credentials.
+
+- [ ] **C1** ReconciliationPage — new details topic
+  `reconciliation_snapshot` (phantom orders, orphaned orders,
+  balance drift). Controller endpoint
+  `GET /api/v1/reconciliation/fleet` fans out + aggregates.
+  Frontend page with three tables + "resolve" actions per row.
+- [ ] **C2** Global pause: `POST /api/v1/ops/pause_fleet` fans
+  out `ops/pause` to every accepted agent's active deployments.
+  Button at fleet-level on FleetPage. Same for `resume_fleet`.
+- [ ] **C3** Multi-agent batch deploy: `FleetPage` adds
+  checkbox selection → "Deploy to selected". `DeployDialog`
+  accepts an array of agent_ids → serial fan-out with
+  per-agent result report.
+- [ ] **C4** Revoke-flow safety: when operator clicks "Revoke"
+  on an agent with live deployments, show warning modal listing
+  them + option to "stop all deployments then revoke" vs "cancel".
+- [ ] **C5** Credential rotation UI: VaultPage edit mode that
+  bumps version without changing kind/ACL. Separate
+  `credential_rotated_at` timestamp. Per-credential fetch audit
+  (which agent fetched + when) via controller-side tap on
+  `resolve_for`.
+- [ ] **C6** Credential expiry warnings: optional
+  `expires_at: Option<DateTime>` on `VaultEntry`. VaultPage
+  renders red chip for <7 days remaining; Platform dashboard
+  has a rollup counter.
+- [ ] **C7** Fleet-level aggregate card on FleetPage: per-agent
+  "running N deployments · M live orders · total PnL $X · last
+  tick Y ms ago" summary row above the agent-card list.
+- [ ] **C8** Deployment-level flatten preview: before dispatch,
+  `GET .../ops/flatten/preview` returns qty/side/expected
+  slippage; confirmation modal shows it.
+
+**Wave E-I — auth, operator UX, incident playbook, compliance polish (in flight 2026-04-21)**
+
+Landed:
+- **E** Tenant-isolated client portal: `Role::ClientReader`,
+  `tenant_scope_middleware`, invite-based signup flow,
+  `/api/v1/client/self/*` aliases for self-scoped reads.
+- **F** Operator UX: pre-approve fingerprint, FirstInstallWizard,
+  EmptyStateGuide on Fleet/Clients, deploy templates carry
+  `risk_band` + `recommended_for` + `caveats`, kill drill-down
+  links deployment from Admin.
+- **G** Incident lifecycle: per-category auto-widen flags
+  (sla/manip/recon), `OpenIncident` store with ack + resolve
+  + post-mortem, violation rollup surfaces per-row Pause /
+  Widen / Open-incident actions.
+- **H** Auth hardening: password reset (admin mints one-shot
+  signed URL → user consumes → token burned), env-gated
+  `require_totp_for_admin` returning structured `must_enroll_totp`,
+  `/api/admin/auth/audit` readback + LoginAuditPage, public
+  probes verified minimal.
+- **I** Tenant-self webhook CRUD (list/add/remove/test) with
+  scheme + length validation + cross-tenant isolation tested.
+
+**SEC-1 (2026-04-21 evening) — CLOSED.** The product-journey smoke
+exposed that every route mounted via `mm_controller::http_router_full`
+(fleet, vault, approvals, agents/deployments, ops, tunables) was
+reachable anonymously. `curl -sS http://controller/api/v1/vault`
+without a token returned the full credential list. Wave H/I auth
+polish (password reset, TOTP gate, login audit) was effectively
+defense in depth over a ground-floor open door. Fixed with
+`router_full_authed(..., auth_state)`:
+- Tier 1 (read, admin/operator/viewer): `/api/v1/fleet`, vault
+  GET, approvals GET, tunables GET, templates, per-deployment
+  details read, surveillance/reconciliation/alerts fleet — layered
+  `auth_middleware` + `tenant_scope_middleware` (blocks ClientReader).
+- Tier 2 (control, admin/operator): deploy POST, variables PATCH,
+  ops/{op}, ops/fleet/{op}, audit/verify, sentiment/headline,
+  admin/config/{symbol} — layered `auth_middleware` +
+  `control_role_middleware` (Admin/Operator; blocks Viewer).
+- Tier 3 (admin only): vault POST/PUT/DELETE, approvals writes
+  (accept/reject/revoke/pre-approve/delete), tunables PUT,
+  agent profile PUT — layered `auth_middleware` + `admin_middleware`.
+- Regression test `crates/controller/tests/auth_matrix.rs` walks
+  the full role × route matrix; it must stay green.
+
+Outstanding follow-ups surfaced by the 2026-04-21 smoke run:
+- [x] **I3** Distributed webhook dispatch — CLOSED 2026-04-21
+  evening. Controller now runs a `webhook_fanout_loop` that
+  ticks every 5s, walks tenants with registered dispatchers,
+  pulls their `recent_fills` via the fleet fetcher, and fires
+  `WebhookEvent::Fill` for every fill newer than a per-tenant
+  cursor. First-pass-initialisation prevents flooding freshly
+  registered endpoints with pre-existing fills. Verified
+  live: tenant registered `http://sink:38080/hook`, deployed
+  paper avellaneda, 4 distinct Fill events delivered without
+  dupes (vs 9 engine fills — the gap is the cursor-bootstrap
+  skip, working as designed).
+- [x] **I4** Preview banner CLOSED — removed from
+  ClientPortalPage once I3 landed.
+- [ ] **H5** TOTP migration story: if an operator flips
+  `MM_REQUIRE_TOTP_FOR_ADMIN=true` while the root admin has
+  no TOTP, the admin is locked out (must bootstrap a fresh
+  deployment). Add a "lockout-safe" self-unlock via a signed
+  out-of-band token, or document "always enroll TOTP before
+  flipping the flag" in SECURITY.md + warn at server boot.
+- [ ] **TEST-1** `pentest_templates_e2e` flakes when run
+  concurrently (2/6 fail → 6/6 pass in isolation). Shared
+  global state (metrics registry? audit singleton?) needs a
+  per-test isolate or a serial-only `#[serial_test::serial]`.
+- [ ] **AUDIT-1** Controller auth-event fsync added
+  (2026-04-21) — LoginSucceeded/Failed/Logout + PasswordReset
+  Issued/Completed now critical. Agents emit their own event
+  classes; audit their critical list independently.
+
+---
+
+**Wave D — compliance polish (~2 days)**
+
+Surface-level polish for the compliance/audit flow. Lower
+urgency — current state already passes MiCA Article 17 export.
+
+- [ ] **D1** Hash-chain visual in AuditStream: highlight rows
+  where chain is broken (prev_hash mismatch). Requires audit
+  JSONL to carry both `hash` and `prev_hash` per row (already
+  does per `crates/risk/src/audit.rs`).
+- [ ] **D2** Signed audit-range export endpoint:
+  `POST /api/v1/audit/export` with `from_ms/until_ms/client_id`
+  → returns tamper-proof bundle (same HMAC-SHA256 manifest
+  shape as monthly bundle, arbitrary range). Button on
+  ReportsPanel.
+- [ ] **D3** Webhook test + delivery log: per-client "Test
+  webhook" button on ClientOnboardingPanel; controller stores
+  last-50 deliveries in a ring buffer, surfaces via a new
+  `/api/admin/clients/{id}/webhooks/deliveries` endpoint.
+- [ ] **D4** Fleet alert dedup: today each agent spawns its own
+  AlertManager → Telegram. Moves to controller:
+  `TelemetryPayload::Alert` envelope → controller dedups by
+  `(severity, message_hash)` with 60s window → single Telegram
+  send. Keeps per-agent AlertManager as emitter only.
+- [ ] **D5** Compliance violations panel: per-client watch list
+  (daily loss > threshold, position limit breach, SLA uptime
+  drop, halt participation). Rolls up across the fleet with
+  direct links to relevant drilldown.
+
+---
+
+
 
 Tracking debt not yet closed. Closed items live in git history.
 Each row is a concrete deliverable; bigger initiatives are
@@ -100,6 +552,42 @@ Legend:
   7 tests in `crates/strategy-graph/src/nodes/plan.rs`.
 
 ### UI / UX
+- [ ] **UX-SURV-1** Surveillance detectors are currently a
+  standalone global page with 16 empty cards until a strategy
+  is quoting a symbol — operator-unfriendly "no data / no data /
+  no data" wall. Detectors only make sense in the
+  `(strategy, symbol)` context: move per-symbol scores onto
+  `OrderbookPage` alongside the book they describe, and into
+  `StrategyPage` drilldown as a toxicity/environment panel.
+  Remove the nav entry for the standalone page; keep an
+  admin-only raw diagnostic view if engineering still wants it.
+  Audit/log side unchanged — this is purely UI reorganisation.
+- [ ] **UX-VENUE-1** Per-venue market strip on Overview is live
+  (`/api/v1/venues/book_state` → `VenueMarketStrip.svelte`) and
+  publishes `primary_engine.book` + `hedge_book` to the data bus.
+  **Gap**: SOR-extra venues (e.g. Binance linear perp in
+  `cross-exchange-paper.toml`) are not WS-subscribed — they only
+  serve on-demand REST queries inside `VenueStateAggregator.collect`.
+  Result: the strip currently renders only primary (+ hedge when
+  cross-exchange). Two fixes possible: (a) subscribe extras to WS
+  + stream their books through a lightweight `ExtraBookKeeper`
+  in the engine; (b) periodic `get_orderbook(depth=1)` poll per
+  extra on a new tokio interval that publishes L1 to the data
+  bus. Option (b) is simpler but lossy; (a) is correct.
+- [ ] **UX-VENUE-2** Per-venue regime classification. Today the
+  engine runs one `RegimeClassifier` on the primary mid stream
+  and the Overview's market-quality card labels its regime chip
+  `primary`. For cross-venue, operators want to see regime for
+  EACH active venue surface (spot `Quiet` vs perp `Volatile` is
+  a real signal). Depends on UX-VENUE-1 landing first so there's
+  per-venue mid data on the data bus to feed classifiers.
+- [ ] **UX-VENUE-3** Bybit hedge WS book stream is silent —
+  `hedge_conn.subscribe(BTCUSDT)` on Bybit linear perp delivers
+  only a `Connected` event; no subsequent `BookSnapshot` /
+  `BookDelta`. Initial REST orderbook load works (see
+  `initial hedge book loaded seq=...`) but without WS streaming
+  the hedge book stays stale from t=0. Root-cause the Bybit V5
+  WS subscribe call path in `crates/exchange/bybit`.
 - [x] **UI-5** `StrategyDeployHistory.svelte` gained a Diff
   button per history row: loads the current + previous deploy
   bodies via `/api/v1/strategy/graphs/{name}/history/{hash}`,
@@ -1277,3 +1765,21 @@ See git log since 2026-04-17 for:
   sub-bullets inline — no separate file per epic.
 - Revisit P0 list after every paper-trading smoke run —
   whatever the operator hit first belongs at the top.
+
+---
+
+## Legacy cleanup tracker
+
+When a dated pattern surfaces during an audit that's too big to
+refactor in the same session, log it here with file:line + the
+replacement approach. Refactor-in-place is the default — entries
+here are only the deferred cases.
+
+**Format**: `- [ ] **LEGACY-NNN** — <kind> at <file>:<line>. Replace
+with <new approach>. Estimated scope: <size>.`
+
+No entries yet — the Apr-2026 audit sweeps refactored every
+dated pattern in place (xemm `.expect("is_some")`, venue-scoped
+env-var migration, stale audit-event type names). Add entries
+here when the next audit pass finds something too big for a
+single-session refactor.

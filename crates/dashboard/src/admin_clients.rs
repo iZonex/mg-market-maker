@@ -20,6 +20,15 @@ pub fn admin_client_routes() -> Router<DashboardState> {
         .route("/api/admin/clients", post(create_client))
         .route("/api/admin/clients", get(list_clients))
         .route("/api/admin/clients/{id}", get(get_client))
+        // Wave D3 — webhook test + delivery log.
+        .route(
+            "/api/admin/clients/{id}/webhooks/test",
+            post(post_webhook_test),
+        )
+        .route(
+            "/api/admin/clients/{id}/webhooks/deliveries",
+            get(get_webhook_deliveries),
+        )
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,7 +102,8 @@ async fn create_client(
             .into_response();
     }
 
-    // Register client and its symbols.
+    // Register client and its symbols on the controller-side
+    // state (first-class view for `/api/v1/clients` listings).
     state.register_client(&req.id, &req.symbols);
 
     // Set up webhook dispatcher if URLs provided.
@@ -105,12 +115,23 @@ async fn create_client(
         state.set_client_webhook_dispatcher(&req.id, wh);
     }
 
-    Json(ClientResponse {
-        id: req.id,
-        name: Some(req.name),
-        symbols: req.symbols,
-        registered: true,
-    })
+    // Wave B5 — fan out to every accepted agent so per-client
+    // report endpoints (`/api/v1/client/{id}/*`) start
+    // aggregating fleet data immediately, without restart.
+    // Absent broadcaster (unit tests) degrades to controller-
+    // local registration above.
+    let mut propagated = 0usize;
+    if let Some(broadcaster) = state.fleet_add_client_broadcaster() {
+        propagated = broadcaster(req.id.clone(), req.symbols.clone()).await;
+    }
+
+    Json(serde_json::json!({
+        "id": req.id,
+        "name": req.name,
+        "symbols": req.symbols,
+        "registered": true,
+        "propagated_to_agents": propagated,
+    }))
     .into_response()
 }
 
@@ -143,6 +164,59 @@ async fn get_client(
         symbols: syms.into_iter().map(|s| s.symbol).collect(),
         registered,
     })
+}
+
+/// Wave D3 — fire a synthetic webhook payload to every URL
+/// registered for this client. Returns one record per URL
+/// (status, latency, error). Invalid client id → 404.
+async fn post_webhook_test(
+    State(state): State<DashboardState>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(dispatcher) = state.get_client_webhook_dispatcher(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "no webhook dispatcher registered for this client",
+                "client_id": id,
+            })),
+        )
+            .into_response();
+    };
+    let results = dispatcher.test_dispatch().await;
+    Json(serde_json::json!({
+        "client_id": id,
+        "attempted": results.len(),
+        "succeeded": results.iter().filter(|r| r.ok).count(),
+        "results": results,
+    }))
+    .into_response()
+}
+
+/// Wave D3 — return the last N webhook deliveries for this
+/// client. Newest first. Empty array when the dispatcher has
+/// never fired. 404 when the client has no dispatcher.
+async fn get_webhook_deliveries(
+    State(state): State<DashboardState>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(dispatcher) = state.get_client_webhook_dispatcher(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "no webhook dispatcher registered for this client",
+                "client_id": id,
+            })),
+        )
+            .into_response();
+    };
+    let records = dispatcher.recent_deliveries();
+    Json(serde_json::json!({
+        "client_id": id,
+        "count": records.len(),
+        "deliveries": records,
+    }))
+    .into_response()
 }
 
 #[cfg(test)]

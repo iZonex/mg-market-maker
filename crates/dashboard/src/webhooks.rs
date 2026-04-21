@@ -34,6 +34,19 @@ pub enum WebhookEvent {
         qty: Decimal,
         value_quote: Decimal,
     },
+    /// I3 (2026-04-21) — every fill, not only above the
+    /// "large" threshold. Fires from the controller's
+    /// periodic webhook-fanout loop once per new fill that
+    /// landed in the tenant's per-client metrics snapshot.
+    Fill {
+        symbol: String,
+        side: String,
+        price: Decimal,
+        qty: Decimal,
+        timestamp: String,
+        is_maker: bool,
+        fee: Decimal,
+    },
     /// Daily report generated.
     DailyReportReady {
         date: String,
@@ -73,6 +86,31 @@ struct WebhookInner {
     urls: Vec<String>,
     events_sent: u64,
     events_failed: u64,
+    /// Wave D3 — ring buffer of the last `DELIVERY_LOG_CAP`
+    /// dispatches. Operators read via
+    /// `/api/admin/clients/{id}/webhooks/deliveries` to verify
+    /// their endpoint is receiving + acknowledging the payload.
+    /// Newest last; drained FIFO once the cap is reached.
+    deliveries: std::collections::VecDeque<DeliveryRecord>,
+}
+
+const DELIVERY_LOG_CAP: usize = 50;
+
+/// One delivery attempt — which URL, status, error (if any),
+/// plus enough payload context to correlate on the receiver
+/// side. Kept small on purpose: event body lives in audit.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeliveryRecord {
+    pub timestamp: String,
+    pub url: String,
+    pub event_type: String,
+    pub ok: bool,
+    pub http_status: Option<u16>,
+    pub error: Option<String>,
+    /// Round-trip latency in milliseconds, from the moment we
+    /// invoked `.send()` to the moment we got the response (or
+    /// the error). `None` for fire-and-forget paths.
+    pub latency_ms: Option<u64>,
 }
 
 impl WebhookDispatcher {
@@ -84,8 +122,74 @@ impl WebhookDispatcher {
                 urls: Vec::new(),
                 events_sent: 0,
                 events_failed: 0,
+                deliveries: std::collections::VecDeque::with_capacity(DELIVERY_LOG_CAP),
             })),
         }
+    }
+
+    /// Wave D3 — read recent delivery records (newest first).
+    pub fn recent_deliveries(&self) -> Vec<DeliveryRecord> {
+        let g = self.inner.lock().unwrap();
+        g.deliveries.iter().rev().cloned().collect()
+    }
+
+    /// Wave D3 — synchronous, blocking test dispatch with a
+    /// minimal synthetic payload. Used by the admin "Test
+    /// webhook" button so operators get an immediate yes/no
+    /// on whether their URL is reachable + returning 2xx.
+    /// Delivery records are appended just like the async
+    /// `dispatch` path so the result shows up in the log too.
+    pub async fn test_dispatch(&self) -> Vec<DeliveryRecord> {
+        let urls = {
+            let inner = self.inner.lock().unwrap();
+            inner.urls.clone()
+        };
+        let payload = serde_json::json!({
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "event": { "kind": "test", "source": "mm-controller" },
+        });
+        let body = payload.to_string();
+        let mut out = Vec::new();
+        for url in &urls {
+            let client = reqwest::Client::new();
+            let started = std::time::Instant::now();
+            let (ok, http_status, error) = match client
+                .post(url)
+                .header("Content-Type", "application/json")
+                .body(body.clone())
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let s = resp.status();
+                    (s.is_success(), Some(s.as_u16()), None)
+                }
+                Err(e) => (false, None, Some(e.to_string())),
+            };
+            let rec = DeliveryRecord {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                url: url.clone(),
+                event_type: "test".into(),
+                ok,
+                http_status,
+                error,
+                latency_ms: Some(started.elapsed().as_millis() as u64),
+            };
+            if let Ok(mut inner) = self.inner.lock() {
+                if ok {
+                    inner.events_sent += 1;
+                } else {
+                    inner.events_failed += 1;
+                }
+                if inner.deliveries.len() >= DELIVERY_LOG_CAP {
+                    inner.deliveries.pop_front();
+                }
+                inner.deliveries.push_back(rec.clone());
+            }
+            out.push(rec);
+        }
+        out
     }
 
     /// Register a webhook URL. Duplicates are silently ignored.
@@ -100,6 +204,14 @@ impl WebhookDispatcher {
     pub fn remove_url(&self, url: &str) {
         let mut inner = self.inner.lock().unwrap();
         inner.urls.retain(|u| u != url);
+    }
+
+    /// Snapshot of the configured URLs. Read-only view for
+    /// surface readback (self-service panel, admin UI) that
+    /// doesn't need to mutate state. Cloned under the lock so
+    /// the caller's iteration cannot race with adds/removes.
+    pub fn list_urls(&self) -> Vec<String> {
+        self.inner.lock().unwrap().urls.clone()
     }
 
     /// Number of configured webhook URLs.
@@ -141,10 +253,27 @@ impl WebhookDispatcher {
         };
 
         let inner = self.inner.clone();
+        // Capture event kind (tag name) for the delivery log so
+        // operators can spot patterns ("all price-update posts
+        // are failing but fill events work") without replaying
+        // the full audit stream.
+        let event_type = serde_json::from_str::<serde_json::Value>(&json)
+            .ok()
+            .and_then(|v| v.get("event")
+                .and_then(|e| e.get("kind").and_then(|k| k.as_str()).map(String::from)
+                    .or_else(|| {
+                        // Unwrap the `#[serde(tag = "kind")]`
+                        // variant where serde flattens the tag
+                        // into the enclosing object.
+                        e.as_object()
+                            .and_then(|o| o.keys().next().cloned())
+                    })))
+            .unwrap_or_else(|| "unknown".into());
         tokio::spawn(async move {
             for url in &urls {
                 let client = reqwest::Client::new();
-                match client
+                let started = std::time::Instant::now();
+                let (ok, http_status, error) = match client
                     .post(url)
                     .header("Content-Type", "application/json")
                     .body(json.clone())
@@ -152,24 +281,40 @@ impl WebhookDispatcher {
                     .send()
                     .await
                 {
-                    Ok(resp) if resp.status().is_success() => {
-                        debug!(url, "webhook delivered");
-                        if let Ok(mut i) = inner.lock() {
-                            i.events_sent += 1;
-                        }
-                    }
                     Ok(resp) => {
-                        warn!(url, status = %resp.status(), "webhook delivery failed");
-                        if let Ok(mut i) = inner.lock() {
-                            i.events_failed += 1;
+                        let s = resp.status();
+                        let ok = s.is_success();
+                        if ok {
+                            debug!(url, "webhook delivered");
+                        } else {
+                            warn!(url, status = %s, "webhook delivery failed");
                         }
+                        (ok, Some(s.as_u16()), None)
                     }
                     Err(e) => {
                         warn!(url, error = %e, "webhook delivery error");
-                        if let Ok(mut i) = inner.lock() {
-                            i.events_failed += 1;
-                        }
+                        (false, None, Some(e.to_string()))
                     }
+                };
+                let latency_ms = Some(started.elapsed().as_millis() as u64);
+                if let Ok(mut i) = inner.lock() {
+                    if ok {
+                        i.events_sent += 1;
+                    } else {
+                        i.events_failed += 1;
+                    }
+                    if i.deliveries.len() >= DELIVERY_LOG_CAP {
+                        i.deliveries.pop_front();
+                    }
+                    i.deliveries.push_back(DeliveryRecord {
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        url: url.clone(),
+                        event_type: event_type.clone(),
+                        ok,
+                        http_status,
+                        error,
+                        latency_ms,
+                    });
                 }
             }
         });
@@ -206,6 +351,21 @@ mod tests {
         assert_eq!(d.url_count(), 1);
         d.remove_url("https://example.com/hook");
         assert_eq!(d.url_count(), 0);
+    }
+
+    #[test]
+    fn list_urls_returns_snapshot() {
+        let d = WebhookDispatcher::new();
+        assert!(d.list_urls().is_empty());
+        d.add_url("https://a.example/hook".into());
+        d.add_url("https://b.example/hook".into());
+        let urls = d.list_urls();
+        assert_eq!(urls.len(), 2);
+        assert!(urls.contains(&"https://a.example/hook".to_string()));
+        assert!(urls.contains(&"https://b.example/hook".to_string()));
+        d.remove_url("https://a.example/hook");
+        let urls = d.list_urls();
+        assert_eq!(urls, vec!["https://b.example/hook".to_string()]);
     }
 
     #[test]

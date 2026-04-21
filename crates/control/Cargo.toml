@@ -1,0 +1,38 @@
+[package]
+name = "mm-control"
+version.workspace = true
+edition.workspace = true
+
+# The control-plane protocol shared by the controller and agent binaries.
+# Keeps message types, leases, the fail-ladder schema, sequence-number
+# cursors, the last-known-good cache format, and the Transport trait
+# in one place so controller + agent cannot drift out of sync — they
+# compile against the same envelope definitions.
+#
+# IO deliberately stays out: this crate defines types + traits.
+# Concrete transports (in-memory for local/test, WS-RPC for real
+# colo deployments) live next to the binaries that consume them.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+futures-util = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+rcgen = "0.13"
+tempfile = "3"
+serde_json = { workspace = true }

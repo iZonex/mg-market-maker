@@ -23,15 +23,19 @@
   // status payload. Falls back to null so the existing UI
   // never blocks on the new endpoint being unreachable.
   let latencyP95 = $state({})
+  // 23-UX-6 — venue-scoped kill overlay. Map venue → level
+  // read from /api/v1/kill/venues; absent / 0 = Normal.
+  let venueKillLevels = $state({})
   let error = $state(null)
   let lastFetch = $state(null)
   let loading = $state(true)
 
   async function refresh() {
     try {
-      const [statusData, latencyData] = await Promise.all([
+      const [statusData, latencyData, venueKill] = await Promise.all([
         api.getJson('/api/v1/venues/status'),
         api.getJson('/api/v1/venues/latency_p95').catch(() => null),
+        api.getJson('/api/v1/kill/venues').catch(() => null),
       ])
       rows = Array.isArray(statusData) ? statusData : []
       const next = {}
@@ -41,12 +45,34 @@
         }
       }
       latencyP95 = next
+      const vk = {}
+      for (const row of venueKill?.venues ?? []) {
+        if (typeof row?.level === 'number') {
+          vk[row.venue] = row.level
+        }
+      }
+      venueKillLevels = vk
       error = null
       lastFetch = new Date()
       loading = false
     } catch (e) {
       error = e?.message || String(e)
       loading = false
+    }
+  }
+
+  // 23-UX-6 — POST a new kill level for a venue. Refresh
+  // immediately so the chip updates without waiting for the
+  // next poll tick. `level=0` clears.
+  async function setVenueKill(venue, level) {
+    try {
+      await api.postJson(`/api/v1/ops/venue-kill/${encodeURIComponent(venue)}`, {
+        level,
+        reason: 'dashboard operator',
+      })
+      await refresh()
+    } catch (e) {
+      error = e?.message || String(e)
     }
   }
 
@@ -121,9 +147,31 @@
         <div class="venue" class:halted={v.halted}>
           <div class="venue-head">
             <span class="name">{v.venue}</span>
-            <span class="chip" style:color={killColour(v.max_kill)}>
-              {killLabel[v.max_kill] || 'UNKNOWN'}
-            </span>
+            <div class="chips">
+              <span class="chip" style:color={killColour(v.max_kill)}>
+                {killLabel[v.max_kill] || 'UNKNOWN'}
+              </span>
+              {#if (venueKillLevels[v.venue] || 0) > 0}
+                <span class="chip venue-kill" style:color={killColour(venueKillLevels[v.venue])}>
+                  VENUE·{killLabel[venueKillLevels[v.venue]]}
+                </span>
+              {/if}
+            </div>
+          </div>
+          <div class="venue-controls">
+            <label for="vk-{v.venue}">Venue kill:</label>
+            <select
+              id="vk-{v.venue}"
+              value={venueKillLevels[v.venue] || 0}
+              onchange={(e) => setVenueKill(v.venue, Number(e.target.value))}
+            >
+              <option value={0}>0 · Normal</option>
+              <option value={1}>1 · Widen</option>
+              <option value={2}>2 · Stop new</option>
+              <option value={3}>3 · Cancel all</option>
+              <option value={4}>4 · Flatten</option>
+              <option value={5}>5 · Disconnect</option>
+            </select>
           </div>
           <div class="stats">
             <div class="stat">
@@ -218,6 +266,27 @@
     text-transform: uppercase;
     letter-spacing: var(--tracking-label);
     font-weight: 600;
+  }
+  .chips { display: flex; gap: var(--s-1); align-items: baseline; }
+  .chip.venue-kill {
+    border: 1px solid currentColor;
+    padding: 0 var(--s-1);
+    border-radius: var(--r-sm);
+  }
+  .venue-controls {
+    display: flex; gap: var(--s-1); align-items: center;
+    margin-top: var(--s-1); margin-bottom: var(--s-2);
+    font-size: 10px;
+    color: var(--fg-muted);
+  }
+  .venue-controls select {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    background: var(--bg-chip);
+    color: var(--fg-primary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--r-sm);
+    padding: 2px 4px;
   }
   .stats {
     display: flex; flex-direction: column; gap: 2px;

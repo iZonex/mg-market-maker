@@ -65,7 +65,7 @@ impl PresenceBucket {
 
 /// Per-hour SLA summary for time-of-day breakdown. Clients
 /// use this to verify compliance during specific trading windows.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HourlyPresenceSummary {
     /// Hour of day in UTC (0..23).
     pub hour: u8,
@@ -525,6 +525,37 @@ mod tests {
         // Uptime: only tick 3 was fully compliant → 33.33%.
         let uptime_pct = tracker.uptime_pct();
         assert!(uptime_pct > dec!(33) && uptime_pct < dec!(34));
+    }
+
+    /// SLA-1 regression — with `min_depth_quote = 0` (paper-mode
+    /// relax path in `MarketMakerEngine::new`) the depth gate
+    /// must not trip compliant=false on legitimate tiny quotes.
+    /// Under that config, a tick with two-sided quotes +
+    /// in-spec spread + near-zero depth must be compliant, so
+    /// presence_pct rises toward 100 instead of staying at 0.
+    #[test]
+    fn zero_min_depth_does_not_fail_tiny_paper_quotes() {
+        let mut tracker = SlaTracker::new(SlaConfig {
+            max_spread_bps: dec!(100),
+            min_depth_quote: dec!(0),
+            min_uptime_pct: dec!(95),
+            two_sided_required: true,
+            max_requote_secs: 5,
+            min_order_rest_secs: 3,
+        });
+        // Tiny paper quote: $90 per side — wouldn't pass the
+        // $2000 production threshold but does pass the relaxed
+        // paper floor.
+        for _ in 0..10 {
+            tracker.update_quotes(true, true, Some(dec!(50)), dec!(90), dec!(90));
+            tracker.tick();
+        }
+        let summary = tracker.daily_presence_summary();
+        assert_eq!(
+            summary.presence_pct,
+            dec!(100),
+            "paper-mode tiny quotes must count as compliant under relaxed depth"
+        );
     }
 
     #[test]

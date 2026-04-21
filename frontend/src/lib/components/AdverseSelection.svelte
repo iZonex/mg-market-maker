@@ -23,8 +23,35 @@
 
   async function refresh() {
     try {
-      const data = await api.getJson('/api/v1/adverse-selection')
-      rows = data?.rows ?? []
+      const fleet = await api.getJson('/api/v1/fleet')
+      const fetches = []
+      for (const a of Array.isArray(fleet) ? fleet : []) {
+        for (const d of a.deployments || []) {
+          if (!d.running) continue
+          const path = `/api/v1/agents/${encodeURIComponent(a.agent_id)}`
+            + `/deployments/${encodeURIComponent(d.deployment_id)}`
+            + `/details/adverse_selection`
+          fetches.push(
+            api.getJson(path)
+              .then(resp => resp.payload?.row ? [resp.payload.row] : [])
+              .catch(() => []),
+          )
+        }
+      }
+      const all = (await Promise.all(fetches)).flat()
+      // One row per symbol — dedup (same symbol may appear on
+      // multiple deployments; keep the one with highest
+      // adverse_bps, worst-case signal).
+      const bySymbol = new Map()
+      for (const r of all) {
+        const prev = bySymbol.get(r.symbol)
+        if (!prev || Number(r.adverse_bps) > Number(prev.adverse_bps)) {
+          bySymbol.set(r.symbol, r)
+        }
+      }
+      rows = Array.from(bySymbol.values()).sort((a, b) =>
+        a.symbol.localeCompare(b.symbol),
+      )
       error = null
       lastFetch = new Date()
       loading = false

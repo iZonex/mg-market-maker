@@ -407,7 +407,10 @@ impl HyperLiquidConnector {
             b: is_buy,
             p: format_decimal(price, px_decimals),
             s: format_decimal(order.qty, sz_decimals),
-            r: false,
+            // HyperLiquid's `r` field IS reduceOnly. Thread the
+            // operator's flag through — the venue refuses the
+            // order when the fill would grow the position.
+            r: order.reduce_only,
             t: HlOrderTif::Limit {
                 limit: HlLimit { tif: tif.into() },
             },

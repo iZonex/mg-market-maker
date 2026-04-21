@@ -31,3 +31,18 @@ docs/epics/
 docs/audits/
 docs/sprints/
 .claude/
+
+# Smoke / paper-run scratch dirs — generated credentials, leases,
+# approvals, audit files. Never ship.
+.smoke-run/
+auth-secret
+jwt-secret
+master-key
+users.json
+vault.json
+approvals.json
+tunables.json
+dev-master-key
+dev-users.json
+dev-vault.json
+frontend/auth-secret

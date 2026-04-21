@@ -23,8 +23,24 @@
 
   async function refresh() {
     try {
-      const data = await api.getJson('/api/v1/sor/decisions/recent?limit=30')
-      decisions = data?.decisions ?? []
+      const fleet = await api.getJson('/api/v1/fleet')
+      const fetches = []
+      for (const a of Array.isArray(fleet) ? fleet : []) {
+        for (const d of a.deployments || []) {
+          if (!d.running) continue
+          const path = `/api/v1/agents/${encodeURIComponent(a.agent_id)}`
+            + `/deployments/${encodeURIComponent(d.deployment_id)}`
+            + `/details/sor_decisions_recent`
+          fetches.push(
+            api.getJson(path)
+              .then(resp => resp.payload?.decisions || [])
+              .catch(() => []),
+          )
+        }
+      }
+      const all = (await Promise.all(fetches)).flat()
+      all.sort((a, b) => (b.ts_ms ?? 0) - (a.ts_ms ?? 0))
+      decisions = all.slice(0, 30)
       error = null
       lastFetch = new Date()
       loading = false

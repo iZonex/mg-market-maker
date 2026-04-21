@@ -598,6 +598,13 @@ async fn place_ioc_leg(
         qty: rounded_qty,
         time_in_force: Some(TimeInForce::Ioc),
         client_order_id: Some(format!("{label}-{}", uuid_like_stub(symbol))),
+        // Stat-arb legs can both open AND close positions depending
+        // on the signal direction. Without a per-dispatch signal
+        // flag here we default to false (allow opening). Wiring
+        // "close vs open" intent through is a follow-up; in the
+        // meantime an accidental flip is caught by the pair-break
+        // detector.
+        reduce_only: false,
     };
     match connector.place_order(&order).await {
         Ok(order_id) => {

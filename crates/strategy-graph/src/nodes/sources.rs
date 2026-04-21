@@ -844,6 +844,118 @@ impl NodeKind for TradeTape {
     }
 }
 
+/// `Trade.OwnFill` — pulse source that fires ONE tick per fill
+/// of the engine's own order(s). Outputs:
+///   - `fired`: `true` on the tick a fill was observed, else
+///     `false`. Downstream gates (`Cast.ToBool` → `Out.*If`) use
+///     it as the edge trigger.
+///   - `side`: `+1` for buy fill, `-1` for sell, `0` when `fired`
+///     is false. Number (not Enum) so math nodes can compose —
+///     e.g. `Math.Mul(side, qty)` gives signed delta directly.
+///   - `qty`: fill quantity on the firing tick, `0` otherwise.
+///   - `price`: fill price on the firing tick, `0` otherwise.
+///
+/// When multiple fills land between two ticks, the source emits
+/// the AGGREGATE of the batch: `side` is taken from the last fill,
+/// `qty` is the sum, `price` is the quantity-weighted average.
+/// Aggregating (rather than dropping all-but-one) keeps the
+/// reactive-hedge flow correct even under a burst where an order
+/// partial-fills twice before the engine ticks.
+///
+/// Config fields let operators filter to a specific venue/symbol
+/// or by maker-vs-taker so a hedge-side template only fires on
+/// primary-venue maker fills. Empty filters = any.
+///
+/// Phase IV XEMM-native — this is the source that makes
+/// fill-triggered cross-venue hedging expressible in the graph
+/// without touching the legacy `XemmExecutor`.
+#[derive(Debug, Default)]
+pub struct TradeOwnFill;
+
+static OWN_FILL_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
+    vec![
+        Port::new("fired", PortType::Bool),
+        Port::new("side", PortType::Number),
+        Port::new("qty", PortType::Number),
+        Port::new("price", PortType::Number),
+    ]
+});
+
+impl NodeKind for TradeOwnFill {
+    fn kind(&self) -> &'static str {
+        "Trade.OwnFill"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &EMPTY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &OWN_FILL_OUTPUTS
+    }
+    fn config_schema(&self) -> Vec<crate::node::ConfigField> {
+        use crate::node::{ConfigEnumOption, ConfigField, ConfigWidget};
+        vec![
+            ConfigField {
+                name: "venue",
+                label: "Venue filter (optional)",
+                hint: Some("Only fire when fill is on this venue. Empty = any."),
+                default: serde_json::json!(""),
+                widget: ConfigWidget::Text,
+            },
+            ConfigField {
+                name: "symbol",
+                label: "Symbol filter (optional)",
+                hint: Some("Only fire when fill is on this symbol. Empty = any."),
+                default: serde_json::json!(""),
+                widget: ConfigWidget::Text,
+            },
+            ConfigField {
+                name: "role",
+                label: "Maker / taker filter",
+                hint: Some("Maker = only fills from posted quotes; taker = only crossing fills."),
+                default: serde_json::json!("any"),
+                widget: ConfigWidget::Enum {
+                    options: vec![
+                        ConfigEnumOption { value: "any", label: "Any" },
+                        ConfigEnumOption { value: "maker", label: "Maker only" },
+                        ConfigEnumOption { value: "taker", label: "Taker only" },
+                    ],
+                },
+            },
+            ConfigField {
+                name: "side_filter",
+                label: "Side filter",
+                hint: Some("Trigger only on one side of fills."),
+                default: serde_json::json!("any"),
+                widget: ConfigWidget::Enum {
+                    options: vec![
+                        ConfigEnumOption { value: "any", label: "Any" },
+                        ConfigEnumOption { value: "buy", label: "Buy only" },
+                        ConfigEnumOption { value: "sell", label: "Sell only" },
+                    ],
+                },
+            },
+        ]
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        // Default to non-firing when the engine overlay hasn't
+        // populated this tick's source_inputs (cold boot, test
+        // harness without engine wiring, etc). The `fired=false`
+        // output lets downstream gates fail closed — no hedge
+        // fires on a missing fill event.
+        Ok(vec![
+            Value::Bool(false),
+            Value::Number(rust_decimal::Decimal::ZERO),
+            Value::Number(rust_decimal::Decimal::ZERO),
+            Value::Number(rust_decimal::Decimal::ZERO),
+        ])
+    }
+}
+
 /// `Balance(venue, asset)` — wallet balance off the bus. `total`
 /// and `available` are what graphs usually consume; `reserved` is
 /// the margin + open-orders-locked portion for parity with
@@ -1909,5 +2021,55 @@ mod tests {
         let n = PairClassCurrent;
         assert_eq!(n.output_ports().len(), 1);
         assert_eq!(n.output_ports()[0].ty, PortType::PairClass);
+    }
+
+    /// Phase IV — `Trade.OwnFill` declares 4 outputs with the
+    /// expected types so downstream gates can distinguish the
+    /// firing-edge boolean from the numeric side/qty/price.
+    #[test]
+    fn trade_own_fill_declares_fired_bool_plus_three_numbers() {
+        let n = TradeOwnFill;
+        assert!(n.input_ports().is_empty());
+        let out = n.output_ports();
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0].name, "fired");
+        assert_eq!(out[0].ty, PortType::Bool);
+        assert_eq!(out[1].name, "side");
+        assert_eq!(out[1].ty, PortType::Number);
+        assert_eq!(out[2].name, "qty");
+        assert_eq!(out[2].ty, PortType::Number);
+        assert_eq!(out[3].name, "price");
+        assert_eq!(out[3].ty, PortType::Number);
+    }
+
+    /// Default (no engine overlay) emits `fired=false` + zeros so
+    /// a downstream `Cast.ToBool` or `Out.VenueQuotesIf` gate fails
+    /// closed — no hedge fires on a missing fill event.
+    #[test]
+    fn trade_own_fill_default_emits_fired_false_and_zeros() {
+        let mut state = NodeState::default();
+        let out = TradeOwnFill
+            .evaluate(&EvalCtx::default(), &[], &mut state)
+            .unwrap();
+        match &out[0] {
+            Value::Bool(b) => assert!(!*b, "fired must default to false"),
+            other => panic!("expected Bool, got {other:?}"),
+        }
+        for i in 1..=3 {
+            match &out[i] {
+                Value::Number(n) => assert_eq!(*n, rust_decimal::Decimal::ZERO),
+                other => panic!("expected Number, got {other:?}"),
+            }
+        }
+    }
+
+    /// Schema includes venue/symbol/role/side_filter so operators
+    /// can narrow the source to a specific leg without pulling in
+    /// downstream filter nodes.
+    #[test]
+    fn trade_own_fill_schema_exposes_four_filter_fields() {
+        let schema = TradeOwnFill.config_schema();
+        let names: Vec<&str> = schema.iter().map(|f| f.name).collect();
+        assert_eq!(names, vec!["venue", "symbol", "role", "side_filter"]);
     }
 }

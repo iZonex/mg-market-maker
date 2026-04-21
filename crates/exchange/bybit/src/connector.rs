@@ -464,7 +464,11 @@ impl ExchangeConnector for BybitConnector {
     }
 
     async fn place_order(&self, order: &NewOrder) -> anyhow::Result<OrderId> {
-        let body = serde_json::json!({
+        // Bybit V5 honours `reduceOnly: true` on Linear + Inverse
+        // perp categories; Spot silently ignores. Threading the
+        // operator's flag through lets MarginGuard + paired-unwind
+        // slices guarantee the fill can ONLY unwind.
+        let mut body = serde_json::json!({
             "category": self.category.as_str(),
             "symbol": order.symbol,
             "side": match order.side { Side::Buy => "Buy", Side::Sell => "Sell" },
@@ -473,6 +477,9 @@ impl ExchangeConnector for BybitConnector {
             "price": order.price.map(|p| p.to_string()),
             "timeInForce": bybit_tif(order.time_in_force),
         });
+        if order.reduce_only {
+            body["reduceOnly"] = Value::Bool(true);
+        }
         // Only a REST path exists today — WS trading is listed as an
         // operator next-step in docs/deployment.md §3. The metric label
         // reflects reality.
@@ -494,14 +501,18 @@ impl ExchangeConnector for BybitConnector {
         let batch: Vec<Value> = orders
             .iter()
             .map(|o| {
-                serde_json::json!({
+                let mut entry = serde_json::json!({
                     "symbol": o.symbol,
                     "side": match o.side { Side::Buy => "Buy", Side::Sell => "Sell" },
                     "orderType": match o.order_type { OrderType::Limit => "Limit", OrderType::Market => "Market" },
                     "qty": o.qty.to_string(),
                     "price": o.price.map(|p| p.to_string()),
                     "timeInForce": bybit_tif(o.time_in_force),
-                })
+                });
+                if o.reduce_only {
+                    entry["reduceOnly"] = Value::Bool(true);
+                }
+                entry
             })
             .collect();
 

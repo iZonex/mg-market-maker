@@ -6,6 +6,7 @@ pub mod auth;
 pub mod client_api;
 pub mod client_portal;
 pub mod data_bus;
+pub mod details_store;
 pub mod email;
 pub mod metrics;
 pub mod mica_report;

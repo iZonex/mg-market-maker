@@ -1,12 +1,18 @@
 <script>
   /*
-   * Surveillance — live detector score board.
+   * Surveillance — fleet-wide detector board.
    *
-   * Reads GET /api/v1/surveillance/scores every `REFRESH_MS`,
-   * groups by pattern, and renders a row per (pattern, symbol)
-   * with a horizontal bar that colour-codes on the 0.8 alert
-   * threshold. Cumulative alert count per row is the total
-   * audit rows fired for that pattern since server start.
+   * Reads GET /api/v1/surveillance/fleet every `REFRESH_MS` —
+   * the controller joins every live DeploymentStateRow's
+   * manipulation_* scalars into one array, sorted by the
+   * combined score (highest first). Engine emits the underlying
+   * Prometheus gauges on each refresh tick; the agent scrapes +
+   * forwards via telemetry.
+   *
+   * The earlier 16-pattern detector board was speculative UI
+   * ahead of the risk layer — the actual aggregator surfaces
+   * only four categories (pump_dump, wash, thin_book, combined)
+   * and this page now matches what the detector really reports.
    */
   import Card from '../components/Card.svelte'
   import { createApiClient } from '../api.svelte.js'
@@ -16,47 +22,27 @@
 
   const REFRESH_MS = 3_000
   const ALERT_THRESHOLD = 0.8
+  const WATCH_THRESHOLD = 0.5
 
-  // Patterns in a canonical order so the board doesn't reshuffle
-  // when detectors fire in different sequences tick-to-tick.
-  const PATTERN_ORDER = [
-    'spoofing', 'layering', 'quote_stuffing',
-    'wash', 'momentum_ignition', 'fake_liquidity',
-    'marking_close', 'cross_market', 'latency_exploit',
-    'rebate_abuse', 'imbalance_manipulation',
-    'cancel_on_reaction', 'one_sided_quoting',
-    'inventory_pushing', 'strategic_non_filling',
-    'foreign_twap',
+  // Category order mirrors the `ManipulationScoreSnapshot` enum
+  // order in crates/risk/src/manipulation.rs so the board reads
+  // the same way every tick.
+  const CATEGORIES = [
+    { key: 'combined',  label: 'Combined',    hint: 'Aggregator over sub-detectors' },
+    { key: 'pump_dump', label: 'Pump-dump',   hint: 'Abnormal up-move followed by dump' },
+    { key: 'wash',      label: 'Wash',        hint: 'Self-trading / matched counterparty' },
+    { key: 'thin_book', label: 'Thin book',   hint: 'Depth collapse relative to recent baseline' },
   ]
 
-  const PATTERN_LABELS = {
-    spoofing: 'Spoofing',
-    layering: 'Layering',
-    quote_stuffing: 'Quote stuffing',
-    wash: 'Wash trading',
-    momentum_ignition: 'Momentum ignition',
-    fake_liquidity: 'Fake liquidity',
-    marking_close: 'Marking the close',
-    cross_market: 'Cross-market manipulation',
-    latency_exploit: 'Latency exploit',
-    rebate_abuse: 'Rebate abuse',
-    imbalance_manipulation: 'Imbalance manipulation',
-    cancel_on_reaction: 'Cancel on reaction',
-    one_sided_quoting: 'One-sided quoting',
-    inventory_pushing: 'Inventory pushing',
-    strategic_non_filling: 'Strategic non-filling',
-    foreign_twap: 'Foreign TWAP (competing algo)',
-  }
-
-  let patterns = $state({})
+  let rows = $state([])
   let error = $state(null)
   let lastFetch = $state(null)
   let loading = $state(true)
 
   async function refresh() {
     try {
-      const data = await api.getJson('/api/v1/surveillance/scores')
-      patterns = data?.patterns ?? {}
+      const data = await api.getJson('/api/v1/surveillance/fleet')
+      rows = Array.isArray(data) ? data : []
       error = null
       lastFetch = new Date()
       loading = false
@@ -72,108 +58,159 @@
     return () => clearInterval(t)
   })
 
-  function barColour(score) {
-    if (score >= ALERT_THRESHOLD) return 'var(--danger)'
-    if (score >= 0.5) return 'var(--warn)'
+  function score(row, key) {
+    const n = parseFloat(row[key])
+    return Number.isFinite(n) ? n : 0
+  }
+
+  function tone(s) {
+    if (s >= ALERT_THRESHOLD) return 'danger'
+    if (s >= WATCH_THRESHOLD) return 'warn'
+    return 'ok'
+  }
+
+  function barColour(s) {
+    if (s >= ALERT_THRESHOLD) return 'var(--danger)'
+    if (s >= WATCH_THRESHOLD) return 'var(--warn)'
     return 'var(--accent)'
   }
 
-  function totalAlerts(patternKey) {
-    const rows = patterns[patternKey] || {}
-    return Object.values(rows).reduce((a, r) => a + (r.alerts_total ?? 0), 0)
-  }
+  // Counter roll-up per category — how many deployments are
+  // above the alert / watch thresholds right now. Gives the
+  // operator a single-glance pulse of the whole fleet.
+  const rollup = $derived.by(() => {
+    const out = {}
+    for (const cat of CATEGORIES) {
+      let alert = 0, watch = 0
+      let peak = 0
+      for (const r of rows) {
+        const s = score(r, cat.key)
+        if (s >= ALERT_THRESHOLD) alert += 1
+        else if (s >= WATCH_THRESHOLD) watch += 1
+        if (s > peak) peak = s
+      }
+      out[cat.key] = { alert, watch, peak }
+    }
+    return out
+  })
 
-  function maxScore(patternKey) {
-    const rows = patterns[patternKey] || {}
-    return Object.values(rows).reduce((m, r) => Math.max(m, r.score ?? 0), 0)
+  function fmtScore(n) {
+    if (!Number.isFinite(n)) return '—'
+    return n.toFixed(3)
   }
 </script>
 
 <div class="page scroll">
   <div class="header">
-    <div class="title">Surveillance detectors</div>
+    <div class="head-text">
+      <div class="title">Surveillance · fleet-wide</div>
+      <div class="subtitle">
+        Per-deployment manipulation detector scores, sorted by
+        combined risk. Scores above {WATCH_THRESHOLD} go amber,
+        above {ALERT_THRESHOLD} red.
+      </div>
+    </div>
     <div class="meta">
       {#if error}
         <span class="error">error: {error}</span>
       {:else if loading}
         <span class="stale"><span class="spinner" aria-hidden="true"></span>loading…</span>
       {:else if lastFetch}
-        <span class="stale">last refresh {lastFetch.toLocaleTimeString()}</span>
+        <span class="stale">{rows.length} deployment(s) · {lastFetch.toLocaleTimeString()}</span>
       {/if}
     </div>
   </div>
 
-  <div class="grid">
-    {#each PATTERN_ORDER as pattern (pattern)}
-      {@const rows = patterns[pattern] || {}}
-      {@const symbols = Object.keys(rows).sort()}
-      {@const mx = maxScore(pattern)}
-      {@const alerts = totalAlerts(pattern)}
-      <Card
-        title={PATTERN_LABELS[pattern] || pattern}
-        subtitle={symbols.length ? `${symbols.length} symbol(s)` : 'no data'}
-        span={1}
-      >
-        {#snippet children()}
-          <div class="pattern-body">
-            <div class="pattern-summary">
-              <span class="stat">
-                <span class="stat-label">peak</span>
-                <span class="stat-value" style:color={barColour(mx)}>
-                  {mx.toFixed(2)}
-                </span>
-              </span>
-              <span class="stat">
-                <span class="stat-label">alerts</span>
-                <span class="stat-value" class:hot={alerts > 0}>
-                  {alerts}
-                </span>
-              </span>
-            </div>
-            {#if symbols.length === 0}
-              <div class="empty">detector hasn't run yet</div>
-            {:else}
-              <div class="rows">
-                {#each symbols as sym (sym)}
-                  {@const row = rows[sym]}
-                  {@const pct = Math.min(100, Math.max(0, row.score * 100))}
-                  <div class="row" class:alerting={row.score >= ALERT_THRESHOLD}>
-                    <span class="sym">{sym}</span>
-                    <div class="bar-track">
-                      <div class="bar-fill" style:width="{pct}%" style:background={barColour(row.score)}></div>
-                      <div class="threshold" style:left="{ALERT_THRESHOLD * 100}%" aria-hidden="true"></div>
-                    </div>
-                    <span class="score" style:color={barColour(row.score)}>
-                      {row.score.toFixed(3)}
-                    </span>
-                    <span class="alerts" class:hot={row.alerts_total > 0}>
-                      {row.alerts_total}
-                    </span>
-                  </div>
-                {/each}
-              </div>
-            {/if}
-          </div>
-        {/snippet}
-      </Card>
+  <div class="rollup-row">
+    {#each CATEGORIES as cat (cat.key)}
+      {@const r = rollup[cat.key]}
+      <div class="rollup-cell">
+        <div class="rollup-label">{cat.label}</div>
+        <div class="rollup-stats">
+          <span class="rollup-peak" style:color={barColour(r?.peak ?? 0)}>
+            peak {fmtScore(r?.peak ?? 0)}
+          </span>
+          {#if (r?.alert ?? 0) > 0}
+            <span class="chip tone-danger">{r.alert} alert</span>
+          {/if}
+          {#if (r?.watch ?? 0) > 0}
+            <span class="chip tone-warn">{r.watch} watch</span>
+          {/if}
+          {#if (r?.alert ?? 0) === 0 && (r?.watch ?? 0) === 0}
+            <span class="chip tone-muted">quiet</span>
+          {/if}
+        </div>
+      </div>
     {/each}
   </div>
+
+  <Card title="Deployments" subtitle={`${rows.length} with data`} span={3}>
+    {#snippet children()}
+      {#if loading}
+        <div class="empty">loading fleet surveillance…</div>
+      {:else if rows.length === 0}
+        <div class="empty">
+          No deployments have emitted a manipulation score yet.
+          Detectors warm up after a few minutes of book + trade
+          history — this board populates once the first sample
+          lands.
+        </div>
+      {:else}
+        <table class="board">
+          <thead>
+            <tr>
+              <th>agent</th>
+              <th>deployment</th>
+              <th>symbol</th>
+              {#each CATEGORIES as cat (cat.key)}
+                <th title={cat.hint}>{cat.label}</th>
+              {/each}
+              <th class="num">kill</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each rows as row (`${row.agent_id}/${row.deployment_id}`)}
+              {@const combined = score(row, 'combined')}
+              <tr class:alerting={combined >= ALERT_THRESHOLD} class:watching={combined >= WATCH_THRESHOLD && combined < ALERT_THRESHOLD}>
+                <td class="mono">{row.agent_id}</td>
+                <td class="mono">{row.deployment_id}</td>
+                <td class="mono">{row.symbol}</td>
+                {#each CATEGORIES as cat (cat.key)}
+                  {@const s = score(row, cat.key)}
+                  {@const pct = Math.min(100, Math.max(0, s * 100))}
+                  <td class="score-cell">
+                    <div class="bar-track">
+                      <div class="bar-fill" style:width="{pct}%" style:background={barColour(s)}></div>
+                      <div class="threshold" style:left="{ALERT_THRESHOLD * 100}%" aria-hidden="true"></div>
+                    </div>
+                    <span class="score-value mono" style:color={barColour(s)}>{fmtScore(s)}</span>
+                  </td>
+                {/each}
+                <td class="num">
+                  {#if row.kill_level > 0}
+                    <span class="chip tone-danger">L{row.kill_level}</span>
+                  {:else}
+                    <span class="faint">—</span>
+                  {/if}
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      {/if}
+    {/snippet}
+  </Card>
 </div>
 
 <style>
   .page { padding: var(--s-6); height: calc(100vh - 57px); overflow-y: auto; }
   .header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: var(--s-4);
+    display: flex; align-items: flex-start; justify-content: space-between;
+    margin-bottom: var(--s-4); gap: var(--s-3);
   }
-  .title {
-    font-family: var(--font-sans);
-    font-size: var(--fs-lg);
-    font-weight: 600;
-    color: var(--fg-primary);
-  }
+  .head-text { display: flex; flex-direction: column; gap: 2px; max-width: 680px; }
+  .title { font-size: var(--fs-lg); font-weight: 600; color: var(--fg-primary); }
+  .subtitle { font-size: var(--fs-xs); color: var(--fg-muted); line-height: 1.5; }
   .meta { font-size: var(--fs-xs); color: var(--fg-muted); display: flex; align-items: center; gap: var(--s-2); }
   .meta .error { color: var(--danger); }
   .spinner {
@@ -187,54 +224,99 @@
     vertical-align: middle;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
-  .grid {
+
+  .rollup-row {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
-    gap: var(--s-4);
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: var(--s-3);
+    margin-bottom: var(--s-4);
   }
-  .pattern-body { display: flex; flex-direction: column; gap: var(--s-3); }
-  .pattern-summary {
-    display: flex;
-    gap: var(--s-4);
+  .rollup-cell {
+    display: flex; flex-direction: column; gap: 4px;
+    padding: var(--s-3);
+    background: var(--bg-chip);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--r-md);
+  }
+  .rollup-label {
+    font-size: 10px; color: var(--fg-muted);
+    text-transform: uppercase; letter-spacing: var(--tracking-label);
+    font-weight: 600;
+  }
+  .rollup-stats { display: flex; gap: var(--s-2); align-items: center; flex-wrap: wrap; }
+  .rollup-peak {
+    font-family: var(--font-mono);
+    font-size: var(--fs-sm);
+    font-weight: 600;
+  }
+  .chip {
+    font-family: var(--font-mono); font-size: 10px;
+    padding: 2px 6px; border-radius: var(--r-sm);
+    border: 1px solid currentColor;
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-label);
+    font-weight: 600;
+  }
+  .chip.tone-danger { color: var(--danger); }
+  .chip.tone-warn { color: var(--warn); }
+  .chip.tone-muted { color: var(--fg-muted); }
+
+  .empty {
+    padding: var(--s-4);
+    color: var(--fg-muted);
+    font-size: var(--fs-sm);
+    text-align: center;
+    line-height: 1.6;
+  }
+
+  .board {
+    width: 100%; border-collapse: collapse;
     font-size: var(--fs-xs);
   }
-  .stat { display: flex; flex-direction: column; gap: 2px; }
-  .stat-label { color: var(--fg-muted); letter-spacing: var(--tracking-label); text-transform: uppercase; font-size: 10px; }
-  .stat-value { font-family: var(--font-mono); font-weight: 600; color: var(--fg-primary); }
-  .stat-value.hot { color: var(--danger); }
-  .empty { color: var(--fg-muted); font-size: var(--fs-xs); padding: var(--s-2) 0; }
-  .rows { display: flex; flex-direction: column; gap: var(--s-1); }
-  .row {
-    display: grid;
-    grid-template-columns: 90px 1fr 60px 40px;
+  .board th, .board td {
+    padding: var(--s-2);
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+    vertical-align: middle;
+  }
+  .board th {
+    color: var(--fg-muted);
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-label);
+    font-size: 10px;
+    font-weight: 600;
+  }
+  .board .num { text-align: right; }
+  .board tr.alerting { background: rgba(239, 68, 68, 0.06); }
+  .board tr.watching { background: rgba(245, 158, 11, 0.04); }
+
+  .score-cell {
+    display: flex;
     align-items: center;
     gap: var(--s-2);
-    padding: var(--s-1) 0;
-    font-size: var(--fs-xs);
+    min-width: 140px;
   }
-  .row.alerting { font-weight: 600; }
-  .sym { font-family: var(--font-mono); color: var(--fg-secondary); }
   .bar-track {
     position: relative;
-    height: 8px;
-    background: var(--bg-chip);
+    flex: 1;
+    height: 6px;
+    background: var(--bg-base);
     border-radius: var(--r-pill);
     overflow: hidden;
   }
   .bar-fill {
     height: 100%;
-    border-radius: var(--r-pill);
-    transition: width var(--dur-base) var(--ease-out);
+    transition: width var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out);
   }
   .threshold {
-    position: absolute;
-    top: -2px;
-    bottom: -2px;
-    width: 2px;
-    background: var(--danger);
-    opacity: 0.5;
+    position: absolute; top: -2px; bottom: -2px;
+    width: 2px; background: var(--border-strong);
   }
-  .score { font-family: var(--font-mono); font-variant-numeric: tabular-nums; text-align: right; }
-  .alerts { font-family: var(--font-mono); text-align: right; color: var(--fg-muted); font-variant-numeric: tabular-nums; }
-  .alerts.hot { color: var(--danger); font-weight: 600; }
+  .score-value {
+    font-size: 10px;
+    min-width: 40px;
+    text-align: right;
+  }
+  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .faint { color: var(--fg-muted); }
 </style>

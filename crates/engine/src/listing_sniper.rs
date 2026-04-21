@@ -482,6 +482,9 @@ impl ListingSniperRunner {
                 qty,
                 time_in_force: Some(TimeInForce::Ioc),
                 client_order_id: Some(uuid::Uuid::new_v4().to_string()),
+                // Listing sniper opens the position — reduce_only
+                // would reject the very first entry.
+                reduce_only: false,
             };
             match connector.place_order(&order).await {
                 Ok(_) => {

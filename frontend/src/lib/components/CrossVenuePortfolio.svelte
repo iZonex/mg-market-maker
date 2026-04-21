@@ -26,11 +26,19 @@
   }
 
   const REFRESH_MS = 4_000
+  const FUNDING_REFRESH_MS = 10_000
 
   let assets = $state([])
   let error = $state(null)
   let lastFetch = $state(null)
   let loading = $state(true)
+  // 23-UX-16 — funding state map keyed by `${venue}|${symbol}`.
+  // Populated by a parallel poll so perp legs can render the
+  // inline settlement countdown without the operator having to
+  // open the LegDetailModal just to check "when does funding
+  // settle?" — the UX-audit top-three gap.
+  let fundingByLeg = $state({})
+  let now = $state(Date.now())
 
   async function refresh() {
     try {
@@ -49,15 +57,67 @@
     }
   }
 
+  async function refreshFunding() {
+    try {
+      const rows = await api.getJson('/api/v1/venues/funding_state')
+      const next = {}
+      for (const r of rows ?? []) {
+        if (r?.venue && r?.symbol) {
+          next[`${r.venue}|${r.symbol}`] = r
+        }
+      }
+      fundingByLeg = next
+    } catch (_) { /* best-effort; inline countdown just hides */ }
+  }
+
   $effect(() => {
     refresh()
+    refreshFunding()
     const t = setInterval(refresh, REFRESH_MS)
-    return () => clearInterval(t)
+    const f = setInterval(refreshFunding, FUNDING_REFRESH_MS)
+    const tick = setInterval(() => { now = Date.now() }, 1000)
+    return () => {
+      clearInterval(t)
+      clearInterval(f)
+      clearInterval(tick)
+    }
   })
 
   function deltaColour(v) {
     if (Math.abs(v) < 1e-12) return 'var(--fg-muted)'
     return v > 0 ? 'var(--accent)' : 'var(--danger)'
+  }
+
+  function fundingFor(leg) {
+    return fundingByLeg[`${leg.venue}|${leg.symbol}`] ?? null
+  }
+
+  function fmtCountdown(ms) {
+    if (!ms) return null
+    const d = ms - now
+    if (d <= 0) return 'now'
+    const h = Math.floor(d / 3_600_000)
+    const m = Math.floor((d % 3_600_000) / 60_000)
+    const s = Math.floor((d % 60_000) / 1000)
+    if (h > 0) return `${h}h ${m}m`
+    if (m > 0) return `${m}m ${s}s`
+    return `${s}s`
+  }
+
+  function countdownSeverity(ms) {
+    if (!ms) return 'muted'
+    const d = ms - now
+    if (d <= 60_000) return 'warn'   // <1min
+    if (d <= 300_000) return 'info'  // <5min
+    return 'ok'
+  }
+
+  function fmtRateBps(rateStr) {
+    if (rateStr === null || rateStr === undefined) return null
+    const n = parseFloat(rateStr)
+    if (!Number.isFinite(n)) return null
+    // rate is fractional — 0.0001 = 1 bps per period
+    return (n * 10_000).toFixed(2)
   }
 </script>
 
@@ -89,10 +149,28 @@
           </div>
           <div class="legs">
             {#each a.legs as leg}
-              <!-- 23-UX-7 — clickable leg opens the detail modal. -->
+              {@const f = fundingFor(leg)}
+              <!-- 23-UX-7 — clickable leg opens the detail modal.
+                   23-UX-16 — inline funding countdown renders on
+                   perp legs so the operator doesn't need the modal
+                   just to answer "hold through settlement?" -->
               <button type="button" class="leg leg-btn" onclick={() => openLeg(leg)}>
                 <span class="venue">{leg.venue}</span>
                 <span class="sym">{leg.symbol}</span>
+                {#if f}
+                  <span class="funding" title="Funding rate + settlement countdown">
+                    {#if fmtRateBps(f.rate) !== null}
+                      <span class="funding-rate mono" class:neg={parseFloat(f.rate) < 0} class:pos={parseFloat(f.rate) > 0}>
+                        {parseFloat(f.rate) > 0 ? '+' : ''}{fmtRateBps(f.rate)}bps
+                      </span>
+                    {/if}
+                    {#if f.next_funding_ts}
+                      <span class="funding-eta mono" data-sev={countdownSeverity(f.next_funding_ts)}>
+                        {fmtCountdown(f.next_funding_ts)}
+                      </span>
+                    {/if}
+                  </span>
+                {/if}
                 <span class="leg-val mono" style:color={deltaColour(leg.inventory)}>
                   {leg.inventory > 0 ? '+' : ''}{leg.inventory}
                 </span>
@@ -169,13 +247,40 @@
     gap: 2px;
   }
   .leg {
+    /* 23-UX-16 — 4 columns so the funding strip fits between
+       symbol and inventory without cramping. Middle strip is
+       flexible for long symbol names; funding is fixed-ish. */
     display: grid;
-    grid-template-columns: 90px 1fr auto;
+    grid-template-columns: 90px 1fr auto auto;
     gap: var(--s-2);
     font-size: var(--fs-xs);
     align-items: baseline;
     padding: var(--s-1) var(--s-2);
     border-radius: var(--r-sm);
+  }
+  .funding {
+    display: inline-flex;
+    gap: 6px;
+    align-items: baseline;
+    font-size: 10px;
+  }
+  .funding-rate { color: var(--fg-secondary); }
+  .funding-rate.pos { color: var(--pos); }
+  .funding-rate.neg { color: var(--neg); }
+  .funding-eta {
+    padding: 0 4px;
+    border-radius: 3px;
+    background: var(--bg-chip);
+    color: var(--fg-secondary);
+  }
+  .funding-eta[data-sev='warn'] {
+    background: var(--warn-bg);
+    color: var(--warn);
+    font-weight: 600;
+  }
+  .funding-eta[data-sev='info'] {
+    background: rgba(245, 158, 11, 0.08);
+    color: var(--warn);
   }
   /* 23-UX-7 clickable-leg affordance. */
   .leg-btn {

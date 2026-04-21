@@ -191,6 +191,9 @@ impl FundingArbExecutor {
             qty: hedge_size,
             time_in_force: Some(TimeInForce::Ioc),
             client_order_id: None,
+            // Opening hedge leg — perp bucket may be flat. Leave
+            // reduce_only off so the order is accepted.
+            reduce_only: false,
         };
 
         let taker_order_id = match self.hedge.place_order(&taker_order).await {
@@ -221,6 +224,9 @@ impl FundingArbExecutor {
             qty: size,
             time_in_force: Some(TimeInForce::PostOnly),
             client_order_id: None,
+            // Spot-side maker — reduce_only is a perp-only flag,
+            // leave off.
+            reduce_only: false,
         };
 
         match self.primary.place_order(&maker_order).await {
@@ -257,6 +263,13 @@ impl FundingArbExecutor {
                     qty: hedge_size,
                     time_in_force: Some(TimeInForce::Ioc),
                     client_order_id: None,
+                    // Compensation fires ONLY after the taker leg
+                    // already filled — the bucket has an open
+                    // position we need to unwind. reduce_only
+                    // guards against racing back into fresh
+                    // exposure if the market ran away between
+                    // the original fill and this retry.
+                    reduce_only: true,
                 };
 
                 // S1.1 — retry the compensation with exponential

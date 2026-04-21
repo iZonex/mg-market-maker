@@ -96,13 +96,52 @@ pub fn build_monthly_report(
         .collect();
 
     // ── Audit events ────────────────────────────────────────
-    let audit_events = match audit_log_path {
-        Some(p) if p.exists() => {
-            let events = mm_risk::audit_reader::read_audit_range(p, from_ts, to_ts)
-                .unwrap_or_default();
-            events.into_iter().map(audit_event_to_row).collect()
+    // Distributed path: when a fleet audit fetcher is wired
+    // (server/main.rs hooks one up when both controller and
+    // dashboard run in the same process), call it on the
+    // current runtime to fan out across every deployment's
+    // audit JSONL and merge the results. Falls back to the
+    // local-file reader when no fetcher is set — preserves
+    // standalone test / single-process dev flows.
+    let audit_events = if let Some(fetcher) = state.audit_range_fetcher() {
+        let from_ms = from_ts.timestamp_millis();
+        let until_ms = to_ts.timestamp_millis();
+        // Cap the per-request limit — MiCA months can have
+        // hundreds of thousands of events in busy deployments,
+        // but a single run shouldn't chew hours of engine time.
+        // Controller caps at 5000 per deployment via the
+        // `audit_tail` topic handler; the fleet merge can exceed
+        // that across deployments. 50 000 is a generous global
+        // cap that still keeps the in-memory JSON manageable.
+        const FLEET_AUDIT_LIMIT: usize = 50_000;
+        let events = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                // We're inside a tokio runtime (HTTP handler path).
+                // `block_in_place` keeps the runtime responsive
+                // while we await on the fan-out future — the
+                // fetcher spins out independent tokio tasks per
+                // agent, so this doesn't deadlock.
+                tokio::task::block_in_place(|| {
+                    handle.block_on(fetcher(from_ms, until_ms, FLEET_AUDIT_LIMIT))
+                })
+            }
+            Err(_) => Vec::new(),
+        };
+        events
+            .into_iter()
+            .filter_map(|v| serde_json::from_value::<mm_risk::audit::AuditEvent>(v).ok())
+            .map(audit_event_to_row)
+            .collect()
+    } else {
+        match audit_log_path {
+            Some(p) if p.exists() => {
+                let events =
+                    mm_risk::audit_reader::read_audit_range(p, from_ts, to_ts)
+                        .unwrap_or_default();
+                events.into_iter().map(audit_event_to_row).collect()
+            }
+            _ => Vec::new(),
         }
-        _ => Vec::new(),
     };
 
     Ok(MonthlyReportData {

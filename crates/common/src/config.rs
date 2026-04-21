@@ -131,6 +131,14 @@ pub struct AppConfig {
     #[serde(default)]
     pub paper_fill: Option<PaperFillCfg>,
 
+    /// A/B split test configuration. Runs two parameter variants
+    /// side-by-side; the engine folds per-variant multipliers into
+    /// `gamma`, `spread`, and `order_size` every tick and records
+    /// PnL deltas per variant. `None` disables the split (legacy
+    /// single-variant behaviour).
+    #[serde(default)]
+    pub ab_split: Option<AbSplitCfg>,
+
     /// Cross-venue rebalancer configuration (Epic 4).
     #[serde(default)]
     pub rebalancer: Option<RebalancerCfg>,
@@ -1083,7 +1091,17 @@ pub struct ExchangeConfig {
     /// `spot()` constructors already.
     #[serde(default)]
     pub product: ProductType,
+    /// REST base URL. Empty → the connector uses its built-in
+    /// default for the `(exchange_type, product)` pair
+    /// (`https://api.binance.com` for binance spot,
+    /// `https://fapi.binance.com` for binance linear_perp,
+    /// Bybit/HL hardcode their own REST base). Only set
+    /// explicitly for `exchange_type = "custom"` or testnet
+    /// overrides.
+    #[serde(default)]
     pub rest_url: String,
+    /// WebSocket base URL. Same defaulting rule as `rest_url`.
+    #[serde(default)]
     pub ws_url: String,
     pub api_key: Option<String>,
     pub api_secret: Option<String>,
@@ -2327,6 +2345,48 @@ fn default_paper_latency() -> u64 {
     5
 }
 
+/// A/B split test configuration (Epic 6 item 6.2).
+///
+/// Declares two parameter variants and how the engine alternates
+/// between them. The engine applies `variant.gamma_mult`,
+/// `spread_mult`, and `size_mult` to the tuned strategy output
+/// every tick and records per-variant PnL so operators can pick
+/// the winner after a run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbSplitCfg {
+    pub variant_a: AbVariantCfg,
+    pub variant_b: AbVariantCfg,
+    /// "time_based" → alternates every `period_ticks`; "symbol_based"
+    /// → partitions by symbol hash (stable per symbol).
+    #[serde(default = "default_ab_split_mode")]
+    pub mode: String,
+    /// Ticks per variant in time-based mode. Ignored in symbol-based
+    /// mode.
+    #[serde(default = "default_ab_period_ticks")]
+    pub period_ticks: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbVariantCfg {
+    pub name: String,
+    #[serde(default = "one")]
+    pub gamma_mult: Decimal,
+    #[serde(default = "one")]
+    pub spread_mult: Decimal,
+    #[serde(default = "one")]
+    pub size_mult: Decimal,
+}
+
+fn default_ab_split_mode() -> String {
+    "time_based".into()
+}
+fn default_ab_period_ticks() -> u64 {
+    60
+}
+fn one() -> Decimal {
+    dec!(1)
+}
+
 /// Cross-venue rebalancer configuration (Epic 4).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RebalancerCfg {
@@ -2650,6 +2710,7 @@ impl Default for AppConfig {
             execution: None,
             record_market_data: false,
             paper_fill: None,
+            ab_split: None,
             rebalancer: None,
             onchain: None,
             portfolio_risk: None,

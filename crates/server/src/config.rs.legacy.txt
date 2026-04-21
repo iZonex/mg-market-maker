@@ -1,0 +1,182 @@
+use anyhow::Result;
+use mm_common::config::{AppConfig, ExchangeType};
+use std::path::Path;
+use tracing::info;
+
+/// Load config from TOML file, then override secrets from env vars.
+///
+/// Environment variables (override config file):
+///   MM_CONFIG            — path to config file (default: config/default.toml)
+///   MM_BINANCE_API_KEY  / MM_BINANCE_API_SECRET
+///   MM_BYBIT_API_KEY    / MM_BYBIT_API_SECRET
+///   MM_HL_API_SECRET    (HL has no api_key; the address is derived)
+///   MM_READ_KEY / MM_READ_SECRET — optional read-only key pair
+///   MM_TELEGRAM_TOKEN, MM_TELEGRAM_CHAT
+///   MM_MODE              — "live" or "paper"
+///
+/// The venue-scoped vars let a single `.env` carry keys for all
+/// three supported venues simultaneously; the loader picks the
+/// right pair based on `config.exchange.exchange_type` at startup.
+pub fn load_config() -> Result<AppConfig> {
+    let config_path = std::env::var("MM_CONFIG").unwrap_or_else(|_| "config/default.toml".into());
+    let path = Path::new(&config_path);
+
+    let mut config = if path.exists() {
+        info!(path = %config_path, "loading config from file");
+        let contents = std::fs::read_to_string(path)?;
+        toml::from_str(&contents)?
+    } else {
+        info!("no config file found, using defaults");
+        AppConfig::default()
+    };
+
+    // Venue-scoped env vars — the only supported path. A single
+    // `.env` can carry MM_BINANCE_* / MM_BYBIT_* / MM_HL_*
+    // simultaneously; the loader picks the pair that matches
+    // `config.exchange.exchange_type` at startup.
+    let venue_prefix = match config.exchange.exchange_type {
+        ExchangeType::Binance | ExchangeType::BinanceTestnet => Some("BINANCE"),
+        ExchangeType::Bybit | ExchangeType::BybitTestnet => Some("BYBIT"),
+        ExchangeType::HyperLiquid | ExchangeType::HyperLiquidTestnet => Some("HL"),
+        ExchangeType::Custom => None,
+    };
+
+    if let Some(prefix) = venue_prefix {
+        let key_var = format!("MM_{prefix}_API_KEY");
+        let secret_var = format!("MM_{prefix}_API_SECRET");
+        if let Ok(key) = std::env::var(&key_var) {
+            config.exchange.api_key = Some(key);
+            info!(%key_var, "API key loaded from venue-scoped env var");
+        }
+        if let Ok(secret) = std::env::var(&secret_var) {
+            config.exchange.api_secret = Some(secret);
+            info!(%secret_var, "API secret loaded from venue-scoped env var");
+        }
+    }
+    // Optional read-only key pair (Epic 3). Lets operators
+    // isolate the trading key (write, IP-whitelisted) from a
+    // second key used for market data / balance polls / fee
+    // tier lookups. Both keys are redacted in Debug output.
+    if let Ok(key) = std::env::var("MM_READ_KEY") {
+        config.exchange.read_key = Some(key);
+        info!("read-only key loaded from MM_READ_KEY env var");
+    }
+    if let Ok(secret) = std::env::var("MM_READ_SECRET") {
+        config.exchange.read_secret = Some(secret);
+        info!("read-only secret loaded from MM_READ_SECRET env var");
+    }
+    if let Ok(mode) = std::env::var("MM_MODE") {
+        config.mode = mode;
+    }
+
+    // Telegram alerts from env.
+    if let Ok(token) = std::env::var("MM_TELEGRAM_TOKEN") {
+        config.telegram.bot_token = token;
+        info!("Telegram bot token loaded from MM_TELEGRAM_TOKEN");
+    }
+    if let Ok(chat) = std::env::var("MM_TELEGRAM_CHAT") {
+        config.telegram.chat_id = chat;
+        info!("Telegram chat ID loaded from MM_TELEGRAM_CHAT");
+    }
+
+    Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use mm_common::config::AppConfig;
+
+    /// The shipped `config/default.toml` must deserialize cleanly
+    /// against the current `AppConfig` schema. Guards against a
+    /// config-struct rename / new required field breaking the
+    /// example without CI catching it — operators copy this file
+    /// verbatim as their starting point, so a silent drift bricks
+    /// every fresh deployment. Commented-out sections exercise
+    /// the parser's tolerance of incomplete optional blocks.
+    #[test]
+    fn shipped_default_toml_parses_cleanly() {
+        // Walk up from the test's CARGO_MANIFEST_DIR (`crates/server`)
+        // to the workspace root so the test runs regardless of
+        // where `cargo test` was invoked from.
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR set by cargo");
+        let path = std::path::Path::new(&manifest_dir)
+            .join("..")
+            .join("..")
+            .join("config")
+            .join("default.toml");
+        let contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let _parsed: AppConfig = toml::from_str(&contents)
+            .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+    }
+
+    /// Every `# [xxx]` commented example block in default.toml
+    /// must ALSO parse cleanly once uncommented. Guards the drift
+    /// case where a field is added to the struct but the example
+    /// in the shipped file ages out with stale names. Strips the
+    /// `# ` prefix off every comment line between the feature-
+    /// config header and EOF and re-parses.
+    #[test]
+    fn optional_feature_blocks_parse_when_uncommented() {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR set by cargo");
+        let path = std::path::Path::new(&manifest_dir)
+            .join("..")
+            .join("..")
+            .join("config")
+            .join("default.toml");
+        let raw = std::fs::read_to_string(&path).expect("read default.toml");
+        let header = "# ─── Optional feature configs";
+        let idx = raw
+            .find(header)
+            .expect("feature-config header present in default.toml");
+        // Keep everything BEFORE the feature block as-is; strip
+        // leading `# ` off every commented line in the feature
+        // block so example TOML lines become live config.
+        let (prelude, tail) = raw.split_at(idx);
+        // Only uncomment lines that LOOK like TOML. A section
+        // header is `[...]`; a key-value line has an identifier
+        // (only a-z0-9_. and whitespace) BEFORE the first `=`.
+        // Prose comments that mention `enabled = false` inside
+        // English text fail the identifier check and stay
+        // commented.
+        fn is_toml_line(s: &str) -> bool {
+            let t = s.trim_start();
+            if t.starts_with('[') {
+                return true;
+            }
+            let Some((before_eq, _)) = t.split_once('=') else {
+                return false;
+            };
+            !before_eq.is_empty()
+                && before_eq.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || c == '_' || c == '.' || c.is_whitespace()
+                })
+        }
+        let uncommented: String = tail
+            .lines()
+            .map(|l| {
+                let trimmed = l.trim_start();
+                if let Some(body) = trimmed.strip_prefix("# ") {
+                    if is_toml_line(body) {
+                        body.to_string()
+                    } else {
+                        l.to_string()
+                    }
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let combined = format!("{prelude}{uncommented}");
+        let _parsed: AppConfig = toml::from_str(&combined).unwrap_or_else(|e| {
+            panic!(
+                "uncommented feature blocks in default.toml failed to parse: {e}\n\
+                 this means a commented example drifted away from the live \
+                 `AppConfig` schema — fix the example."
+            )
+        });
+    }
+}

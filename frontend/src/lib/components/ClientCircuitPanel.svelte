@@ -19,7 +19,7 @@
   }
 
   async function resetClient(cid) {
-    if (!confirm(`Reset per-client loss circuit for ${cid}?\n\nNote: engine kill switches must be reset separately via /api/v1/ops/reset/{symbol}; this only clears the aggregate breaker.`)) {
+    if (!confirm(`Reset per-client loss circuit for ${cid}?\n\nNote: engine kill switches must be reset separately via Fleet → deployment drilldown → Ops → Reset; this only clears the aggregate breaker.`)) {
       return
     }
     busy = true

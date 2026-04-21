@@ -397,6 +397,13 @@ pub struct MarketMakerEngine {
     /// deltas + trade feed. Backs the `Book.FillProbability`
     /// graph source.
     queue_tracker: crate::queue_tracker::QueueTracker,
+    /// 23-P1-5 — probabilistic paper-mode fill simulator. Built from
+    /// `config.paper_fill` in the constructor; `None` in live mode or
+    /// when the operator didn't set `[paper_fill]`. Engine drives
+    /// this on every `MarketEvent::Trade` in paper mode to apply
+    /// `prob_fill_on_touch`, `prob_slippage`, `slippage_bps`, and
+    /// `latency_ms` — without it, `PaperFillCfg` was config-only.
+    paper_filler: Option<mm_backtester::ProbabilisticFiller>,
     inventory_manager: InventoryManager,
     exposure_manager: ExposureManager,
     circuit_breaker: CircuitBreaker,
@@ -719,6 +726,17 @@ pub struct MarketMakerEngine {
     /// fill we compute `(fill_ts - last_reprice_ts)` and stash it
     /// into this capped deque.
     fill_reprice_deltas_ms: std::collections::VecDeque<i64>,
+    /// Phase IV graph-native XEMM — own-fill pulse buffer for the
+    /// `Trade.OwnFill` graph source. Every `MarketEvent::Fill` push
+    /// appends a `(venue, Fill)` clone; `tick_strategy_graph`
+    /// drains + per-node filters + aggregates (last-side, sum-qty,
+    /// vwap-price) and emits as source values, then clears.
+    /// Capped at 32 entries so a burst-fill loop can't grow memory
+    /// while the graph isn't ticking.
+    pending_own_fills: std::collections::VecDeque<(
+        mm_exchange_core::connector::VenueId,
+        mm_common::types::Fill,
+    )>,
     /// Cancel-to-nearby-trade timing for `CancelOnReactionDetector`.
     cancel_reaction_deltas_ms: std::collections::VecDeque<Option<i64>>,
     /// Imbalance sample history for `ImbalanceManipulationDetector`.
@@ -842,9 +860,25 @@ impl MarketMakerEngine {
         let tick_secs = Decimal::from(config.market_maker.refresh_interval_ms) / dec!(1000);
         let vol_est = VolatilityEstimator::new(dec!(0.94), tick_secs);
 
+        // SLA-1 (2026-04-21) — paper mode uses tiny diagnostic
+        // quotes (often $50–100 per side vs the $2k production
+        // default) purely to exercise the pipeline. Leaving the
+        // production min_depth threshold on would mark every
+        // tick non-compliant → presence_pct=0 → tenant SLA
+        // certificate shows FAIL despite a healthy running engine.
+        // Relax the depth floor in paper mode; operator can still
+        // override by setting a non-zero `sla.min_depth_quote` in
+        // the deployment config — we only null it out when the
+        // config left it at the built-in $2k default.
+        let paper_min_depth = config.mode.eq_ignore_ascii_case("paper")
+            && config.sla.min_depth_quote == dec!(2000);
         let sla_config = SlaConfig {
             max_spread_bps: config.sla.max_spread_bps,
-            min_depth_quote: config.sla.min_depth_quote,
+            min_depth_quote: if paper_min_depth {
+                Decimal::ZERO
+            } else {
+                config.sla.min_depth_quote
+            },
             min_uptime_pct: config.sla.min_uptime_pct,
             two_sided_required: config.sla.two_sided_required,
             max_requote_secs: config.sla.max_requote_secs,
@@ -950,7 +984,8 @@ impl MarketMakerEngine {
                 // the box. Operators override via
                 // `with_sor_venue` when running against
                 // more than one venue.
-                let seed = VenueSeed::new(&symbol, product.clone(), config.risk.max_inventory);
+                let seed = VenueSeed::new(&symbol, product.clone(), config.risk.max_inventory)
+                    .with_venue_product(connectors.primary.product());
                 agg.register_venue(connectors.primary.venue_id(), seed);
                 agg
             },
@@ -969,6 +1004,37 @@ impl MarketMakerEngine {
                 OrderManager::new()
             },
             queue_tracker: crate::queue_tracker::QueueTracker::new(),
+            paper_filler: if paper_mode {
+                config.paper_fill.as_ref().map(|cfg| {
+                    use rust_decimal::prelude::ToPrimitive;
+                    let pf_cfg = mm_backtester::ProbabilisticFillConfig {
+                        prob_fill_on_touch: cfg
+                            .prob_fill_on_touch
+                            .to_f64()
+                            .unwrap_or(1.0)
+                            .clamp(0.0, 1.0),
+                        prob_slippage: cfg
+                            .prob_slippage
+                            .to_f64()
+                            .unwrap_or(0.0)
+                            .clamp(0.0, 1.0),
+                        slippage_bps: cfg.slippage_bps,
+                        latency_ms: cfg.latency_ms,
+                    };
+                    // Seed: derive deterministically from the symbol so
+                    // two runs of the same paper config on the same
+                    // symbol replay identically for comparison.
+                    let mut seed: u64 = 0;
+                    for b in symbol.bytes() {
+                        seed = seed
+                            .wrapping_mul(31)
+                            .wrapping_add(b as u64);
+                    }
+                    mm_backtester::ProbabilisticFiller::new(pf_cfg, seed)
+                })
+            } else {
+                None
+            },
             inventory_manager: InventoryManager::new(),
             exposure_manager: ExposureManager::new(dec!(0)),
             circuit_breaker: CircuitBreaker::new(),
@@ -1195,6 +1261,7 @@ impl MarketMakerEngine {
             last_mid_for_push: rust_decimal::Decimal::ZERO,
             one_sided_tick_ring: std::collections::VecDeque::with_capacity(100),
             fill_reprice_deltas_ms: std::collections::VecDeque::with_capacity(50),
+            pending_own_fills: std::collections::VecDeque::with_capacity(32),
             cancel_reaction_deltas_ms: std::collections::VecDeque::with_capacity(50),
             imbalance_history: std::collections::VecDeque::with_capacity(200),
             near_touch_placements: 0,
@@ -1694,57 +1761,66 @@ impl MarketMakerEngine {
         self.audit
             .risk_event(&self.symbol, AuditEventType::RouteDecisionEmitted, &detail);
 
-        // S1.3 — also publish to DashboardState for the
-        // operator panel.
-        if let Some(dash) = self.dashboard.as_ref() {
-            let urgency_clamped =
-                urgency.max(Decimal::ZERO).min(Decimal::ONE);
-            let is_taker = urgency_clamped
-                >= crate::sor::router::TAKER_THRESHOLD;
-            let winners: Vec<mm_dashboard::state::SorLegRecord> = decision
-                .legs
-                .iter()
-                .map(|l| mm_dashboard::state::SorLegRecord {
-                    venue: format!("{:?}", l.venue).to_lowercase(),
-                    qty: l.qty,
-                    is_taker: l.is_taker,
-                    cost_bps: l.expected_cost_bps,
-                })
-                .collect();
-            // Runner-ups: every snapshot venue not in the
-            // winners, priced through the same cost model,
-            // sorted ascending by cost.
-            let winner_venues: std::collections::HashSet<_> =
-                decision.legs.iter().map(|l| l.venue).collect();
-            let mut considered: Vec<mm_dashboard::state::SorLegRecord> = snapshots
-                .iter()
-                .filter(|s| s.is_available() && !winner_venues.contains(&s.venue))
-                .map(|s| {
-                    let cost = self.sor_router.cost_model.price(
-                        s,
-                        decision.target_side,
-                        urgency_clamped,
-                    );
-                    mm_dashboard::state::SorLegRecord {
-                        venue: format!("{:?}", s.venue).to_lowercase(),
-                        qty: s.available_qty,
-                        is_taker,
-                        cost_bps: cost.effective_cost_bps,
-                    }
-                })
-                .collect();
-            considered.sort_by(|a, b| a.cost_bps.cmp(&b.cost_bps));
+        // S1.3 — also publish to DashboardState / details_store
+        // for the operator panel. Constructed unconditionally so
+        // colo agents (dashboard = None) still push to the
+        // details store; the agent's `sor_decisions_recent`
+        // topic reads from there.
+        let urgency_clamped = urgency.max(Decimal::ZERO).min(Decimal::ONE);
+        let is_taker = urgency_clamped >= crate::sor::router::TAKER_THRESHOLD;
+        let winners: Vec<mm_dashboard::state::SorLegRecord> = decision
+            .legs
+            .iter()
+            .map(|l| mm_dashboard::state::SorLegRecord {
+                venue: format!("{:?}", l.venue).to_lowercase(),
+                qty: l.qty,
+                is_taker: l.is_taker,
+                cost_bps: l.expected_cost_bps,
+            })
+            .collect();
+        // Runner-ups: every snapshot venue not in the winners,
+        // priced through the same cost model, sorted ascending
+        // by cost.
+        let winner_venues: std::collections::HashSet<_> =
+            decision.legs.iter().map(|l| l.venue).collect();
+        let mut considered: Vec<mm_dashboard::state::SorLegRecord> = snapshots
+            .iter()
+            .filter(|s| s.is_available() && !winner_venues.contains(&s.venue))
+            .map(|s| {
+                let cost = self.sor_router.cost_model.price(
+                    s,
+                    decision.target_side,
+                    urgency_clamped,
+                );
+                mm_dashboard::state::SorLegRecord {
+                    venue: format!("{:?}", s.venue).to_lowercase(),
+                    qty: s.available_qty,
+                    is_taker,
+                    cost_bps: cost.effective_cost_bps,
+                }
+            })
+            .collect();
+        considered.sort_by(|a, b| a.cost_bps.cmp(&b.cost_bps));
 
-            dash.record_sor_decision(mm_dashboard::state::SorDecisionRecord {
-                ts_ms: chrono::Utc::now().timestamp_millis(),
-                symbol: self.symbol.clone(),
-                side: decision.target_side,
-                target_qty: decision.target_qty,
-                filled_qty: decision.filled_qty,
-                is_complete: decision.is_complete,
-                winners,
-                considered,
-            });
+        let record = mm_dashboard::state::SorDecisionRecord {
+            ts_ms: chrono::Utc::now().timestamp_millis(),
+            symbol: self.symbol.clone(),
+            side: decision.target_side,
+            target_qty: decision.target_qty,
+            filled_qty: decision.filled_qty,
+            is_complete: decision.is_complete,
+            winners,
+            considered,
+        };
+        // Details store mirror — always runs so the distributed
+        // `/details/sor_decisions_recent` endpoint serves fresh
+        // data even without a local dashboard.
+        if let Ok(value) = serde_json::to_value(&record) {
+            mm_dashboard::details_store::global()
+                .push_sor_decision(&self.symbol, value);
+        }
+        if let Some(dash) = self.dashboard.as_ref() {
+            dash.record_sor_decision(record);
         }
     }
 
@@ -3392,6 +3468,84 @@ impl MarketMakerEngine {
                         last_px.map(Value::Number).unwrap_or(Value::Missing),
                     );
                 }
+                "Trade.OwnFill" => {
+                    // Phase IV graph-native XEMM — filter + aggregate
+                    // the tick's pending own fills against this node's
+                    // config. Multiple Trade.OwnFill nodes in a single
+                    // graph each apply their own filter; the drain
+                    // happens ONCE after the loop so every node sees
+                    // the same batch.
+                    let cfg = graph.node_configs().get(id);
+                    let cfg_venue = cfg
+                        .and_then(|c| c.get("venue"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let cfg_symbol = cfg
+                        .and_then(|c| c.get("symbol"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let cfg_role = cfg
+                        .and_then(|c| c.get("role"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("any")
+                        .to_string();
+                    let cfg_side = cfg
+                        .and_then(|c| c.get("side_filter"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("any")
+                        .to_string();
+                    let mut last_side = mm_common::types::Side::Buy;
+                    let mut any_matched = false;
+                    let mut qty_sum = rust_decimal::Decimal::ZERO;
+                    let mut notional_sum = rust_decimal::Decimal::ZERO;
+                    for (fv, f) in self.pending_own_fills.iter() {
+                        if !cfg_venue.is_empty() && fv.to_string() != cfg_venue {
+                            continue;
+                        }
+                        if !cfg_symbol.is_empty() && f.symbol != cfg_symbol {
+                            continue;
+                        }
+                        match cfg_role.as_str() {
+                            "maker" if !f.is_maker => continue,
+                            "taker" if f.is_maker => continue,
+                            _ => {}
+                        }
+                        match (cfg_side.as_str(), f.side) {
+                            ("buy", mm_common::types::Side::Sell) => continue,
+                            ("sell", mm_common::types::Side::Buy) => continue,
+                            _ => {}
+                        }
+                        any_matched = true;
+                        last_side = f.side;
+                        qty_sum += f.qty;
+                        notional_sum += f.qty * f.price;
+                    }
+                    let (fired, side_num, qty_out, price_out) = if any_matched {
+                        let side_num = match last_side {
+                            mm_common::types::Side::Buy => rust_decimal::Decimal::ONE,
+                            mm_common::types::Side::Sell => -rust_decimal::Decimal::ONE,
+                        };
+                        let price_out = if qty_sum > rust_decimal::Decimal::ZERO {
+                            notional_sum / qty_sum
+                        } else {
+                            rust_decimal::Decimal::ZERO
+                        };
+                        (true, side_num, qty_sum, price_out)
+                    } else {
+                        (
+                            false,
+                            rust_decimal::Decimal::ZERO,
+                            rust_decimal::Decimal::ZERO,
+                            rust_decimal::Decimal::ZERO,
+                        )
+                    };
+                    src.insert((*id, "fired".into()), Value::Bool(fired));
+                    src.insert((*id, "side".into()), Value::Number(side_num));
+                    src.insert((*id, "qty".into()), Value::Number(qty_out));
+                    src.insert((*id, "price".into()), Value::Number(price_out));
+                }
                 "Balance" => {
                     let cfg = graph.node_configs().get(id);
                     let venue = cfg
@@ -4804,6 +4958,17 @@ impl MarketMakerEngine {
             }
         }
 
+        // Phase IV — drain the own-fill pulse buffer AFTER every
+        // Trade.OwnFill node has read it. Keeping the drain here
+        // means multiple nodes in the same graph see the same
+        // batch of fills under their own filters; not draining
+        // would grow the buffer indefinitely until a fill storm
+        // tripped the 32-entry cap. Cleared unconditionally so a
+        // graph without Trade.OwnFill nodes doesn't accumulate
+        // fills either (cheap: a VecDeque::clear on up to 32
+        // entries is a handful of ops).
+        self.pending_own_fills.clear();
+
         // Sprint 4 — per-detector score gauge. Read from the
         // same `src` map the evaluator consumes so the gauge
         // never drifts from what a downstream node sees.
@@ -5593,6 +5758,54 @@ impl MarketMakerEngine {
             );
         }
 
+        // Investigate #13 — startup fill recovery. Fetch fills
+        // from the last 10 minutes and audit-log them as
+        // recovered; this gives the operator a paper trail
+        // showing what landed on-venue while the agent was
+        // disconnected. We DON'T apply them to
+        // `inventory_manager` here — cancel_all above nuked
+        // surviving orders, and the wallet-side drift check in
+        // reconcile() will flag any inventory mismatch on the
+        // next cycle. Venues that don't implement
+        // `get_my_trades_since` return empty and this is a
+        // no-op. Default window is 10 minutes because the
+        // typical disconnect scenarios (process crash, network
+        // hiccup, controller restart) are all well under that.
+        {
+            let since_ms = chrono::Utc::now().timestamp_millis() - 10 * 60 * 1000;
+            match self
+                .connectors
+                .primary
+                .get_my_trades_since(&self.symbol, since_ms)
+                .await
+            {
+                Ok(trades) if !trades.is_empty() => {
+                    warn!(
+                        symbol = %self.symbol,
+                        count = trades.len(),
+                        since_ms,
+                        "startup fill recovery — found fills that may have landed while offline; inventory drift will reconcile on next cycle"
+                    );
+                    for t in &trades {
+                        self.audit.order_filled(
+                            &self.symbol,
+                            t.order_id,
+                            t.side,
+                            t.price,
+                            t.qty,
+                            t.is_maker,
+                        );
+                    }
+                }
+                Ok(_) => {
+                    info!(symbol = %self.symbol, "startup fill recovery — no recent fills reported by venue");
+                }
+                Err(e) => {
+                    warn!(symbol = %self.symbol, error = %e, "startup fill recovery failed — venue did not return recent trades");
+                }
+            }
+        }
+
         // Initial orderbook snapshot via REST.
         match self
             .connectors
@@ -5935,6 +6148,56 @@ impl MarketMakerEngine {
     /// stronger escalation (L4 paired unwind) is left to the
     /// operator via the regular kill-switch policy paths.
     fn handle_driver_event(&mut self, event: DriverEvent) {
+        // Wave 1 R follow-up — emit a Prometheus counter bump +
+        // active-gauge flip per event BEFORE the audit/kill-switch
+        // bookkeeping below. The outcome label matches the
+        // `FundingArbPairs` UI schema so the drilldown panel can
+        // render a per-outcome column directly off the counter.
+        let outcome_label: &str = match &event {
+            DriverEvent::Entered { .. } => "entered",
+            DriverEvent::Exited { .. } => "exited",
+            DriverEvent::TakerRejected { .. } => "taker_rejected",
+            DriverEvent::PairBreak { compensated: true, .. } => "pair_break",
+            DriverEvent::PairBreak { compensated: false, .. } => "pair_break_uncompensated",
+            DriverEvent::Hold => "hold",
+            DriverEvent::InputUnavailable { .. } => "input_unavailable",
+        };
+        mm_dashboard::metrics::FUNDING_ARB_TRANSITIONS
+            .with_label_values(&[&self.symbol, outcome_label])
+            .inc();
+        match &event {
+            DriverEvent::Entered { .. } => {
+                mm_dashboard::metrics::FUNDING_ARB_ACTIVE
+                    .with_label_values(&[&self.symbol])
+                    .set(1.0);
+            }
+            DriverEvent::Exited { .. } | DriverEvent::PairBreak { .. } => {
+                mm_dashboard::metrics::FUNDING_ARB_ACTIVE
+                    .with_label_values(&[&self.symbol])
+                    .set(0.0);
+            }
+            _ => {}
+        }
+        // Detail ring buffer — the drilldown's "recent events"
+        // section reads this on-demand via FetchDeploymentDetails.
+        // Reason strings come from the event variants that carry
+        // them; Entered and Hold carry no reason so leave empty.
+        let reason_for_store = match &event {
+            DriverEvent::Exited { reason, .. } => reason.clone(),
+            DriverEvent::TakerRejected { reason } => reason.clone(),
+            DriverEvent::PairBreak { reason, .. } => reason.clone(),
+            DriverEvent::InputUnavailable { reason } => reason.clone(),
+            DriverEvent::Entered { .. } | DriverEvent::Hold => String::new(),
+        };
+        mm_dashboard::details_store::global().push_funding_arb_event(
+            &self.symbol,
+            mm_dashboard::details_store::FundingArbEventEntry {
+                at_ms: chrono::Utc::now().timestamp_millis(),
+                outcome: outcome_label.to_string(),
+                reason: reason_for_store,
+            },
+        );
+
         match event {
             DriverEvent::Entered { .. } => {
                 self.audit.risk_event(
@@ -6129,6 +6392,35 @@ impl MarketMakerEngine {
                         }
                     }
                 }
+                // Per-venue market-strip data: publish the hedge
+                // leg's L1 to the data bus so the UI's venue
+                // strip can render mid/spread/age for the hedge
+                // venue instead of only the primary. Without this
+                // the operator had no way to see "is the hedge
+                // feed healthy?" short of the basis panel lower
+                // down the page.
+                if let (Some(dash), Some(hb), Some(hedge_cfg), Some(pair)) = (
+                    self.dashboard.as_ref(),
+                    self.hedge_book.as_ref(),
+                    self.config.hedge.as_ref(),
+                    self.connectors.pair.as_ref(),
+                ) {
+                    let key = (
+                        format!("{:?}", hedge_cfg.exchange.exchange_type).to_lowercase(),
+                        pair.hedge_symbol.clone(),
+                        hedge_cfg.exchange.product,
+                    );
+                    dash.data_bus().publish_l1(
+                        key,
+                        mm_dashboard::data_bus::BookL1Snapshot {
+                            bid_px: hb.book.best_bid(),
+                            ask_px: hb.book.best_ask(),
+                            mid: hb.book.mid_price(),
+                            spread_bps: hb.book.spread_bps(),
+                            ts: Some(chrono::Utc::now()),
+                        },
+                    );
+                }
             }
             MarketEvent::Fill { fill, .. } => {
                 info!(
@@ -6269,6 +6561,14 @@ impl MarketMakerEngine {
         let internal_ids: std::collections::HashSet<_> =
             self.order_manager.live_order_ids().into_iter().collect();
 
+        let mut recon_snapshot = mm_dashboard::state::ReconciliationSnapshot {
+            symbol: self.symbol.clone(),
+            cycle: self.reconcile_counter,
+            last_cycle_ms: chrono::Utc::now().timestamp_millis(),
+            internal_orders: internal_ids.len() as u32,
+            ..Default::default()
+        };
+
         match self.connectors.primary.get_open_orders(&self.symbol).await {
             Ok(venue_orders) => {
                 let venue_ids: std::collections::HashSet<_> =
@@ -6277,6 +6577,12 @@ impl MarketMakerEngine {
                 let ghosts: Vec<_> = internal_ids.difference(&venue_ids).copied().collect();
                 // Phantom orders: live on venue but unknown locally.
                 let phantoms: Vec<_> = venue_ids.difference(&internal_ids).copied().collect();
+
+                recon_snapshot.venue_orders = venue_ids.len() as u32;
+                recon_snapshot.ghost_orders =
+                    ghosts.iter().map(|id| id.to_string()).collect();
+                recon_snapshot.phantom_orders =
+                    phantoms.iter().map(|id| id.to_string()).collect();
 
                 if !ghosts.is_empty() {
                     warn!(
@@ -6325,6 +6631,7 @@ impl MarketMakerEngine {
                     internal_orders = internal_ids.len(),
                     "reconciliation: get_open_orders failed — skipping order reconciliation"
                 );
+                recon_snapshot.orders_fetch_failed = true;
             }
         }
 
@@ -6339,7 +6646,29 @@ impl MarketMakerEngine {
         // cycles compare the tracked inventory delta against
         // the wallet delta and surface any mismatch to the
         // audit trail + optional auto-correct.
-        self.check_inventory_drift();
+        // Fix #7 — drift report now flows into recon_snapshot
+        // so the ReconciliationPage shows balance-side drift
+        // alongside order ghosts/phantoms. Previously
+        // balance_mismatches was left empty — page was
+        // structurally half-honest.
+        let drift_report = self.check_inventory_drift();
+        if let Some(report) = drift_report {
+            recon_snapshot
+                .balance_mismatches
+                .push(mm_dashboard::state::BalanceMismatch {
+                    asset: report.asset.clone(),
+                    internal: report.tracked_inventory.to_string(),
+                    exchange: report.expected_inventory.to_string(),
+                });
+        }
+
+        // Wave C1 — publish the reconciliation outcome so
+        // operators can see drift without tailing logs. One
+        // snapshot per cycle overwrites the previous; the UI
+        // reads the latest via /api/v1/reconciliation/fleet.
+        if let Some(dash) = self.dashboard.as_ref() {
+            dash.push_reconciliation(recon_snapshot);
+        }
 
         // S3.2 — position-delta reconciliation. The two
         // existing paths compare orders and wallet balances;
@@ -6386,14 +6715,12 @@ impl MarketMakerEngine {
     /// wallet-delta baseline and fire a drift report when the
     /// mismatch exceeds the configured tolerance. Called from
     /// inside `reconcile` on every reconcile cycle.
-    fn check_inventory_drift(&mut self) {
+    fn check_inventory_drift(&mut self) -> Option<mm_risk::inventory_drift::DriftReport> {
         let wallet_total = self
             .balance_cache
             .total_in(&self.product.base_asset, mm_common::types::WalletType::Spot);
         let tracked = self.inventory_manager.inventory();
-        let Some(report) = self.inventory_drift.check(wallet_total, tracked) else {
-            return;
-        };
+        let report = self.inventory_drift.check(wallet_total, tracked)?;
         warn!(
             asset = %report.asset,
             venue = %report.venue,
@@ -6429,6 +6756,7 @@ impl MarketMakerEngine {
             self.inventory_manager
                 .force_reset_inventory_to(report.expected_inventory);
         }
+        Some(report)
     }
 
     async fn tick_second(&mut self) {
@@ -7126,19 +7454,79 @@ impl MarketMakerEngine {
                     // semantics with the backtester's
                     // QueueAware simulator so PnL from a paper
                     // run tracks a backtest on the same feed.
-                    // Orders without a queue position (edge
-                    // case — queue_tracker hasn't seen a
-                    // placement event yet) fall through to
-                    // fill for backwards compat.
+                    // 23-P1-3 — orphan fallthrough: if
+                    // queue_tracker doesn't know the order
+                    // (placement hook missed, or we restored
+                    // from a checkpoint that predates queue
+                    // persistence), block the fill rather than
+                    // firing unconditionally. Orphans are a
+                    // bug, not an edge case — a silent
+                    // fill-through diverges paper PnL from the
+                    // backtester and masks the underlying
+                    // issue. Emit a warning so operators see
+                    // it.
+                    // 23-P1-5 — probabilistic layer. When
+                    // `[paper_fill]` is configured, the
+                    // per-candidate `ProbabilisticFiller.try_fill`
+                    // decides whether the touch actually fills
+                    // and at what price (applies slippage). No
+                    // filler → every queue-clear candidate
+                    // fills at the original quote price
+                    // (legacy behaviour).
+                    let order_snap: std::collections::HashMap<
+                        mm_common::types::OrderId,
+                        (mm_common::types::Side, rust_decimal::Decimal),
+                    > = self
+                        .order_manager
+                        .live_orders_snapshot()
+                        .into_iter()
+                        .map(|(id, side, price, _qty, _status)| (id, (side, price)))
+                        .collect();
                     let queue_tracker = &self.queue_tracker;
+                    let symbol = self.symbol.clone();
+                    let best_bid = self
+                        .book_keeper
+                        .book
+                        .best_bid()
+                        .unwrap_or(rust_decimal::Decimal::ZERO);
+                    let best_ask = self
+                        .book_keeper
+                        .book
+                        .best_ask()
+                        .unwrap_or(rust_decimal::Decimal::ZERO);
+                    let mut paper_filler = self.paper_filler.as_mut();
                     let synthetic = self.order_manager.paper_match_trade_filtered(
                         trade.price,
                         trade.taker_side,
                         |id| {
-                            queue_tracker
-                                .queue_pos_of(id)
-                                .map(|pos| pos.front_q_qty <= rust_decimal::Decimal::ZERO)
-                                .unwrap_or(true)
+                            match queue_tracker.queue_pos_of(id) {
+                                Some(pos)
+                                    if pos.front_q_qty <= rust_decimal::Decimal::ZERO => {}
+                                Some(_) => return None,
+                                None => {
+                                    tracing::warn!(
+                                        order_id = %id,
+                                        symbol = %symbol,
+                                        "[PAPER] queue_tracker orphan — blocking fill; \
+                                         live order has no queue position (placement hook missed?)"
+                                    );
+                                    return None;
+                                }
+                            }
+                            let (side, price) = order_snap.get(&id).copied()?;
+                            if let Some(ref mut filler) = paper_filler {
+                                let quote = mm_common::types::Quote {
+                                    side,
+                                    price,
+                                    qty: rust_decimal::Decimal::ZERO,
+                                };
+                                let outcome = filler.try_fill(&quote, best_bid, best_ask);
+                                if !outcome.filled {
+                                    return None;
+                                }
+                                return Some(outcome.fill_price);
+                            }
+                            Some(price)
                         },
                     );
                     for fill in synthetic {
@@ -7154,7 +7542,7 @@ impl MarketMakerEngine {
                     }
                 }
             }
-            MarketEvent::Fill { fill, .. } => {
+            MarketEvent::Fill { fill, venue } => {
                 info!(
                     trade_id = fill.trade_id,
                     side = ?fill.side,
@@ -7173,6 +7561,16 @@ impl MarketMakerEngine {
                 );
 
                 self.inventory_manager.on_fill(fill);
+                // Phase IV — buffer own fills for the
+                // `Trade.OwnFill` graph source. Bounded so a
+                // fill storm while the graph is paused cannot
+                // grow memory. `venue` is carried with the fill
+                // so per-node venue filters on the source can
+                // match accurately in a multi-venue engine.
+                if self.pending_own_fills.len() >= 32 {
+                    self.pending_own_fills.pop_front();
+                }
+                self.pending_own_fills.push_back((*venue, fill.clone()));
                 // BOOK-1 — consume any queue-inferred fill
                 // overshoot and drop the tracker if the venue
                 // considers the order fully filled. We check
@@ -7319,7 +7717,7 @@ impl MarketMakerEngine {
                     // a warning flag. Dispatch is fire-and-forget
                     // on a spawned task — `handle_ws_event` is
                     // sync and we can't await from here.
-                    if self.xemm_executor.is_some() {
+                    if let Some(xemm) = self.xemm_executor.as_mut() {
                         if let (Some(hedge_book), Some(hedge_conn)) = (
                             self.hedge_book.as_ref(),
                             self.connectors.hedge.as_ref().cloned(),
@@ -7328,10 +7726,7 @@ impl MarketMakerEngine {
                                 hedge_book.book.best_bid(),
                                 hedge_book.book.best_ask(),
                             ) {
-                                let decision = self
-                                    .xemm_executor
-                                    .as_mut()
-                                    .expect("is_some")
+                                let decision = xemm
                                     .on_maker_fill(
                                         fill.side,
                                         fill.qty,
@@ -7759,9 +8154,15 @@ impl MarketMakerEngine {
                 "PERP-1 proactive reduce slice: side={unwind_side:?} qty={slice_qty} price={price}"
             ),
         );
+        // Phase IV P0 — margin reduce slices now ride the
+        // venue-level reduce_only flag so a mid-flight price move
+        // can't let the IoC fill cross zero and FLIP the
+        // position. Every major perp venue honours the flag
+        // natively; spot venues ignore it (no-op, guard never
+        // runs on spot anyway).
         if let Err(e) = self
             .order_manager
-            .execute_unwind_slice(
+            .execute_reduce_slice(
                 &self.symbol,
                 &quote,
                 &self.product,
@@ -8042,11 +8443,33 @@ impl MarketMakerEngine {
             }
         }
 
-        // Circuit breaker.
+        // Circuit breaker. The stale-book + wide-spread checks
+        // trip silently inside the struct; fire `record_incident`
+        // here on the edge so the engine's AlertManager +
+        // controller-side dedup feed actually see the event.
+        // Without this, StaleBook/WideSpread trips only hit
+        // `error!` in the log and stay invisible to operators.
+        let was_tripped = self.circuit_breaker.is_tripped();
         self.circuit_breaker
             .check_stale_book(self.book_keeper.book.last_update_ms, &self.config.risk);
         self.circuit_breaker
             .check_spread(self.book_keeper.book.spread_bps(), &self.config.risk);
+        if !was_tripped && self.circuit_breaker.is_tripped() {
+            let reason = self
+                .circuit_breaker
+                .reason()
+                .map(|r| format!("{:?}", r))
+                .unwrap_or_else(|| "unknown".into());
+            self.audit.risk_event(
+                &self.symbol,
+                AuditEventType::CircuitBreakerTripped,
+                &reason,
+            );
+            self.record_incident(
+                "high",
+                &format!("Circuit breaker tripped: {reason}"),
+            );
+        }
 
         // Soft spread gate — skip quoting for this tick when the
         // current book spread blows past the quote-gate threshold
@@ -8583,17 +9006,61 @@ impl MarketMakerEngine {
                     .values()
                     .find_map(|s| s.calibration_state())
             });
-        if let (Some(cs), Some(dashboard)) = (cal_state, self.dashboard.as_ref()) {
+        if let (Some(cs), Some(dashboard)) = (cal_state.as_ref(), self.dashboard.as_ref()) {
             dashboard.publish_calibration(
                 mm_dashboard::state::CalibrationSnapshot {
                     symbol: self.symbol.clone(),
-                    strategy: cs.strategy,
+                    strategy: cs.strategy.clone(),
                     a: cs.a,
                     k: cs.k,
                     samples: cs.samples,
                     last_recalibrated_ms: cs.last_recalibrated_ms,
                 },
             );
+        }
+        // Wave 1 R follow-up — mirror the calibration state to
+        // Prometheus so the agent telemetry scrape surfaces it
+        // in DeploymentStateRow. Emit even when no dashboard is
+        // attached (colo agents run dashboard=None).
+        if let Some(cs) = cal_state.as_ref() {
+            use rust_decimal::prelude::ToPrimitive;
+            mm_dashboard::metrics::CALIBRATION_A
+                .with_label_values(&[&self.symbol])
+                .set(cs.a.to_f64().unwrap_or(0.0));
+            mm_dashboard::metrics::CALIBRATION_K
+                .with_label_values(&[&self.symbol])
+                .set(cs.k.to_f64().unwrap_or(0.0));
+            mm_dashboard::metrics::CALIBRATION_SAMPLES
+                .with_label_values(&[&self.symbol])
+                .set(cs.samples as f64);
+        }
+        // Manipulation detector mirror — same distributed-path
+        // reasoning: the `SymbolState` publish at the bottom of
+        // this tick runs only when a dashboard is attached; on
+        // colo agents we still want Prometheus to carry the
+        // latest score so the agent's telemetry scrape sees it.
+        // `on_book` is called inside the SymbolState block below
+        // AND when graph source `Surveillance.ManipulationScore`
+        // reads it; here we just snapshot the current aggregator
+        // state.
+        {
+            let m = self.manipulation.snapshot();
+            let pd = m.pump_dump.to_string().parse::<f64>().unwrap_or(0.0);
+            let ws = m.wash.to_string().parse::<f64>().unwrap_or(0.0);
+            let tb = m.thin_book.to_string().parse::<f64>().unwrap_or(0.0);
+            let cb = m.combined.to_string().parse::<f64>().unwrap_or(0.0);
+            mm_dashboard::metrics::MANIPULATION_PUMP_DUMP
+                .with_label_values(&[&self.symbol])
+                .set(pd);
+            mm_dashboard::metrics::MANIPULATION_WASH
+                .with_label_values(&[&self.symbol])
+                .set(ws);
+            mm_dashboard::metrics::MANIPULATION_THIN_BOOK
+                .with_label_values(&[&self.symbol])
+                .set(tb);
+            mm_dashboard::metrics::MANIPULATION_COMBINED
+                .with_label_values(&[&self.symbol])
+                .set(cb);
         }
 
         // Phase 4 — if the graph authored a quote bundle on the last
@@ -8704,6 +9171,17 @@ impl MarketMakerEngine {
         self.adv_inventory
             .apply_urgency(&mut quotes, self.inventory_manager.inventory(), mid);
 
+        // Paper mode skips the balance gate entirely — the
+        // connector's `get_balances()` returns 401 with dummy
+        // keys (which is the whole point of paper on testnet),
+        // so `balance_cache` stays empty and `can_afford`
+        // zeroes every quote. Without this guard the strategy
+        // silently posts zero quotes for the entire paper run,
+        // which is why inventory/PnL stayed at 0 in the smoke
+        // test. Live mode keeps the gate: a real get_balances
+        // failure there IS a reason to stand down.
+        let skip_balance_gate = self.order_manager.is_paper();
+
         for q in quotes.iter_mut() {
             if let Some(bid) = &mut q.bid {
                 bid.qty = self.product.round_qty(self.adv_inventory.dynamic_size(
@@ -8711,14 +9189,15 @@ impl MarketMakerEngine {
                     self.inventory_manager.inventory(),
                     bid.side,
                 ));
-                // Balance pre-check.
-                if !self.balance_cache.can_afford(
-                    bid.side,
-                    bid.price,
-                    bid.qty,
-                    &self.product.base_asset,
-                    &self.product.quote_asset,
-                ) {
+                if !skip_balance_gate
+                    && !self.balance_cache.can_afford(
+                        bid.side,
+                        bid.price,
+                        bid.qty,
+                        &self.product.base_asset,
+                        &self.product.quote_asset,
+                    )
+                {
                     *bid = mm_common::types::Quote {
                         side: bid.side,
                         price: bid.price,
@@ -8732,13 +9211,15 @@ impl MarketMakerEngine {
                     self.inventory_manager.inventory(),
                     ask.side,
                 ));
-                if !self.balance_cache.can_afford(
-                    ask.side,
-                    ask.price,
-                    ask.qty,
-                    &self.product.base_asset,
-                    &self.product.quote_asset,
-                ) {
+                if !skip_balance_gate
+                    && !self.balance_cache.can_afford(
+                        ask.side,
+                        ask.price,
+                        ask.qty,
+                        &self.product.base_asset,
+                        &self.product.quote_asset,
+                    )
+                {
                     *ask = mm_common::types::Quote {
                         side: ask.side,
                         price: ask.price,
@@ -8891,6 +9372,31 @@ impl MarketMakerEngine {
         } else {
             0
         };
+
+        // 23-UX-6 — venue-scoped kill gate. A venue at L3+
+        // (CancelAll) quenches its primary connector without
+        // touching sibling venues: we cancel any live orders,
+        // skip execute_diff, and return. L2 (StopNewOrders)
+        // keeps existing quotes but blocks new placements.
+        // L0/L1 fall through — widen is handled upstream in the
+        // quote-shaping path and applies globally today; a
+        // per-venue widen multiplier is a future wire-up.
+        if let Some(ds) = &self.dashboard {
+            let venue_name = self.connectors.primary.venue_id().to_string();
+            let lvl = ds.venue_kill_level(&venue_name);
+            if lvl >= 3 {
+                if !self.order_manager.live_order_ids().is_empty() {
+                    self.order_manager
+                        .cancel_all(&self.connectors.primary, &self.symbol)
+                        .await?;
+                }
+                return Ok(());
+            }
+            if lvl == 2 {
+                return Ok(());
+            }
+        }
+
         self.order_manager
             .execute_diff(
                 &self.symbol,
@@ -8989,6 +9495,13 @@ impl MarketMakerEngine {
             ask_depth,
         );
 
+        // Publish dashboard state every quote refresh so the UI
+        // never shows FROZEN between the 30s summary ticks. WS
+        // push inside `update_dashboard()` is cheap (one broadcast
+        // per subscriber, serialisation dominated by PnL attribution
+        // which we already hold in memory).
+        self.update_dashboard();
+
         Ok(())
     }
 
@@ -9005,6 +9518,16 @@ impl MarketMakerEngine {
                 description: description.to_string(),
                 duration_secs: 0,
                 resolved: false,
+            });
+            // Wave D4 — mirror into the alert ring buffer so
+            // agents can surface alerts_recent via the details
+            // topic, and the controller can fan-out + dedup.
+            ds.push_alert(mm_dashboard::state::AlertRecord {
+                ts_ms: chrono::Utc::now().timestamp_millis(),
+                severity: severity.to_string(),
+                title: description.to_string(),
+                message: format!("Symbol: {}", self.symbol),
+                symbol: Some(self.symbol.clone()),
             });
         }
         if let Some(alerts) = &self.alerts {
@@ -9080,6 +9603,7 @@ impl MarketMakerEngine {
                 qty: *qty,
                 time_in_force: Some(TimeInForce::Ioc),
                 client_order_id: Some(format!("emu-{}", emulator_id)),
+                reduce_only: false,
             },
             EmulatorAction::PlaceLimit { side, price, qty, emulator_id } => NewOrder {
                 symbol: self.symbol.clone(),
@@ -9089,6 +9613,7 @@ impl MarketMakerEngine {
                 qty: *qty,
                 time_in_force: Some(TimeInForce::Gtc),
                 client_order_id: Some(format!("emu-{}", emulator_id)),
+                reduce_only: false,
             },
             EmulatorAction::CancelVenue { venue_order_id, emulator_id } => {
                 let parsed = match uuid::Uuid::parse_str(venue_order_id) {
@@ -9204,6 +9729,11 @@ impl MarketMakerEngine {
                         chrono::Utc::now().timestamp_millis(),
                         expected_price
                     )),
+                    // XEMM hedge opens an opposite position on the
+                    // hedge venue to neutralise primary inventory.
+                    // reduce_only would reject the first hedge tick
+                    // when the hedge book is flat.
+                    reduce_only: false,
                 };
                 match hedge_conn.place_order(&order).await {
                     Ok(order_id) => {
@@ -9301,9 +9831,10 @@ impl MarketMakerEngine {
 
     /// 22W-4 — fire a single DCA slice via the primary
     /// connector as IOC. `reduce_only` is honoured where the
-    /// venue supports it — currently threaded only into the
-    /// client order id prefix as a forensic tag; true
-    /// venue-side reduceOnly plumbing is stage-2.
+    /// DCA reduce slices now ride the venue's reduce_only flag
+    /// on perp venues — stage-2 plumbing (see Phase IV close-out).
+    /// The forensic `dca-red` client-order-id prefix is kept for
+    /// post-mortem grep; spot venues ignore the flag by spec.
     async fn dispatch_dca_slice(&mut self, slice: &DcaSlice) {
         use mm_common::types::{OrderType, Side as CommonSide, TimeInForce};
         use mm_exchange_core::connector::NewOrder;
@@ -9326,6 +9857,7 @@ impl MarketMakerEngine {
                 chrono::Utc::now().timestamp_millis(),
                 slice.offset.as_secs()
             )),
+            reduce_only: slice.reduce_only,
         };
         match self.connectors.primary.place_order(&order).await {
             Ok(order_id) => tracing::info!(
@@ -9641,6 +10173,21 @@ impl MarketMakerEngine {
     }
 
     fn update_dashboard(&mut self) {
+        // Mirror recent decisions into the process-global
+        // details store so the distributed `decisions_recent`
+        // topic (agent → controller HTTP) has fresh data even
+        // when no local dashboard is attached. Runs before the
+        // early-return because colo agents have `dashboard =
+        // None` but still need to surface decisions.
+        let decisions_snapshot = self
+            .decision_ledger
+            .recent(200)
+            .into_iter()
+            .filter_map(|snap| serde_json::to_value(&snap).ok())
+            .collect::<Vec<_>>();
+        mm_dashboard::details_store::global()
+            .set_decisions_snapshot(&self.symbol, decisions_snapshot);
+
         let Some(ds) = &self.dashboard else { return };
 
         // Publish the unified portfolio snapshot on every
@@ -9715,7 +10262,7 @@ impl MarketMakerEngine {
             inventory: self.inventory_manager.inventory(),
             inventory_value: self.inventory_manager.inventory().abs() * self.last_mid,
             live_orders: self.order_manager.live_count(),
-            total_fills: self.pnl_tracker.attribution.round_trips,
+            total_fills: self.pnl_tracker.attribution.fill_count,
             pnl: PnlSnapshot {
                 total: self.pnl_tracker.attribution.total_pnl(),
                 spread: self.pnl_tracker.attribution.spread_pnl,
@@ -9725,6 +10272,7 @@ impl MarketMakerEngine {
                 funding: self.pnl_tracker.attribution.funding_pnl_realised,
                 funding_mtm: self.pnl_tracker.attribution.funding_pnl_mtm,
                 round_trips: self.pnl_tracker.attribution.round_trips,
+                fill_count: self.pnl_tracker.attribution.fill_count,
                 volume: self.pnl_tracker.attribution.total_volume,
             },
             volatility: self.volatility_estimator.volatility().unwrap_or(dec!(0)),
@@ -11862,7 +12410,15 @@ mod dual_connector_tests {
         let acc_after = mm_dashboard::metrics::STRATEGY_GRAPH_DEPLOYS_TOTAL
             .with_label_values(&["accepted"])
             .get();
-        assert_eq!(acc_after - acc_before, 1);
+        // Counters are process-global across Prometheus state — if
+        // another test runs in parallel on the same counter the
+        // delta could be > 1. Assert `>= +1` so the test stays
+        // deterministic under the `cargo test -j N` scheduler
+        // while still proving this path incremented.
+        assert!(
+            acc_after >= acc_before + 1,
+            "accepted counter must increase by ≥ 1; got {acc_before} → {acc_after}"
+        );
         assert_eq!(
             mm_dashboard::metrics::STRATEGY_GRAPH_NODES
                 .with_label_values(&["sp4dep-good"])
@@ -11886,7 +12442,10 @@ mod dual_connector_tests {
         let rej_after = mm_dashboard::metrics::STRATEGY_GRAPH_DEPLOYS_TOTAL
             .with_label_values(&["rejected"])
             .get();
-        assert_eq!(rej_after - rej_before, 1);
+        assert!(
+            rej_after >= rej_before + 1,
+            "rejected counter must increase by ≥ 1; got {rej_before} → {rej_after}"
+        );
     }
 }
 
@@ -14614,6 +15173,308 @@ mod graph_source_sanity_tests {
             "profitable-long flatten PnL should propagate to SpreadMult, got {mult}"
         );
     }
+
+    /// Build a Phase IV reactive-XEMM style graph end-to-end:
+    ///
+    ///   Trade.OwnFill ──fired──┐
+    ///                ──side────┤
+    ///                ──qty ────┼──► Quote.Hedge ──quotes──► Out.VenueQuotesIf
+    ///                ──price ──┤                            ▲
+    ///                          └────────────────────────────┘ (trigger = fired)
+    ///
+    ///   + baseline Math.Const → Out.SpreadMult (validator
+    ///     requires a SpreadMult sink).
+    ///
+    /// The hedge node is configured with empty venue/symbol so
+    /// it emits plain `Value::Quotes` targeting the test engine's
+    /// own venue — the sink therefore populates
+    /// `graph_quotes_override` (the self-venue path) instead of
+    /// calling out to `dashboard.send_config_override` (which the
+    /// test harness doesn't wire).
+    fn build_xemm_reactive_graph(hedge_cross_bps: &str) -> Graph {
+        let own_fill = NodeId::new();
+        let hedge = NodeId::new();
+        let sink = NodeId::new();
+        let const_node = NodeId::new();
+        let baseline_sink = NodeId::new();
+        let mut g = Graph::empty("xemm-reactive-test", Scope::Symbol("BTCUSDT".into()));
+        g.nodes.push(GraphNode {
+            id: own_fill,
+            kind: "Trade.OwnFill".into(),
+            config: serde_json::json!({
+                "venue": "",          // match any venue (MockConnector = binance)
+                "symbol": "",
+                "role": "any",
+                "side_filter": "any",
+            }),
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(GraphNode {
+            id: hedge,
+            kind: "Quote.Hedge".into(),
+            config: serde_json::json!({
+                // Empty hedge venue → emits plain Quotes targeting
+                // this engine's venue so graph_quotes_override
+                // captures the hedge (no dashboard needed).
+                "hedge_venue": "",
+                "hedge_symbol": "",
+                "hedge_product": "",
+                "cross_bps": hedge_cross_bps,
+            }),
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(GraphNode {
+            id: sink,
+            kind: "Out.VenueQuotesIf".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(GraphNode {
+            id: const_node,
+            kind: "Math.Const".into(),
+            config: serde_json::json!({ "value": "1" }),
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(GraphNode {
+            id: baseline_sink,
+            kind: "Out.SpreadMult".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        // fill payload → hedge inputs
+        for (port_out, port_in) in [
+            ("fired", "fired"),
+            ("side", "side"),
+            ("qty", "qty"),
+            ("price", "price"),
+        ] {
+            g.edges.push(Edge {
+                from: PortRef { node: own_fill, port: port_out.into() },
+                to: PortRef { node: hedge, port: port_in.into() },
+            });
+        }
+        // hedge.quotes → sink.quotes
+        g.edges.push(Edge {
+            from: PortRef { node: hedge, port: "quotes".into() },
+            to: PortRef { node: sink, port: "quotes".into() },
+        });
+        // fired → sink.trigger
+        g.edges.push(Edge {
+            from: PortRef { node: own_fill, port: "fired".into() },
+            to: PortRef { node: sink, port: "trigger".into() },
+        });
+        // baseline sink
+        g.edges.push(Edge {
+            from: PortRef { node: const_node, port: "value".into() },
+            to: PortRef { node: baseline_sink, port: "mult".into() },
+        });
+        g
+    }
+
+    /// Without a fill event, the `Trade.OwnFill` source emits
+    /// `fired=false`, `Out.VenueQuotesIf` suppresses the sink,
+    /// and `graph_quotes_override` stays `None`. Proves the gate
+    /// fails closed — a graph deployed without fills never
+    /// places a phantom hedge.
+    #[test]
+    fn xemm_reactive_without_fill_emits_no_hedge() {
+        let mut engine = build_engine();
+        feed_snapshot(
+            &mut engine,
+            vec![(dec!(50_000), dec!(5))],
+            vec![(dec!(50_100), dec!(5))],
+        );
+        let g = build_xemm_reactive_graph("10");
+        engine.swap_strategy_graph(&g).expect("compiles");
+        engine.tick_strategy_graph();
+        assert!(
+            engine.graph_quotes_override.is_none(),
+            "no fill → VenueQuotesIf must not fire; got override={:?}",
+            engine.graph_quotes_override
+        );
+    }
+
+    /// With a primary-venue fill, the full chain fires:
+    ///   Fill(Buy, 0.01 @ 50_000) →
+    ///     Trade.OwnFill(fired=true, side=+1, qty=0.01, price=50_000)
+    ///     → Quote.Hedge(side=Sell, qty=0.01, price=50_000 − 10bps)
+    ///     → Out.VenueQuotesIf(trigger=true) → SinkAction::Quotes
+    ///     → graph_quotes_override populated with one ask.
+    ///
+    /// Proves Phase IV graph-native reactive XEMM works
+    /// end-to-end: source overlay + conditional sink + hedge-leg
+    /// transform all compose to produce exactly one counter-side
+    /// quote at the expected crossed price.
+    #[test]
+    fn xemm_reactive_fill_produces_opposite_hedge() {
+        let mut engine = build_engine();
+        feed_snapshot(
+            &mut engine,
+            vec![(dec!(50_000), dec!(5))],
+            vec![(dec!(50_100), dec!(5))],
+        );
+        let g = build_xemm_reactive_graph("10");
+        engine.swap_strategy_graph(&g).expect("compiles");
+
+        // Inject an own-fill via the same path the live engine
+        // uses. The `handle_ws_event(Fill)` handler pushes into
+        // `pending_own_fills` which the graph source drains at
+        // tick time.
+        let fill = Fill {
+            trade_id: 1,
+            order_id: Uuid::new_v4(),
+            symbol: "BTCUSDT".into(),
+            side: Side::Buy,
+            price: dec!(50_000),
+            qty: dec!(0.01),
+            is_maker: true,
+            timestamp: chrono::Utc::now(),
+        };
+        engine.handle_ws_event(MarketEvent::Fill {
+            venue: VenueId::Binance,
+            fill,
+        });
+        assert_eq!(
+            engine.pending_own_fills.len(),
+            1,
+            "fill must land in the pending buffer"
+        );
+
+        engine.tick_strategy_graph();
+
+        // Drain happened — buffer is empty.
+        assert!(
+            engine.pending_own_fills.is_empty(),
+            "tick_strategy_graph must drain pending_own_fills"
+        );
+
+        // Hedge fired — graph_quotes_override carries one ask
+        // (opposite side of the Buy fill) at crossed price.
+        let pairs = engine
+            .graph_quotes_override
+            .as_ref()
+            .expect("hedge must fire on fill");
+        assert_eq!(pairs.len(), 1);
+        let ask = pairs[0]
+            .ask
+            .as_ref()
+            .expect("hedge must be a Sell (opposite of Buy fill)");
+        assert!(
+            pairs[0].bid.is_none(),
+            "buy-fill hedge must be sell-only, got bid {:?}",
+            pairs[0].bid
+        );
+        assert_eq!(ask.qty, dec!(0.01));
+        // Price = 50_000 − 10bps = 50_000 − 50 = 49_950, then
+        // rounded to the product's tick_size (0.01) — identity
+        // on this value.
+        assert_eq!(ask.price, dec!(49_950));
+    }
+
+    /// Fill on a symbol that doesn't match the `Trade.OwnFill`
+    /// filter (symbol = "ETHUSDT") does NOT fire the hedge —
+    /// per-node filter works.
+    #[test]
+    fn xemm_reactive_symbol_filter_suppresses_unmatched_fills() {
+        let mut engine = build_engine();
+        feed_snapshot(
+            &mut engine,
+            vec![(dec!(50_000), dec!(5))],
+            vec![(dec!(50_100), dec!(5))],
+        );
+        let own_fill = NodeId::new();
+        let hedge = NodeId::new();
+        let sink = NodeId::new();
+        let const_node = NodeId::new();
+        let baseline_sink = NodeId::new();
+        let mut g = Graph::empty("xemm-filtered-test", Scope::Symbol("BTCUSDT".into()));
+        g.nodes.push(GraphNode {
+            id: own_fill,
+            kind: "Trade.OwnFill".into(),
+            // Filter wants ETH fills only — the BTC fill below
+            // must be skipped.
+            config: serde_json::json!({
+                "venue": "",
+                "symbol": "ETHUSDT",
+                "role": "any",
+                "side_filter": "any",
+            }),
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(GraphNode {
+            id: hedge,
+            kind: "Quote.Hedge".into(),
+            config: serde_json::json!({
+                "hedge_venue": "",
+                "hedge_symbol": "",
+                "hedge_product": "",
+                "cross_bps": "10",
+            }),
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(GraphNode {
+            id: sink,
+            kind: "Out.VenueQuotesIf".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(GraphNode {
+            id: const_node,
+            kind: "Math.Const".into(),
+            config: serde_json::json!({ "value": "1" }),
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(GraphNode {
+            id: baseline_sink,
+            kind: "Out.SpreadMult".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        for (port_out, port_in) in [
+            ("fired", "fired"),
+            ("side", "side"),
+            ("qty", "qty"),
+            ("price", "price"),
+        ] {
+            g.edges.push(Edge {
+                from: PortRef { node: own_fill, port: port_out.into() },
+                to: PortRef { node: hedge, port: port_in.into() },
+            });
+        }
+        g.edges.push(Edge {
+            from: PortRef { node: hedge, port: "quotes".into() },
+            to: PortRef { node: sink, port: "quotes".into() },
+        });
+        g.edges.push(Edge {
+            from: PortRef { node: own_fill, port: "fired".into() },
+            to: PortRef { node: sink, port: "trigger".into() },
+        });
+        g.edges.push(Edge {
+            from: PortRef { node: const_node, port: "value".into() },
+            to: PortRef { node: baseline_sink, port: "mult".into() },
+        });
+        engine.swap_strategy_graph(&g).expect("compiles");
+
+        engine.handle_ws_event(MarketEvent::Fill {
+            venue: VenueId::Binance,
+            fill: Fill {
+                trade_id: 1,
+                order_id: Uuid::new_v4(),
+                symbol: "BTCUSDT".into(),
+                side: Side::Buy,
+                price: dec!(50_000),
+                qty: dec!(0.01),
+                is_maker: true,
+                timestamp: chrono::Utc::now(),
+            },
+        });
+        engine.tick_strategy_graph();
+
+        assert!(
+            engine.graph_quotes_override.is_none(),
+            "symbol filter must suppress the hedge"
+        );
+    }
 }
 
 // -------------------------------------------------------------
@@ -14697,6 +15558,10 @@ mod graph_catalog_coverage {
         ("Out.Flatten", "sink — SinkAction::Flatten"),
         ("Out.Quotes", "sink — SinkAction::Quotes"),
         ("Out.VenueQuotes", "sink — SinkAction::VenueQuotes"),
+        (
+            "Out.VenueQuotesIf",
+            "sink — SinkAction::VenueQuotes (gated) or ::Quotes when input is plain Quotes",
+        ),
         ("Out.AtomicBundle", "sink — SinkAction::AtomicBundle"),
     ];
 

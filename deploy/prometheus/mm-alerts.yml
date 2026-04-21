@@ -1,0 +1,234 @@
+---
+# Market-maker Prometheus alert rules.
+#
+# Mount this file into Prometheus alongside prometheus.yml:
+#
+#   docker run -v $(pwd)/deploy/prometheus/mm-alerts.yml:/etc/prometheus/mm-alerts.yml ...
+#
+# Then reference it from the main prometheus.yml:
+#
+#   rule_files:
+#     - /etc/prometheus/mm-alerts.yml
+#
+# Severity convention matches the engine's kill-switch ladder:
+#   critical — page immediately (kill switch tripped, venue dead,
+#              uncaught exception in archive/scheduler)
+#   warning  — notify channel (degraded but trading, SLA slipping,
+#              elevated toxicity)
+#   info     — ticket/backlog (margin nearing guard, spreads wide
+#              but not tripping)
+#
+# All `for:` windows are conservative — too-short triggers page
+# on transient blips. Tune per deployment by editing the `for:`
+# duration and the threshold in `expr:`.
+
+groups:
+  # ── Critical: immediately page ─────────────────────────────
+  - name: mm-critical
+    interval: 15s
+    rules:
+      - alert: MMKillSwitchAtCancelOrAbove
+        expr: max(mm_kill_switch_level) by (symbol) >= 3
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kill switch at level {{ $value }} on {{ $labels.symbol }}"
+          description: >
+            Kill switch reached CancelAll (3), Flatten (4), or
+            Disconnect (5) and has held for 30s. Engine is no
+            longer placing new orders on this symbol. Check the
+            dashboard and audit log to find the triggering
+            condition (margin, circuit breaker, protections
+            stack, manual escalation).
+
+      - alert: MMKillSwitchDisconnected
+        expr: max(mm_kill_switch_level) by (symbol) == 5
+        for: 10s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kill switch L5 Disconnect on {{ $labels.symbol }}"
+          description: >
+            Engine stopped the WS event loop. Only ManualKillSwitchReset
+            clears this. Check audit log for the trigger and
+            reset from the dashboard (/api/v1/ops/reset/{symbol})
+            after validating.
+
+      - alert: MMArchiveUploadsFailing
+        expr: rate(mm_archive_upload_errors_total[15m]) > 0
+              and on()
+              (time() - max(mm_archive_last_success_ts)) > 3600
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Archive uploads failing — compliance chain broken"
+          description: >
+            Audit/report archive has failed for >1h and the error
+            rate is non-zero. MiCA Article 17 compliance requires
+            continuous archive — fix credentials / network / disk
+            now.
+
+      - alert: MMAtomicBundleRollbacksElevated
+        expr: rate(mm_atomic_bundles_rolled_back_total[5m]) * 60 >= 2
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Atomic bundle rollbacks ≥ 2/min"
+          description: >
+            Cross-venue atomic bundles are rolling back
+            repeatedly, meaning one leg keeps acking without the
+            other. Check venue connectivity + bundle timeout
+            config; naked-leg risk is real here.
+
+  # ── Warning: notify ops channel ────────────────────────────
+  - name: mm-warning
+    interval: 30s
+    rules:
+      - alert: MMKillSwitchWidenOrStop
+        expr: max(mm_kill_switch_level) by (symbol) >= 1 and max(mm_kill_switch_level) by (symbol) < 3
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kill switch at L{{ $value }} on {{ $labels.symbol }} (WidenSpreads/StopNewOrders)"
+          description: >
+            Engine is in WidenSpreads (1) or StopNewOrders (2)
+            for >2m. Either a risk guard tripped or the operator
+            manually escalated. Trading may still happen with
+            wider quotes.
+
+      - alert: MMSlaUptimeBelow98pct
+        expr: min(mm_sla_uptime_pct) by (symbol) < 98 and min(mm_sla_uptime_pct) by (symbol) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SLA uptime {{ $value }}% on {{ $labels.symbol }}"
+          description: >
+            Sustained SLA uptime below 98%. Exchange obligations
+            typically require 95%+ — a 2pp margin is the natural
+            warn threshold. Check kill switch / circuit breaker
+            history for the downtime cause.
+
+      - alert: MMBookUpdateLatencyP95Elevated
+        expr: >
+          histogram_quantile(
+            0.95,
+            sum(rate(mm_book_update_latency_ms_bucket[5m])) by (le, venue)
+          ) > 250
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Book update p95 latency > 250ms on {{ $labels.venue }}"
+          description: >
+            WS book-update-applied latency p95 has crossed 250ms
+            on venue {{ $labels.venue }} for 5m. At this level
+            the engine's quote decisions are reading a 250ms-stale
+            book; consider switching to user-stream or closer
+            colo.
+
+      - alert: MMSorDispatchErrorRate
+        expr: >
+          sum(rate(mm_sor_dispatch_errors_total[5m])) by (venue)
+          /
+          (sum(rate(mm_sor_dispatch_success_total[5m])) by (venue)
+           + sum(rate(mm_sor_dispatch_errors_total[5m])) by (venue))
+          > 0.10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SOR error rate > 10% on {{ $labels.venue }}"
+          description: >
+            More than one in ten SOR dispatches to {{ $labels.venue }}
+            failed over the last 5m. Check venue status (rate
+            limits, auth) and venue-scoped kill switch state.
+
+      - alert: MMSurveillanceAlertsFiring
+        expr: increase(mm_surveillance_alerts_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Surveillance alert fired ({{ $labels.pattern }} on {{ $labels.symbol }})"
+          description: >
+            A surveillance detector crossed its threshold in the
+            last 10m. Review the audit log for the triggering
+            trade(s) and decide whether to escalate.
+
+      - alert: MMStrategyGraphDeployRejected
+        expr: increase(mm_strategy_graph_deploys_total{outcome="rejected"}[15m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Strategy graph deploy rejected"
+          description: >
+            An operator attempted to deploy a graph that failed
+            validation (dangling edge, missing sink, restricted
+            node without env gate). Check
+            /api/admin/strategy/graph 400/403 responses in the
+            server log.
+
+  # ── Info: ticket / backlog ────────────────────────────────
+  - name: mm-info
+    interval: 60s
+    rules:
+      - alert: MMMarginRatioApproachingWiden
+        expr: >
+          max(mm_portfolio_unrealised_pnl < 0) by (symbol)
+            < -100
+          unless
+          max(mm_kill_switch_level) by (symbol) >= 1
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: "Sustained unrealised drawdown on {{ $labels.symbol }}"
+          description: >
+            Unrealised PnL has been below -100 quote for 15m
+            without tripping the kill switch. Confirm it's the
+            expected regime (mean-reverting trade open), not a
+            broken risk stack.
+
+      - alert: MMToxicityElevatedVpin
+        expr: max(mm_vpin) by (symbol) > 0.75
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "VPIN toxicity > 0.75 on {{ $labels.symbol }}"
+          description: >
+            Sustained adverse flow signal. Autotuner should be
+            widening spread already; this alert just makes the
+            regime visible in the on-call channel.
+
+      - alert: MMFillSlippageAboveBaseline
+        expr: avg(mm_fill_slippage_avg_bps) by (symbol) > 2
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "Avg fill slippage > 2 bps on {{ $labels.symbol }}"
+          description: >
+            Average fill slippage has held above 2 bps for 30m.
+            Usually means the queue-position model drifted or
+            market maker quotes are too aggressive. Re-check the
+            autotune regime and queue-tracker state.
+
+      - alert: MMSentimentKillTriggered
+        expr: increase(mm_social_kill_triggers_total[1h]) > 0
+        for: 1m
+        labels:
+          severity: info
+        annotations:
+          summary: "Sentiment kill triggered for {{ $labels.asset }}"
+          description: >
+            Social risk feed escalated the kill switch in the
+            last hour. Check the news retreat state machine +
+            recent sentiment ticks to confirm the fire was
+            real, not a stale feed.

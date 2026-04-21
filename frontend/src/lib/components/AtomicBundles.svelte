@@ -22,8 +22,47 @@
 
   async function refresh() {
     try {
-      const data = await api.getJson('/api/v1/atomic-bundles/inflight')
-      bundles = data?.bundles ?? []
+      const fleet = await api.getJson('/api/v1/fleet')
+      const fetches = []
+      for (const a of Array.isArray(fleet) ? fleet : []) {
+        for (const d of a.deployments || []) {
+          if (!d.running) continue
+          const path = `/api/v1/agents/${encodeURIComponent(a.agent_id)}`
+            + `/deployments/${encodeURIComponent(d.deployment_id)}`
+            + `/details/atomic_bundles_inflight`
+          fetches.push(
+            api.getJson(path)
+              .then(resp => resp.payload?.bundles || [])
+              .catch(() => []),
+          )
+        }
+      }
+      // Dedup by bundle_id — the same bundle's legs may be
+      // registered on two different deployments (maker on one
+      // agent, hedge on another). Prefer whichever copy has
+      // more fields populated.
+      const all = (await Promise.all(fetches)).flat()
+      const byId = new Map()
+      for (const b of all) {
+        const existing = byId.get(b.bundle_id)
+        if (!existing) {
+          byId.set(b.bundle_id, b)
+          continue
+        }
+        // Merge leg by leg — whichever side has a non-null entry
+        // wins; if both do, ack=true wins over ack=false.
+        const merged = { bundle_id: b.bundle_id, maker: null, hedge: null }
+        for (const k of ['maker', 'hedge']) {
+          const a = existing[k]
+          const c = b[k]
+          if (!a && !c) continue
+          if (a && !c) merged[k] = a
+          else if (!a && c) merged[k] = c
+          else merged[k] = a.acked ? a : c
+        }
+        byId.set(b.bundle_id, merged)
+      }
+      bundles = Array.from(byId.values())
       error = null
       lastFetch = new Date()
       loading = false

@@ -34,6 +34,16 @@
   let justIssuedKey = $state('')
   let justIssuedName = $state('')
 
+  // Wave H1 — password-reset URL surface. Admin clicks
+  // "Reset password" on a row; we POST to mint a one-shot
+  // signed token and render the URL once. Admin delivers
+  // the link out-of-band.
+  let resetUrl = $state('')
+  let resetForName = $state('')
+  let resetExpires = $state('')
+  let resetBusyFor = $state('')
+  let resetError = $state('')
+
   async function refresh() {
     refreshing = true
     try {
@@ -96,6 +106,52 @@
       // context; if it fails we just leave the box visible
       // so the operator can select + ⌘C manually.
     }
+  }
+
+  async function copyResetLink() {
+    try {
+      await navigator.clipboard.writeText(absoluteUrl(resetUrl))
+    } catch (_) {
+      // Same graceful-fallback — operator can still select
+      // the text in the code block and copy manually.
+    }
+  }
+
+  function absoluteUrl(path) {
+    if (!path) return ''
+    try {
+      return new URL(path, window.location.origin).toString()
+    } catch (_) {
+      return path
+    }
+  }
+
+  async function startReset(u) {
+    resetError = ''
+    resetUrl = ''
+    resetForName = ''
+    resetExpires = ''
+    resetBusyFor = u.id
+    try {
+      const resp = await api.postJson(
+        `/api/admin/users/${encodeURIComponent(u.id)}/reset-password`,
+        {},
+      )
+      resetUrl = resp.reset_url
+      resetForName = u.name
+      resetExpires = resp.expires_at
+    } catch (e) {
+      resetError = e.message
+    } finally {
+      resetBusyFor = ''
+    }
+  }
+
+  function dismissReset() {
+    resetUrl = ''
+    resetForName = ''
+    resetExpires = ''
+    resetError = ''
   }
 
   function dismissKey() {
@@ -163,6 +219,9 @@
             <th>Role</th>
             <th>Symbols</th>
             <th>API key</th>
+            {#if canControl}
+              <th class="actions-col">Actions</th>
+            {/if}
           </tr>
         </thead>
         <tbody>
@@ -178,6 +237,25 @@
                 {/if}
               </td>
               <td class="mono">{u.api_key_hint}</td>
+              {#if canControl}
+                <td class="actions-cell">
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-ghost"
+                    onclick={() => startReset(u)}
+                    disabled={resetBusyFor === u.id}
+                    title="Generate a one-shot password-reset URL for this user"
+                  >
+                    {#if resetBusyFor === u.id}
+                      <span class="spinner"></span>
+                      <span>Issuing…</span>
+                    {:else}
+                      <Icon name="shield" size={12} />
+                      <span>Reset password</span>
+                    {/if}
+                  </button>
+                </td>
+              {/if}
             </tr>
           {/each}
         </tbody>
@@ -251,6 +329,39 @@
     </form>
   {/if}
 
+  {#if resetError}
+    <div class="error-line">
+      <Icon name="alert" size={12} />
+      <span>{resetError}</span>
+    </div>
+  {/if}
+
+  {#if resetUrl}
+    <div class="issued-box" role="alert">
+      <div class="issued-head">
+        <Icon name="shield" size={14} />
+        <span class="issued-title">Password reset for “{resetForName}”</span>
+      </div>
+      <p class="issued-hint">
+        Deliver this link to the user via a secure channel
+        (Signal, in-person). It is one-shot and expires at
+        {new Date(resetExpires).toLocaleString()}.
+      </p>
+      <div class="issued-key">
+        <code>{absoluteUrl(resetUrl)}</code>
+        <button type="button" class="btn btn-sm btn-ghost" onclick={copyResetLink}>
+          <Icon name="check" size={12} />
+          <span>Copy</span>
+        </button>
+      </div>
+      <div class="actions">
+        <button type="button" class="btn btn-ghost btn-sm" onclick={dismissReset}>
+          Done
+        </button>
+      </div>
+    </div>
+  {/if}
+
   {#if justIssuedKey}
     <div class="issued-box" role="alert">
       <div class="issued-head">
@@ -296,6 +407,8 @@
     font-size: var(--fs-2xs);
     color: var(--fg-secondary);
   }
+  .actions-col { width: 1%; white-space: nowrap; }
+  .actions-cell { text-align: right; }
 
   .form {
     display: flex;

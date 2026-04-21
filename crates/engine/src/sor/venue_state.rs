@@ -122,6 +122,12 @@ impl VenueSnapshot {
 pub struct VenueSeed {
     pub symbol: String,
     pub product: ProductSpec,
+    /// Market-type discriminator — Spot / LinearPerp / InversePerp.
+    /// Used together with `venue` as the aggregator's key so a
+    /// single process can run (Binance spot) + (Binance linear
+    /// perp) without the dispatcher lookup colliding on VenueId
+    /// alone.
+    pub venue_product: mm_exchange_core::connector::VenueProduct,
     pub available_qty: Decimal,
     pub queue_wait_secs: Decimal,
     pub best_bid: Decimal,
@@ -132,15 +138,30 @@ impl VenueSeed {
     /// Construct a seed with empty book state. The engine
     /// later refreshes `best_bid` / `best_ask` on every
     /// market-data tick through `update_book`.
+    /// Defaults `venue_product` to `Spot` — callers that trade
+    /// perps should use `with_venue_product` immediately after.
     pub fn new(symbol: &str, product: ProductSpec, available_qty: Decimal) -> Self {
         Self {
             symbol: symbol.to_string(),
             product,
+            venue_product: mm_exchange_core::connector::VenueProduct::Spot,
             available_qty,
             queue_wait_secs: Decimal::ZERO,
             best_bid: Decimal::ZERO,
             best_ask: Decimal::ZERO,
         }
+    }
+
+    /// Builder-style override for the product type. Engine boot
+    /// path calls this after `new()` when the venue is a perp,
+    /// keeping the default-argument ergonomic for the common
+    /// spot case.
+    pub fn with_venue_product(
+        mut self,
+        product: mm_exchange_core::connector::VenueProduct,
+    ) -> Self {
+        self.venue_product = product;
+        self
     }
 }
 
@@ -159,9 +180,18 @@ impl VenueSeed {
 /// identify the implicit symbol from the venue's first
 /// registered seed, so a deployment with exactly one symbol
 /// per venue sees byte-identical behaviour.
+/// Aggregator slot key: venue + product type + symbol. The
+/// triple uniquely identifies a market so a single process can
+/// seed both `(Binance, Spot, BTCUSDT)` and `(Binance, LinearPerp,
+/// BTCUSDT)` at the same time — the collision the old
+/// `(VenueId, symbol)` key produced is gone. Kept as a plain
+/// tuple alias (not a named struct) so the existing HashMap
+/// `get`/`insert` patterns stay ergonomic.
+pub type VenueSlot = (VenueId, mm_exchange_core::connector::VenueProduct, String);
+
 #[derive(Debug, Clone, Default)]
 pub struct VenueStateAggregator {
-    seeds: HashMap<(VenueId, String), VenueSeed>,
+    seeds: HashMap<VenueSlot, VenueSeed>,
 }
 
 impl VenueStateAggregator {
@@ -175,11 +205,17 @@ impl VenueStateAggregator {
     /// `(venue, symbol)` combination. Idempotent on re-
     /// registration.
     pub fn register_venue(&mut self, venue: VenueId, seed: VenueSeed) {
-        self.seeds.insert((venue, seed.symbol.clone()), seed);
+        self.seeds.insert(
+            (venue, seed.venue_product, seed.symbol.clone()),
+            seed,
+        );
     }
 
     /// Update the best-bid / best-ask pair for the seed at
     /// `(venue, symbol)`. No-op if the slot is unregistered.
+    /// Back-compat: scans all products on the venue and updates
+    /// the first match. For multi-product-per-venue deployments,
+    /// use `update_book_for_slot`.
     pub fn update_book_for(
         &mut self,
         venue: VenueId,
@@ -187,7 +223,26 @@ impl VenueStateAggregator {
         best_bid: Decimal,
         best_ask: Decimal,
     ) {
-        if let Some(seed) = self.seeds.get_mut(&(venue, symbol.to_string())) {
+        if let Some(key) = self.find_slot_key(venue, symbol) {
+            if let Some(seed) = self.seeds.get_mut(&key) {
+                seed.best_bid = best_bid;
+                seed.best_ask = best_ask;
+            }
+        }
+    }
+
+    /// Product-aware book update — targets exactly the seed at
+    /// `(venue, product, symbol)`. Use this when the same venue
+    /// has multiple products (spot + perp).
+    pub fn update_book_for_slot(
+        &mut self,
+        venue: VenueId,
+        product: mm_exchange_core::connector::VenueProduct,
+        symbol: &str,
+        best_bid: Decimal,
+        best_ask: Decimal,
+    ) {
+        if let Some(seed) = self.seeds.get_mut(&(venue, product, symbol.to_string())) {
             seed.best_bid = best_bid;
             seed.best_ask = best_ask;
         }
@@ -202,8 +257,8 @@ impl VenueStateAggregator {
         }
     }
 
-    /// Keyed fee-rate update. Targets exactly the seed at
-    /// `(venue, symbol)`.
+    /// Keyed fee-rate update. Targets the first matching
+    /// `(venue, *, symbol)` slot.
     pub fn update_fees_for(
         &mut self,
         venue: VenueId,
@@ -211,9 +266,11 @@ impl VenueStateAggregator {
         maker_fee: Decimal,
         taker_fee: Decimal,
     ) {
-        if let Some(seed) = self.seeds.get_mut(&(venue, symbol.to_string())) {
-            seed.product.maker_fee = maker_fee;
-            seed.product.taker_fee = taker_fee;
+        if let Some(key) = self.find_slot_key(venue, symbol) {
+            if let Some(seed) = self.seeds.get_mut(&key) {
+                seed.product.maker_fee = maker_fee;
+                seed.product.taker_fee = taker_fee;
+            }
         }
     }
 
@@ -231,8 +288,10 @@ impl VenueStateAggregator {
         symbol: &str,
         queue_wait_secs: Decimal,
     ) {
-        if let Some(seed) = self.seeds.get_mut(&(venue, symbol.to_string())) {
-            seed.queue_wait_secs = queue_wait_secs;
+        if let Some(key) = self.find_slot_key(venue, symbol) {
+            if let Some(seed) = self.seeds.get_mut(&key) {
+                seed.queue_wait_secs = queue_wait_secs;
+            }
         }
     }
 
@@ -243,9 +302,20 @@ impl VenueStateAggregator {
         }
     }
 
-    /// Keyed accessor.
+    /// Keyed accessor — first matching `(venue, *, symbol)`.
     pub fn seed_for(&self, venue: VenueId, symbol: &str) -> Option<&VenueSeed> {
-        self.seeds.get(&(venue, symbol.to_string()))
+        let key = self.find_slot_key(venue, symbol)?;
+        self.seeds.get(&key)
+    }
+
+    /// Product-aware accessor.
+    pub fn seed_for_slot(
+        &self,
+        venue: VenueId,
+        product: mm_exchange_core::connector::VenueProduct,
+        symbol: &str,
+    ) -> Option<&VenueSeed> {
+        self.seeds.get(&(venue, product, symbol.to_string()))
     }
 
     /// Single-symbol convenience accessor. Returns the first
@@ -259,18 +329,37 @@ impl VenueStateAggregator {
     /// sorted by venue enum ordinal. Legacy accessor.
     pub fn venues(&self) -> Vec<VenueId> {
         use std::collections::HashSet;
-        let set: HashSet<VenueId> = self.seeds.keys().map(|(v, _)| *v).collect();
+        let set: HashSet<VenueId> = self.seeds.keys().map(|(v, _, _)| *v).collect();
         let mut v: Vec<VenueId> = set.into_iter().collect();
         v.sort_by_key(|venue| *venue as u8);
         v
     }
 
     /// Every `(VenueId, Symbol)` pair registered, sorted
-    /// deterministically. Use this when the caller actually
-    /// cares about the per-symbol slot (multi-symbol SOR).
+    /// deterministically. Dedupes products so a single venue
+    /// running spot+perp on BTCUSDT shows once — legacy
+    /// call sites don't care about the product distinction.
     pub fn venue_symbols(&self) -> Vec<(VenueId, String)> {
-        let mut out: Vec<(VenueId, String)> = self.seeds.keys().cloned().collect();
+        use std::collections::HashSet;
+        let set: HashSet<(VenueId, String)> = self
+            .seeds
+            .keys()
+            .map(|(v, _, s)| (*v, s.clone()))
+            .collect();
+        let mut out: Vec<(VenueId, String)> = set.into_iter().collect();
         out.sort_by(|a, b| (a.0 as u8).cmp(&(b.0 as u8)).then_with(|| a.1.cmp(&b.1)));
+        out
+    }
+
+    /// Product-aware enumeration — every registered
+    /// `(venue, product, symbol)` slot.
+    pub fn venue_slots(&self) -> Vec<VenueSlot> {
+        let mut out: Vec<VenueSlot> = self.seeds.keys().cloned().collect();
+        out.sort_by(|a, b| {
+            (a.0 as u8).cmp(&(b.0 as u8))
+                .then_with(|| (a.1 as u8).cmp(&(b.1 as u8)))
+                .then_with(|| a.2.cmp(&b.2))
+        });
         out
     }
 
@@ -281,25 +370,39 @@ impl VenueStateAggregator {
         let mut syms: Vec<String> = self
             .seeds
             .keys()
-            .filter_map(|(v, s)| if *v == venue { Some(s.clone()) } else { None })
+            .filter_map(|(v, _, s)| if *v == venue { Some(s.clone()) } else { None })
             .collect();
         syms.sort();
         syms.into_iter().next()
     }
 
+    /// Find the first slot key matching `(venue, *, symbol)`.
+    /// Deterministic: scans products in enum-ordinal order.
+    fn find_slot_key(&self, venue: VenueId, symbol: &str) -> Option<VenueSlot> {
+        let mut hits: Vec<VenueSlot> = self
+            .seeds
+            .keys()
+            .filter(|(v, _, s)| *v == venue && s == symbol)
+            .cloned()
+            .collect();
+        hits.sort_by_key(|(_, p, _)| *p as u8);
+        hits.into_iter().next()
+    }
+
     /// Walk the bundle's connectors, pull live rate-limit
     /// budgets, and combine with the seeded state to produce
-    /// one `VenueSnapshot` per registered `(venue, symbol)`
-    /// slot. The same connector may contribute multiple
-    /// snapshots when the aggregator holds multiple symbols
-    /// for that venue.
+    /// one `VenueSnapshot` per registered slot. The same
+    /// connector may contribute multiple snapshots when the
+    /// aggregator holds multiple symbols or products on that
+    /// venue.
     pub async fn collect(&self, bundle: &ConnectorBundle, _side: Side) -> Vec<VenueSnapshot> {
         let mut out = Vec::new();
         for connector in bundle.all_connectors() {
             let venue = connector.venue_id();
+            let product = connector.product();
             let rate_limit_remaining = connector.rate_limit_remaining().await;
-            for ((v, _sym), seed) in &self.seeds {
-                if *v != venue {
+            for ((v, p, _sym), seed) in &self.seeds {
+                if *v != venue || *p != product {
                     continue;
                 }
                 out.push(snapshot_from_seed(connector, seed, rate_limit_remaining));
@@ -317,7 +420,7 @@ impl VenueStateAggregator {
     pub fn collect_synthetic(&self, venues: &[(VenueId, u32)]) -> Vec<VenueSnapshot> {
         let mut out = Vec::new();
         for (venue, remaining) in venues {
-            for ((v, _sym), seed) in &self.seeds {
+            for ((v, _p, _sym), seed) in &self.seeds {
                 if *v != *venue {
                     continue;
                 }
@@ -412,6 +515,7 @@ mod tests {
         VenueSeed {
             symbol: "BTCUSDT".into(),
             product: sample_product(),
+            venue_product: mm_exchange_core::connector::VenueProduct::Spot,
             available_qty: available,
             queue_wait_secs: dec!(10),
             best_bid: dec!(49990),
@@ -565,6 +669,7 @@ mod tests {
                 taker_fee: dec!(0.0005),
                 trading_status: Default::default(),
             },
+            venue_product: mm_exchange_core::connector::VenueProduct::Spot,
             available_qty: available,
             queue_wait_secs: dec!(10),
             best_bid: dec!(49990),

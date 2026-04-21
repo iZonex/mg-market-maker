@@ -1,0 +1,42 @@
+# Dev overrides. Layer on top of values.yaml:
+#
+#   helm install mm-dev ./deploy/helm/mm -f values.yaml -f values-dev.yaml
+#
+# Safe to check in — no secrets here. The Secret is created inline
+# from `values.yaml` empty strings which the engine ignores for a
+# paper run.
+
+image:
+  tag: "latest"
+  pullPolicy: Always
+
+replicaCount: 1
+
+env:
+  MM_MODE: paper
+  RUST_LOG: debug,mm_engine=trace,mm_exchange_binance=debug
+  MM_DASHBOARD_CORS_ORIGINS: ""
+
+secret:
+  create: true               # OK for dev — no real creds in the file
+  existingSecretName: ""
+  stringData:
+    MM_AUTH_SECRET: "dev-auth-secret-change-me-in-staging-32-bytes"
+    MM_CHECKPOINT_SECRET: "dev-checkpoint-secret-change-me-32-bytes"
+
+resources:
+  requests:
+    cpu: "200m"
+    memory: "256Mi"
+  limits:
+    cpu: "1"
+    memory: "1Gi"
+
+persistence:
+  size: 5Gi
+
+pdb:
+  enabled: false              # dev clusters churn; PDB just slows drain
+
+serviceMonitor:
+  enabled: false

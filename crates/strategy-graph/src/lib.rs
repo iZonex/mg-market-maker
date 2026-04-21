@@ -323,6 +323,121 @@ mod integration_tests {
         assert_eq!(cold, vec![SinkAction::SpreadMult(dec!(1))]);
     }
 
+    /// Phase IV — `Out.VenueQuotesIf` gates `SinkAction::VenueQuotes`
+    /// on the boolean trigger input. False → no sink. True → the
+    /// quotes bundle fires as a `VenueQuotes` action.
+    #[test]
+    fn venue_quotes_if_gates_on_trigger() {
+        use crate::types::{GraphQuote, QuoteSide};
+        let quotes_src = NodeId::new();
+        let trigger_src = NodeId::new();
+        let sink = NodeId::new();
+        let mut g = Graph::empty("vq-if", GScope::Symbol("BTCUSDT".into()));
+        g.nodes.push(graph::Node {
+            id: quotes_src,
+            kind: "Strategy.Avellaneda".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(graph::Node {
+            id: trigger_src,
+            kind: "Sentiment.Rate".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        // We abuse Cast.ToBool to convert the sentiment rate into
+        // the trigger bool — same pattern the real xemm template
+        // uses with Trade.OwnFill.fired.
+        let cast = NodeId::new();
+        g.nodes.push(graph::Node {
+            id: cast,
+            kind: "Cast.ToBool".into(),
+            config: serde_json::json!({ "threshold": "1", "cmp": "ge" }),
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(graph::Node {
+            id: sink,
+            kind: "Out.VenueQuotesIf".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        // Graph validator requires at least one `Out.SpreadMult`
+        // sink as a fail-closed default. Wire a dummy so the
+        // validation passes without influencing the test.
+        let baseline_mult = NodeId::new();
+        let baseline_sink = NodeId::new();
+        g.nodes.push(graph::Node {
+            id: baseline_mult,
+            kind: "Math.Const".into(),
+            config: serde_json::json!({ "value": "1" }),
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(graph::Node {
+            id: baseline_sink,
+            kind: "Out.SpreadMult".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        g.edges.push(Edge {
+            from: PortRef { node: baseline_mult, port: "value".into() },
+            to: PortRef { node: baseline_sink, port: "mult".into() },
+        });
+        g.edges.push(Edge {
+            from: PortRef { node: trigger_src, port: "value".into() },
+            to: PortRef { node: cast, port: "x".into() },
+        });
+        g.edges.push(Edge {
+            from: PortRef { node: cast, port: "out".into() },
+            to: PortRef { node: sink, port: "trigger".into() },
+        });
+        g.edges.push(Edge {
+            from: PortRef { node: quotes_src, port: "quotes".into() },
+            to: PortRef { node: sink, port: "quotes".into() },
+        });
+
+        let mut ev = Evaluator::build(&g).expect("valid");
+        let sample_quotes = vec![GraphQuote {
+            side: QuoteSide::Sell,
+            price: dec!(76_100),
+            qty: dec!(0.01),
+        }];
+        let mut src: HashMap<(NodeId, String), Value> = HashMap::new();
+        src.insert(
+            (quotes_src, "quotes".into()),
+            Value::Quotes(sample_quotes.clone()),
+        );
+
+        // Helper: does the sink-action list contain a Quotes
+        // (not SpreadMult — the baseline sink always fires)?
+        let quotes_fired = |sinks: &[SinkAction]| -> Option<Vec<GraphQuote>> {
+            sinks.iter().find_map(|a| match a {
+                SinkAction::Quotes(qs) => Some(qs.clone()),
+                _ => None,
+            })
+        };
+
+        // Rate 0 → Cast.ToBool(≥1) = false → VenueQuotesIf
+        // suppressed. Baseline SpreadMult still fires — that's
+        // fine; we only care about the gated quotes here.
+        src.insert((trigger_src, "value".into()), Value::Number(dec!(0)));
+        let cold = ev.tick(&EvalCtx::default(), &src).unwrap();
+        assert!(
+            quotes_fired(&cold).is_none(),
+            "trigger=false must suppress the VenueQuotesIf sink; got {cold:?}"
+        );
+
+        // Rate 2 → Cast.ToBool(≥1) = true → VenueQuotesIf fires
+        // as Quotes (strategy source emits plain Quotes, not
+        // VenueQuotes).
+        src.insert((trigger_src, "value".into()), Value::Number(dec!(2)));
+        let hot = ev.tick(&EvalCtx::default(), &src).unwrap();
+        assert_eq!(
+            quotes_fired(&hot).as_deref(),
+            Some(sample_quotes.as_slice()),
+            "trigger=true must propagate the upstream quotes; got {hot:?}"
+        );
+    }
+
     #[test]
     fn content_hash_is_stable_across_identical_graphs() {
         let a = Graph::empty("same", GScope::Global);

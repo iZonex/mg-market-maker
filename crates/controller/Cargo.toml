@@ -1,0 +1,60 @@
+[package]
+name = "mm-controller"
+version.workspace = true
+edition.workspace = true
+
+# Controller library — the remote-agent orchestration pieces the
+# `mm-server` binary spins up when it runs with the
+# `MM_CONTROLLER_*` env vars set. Not a standalone binary: the
+# server is the single operator-facing process, and this crate
+# bundles the functionality it adds for multi-agent deployments
+# (agent registry, credential push, fleet state, WS-RPC accept,
+# HTTP endpoints backing the UI's controller views).
+
+[lib]
+name = "mm_controller"
+path = "src/lib.rs"
+
+[dependencies]
+mm-common = { workspace = true }
+mm-control = { workspace = true }
+toml = { workspace = true }
+semver = { workspace = true }
+rust_decimal = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+tokio-rustls = { workspace = true }
+# SEC-1 (2026-04-21) — controller routes layer dashboard's
+# auth + role middlewares so /api/v1/* is no longer anonymous.
+# Moved from dev-dependencies; dashboard doesn't depend back on
+# controller so the graph stays acyclic.
+mm-dashboard = { workspace = true }
+# Credential encryption-at-rest. AES-256-GCM with a per-record
+# 96-bit nonce generated via `OsRng` — the industry standard for
+# authenticated symmetric encryption of short secrets.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "getrandom"] }
+# argon2id for deriving the master key from an operator passphrase
+# (no plaintext key on disk — only the salt, which is useless on
+# its own). OWASP-recommended params baked in.
+argon2 = "0.5"
+rand = { workspace = true }
+hex = { workspace = true }
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { workspace = true }
+mm-agent = { workspace = true }
+mm-common = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = { workspace = true }
+tempfile = "3"

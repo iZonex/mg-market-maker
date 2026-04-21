@@ -3,6 +3,7 @@ pub mod orderbook;
 pub mod p2_quantile;
 pub mod pair_class;
 pub mod queue_model;
+pub mod settings;
 pub mod types;
 
 pub use orderbook::LocalOrderBook;

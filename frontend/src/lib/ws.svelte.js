@@ -126,15 +126,40 @@ export function createWsStore(auth) {
           // grey out when WS stalls. Without this the screen
           // shows stale numbers as if they were fresh, which is
           // the most common way MM dashboards eat P&L.
-          state.data[msg.symbol] = { ...msg.data, _rx_ms: Date.now() }
-
-          // Append to time series.
           const now = Date.now()
+          state.data[msg.symbol] = { ...msg.data, _rx_ms: now }
+          if (!state.symbols.includes(msg.symbol)) {
+            state.symbols = [...state.symbols, msg.symbol]
+          }
+
+          // Compute QUOTED spread from our own open orders
+          // (best sell ask − best buy bid) / mid × 10_000. Venue
+          // spread on tick-size-limited pairs is useless as a
+          // trading signal — the quoted spread is what the MM
+          // actually posts. Falls back to venue spread when no
+          // live orders.
+          const mid = parseFloat(msg.data.mid_price || 0)
+          let quoted = null
+          const orders = msg.data.open_orders || []
+          if (orders.length && mid > 0) {
+            let bb = -Infinity, ba = Infinity
+            for (const o of orders) {
+              const p = parseFloat(o.price || 0)
+              const side = (o.side || '').toLowerCase()
+              if (side === 'buy'  && p > bb) bb = p
+              if (side === 'sell' && p < ba) ba = p
+            }
+            if (Number.isFinite(bb) && Number.isFinite(ba) && ba > bb) {
+              quoted = ((ba - bb) / mid) * 10_000
+            }
+          }
+          const spreadValue = quoted ?? parseFloat(msg.data.spread_bps || '0')
+
           state.pnlHistory = [...state.pnlHistory.slice(-500), {
             time: now, value: parseFloat(msg.data.pnl?.total || '0')
           }]
           state.spreadHistory = [...state.spreadHistory.slice(-500), {
-            time: now, value: parseFloat(msg.data.spread_bps || '0')
+            time: now, value: spreadValue,
           }]
           state.inventoryHistory = [...state.inventoryHistory.slice(-500), {
             time: now, value: parseFloat(msg.data.inventory || '0')
@@ -180,15 +205,17 @@ export function createWsStore(auth) {
   // Auto-connect.
   connect()
 
-  // Poll /api/status every 2 s regardless of WS state. The backend
-  // currently only broadcasts an initial `type: "snapshot"` on WS
-  // connect plus `venue_balances` pushes — it does NOT emit per-
-  // symbol `type: "update"` messages on refresh ticks. Without this
-  // poll the dashboard freezes a few seconds after login. Merging
-  // the REST response back into `state.data` keeps `_rx_ms` fresh
-  // so the stale badge reflects reality. On 401 we log out so the
-  // operator sees the Login screen instead of silently-stale panels.
+  // 23-P1-4 — the backend now emits per-symbol `type: "update"` WS
+  // pushes from `DashboardState::update()` on every refresh tick, so
+  // live data flows through the `onmessage` handler above. The
+  // `/api/status` poll remains as a fallback for WS-disconnected
+  // sessions only: it refreshes the symbols list and `_rx_ms` so the
+  // stale badge reflects reality, but it no longer appends to the
+  // history arrays (the WS path owns that to avoid double-points).
+  // On 401 we log out so the operator sees the Login screen instead
+  // of silently-stale panels.
   setInterval(async () => {
+    if (state.connected) return
     try {
       const token = auth?.state?.token || ''
       if (!token) return
@@ -206,38 +233,6 @@ export function createWsStore(auth) {
         const now = Date.now()
         for (const sym of symbols) {
           state.data[sym.symbol] = { ...sym, _rx_ms: now }
-
-          // Compute QUOTED spread in bps from our own open orders
-          // (best sell ask − best buy bid) / mid × 10_000. Falls
-          // back to the venue spread when we have no live quote.
-          // Venue spread on Binance BTC/USDT is always ≈ 0.0013 bps
-          // (tick-size limited) so it's useless as a trading signal.
-          const mid = parseFloat(sym.mid_price || 0)
-          let quoted = null
-          const orders = sym.open_orders || []
-          if (orders.length && mid > 0) {
-            let bb = -Infinity, ba = Infinity
-            for (const o of orders) {
-              const p = parseFloat(o.price || 0)
-              const side = (o.side || '').toLowerCase()
-              if (side === 'buy'  && p > bb) bb = p
-              if (side === 'sell' && p < ba) ba = p
-            }
-            if (Number.isFinite(bb) && Number.isFinite(ba) && ba > bb) {
-              quoted = ((ba - bb) / mid) * 10_000
-            }
-          }
-          const spreadValue = quoted ?? parseFloat(sym.spread_bps || '0')
-
-          state.pnlHistory = [...state.pnlHistory.slice(-500), {
-            time: now, value: parseFloat(sym.pnl?.total || '0'),
-          }]
-          state.spreadHistory = [...state.spreadHistory.slice(-500), {
-            time: now, value: spreadValue,
-          }]
-          state.inventoryHistory = [...state.inventoryHistory.slice(-500), {
-            time: now, value: parseFloat(sym.inventory || '0'),
-          }]
         }
       }
     } catch (_) { /* ignore transient errors */ }

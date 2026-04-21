@@ -12,6 +12,17 @@
   import UsersPage from './lib/pages/UsersPage.svelte'
   import StrategyPage from './lib/pages/StrategyPage.svelte'
   import AdminPage from './lib/pages/AdminPage.svelte'
+  import FleetPage from './lib/pages/FleetPage.svelte'
+  import ClientPage from './lib/pages/ClientPage.svelte'
+  import ClientPortalPage from './lib/pages/ClientPortalPage.svelte'
+  import ClientSignupPage from './lib/pages/ClientSignupPage.svelte'
+  import PasswordResetPage from './lib/pages/PasswordResetPage.svelte'
+  import ReconciliationPage from './lib/pages/ReconciliationPage.svelte'
+  import IncidentsPage from './lib/pages/IncidentsPage.svelte'
+  import VaultPage from './lib/pages/VaultPage.svelte'
+  import PlatformPage from './lib/pages/PlatformPage.svelte'
+  import ProfilePage from './lib/pages/ProfilePage.svelte'
+  import LoginAuditPage from './lib/pages/LoginAuditPage.svelte'
   import { createWsStore } from './lib/ws.svelte.js'
   import { createAuthStore } from './lib/auth.svelte.js'
   import { isDemoMode, createDemoStore } from './lib/demo.svelte.js'
@@ -54,8 +65,39 @@
   function onSymbolChange(s) { ws.setActiveSymbol?.(s) }
 </script>
 
-{#if !auth.state.loggedIn}
+{#if !auth.state.loggedIn && (() => {
+  const m = window.location.pathname.match(/^\/client-signup\/(.+)$/);
+  return m ? m[1] : null;
+})()}
+  <!-- Wave E4 — signup page bypasses Login when URL carries an
+       invite token. After successful signup the auth store is
+       populated and we fall into the ClientReader branch below. -->
+  <ClientSignupPage
+    {auth}
+    inviteToken={window.location.pathname.replace(/^\/client-signup\//, '')}
+  />
+{:else if !auth.state.loggedIn && (() => {
+  const m = window.location.pathname.match(/^\/password-reset\/(.+)$/);
+  return m ? m[1] : null;
+})()}
+  <!-- Wave H1 — password-reset page bypasses Login when URL
+       carries a reset token. After success the user hits the
+       normal login form; we don't auto-login on purpose so the
+       audit trail captures a fresh LoginSucceeded row from
+       the user's browser with the new credential. -->
+  <PasswordResetPage
+    resetToken={window.location.pathname.replace(/^\/password-reset\//, '')}
+  />
+{:else if !auth.state.loggedIn}
   <Login {auth} />
+{:else if auth.state.role === 'clientreader'}
+  <!-- Wave E3 — tenant-scoped client portal shell.
+       No Sidebar / TopBar / symbol picker. Just the portal.
+       Server-side tenant_scope_middleware blocks any attempt
+       to hit operator/admin routes regardless. -->
+  <div class="portal-shell">
+    <ClientPortalPage {auth} />
+  </div>
 {:else}
   <div class="shell">
     <Sidebar bind:route {auth} connected={ws.state.connected} {mode} />
@@ -71,6 +113,7 @@
         {symData}
         {maxKillLevel}
         onKillClick={() => (route = 'admin')}
+        onNavigate={(r) => (route = r)}
       />
       {#if demo}
         <div class="demo-banner">
@@ -80,7 +123,7 @@
       {/if}
       <div class="content">
         {#if route === 'overview'}
-          <Overview {ws} {auth} />
+          <Overview {ws} {auth} onNavigate={(r) => (route = r)} />
         {:else if route === 'orderbook'}
           <OrderbookPage {ws} {auth} />
         {:else if route === 'history'}
@@ -94,11 +137,27 @@
         {:else if route === 'strategy' && auth.canControl()}
           <StrategyPage {auth} />
         {:else if route === 'settings' && auth.canControl()}
-          <SettingsPage {ws} {auth} />
+          <SettingsPage {auth} onNavigate={(r) => (route = r)} />
         {:else if route === 'users' && auth.state.role === 'admin'}
           <UsersPage {auth} />
         {:else if route === 'admin' && auth.canControl()}
-          <AdminPage {ws} {auth} />
+          <AdminPage {ws} {auth} onNavigate={(r) => (route = r)} />
+        {:else if route === 'fleet'}
+          <FleetPage {auth} onNavigate={(r) => (route = r)} />
+        {:else if route === 'clients'}
+          <ClientPage {auth} onNavigate={(r) => (route = r)} />
+        {:else if route === 'reconciliation'}
+          <ReconciliationPage {auth} />
+        {:else if route === 'incidents'}
+          <IncidentsPage {auth} />
+        {:else if route === 'vault' && auth.state.role === 'admin'}
+          <VaultPage {auth} />
+        {:else if route === 'platform' && auth.state.role === 'admin'}
+          <PlatformPage {auth} />
+        {:else if route === 'profile'}
+          <ProfilePage {auth} />
+        {:else if route === 'login-audit' && auth.state.role === 'admin'}
+          <LoginAuditPage {auth} />
         {:else}
           <Overview {ws} {auth} />
         {/if}
@@ -110,6 +169,10 @@
 <style>
   .shell {
     display: flex;
+    min-height: 100vh;
+    background: var(--bg-base);
+  }
+  .portal-shell {
     min-height: 100vh;
     background: var(--bg-base);
   }

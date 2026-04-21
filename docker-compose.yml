@@ -16,6 +16,17 @@ services:
       - MM_TELEGRAM_TOKEN=${MM_TELEGRAM_TOKEN:-}
       - MM_TELEGRAM_CHAT=${MM_TELEGRAM_CHAT:-}
       - MM_MODE=${MM_MODE:-paper}
+      # Sentry — unset = no-op. Format:
+      # https://<public>@<host>/<project>. The binary must be
+      # built normally; Sentry hook is compiled in without a
+      # feature flag.
+      - MM_SENTRY_DSN=${MM_SENTRY_DSN:-}
+      # OpenTelemetry — requires the binary to be built with
+      # `--features otel` (not the default). Unset → no
+      # exporter spawn, no overhead. Points at the jaeger
+      # service below when the `tracing` compose profile is
+      # active, or an external OTLP collector in prod.
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-}
 
   prometheus:
     image: prom/prometheus:latest
@@ -24,6 +35,11 @@ services:
       - "9091:9090"
     volumes:
       - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Alert rules: mount the shipped rules file so
+      # critical/warning/info alerts fire out of the box.
+      # Operators tune thresholds by editing this file in-tree;
+      # reload Prometheus with SIGHUP after edits.
+      - ./deploy/prometheus/mm-alerts.yml:/etc/prometheus/mm-alerts.yml:ro
       - prom-data:/prometheus
 
   grafana:
@@ -35,9 +51,66 @@ services:
       - GF_SECURITY_ADMIN_PASSWORD=admin
     volumes:
       - grafana-data:/var/lib/grafana
+      # Auto-provisioned datasource + dashboard so a fresh
+      # `docker compose up` lands the operator straight on the
+      # MM Overview screen instead of an empty Grafana.
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+  # Opt-in Jaeger for OTel tracing. Not started by default —
+  # enable with `docker compose --profile tracing up`.
+  #
+  # The market-maker binary must be built with `--features otel`
+  # to actually emit spans (Dockerfile default build omits it
+  # for image-size reasons). Override by building locally:
+  #
+  #   docker compose build --build-arg CARGO_FEATURES=otel market-maker
+  #   docker compose --profile tracing up
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    profiles: ["tracing"]
+    restart: unless-stopped
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    restart: unless-stopped
+    ports:
+      - "9093:9093"
+    # Alertmanager consumes $VAR references in its YAML via
+    # the `--config.expand-external-labels` + env approach —
+    # every sink (telegram / pagerduty / webhook) reads its
+    # creds from the container env so the checked-in YAML
+    # stays free of secrets.
+    environment:
+      - TELEGRAM_BOT_TOKEN_CRITICAL=${TELEGRAM_BOT_TOKEN_CRITICAL:-}
+      - TELEGRAM_CHAT_ID_CRITICAL=${TELEGRAM_CHAT_ID_CRITICAL:-}
+      - TELEGRAM_BOT_TOKEN_OPS=${TELEGRAM_BOT_TOKEN_OPS:-}
+      - TELEGRAM_CHAT_ID_OPS=${TELEGRAM_CHAT_ID_OPS:-}
+      - PAGERDUTY_SERVICE_KEY=${PAGERDUTY_SERVICE_KEY:-}
+      - GENERIC_WEBHOOK_URL=${GENERIC_WEBHOOK_URL:-}
+    # entrypoint wraps the default command with `envsubst` so
+    # `$VAR` references in the config become the env values before
+    # alertmanager starts. Without this the `$TELEGRAM_*` literals
+    # would be passed to Telegram unchanged.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        apk add --no-cache gettext 2>/dev/null || true;
+        envsubst < /etc/alertmanager/alertmanager.yml > /tmp/alertmanager.yml;
+        exec /bin/alertmanager --config.file=/tmp/alertmanager.yml --storage.path=/alertmanager
+    volumes:
+      - ./deploy/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
 
 volumes:
   mm-data:
   mm-logs:
   prom-data:
   grafana-data:
+  alertmanager-data:

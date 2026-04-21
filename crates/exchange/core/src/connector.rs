@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use mm_common::types::{
-    Balance, LiveOrder, OrderId, OrderType, Price, PriceLevel, ProductSpec, Qty, Side, TimeInForce,
+    Balance, Fill, LiveOrder, OrderId, OrderType, Price, PriceLevel, ProductSpec, Qty, Side,
+    TimeInForce,
 };
 use tokio::sync::mpsc;
 
@@ -44,6 +45,19 @@ pub struct NewOrder {
     pub time_in_force: Option<TimeInForce>,
     /// Client-generated ID for order correlation.
     pub client_order_id: Option<String>,
+    /// Perp-only: when `true` the venue is told to refuse the
+    /// order if it would INCREASE the position on the given
+    /// symbol — guarantees the fill can only unwind. Spot venues
+    /// ignore the flag (no margin concept; no way to "reduce" a
+    /// wallet position). Engine sets this on:
+    ///   - `MarginGuardDecision::Reduce` proactive slices
+    ///   - Kill-switch L4 (Flatten) paired unwind slices
+    ///   - Stat-arb / funding-arb explicit close legs
+    /// Without it the slice can race an adversarial taker and
+    /// flip the position THROUGH zero on a fast mover. Every
+    /// major perp venue (Binance USDⓈ-M, Bybit V5 linear,
+    /// HyperLiquid) supports the flag natively.
+    pub reduce_only: bool,
 }
 
 /// Request to amend an existing order (keep queue priority where supported).
@@ -597,6 +611,7 @@ pub trait ExchangeConnector: Send + Sync {
             qty: amend.new_qty.unwrap_or_default(),
             time_in_force: Some(TimeInForce::PostOnly),
             client_order_id: None,
+            reduce_only: false,
         };
         self.place_order(&new).await?;
         Ok(())
@@ -604,6 +619,28 @@ pub trait ExchangeConnector: Send + Sync {
 
     /// Get all open orders for a symbol (for reconciliation).
     async fn get_open_orders(&self, symbol: &str) -> anyhow::Result<Vec<LiveOrder>>;
+
+    /// Fetch user trade fills that happened on the venue at or
+    /// after `since_ms`. Used on engine startup to recover fills
+    /// that landed while the agent was disconnected — without
+    /// this, reconnect leaves the inventory tracker stale by the
+    /// number of fills missed while offline, and the only hint
+    /// is the balance-drift detector tripping audit N seconds
+    /// later.
+    ///
+    /// Default returns `Ok(Vec::new())` — venues that don't
+    /// implement it leave the gap and the operator relies on
+    /// `check_inventory_drift` to notice. Venue adapters should
+    /// override against their `get_my_trades` / `query_user_trades`
+    /// endpoint, filtering by `symbol` + `since_ms`.
+    #[allow(unused_variables)]
+    async fn get_my_trades_since(
+        &self,
+        symbol: &str,
+        since_ms: i64,
+    ) -> anyhow::Result<Vec<Fill>> {
+        Ok(Vec::new())
+    }
 
     // --- Account ---
 

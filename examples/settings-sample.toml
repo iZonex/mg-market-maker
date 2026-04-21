@@ -1,0 +1,41 @@
+# Agent settings — PR-2k shape.
+#
+# Agent is a thin execution node. It holds:
+#   - Its own identity (agent id + brain WS address)
+#   - Feature flags + rails (safety net that applies to all
+#     deployments this agent runs)
+#   - Dashboard binding (ignored in split-role; brain hosts UI)
+#
+# It does NOT hold venue credentials. Credentials live on the
+# brain side in `MM_BRAIN_CREDENTIALS` TOML and are pushed over
+# the TLS-protected control channel when the agent registers.
+# That means:
+#   - Compromising one agent leaks only the per-agent pairing
+#     identity, never venue API keys
+#   - Rotating a credential = edit brain's TOML + restart brain;
+#     agents receive the fresh payload on their next register
+#   - Adding a new agent = one-line systemd unit with `--brain`
+#     and `--identity`; no credentials to deploy
+
+[agent]
+id = "eu-hft-01"
+# brain_addr can also be supplied via MM_BRAIN_WS_ADDR env.
+# brain_addr = "wss://brain.mm.internal:9190"
+
+[features]
+audit_jsonl = true       # MiCA-critical; keep on
+telegram_alerts = false
+mica_report = false
+paper_fill_simulation = true
+
+[rails]
+daily_loss_limit = "100"
+max_drawdown = "500"
+max_message_rate = 60
+stale_book_timeout_secs = 10
+
+[dashboard]
+# In split-role deployments brain hosts the UI; this block is
+# ignored. Populated only for the legacy single-process
+# `mm-server` path.
+port = 0

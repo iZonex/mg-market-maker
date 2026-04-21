@@ -21,6 +21,9 @@
     // operators see L2+ from any page, not just Admin.
     maxKillLevel = 0,
     onKillClick = () => {},
+    // Callback for nav items that live inside the user menu
+    // (profile). Parent owns routing; we just signal.
+    onNavigate = () => {},
   } = $props()
 
   // 23-UX-12 — client scope selector. Operators running multiple
@@ -254,16 +257,14 @@
           </div>
         </div>
         <div class="menu-items">
-          <a class="menu-item" href="/api/v1/system/preflight" target="_blank" rel="noopener">
-            <Icon name="shield" size={14} />
-            <span>System preflight</span>
-            <Icon name="external" size={11} />
-          </a>
-          <a class="menu-item" href="/metrics" target="_blank" rel="noopener">
-            <Icon name="pulse" size={14} />
-            <span>Prometheus metrics</span>
-            <Icon name="external" size={11} />
-          </a>
+          <button
+            type="button"
+            class="menu-item"
+            onclick={() => { userMenuOpen = false; onNavigate('profile') }}
+          >
+            <Icon name="settings" size={14} />
+            <span>My profile</span>
+          </button>
           <button type="button" class="menu-item menu-item-danger" onclick={handleLogout}>
             <Icon name="logout" size={14} />
             <span>Log out</span>

@@ -1,2441 +1,1061 @@
+//! `mm-server` — controller + dashboard binary.
+//!
+//! Single operator process for the fleet:
+//! - Serves the Svelte UI from `frontend/dist` (configurable via
+//!   `MM_FRONTEND_DIR`).
+//! - Legacy dashboard endpoints (`/api/v1/status`, `/inventory`,
+//!   `/pnl`, `/metrics`, auth flow, WebSocket broadcast) via
+//!   `mm_dashboard` — their backing `DashboardState` is fed by
+//!   an adapter that reads fleet + per-deployment telemetry from
+//!   connected agents.
+//! - Controller surface (`/api/v1/fleet`, `/api/v1/credentials`,
+//!   `/api/v1/agents/{id}/deployments`, WS accept for agents) via
+//!   `mm_controller`.
+//! - Trading lives in `mm-agent`. Server has NO engine.
+//!
+//! Single-machine trading = one `mm-server` + one `mm-agent` on
+//! the same host. Distributed = server central, agents per colo.
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
-use mm_common::config::{AppConfig, ExchangeType, ProductType, StrategyType};
-use mm_common::types::ProductSpec;
-use mm_dashboard::alerts::{AlertManager, TelegramConfig};
-use mm_dashboard::auth::{ApiUser, AuthState, Role};
-use mm_dashboard::state::DashboardState;
-use mm_dashboard::websocket::WsBroadcast;
-use mm_engine::MarketMakerEngine;
-use mm_exchange_core::connector::ExchangeConnector;
-use mm_exchange_core::events::MarketEvent;
-use mm_persistence::checkpoint::CheckpointManager;
-use mm_strategy::{
-    AvellanedaStoikov, BasisStrategy, CrossExchangeStrategy, GlftStrategy, GridStrategy, Strategy,
+use axum::Router;
+use mm_controller::{
+    http_router_full_authed, spawn_accept_loop_tls_full,
+    spawn_accept_loop_with_credentials_and_approvals, AgentRegistry, ApprovalStore, FleetState,
+    LeasePolicy, MasterKey, TunablesStore, VaultStore,
 };
-use rust_decimal_macros::dec;
-use tokio::sync::mpsc;
+use mm_dashboard::{
+    auth::AuthState,
+    state::DashboardState,
+    websocket::WsBroadcast,
+};
 use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
 
-mod config;
-mod hyperopt_worker;
-mod otel;
-mod pair_template;
-mod preflight;
-mod smoke_test;
-mod validate;
+mod adapter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load config first (needed for log_file).
-    let config = config::load_config()?;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    // Initialize logging + Sentry. The guard MUST live for the
-    // program's duration so in-flight Sentry events flush on
-    // exit; we hold it in `main` and drop it on return.
-    // `_otel_guard` flushes OTLP spans on drop when built with
-    // `--features otel`; in the default build it is a zero-sized
-    // marker.
-    let (_sentry_guard, _otel_guard) = init_logging(&config);
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .init();
 
-    // Startup banner — one glance tells the operator what they
-    // are about to run against. Real keys + live mode show up in
-    // the same log line as the venue, so a paste in a bug report
-    // answers "what deployment hit this" immediately.
-    let exchange = format!("{:?}", config.exchange.exchange_type);
-    let api_key_hint = config
-        .exchange
-        .api_key
-        .as_deref()
-        .unwrap_or("")
-        .chars()
-        .take(6)
-        .collect::<String>();
-    let mode_label = match config.mode.as_str() {
-        "paper" => "PAPER (simulated order egress)",
-        "live" => "LIVE (REAL ORDERS)",
-        "smoke" => "SMOKE (single place/cancel test)",
-        other => other,
-    };
-    let key_env_name = match config.exchange.exchange_type {
-        ExchangeType::Binance | ExchangeType::BinanceTestnet => "MM_BINANCE_API_KEY",
-        ExchangeType::Bybit | ExchangeType::BybitTestnet => "MM_BYBIT_API_KEY",
-        ExchangeType::HyperLiquid | ExchangeType::HyperLiquidTestnet => "MM_HL_API_SECRET",
-        ExchangeType::Custom => "(custom)",
-    };
-    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    info!(version = env!("CARGO_PKG_VERSION"), "Market Maker");
-    info!("  mode     : {mode_label}");
-    info!("  exchange : {exchange}");
-    info!("  symbols  : {:?}", config.symbols);
-    info!("  strategy : {:?}", config.market_maker.strategy);
-    info!(
-        "  api_key  : {}",
-        if api_key_hint.is_empty() {
-            "(unset — public endpoints only)".into()
-        } else {
-            format!("{api_key_hint}… (from {key_env_name})")
-        }
+    // UI + dashboard + controller API — one port, operator-facing.
+    // Default 9090 matches the legacy `dashboard_port` config so
+    // operators bookmark the same URL.
+    let http_addr_str = std::env::var("MM_HTTP_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:9090".to_string());
+    let http_addr = SocketAddr::from_str(&http_addr_str)
+        .map_err(|e| anyhow::anyhow!("invalid MM_HTTP_ADDR={http_addr_str}: {e}"))?;
+
+    // Agent WS — agents dial this to join the fleet. Port 9091 is
+    // the HTTP's neighbour so both cluster on one mental block.
+    let ws_addr_str = std::env::var("MM_AGENT_WS_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:9091".to_string());
+    let ws_addr = SocketAddr::from_str(&ws_addr_str)
+        .map_err(|e| anyhow::anyhow!("invalid MM_AGENT_WS_ADDR={ws_addr_str}: {e}"))?;
+
+    let fleet = FleetState::new();
+    let registry = AgentRegistry::new();
+    // Lease policy — seeded from `Tunables` so operator-edited
+    // values apply on next session. Live sessions keep whichever
+    // TTL was in effect when they were issued; no hot-swap of
+    // in-flight leases.
+    let policy = Arc::new(LeasePolicy::default());
+    // NB: full wire-up of tunables → LeasePolicy lands when
+    // `AgentSession` takes `Arc<TunablesStore>` instead of a
+    // baked policy (follow-up). For now the tunables file is
+    // persisted + UI-editable, and a server restart applies
+    // the new values.
+
+    // Master key for vault encryption-at-rest. Preferred:
+    // `MM_MASTER_KEY=<64-hex>` (systemd `Credentials=`, K8s
+    // secret mount). Otherwise read/generate `./master-key`
+    // (0600 perms) so local dev just works. Auto-generated on
+    // first start; operator backs it up separately from the
+    // vault file — an attacker who grabs only `vault.json`
+    // can't decrypt without this key.
+    let master_key_path = PathBuf::from(
+        std::env::var("MM_MASTER_KEY_FILE").unwrap_or_else(|_| "master-key".to_string()),
     );
-    info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    let master_key = MasterKey::resolve(
+        std::env::var("MM_MASTER_KEY").ok().as_deref(),
+        master_key_path,
+    )
+    .map_err(|e| anyhow::anyhow!("master key resolve: {e}"))?;
 
-    // Validate config.
-    validate::validate_config(&config)?;
-    info!("config validation passed");
+    let vault_path = std::env::var("MM_VAULT").unwrap_or_else(|_| "vault.json".to_string());
+    let vault = match VaultStore::load_from_path(&vault_path, master_key.clone()) {
+        Ok(v) => {
+            info!(path = %vault_path, entries = v.len(), "vault loaded");
+            Some(v)
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!("vault load failed at {vault_path}: {e}"));
+        }
+    };
 
-    // Initialize checkpoint manager.
-    let checkpoint_path = std::path::Path::new(&config.checkpoint_path);
-    if let Some(parent) = checkpoint_path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    let checkpoint = Arc::new(std::sync::Mutex::new(CheckpointManager::new(
-        checkpoint_path,
-        10,
-    )));
+    // Runtime tunables — lease policy, version pinning, deploy
+    // defaults. Operator-editable from the UI, persisted to
+    // `MM_TUNABLES=./tunables.json`. Missing fields in the file
+    // get the code default so adding a new tunable is
+    // backwards-compatible with existing deployments.
+    let tunables_path = std::env::var("MM_TUNABLES").unwrap_or_else(|_| "tunables.json".to_string());
+    let tunables = match TunablesStore::load_from_path(&tunables_path) {
+        Ok(t) => {
+            info!(path = %tunables_path, "tunables loaded");
+            Some(t)
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to load tunables — using code defaults");
+            Some(TunablesStore::in_memory())
+        }
+    };
 
-    // Check mode.
-    if config.mode == "paper" {
+    // Admission-control store. `MM_APPROVALS` controls the
+    // backing file; unset now defaults to `./approvals.json`
+    // so operator maintenance-restart of the server keeps the
+    // accepted-agent list intact (previously rejected
+    // fingerprints also stay rejected — critical). Set to
+    // the literal string "memory" to opt into the old
+    // in-memory behaviour (tests / ephemeral smokes).
+    // Unknown fingerprints always land as Pending — operator
+    // has to explicitly accept before the session gets a lease
+    // or credentials.
+    let approvals_path =
+        std::env::var("MM_APPROVALS").unwrap_or_else(|_| "approvals.json".to_string());
+    let approvals = if approvals_path == "memory" || approvals_path.is_empty() {
         info!(
-            "PAPER MODE active — OrderManager and BalanceCache are built with \
-             paper gates. No place / cancel / amend / withdraw call ever reaches \
-             the venue connector. Paper fills are synthesised from public trades."
+            "approval store held in memory only (MM_APPROVALS={}); operator decisions lost on restart",
+            approvals_path
         );
-    } else if config.mode == "live" {
-        warn!(
-            "LIVE MODE — real orders will be submitted. Make sure the config \
-             has calibrated strategy params and realistic risk / kill-switch \
-             limits. `MM_MODE=paper` gives a safe dry-run on the same feed."
+        ApprovalStore::in_memory()
+    } else {
+        let store = ApprovalStore::load_from_path(&approvals_path)
+            .map_err(|e| anyhow::anyhow!("load approval store {approvals_path}: {e}"))?;
+        info!(
+            path = %approvals_path,
+            entries = store.len(),
+            "approval store loaded (persisted)"
         );
-    }
-
-    // Build exchange connector.
-    let connector: Arc<dyn ExchangeConnector> = create_connector(&config)?;
-    info!(
-        exchange = ?config.exchange.exchange_type,
-        "exchange connector created"
-    );
-
-    // Smoke test mode — validate connector, place/cancel test
-    // order, fetch balances, print report, exit.
-    if config.mode == "smoke" {
-        info!("SMOKE TEST MODE — validating connector stack");
-        let smoke_symbol = config.symbols.first().cloned().unwrap_or("BTCUSDT".into());
-        smoke_test::run_smoke_test(&connector, &smoke_symbol).await?;
-        return Ok(());
-    }
-
-    // Epic 40.10 — jurisdiction gate at startup. If ANY client is
-    // tagged US and the engine's product is a perp, fail closed
-    // before preflight. Operator must split the config (US clients
-    // on a spot engine, non-US clients on a perp engine) rather
-    // than relying on runtime checks. Cheaper to catch here than
-    // to discover at first order.
-    {
-        let perp = config.exchange.product.has_funding();
-        if perp {
-            for c in config.effective_clients() {
-                if !c.allows_product(config.exchange.product) {
-                    anyhow::bail!(
-                        "client `{}` jurisdiction `{}` is not permitted to trade \
-                         product `{}`. Move this client to a spot engine or drop \
-                         their jurisdiction tag (Epic 40.10).",
-                        c.id,
-                        c.jurisdiction,
-                        config.exchange.product.label()
-                    );
-                }
-            }
-        }
-    }
-
-    // Pre-flight checks — validate venue, symbols, balances,
-    // config sanity before starting engines.
-    let effective_symbols: Vec<String> = config
-        .effective_clients()
-        .iter()
-        .flat_map(|c| c.symbols.clone())
-        .collect();
-    let preflight_symbols = if effective_symbols.is_empty() {
-        config.symbols.clone()
-    } else {
-        effective_symbols
+        store
     };
-    match preflight::run_preflight(&config, &connector, &preflight_symbols).await {
-        Ok(_results) => info!("preflight checks passed"),
-        Err(e) => {
-            if config.mode == "live" {
-                error!(error = %e, "preflight failed — aborting");
-                anyhow::bail!("preflight failed: {e}");
-            } else {
-                warn!(error = %e, "preflight failed (paper mode, continuing)");
-            }
-        }
-    }
 
-    // Epic 40.7 — set per-symbol margin mode + leverage on the
-    // venue before the engine places its first order. A live
-    // account on the wrong mode is an unacceptable state: cross
-    // without a hedge is a liquidation-cascade risk, and
-    // mis-leveraged positions drift the IM/MM arithmetic the
-    // margin guard relies on. Hard-fail on anything other than
-    // `Ok(())` or `NotSupported`; paper mode downgrades the
-    // hard-fail to a warn so operators can still dry-run
-    // against the real wire without the account being
-    // pre-configured.
-    if let Some(margin_cfg) = &config.margin {
-        if config.exchange.product.has_funding() {
-            use mm_exchange_core::connector::{MarginError, MarginMode};
-            for sym in &preflight_symbols {
-                let (mode_cfg, leverage) = margin_cfg.for_symbol(sym);
-                let mode = match mode_cfg {
-                    mm_common::config::MarginModeCfg::Isolated => MarginMode::Isolated,
-                    mm_common::config::MarginModeCfg::Cross => MarginMode::Cross,
-                };
-                match connector.set_margin_mode(sym, mode).await {
-                    Ok(()) | Err(MarginError::NotSupported) => {}
-                    Err(e) => {
-                        let msg = format!(
-                            "set_margin_mode({sym}, {mode:?}) failed: {e}"
-                        );
-                        if config.mode == "live" {
-                            error!(error = %msg, "margin mode setup failed — aborting");
-                            anyhow::bail!(msg);
-                        }
-                        warn!(error = %msg, "margin mode setup failed (paper mode, continuing)");
-                    }
-                }
-                match connector.set_leverage(sym, leverage).await {
-                    Ok(()) | Err(MarginError::NotSupported) => {}
-                    Err(e) => {
-                        let msg = format!(
-                            "set_leverage({sym}, {leverage}) failed: {e}"
-                        );
-                        if config.mode == "live" {
-                            error!(error = %msg, "leverage setup failed — aborting");
-                            anyhow::bail!(msg);
-                        }
-                        warn!(error = %msg, "leverage setup failed (paper mode, continuing)");
-                    }
-                }
-                info!(
-                    symbol = %sym,
-                    mode = %mode.as_str(),
-                    leverage,
-                    "margin mode + leverage configured"
-                );
-            }
-        }
-    }
-
-    // Auth: create state and load users from config.
-    let auth_secret =
-        std::env::var("MM_AUTH_SECRET").unwrap_or_else(|_| "change-me-in-production".to_string());
-    // HARD-2 — verify the audit log hash-chain before we open
-    // the sink for append. A broken chain is a MiCA-grade
-    // incident: either tampering or a crash mid-write that
-    // left a torn row. Operator can bypass with
-    // `MM_AUDIT_RESUME_ON_BROKEN=yes` once they've triaged.
-    let audit_path = std::path::Path::new("data/audit.jsonl");
-    match mm_risk::audit::verify_chain(audit_path) {
-        Ok(report) => {
-            info!(
-                rows = report.rows_checked,
-                last_hash = ?report.last_hash,
-                "audit hash-chain verified on boot"
-            );
-        }
-        Err(e) => {
-            let resume =
-                std::env::var("MM_AUDIT_RESUME_ON_BROKEN").ok().as_deref() == Some("yes");
-            if resume {
-                error!(
-                    error = %e,
-                    "AUDIT CHAIN BROKEN — continuing under MM_AUDIT_RESUME_ON_BROKEN=yes"
-                );
-            } else {
-                error!(
-                    error = %e,
-                    "AUDIT CHAIN BROKEN — refusing to start (set MM_AUDIT_RESUME_ON_BROKEN=yes to override)"
-                );
-                anyhow::bail!("audit hash-chain verification failed: {e}");
-            }
-        }
-    }
-    // Shared audit sink — attached to AuthState so login /
-    // logout events land in the MiCA trail next to order + risk
-    // rows (Epic 38).
-    let shared_audit = Arc::new(
-        mm_risk::audit::AuditLog::new(audit_path).expect("audit log for auth"),
-    );
-    let auth_state = AuthState::new(&auth_secret).with_audit(shared_audit.clone());
-
-    // Load pre-configured users.
-    for u in &config.users {
-        let role = match u.role.as_str() {
-            "admin" => Role::Admin,
-            "operator" => Role::Operator,
-            _ => Role::Viewer,
-        };
-        // Resolve client_id from ClientConfig.api_keys.
-        let client_id = config
-            .clients
-            .iter()
-            .find(|c| c.api_keys.contains(&u.api_key))
-            .map(|c| c.id.clone());
-        auth_state.add_user(ApiUser {
-            id: u.id.clone(),
-            name: u.name.clone(),
-            role,
-            api_key: u.api_key.clone(),
-            allowed_symbols: if u.allowed_symbols.is_empty() {
-                None
-            } else {
-                Some(u.allowed_symbols.clone())
-            },
-            client_id,
-        });
-        info!(name = %u.name, role = %u.role, "user loaded");
-    }
-
-    // If no users configured, create a default admin.
-    if config.users.is_empty() {
-        let default_key =
-            std::env::var("MM_ADMIN_KEY").unwrap_or_else(|_| "admin-key-change-me".to_string());
-        auth_state.add_user(ApiUser {
-            id: "default-admin".to_string(),
-            name: "Admin".to_string(),
-            role: Role::Admin,
-            api_key: default_key.clone(),
-            allowed_symbols: None,
-            client_id: None,
-        });
-        info!(key_hint = %&default_key[..8], "default admin user created (set MM_ADMIN_KEY to customize)");
-    }
-
-    // Telegram alerts.
-    let telegram_config = if config.telegram.is_configured() {
-        info!("Telegram alerts enabled");
-        Some(TelegramConfig {
-            bot_token: config.telegram.bot_token.clone(),
-            chat_id: config.telegram.chat_id.clone(),
-        })
-    } else {
-        info!("Telegram alerts disabled (set MM_TELEGRAM_TOKEN + MM_TELEGRAM_CHAT to enable)");
-        None
-    };
-    let alert_manager = AlertManager::new(telegram_config);
-
-    // Start dashboard.
+    // Dashboard state + auth + WS broadcast. State starts empty;
+    // the adapter task below fills it from fleet telemetry.
     let dashboard_state = DashboardState::new();
-    // Epic 40.10 — seed the engine product so admin_clients POST
-    // can gate US-jurisdiction clients at ingress time.
-    dashboard_state.set_engine_product(config.exchange.product);
-    dashboard_state.set_loans(config.loans.clone());
-    // 23-P1-1 — give the dashboard the shared CheckpointManager
-    // so the engine's 60-tick checkpoint flush lands here
-    // instead of into the void. Prior shipping: CheckpointManager
-    // was only flushed at shutdown and update_symbol was never
-    // called at runtime — 22B-0 through 22B-6 hooks serialised
-    // into nowhere.
-    dashboard_state.set_checkpoint_manager(checkpoint.clone());
-    // S5.1 — forward the `[rebalancer]` config to the dashboard so
-    // `/api/v1/rebalance/recommendations` has thresholds to work
-    // with. Absent section leaves the endpoint returning an empty
-    // list (rebalancer disabled).
-    if let Some(rc) = config.rebalancer.as_ref() {
-        dashboard_state.set_rebalancer_config(
-            mm_risk::rebalancer::RebalancerConfig {
-                min_balance_per_venue: rc.min_balance_per_venue,
-                target_balance_per_venue: rc.target_balance_per_venue,
-            },
-        );
-    }
-    // S6.4 — open the transfer log JSONL for Execute endpoint
-    // appends. Parent dir must exist.
-    let transfer_log_path = std::path::PathBuf::from("data/transfers.jsonl");
-    if let Some(parent) = transfer_log_path.parent() {
-        if !parent.exists() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-    }
-    match mm_persistence::transfer_log::TransferLogWriter::open(&transfer_log_path) {
-        Ok(w) => {
-            dashboard_state.set_transfer_log(std::sync::Arc::new(w));
-            info!(
-                path = %transfer_log_path.display(),
-                "transfer log ready"
-            );
-        }
-        Err(e) => {
-            warn!(error = %e, path = %transfer_log_path.display(),
-                "transfer log open failed; /api/v1/rebalance/execute disabled");
-        }
-    }
-
-    // R3.7 — on-chain surveillance poller. Spawns one task that
-    // loops over every configured symbol, refreshes holder
-    // concentration on `holder_refresh_secs` cadence and
-    // suspect-wallet inflow on `inflow_poll_secs` cadence, and
-    // publishes the result via `dashboard_state.publish_onchain`.
-    if let Some(oc) = config.onchain.as_ref() {
-        let provider: Option<std::sync::Arc<dyn mm_onchain::OnchainProvider>> = match oc
-            .provider
-            .to_lowercase()
-            .as_str()
-        {
-            "goldrush" => std::env::var("MM_GOLDRUSH_KEY")
-                .ok()
-                .and_then(|k| {
-                    mm_onchain::goldrush::GoldRushProvider::new(
-                        mm_onchain::goldrush::GoldRushConfig::new(k),
-                    )
-                    .ok()
-                })
-                .map(|p| std::sync::Arc::new(p) as _),
-            "etherscan" => std::env::var("MM_ETHERSCAN_KEY")
-                .ok()
-                .and_then(|k| {
-                    mm_onchain::etherscan::EtherscanFamilyProvider::new(
-                        mm_onchain::etherscan::EtherscanFamilyConfig::new(k),
-                    )
-                    .ok()
-                })
-                .map(|p| std::sync::Arc::new(p) as _),
-            "moralis" => std::env::var("MM_MORALIS_KEY")
-                .ok()
-                .and_then(|k| {
-                    mm_onchain::moralis::MoralisProvider::new(
-                        mm_onchain::moralis::MoralisConfig::new(k),
-                    )
-                    .ok()
-                })
-                .map(|p| std::sync::Arc::new(p) as _),
-            "alchemy" => std::env::var("MM_ALCHEMY_KEY")
-                .ok()
-                .and_then(|k| {
-                    mm_onchain::alchemy::AlchemyProvider::new(
-                        mm_onchain::alchemy::AlchemyConfig::new(k),
-                    )
-                    .ok()
-                })
-                .map(|p| std::sync::Arc::new(p) as _),
-            other => {
-                warn!(provider = %other,
-                    "unknown onchain provider; skipping poller");
-                None
-            }
-        };
-
-        if let Some(provider) = provider {
-            let cache = std::sync::Arc::new(
-                mm_onchain::cache::HolderConcentrationCache::new(
-                    provider.clone(),
-                    mm_onchain::cache::HolderConcentrationConfig {
-                        top_n: 10,
-                        ttl: chrono::Duration::seconds(oc.holder_refresh_secs as i64),
-                    },
-                ),
-            );
-            let suspects: std::collections::HashMap<String, Vec<String>> = oc
-                .symbols
-                .iter()
-                .map(|(sym, s)| (sym.clone(), s.suspect_wallets.clone()))
-                .collect();
-            let cex_set: std::collections::HashSet<String> = oc
-                .cex_deposit_addresses
-                .iter()
-                .map(|s| s.to_lowercase())
-                .collect();
-            let tracker = std::sync::Arc::new(
-                mm_onchain::tracker::SuspectWalletTracker::new(
-                    provider.clone(),
-                    mm_onchain::tracker::SuspectWalletConfig {
-                        suspects_per_symbol: suspects,
-                        cex_deposit_addresses: cex_set,
-                        window: chrono::Duration::seconds(
-                            (oc.inflow_poll_secs * 12) as i64,
-                        ),
-                    },
-                ),
-            );
-            let dashboard_for_poller = dashboard_state.clone();
-            let per_symbol = oc.symbols.clone();
-            let symbol_count = per_symbol.len();
-            let holder_poll = oc.holder_refresh_secs.max(60);
-            let inflow_poll = oc.inflow_poll_secs.max(30);
-            let poll_interval = inflow_poll.min(holder_poll);
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(
-                    poll_interval,
-                ));
-                let mut last_holder_poll: std::collections::HashMap<String, i64> =
-                    std::collections::HashMap::new();
-                loop {
-                    tick.tick().await;
-                    let now = chrono::Utc::now().timestamp();
-                    for (symbol, cfg) in &per_symbol {
-                        // Holder concentration on the slower cadence.
-                        let due_holder = last_holder_poll
-                            .get(symbol)
-                            .map(|t| now - t >= holder_poll as i64)
-                            .unwrap_or(true);
-                        let mut conc = rust_decimal::Decimal::ZERO;
-                        let mut top_n = 0u32;
-                        if due_holder {
-                            match cache.get(&cfg.chain, &cfg.token).await {
-                                Ok(s) => {
-                                    conc = s.concentration_pct;
-                                    top_n = s.top_n;
-                                    last_holder_poll.insert(symbol.clone(), now);
-                                }
-                                Err(e) => {
-                                    warn!(sym = %symbol, error = %e,
-                                        "onchain holder fetch failed");
-                                }
-                            }
-                        } else if let Some(s) = cache.peek(&cfg.chain, &cfg.token).await {
-                            conc = s.concentration_pct;
-                            top_n = s.top_n;
-                        }
-                        // Inflow every tick.
-                        let (inflow_total, events) =
-                            match tracker.refresh(symbol, &cfg.chain).await {
-                                Ok(s) => (s.inflow_total, s.event_count),
-                                Err(e) => {
-                                    warn!(sym = %symbol, error = %e,
-                                        "onchain inflow refresh failed");
-                                    (rust_decimal::Decimal::ZERO, 0)
-                                }
-                            };
-                        dashboard_for_poller.publish_onchain(
-                            mm_dashboard::state::OnchainSnapshot {
-                                symbol: symbol.clone(),
-                                chain: cfg.chain.clone(),
-                                concentration_pct: conc,
-                                top_n,
-                                inflow_total,
-                                inflow_events: events,
-                                computed_at_ms: chrono::Utc::now().timestamp_millis(),
-                            },
-                        );
-                    }
-                }
-            });
-            info!(provider = %oc.provider, symbols = symbol_count,
-                "onchain poller started");
-        } else {
-            warn!(provider = %oc.provider,
-                "onchain provider not configured (missing env key); poller disabled");
-        }
-    }
-
-    // UX-5 — publish the effective AppConfig so operators can
-    // inspect which features are configured vs on defaults from
-    // the dashboard. Secrets live in env, not in `AppConfig`.
-    dashboard_state.set_app_config(std::sync::Arc::new(config.clone()));
-    // A1 — expose the hash-chained audit log path to the
-    // monthly-report aggregator. Keep in sync with the
-    // `AuditLog::new` path used when the engine initialises
-    // its risk subsystem.
-    dashboard_state.set_audit_log_path(std::path::PathBuf::from("data/audit.jsonl"));
-    // Epic H Phase 3 — shared AuditLog instance for the dashboard's
-    // deploy / rollback / reject rows. Reuses the same Arc auth uses
-    // so writers stay on one hash-chained timeline.
-    dashboard_state.set_audit_log(shared_audit.clone());
-    // A1 — HMAC secret for report manifests. Sourced from
-    // `MM_REPORT_SECRET` env; falls back to a process-scoped
-    // default (marked unsigned) when unset.
-    if let Ok(sec) = std::env::var("MM_REPORT_SECRET") {
-        if !sec.is_empty() {
-            dashboard_state.set_report_secret(sec.into_bytes());
-        }
-    }
-
-    // Epic H — strategy graph store. Always initialised so the
-    // admin deploy endpoint works even on fresh deployments; the
-    // directory is created on the first save.
-    match mm_strategy_graph::GraphStore::new("data/strategy_graphs") {
-        Ok(store) => {
-            dashboard_state.set_strategy_graph_store(std::sync::Arc::new(store));
-            info!("strategy graph store ready");
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "strategy graph store init failed — graphs disabled");
-        }
-    }
-
-    // Block B — spawn the compliance report scheduler when
-    // at least one cadence is enabled. The concrete
-    // `BuiltinReportJob` writes daily / weekly / monthly
-    // bundles under `data/reports/<cadence>/` which the
-    // archive shipper picks up on its next tick when
-    // `ship_daily_reports = true`.
-    if let Some(sched_cfg) = config.schedule.clone() {
-        if sched_cfg.daily_enabled || sched_cfg.weekly_enabled || sched_cfg.monthly_enabled {
-            use mm_dashboard::builtin_report_job::BuiltinReportJob;
-            use mm_dashboard::report_scheduler::{ReportScheduler, ScheduleConfig};
-            let job = std::sync::Arc::new(BuiltinReportJob::new(
-                dashboard_state.clone(),
-                std::path::PathBuf::from("data/reports"),
-            ));
-            let internal_cfg = ScheduleConfig {
-                daily_enabled: sched_cfg.daily_enabled,
-                weekly_enabled: sched_cfg.weekly_enabled,
-                monthly_enabled: sched_cfg.monthly_enabled,
-                catchup_hours: sched_cfg.catchup_hours,
-                last_run_path: sched_cfg.last_run_path,
-            };
-            let mut scheduler = ReportScheduler::new(internal_cfg, job);
-            if let Err(e) = scheduler.start().await {
-                tracing::error!(error = %e, "report scheduler start failed");
-            } else {
-                // Leak the handle — the scheduler lives for the
-                // rest of the process. `Drop` on shutdown logs
-                // any in-flight job truncation.
-                std::mem::forget(scheduler);
-                tracing::info!("compliance report scheduler spawned");
-            }
-        }
-    }
-
-    // Epic G — spawn the sentiment orchestrator when
-    // configured. On every poll cycle it fans out collectors
-    // → Ollama analyzer → mention counter → one
-    // `ConfigOverride::SentimentTick` broadcast per monitored
-    // asset. Every engine that `with_social_risk` attached
-    // consumes the tick in its existing config-override path.
-    if let Some(sent_cfg) = config.sentiment.clone() {
-        use mm_sentiment::collector::{
-            Collector, cryptopanic::CryptoPanicCollector, rss::RssCollector,
-            twitter::TwitterCollector,
-        };
-        let mut collectors: Vec<Box<dyn Collector>> = Vec::new();
-        if !sent_cfg.rss.feeds.is_empty() {
-            match RssCollector::new(sent_cfg.rss.feeds.clone()) {
-                Ok(c) => collectors.push(Box::new(c)),
-                Err(e) => tracing::warn!(error = %e, "rss collector init failed"),
-            }
-        }
-        if !sent_cfg.cryptopanic.url.is_empty() {
-            match CryptoPanicCollector::new(sent_cfg.cryptopanic.url.clone()) {
-                Ok(c) => collectors.push(Box::new(c)),
-                Err(e) => tracing::warn!(error = %e, "cryptopanic collector init failed"),
-            }
-        }
-        if !sent_cfg.twitter.queries.is_empty() {
-            match std::env::var(&sent_cfg.twitter.bearer_env) {
-                Ok(bearer) if !bearer.is_empty() => {
-                    match TwitterCollector::new(sent_cfg.twitter.queries.clone(), bearer) {
-                        Ok(c) => collectors.push(Box::new(c)),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "twitter collector init failed")
-                        }
-                    }
-                }
-                _ => tracing::warn!(
-                    env = %sent_cfg.twitter.bearer_env,
-                    "twitter queries configured but bearer env var missing"
-                ),
-            }
-        }
-
-        let ollama_client = mm_sentiment::OllamaClient::new(mm_sentiment::OllamaConfig {
-            base_url: sent_cfg.ollama.base_url.clone(),
-            model: sent_cfg.ollama.model.clone(),
-            timeout: std::time::Duration::from_secs(sent_cfg.ollama.timeout_secs),
-            temperature: 0.1,
-        })
-        .ok();
-
-        let broadcast_state = dashboard_state.clone();
-        let sink: mm_sentiment::orchestrator::TickSink =
-            std::sync::Arc::new(move |tick: mm_sentiment::SentimentTick| {
-                use rust_decimal::prelude::ToPrimitive;
-                // Prometheus — one counter + two gauges per
-                // asset so dashboards can chart the feed
-                // going hot/cold in real time.
-                mm_dashboard::metrics::SENTIMENT_TICKS_TOTAL
-                    .with_label_values(&[&tick.asset])
-                    .inc();
-                mm_dashboard::metrics::SENTIMENT_MENTIONS_RATE
-                    .with_label_values(&[&tick.asset])
-                    .set(tick.mentions_rate.to_f64().unwrap_or(0.0));
-                mm_dashboard::metrics::SENTIMENT_SCORE_5MIN
-                    .with_label_values(&[&tick.asset])
-                    .set(tick.sentiment_score_5min.to_f64().unwrap_or(0.0));
-                broadcast_state.push_sentiment_tick(tick.clone());
-                broadcast_state.broadcast_config_override(
-                    mm_dashboard::state::ConfigOverride::SentimentTick(tick),
-                );
-            });
-        let analyze_hook: mm_sentiment::orchestrator::AnalyzeHook =
-            std::sync::Arc::new(|scorer: &str| {
-                mm_dashboard::metrics::SENTIMENT_ARTICLES_TOTAL
-                    .with_label_values(&[scorer])
-                    .inc();
-            });
-
-        let mut orch = mm_sentiment::orchestrator::Orchestrator::new(
-            collectors,
-            ollama_client,
-            sent_cfg.monitored_assets.clone(),
-            sink,
-        )
-        .with_analyze_hook(analyze_hook);
-        if sent_cfg.persist_articles {
-            match mm_sentiment::persistence::ArticleWriter::new(
-                std::path::PathBuf::from(&sent_cfg.persist_path),
-            ) {
-                Ok(w) => {
-                    orch = orch.with_article_writer(std::sync::Arc::new(w));
-                    info!(
-                        path = %sent_cfg.persist_path,
-                        "sentiment article persistence enabled"
-                    );
-                }
-                Err(e) => tracing::warn!(error = %e, "article writer init failed"),
-            }
-        }
-        let poll_interval =
-            std::time::Duration::from_secs(sent_cfg.poll_interval_secs.max(10));
-        // Self-contained shutdown channel. The orchestrator
-        // runs as a daemon and winds down when the process
-        // exits — no coordination with the per-symbol
-        // shutdown signal is required, because it holds no
-        // per-symbol state that needs a graceful flush.
-        let (orch_shutdown_tx, orch_shutdown_rx) =
-            tokio::sync::watch::channel(false);
-        std::mem::forget(orch_shutdown_tx);
-        tokio::spawn(orch.run(poll_interval, orch_shutdown_rx));
-        info!(
-            interval_secs = sent_cfg.poll_interval_secs,
-            monitored = sent_cfg.monitored_assets.len(),
-            "sentiment orchestrator spawned"
-        );
-    }
-
-    // Block C — spawn S3 archive shipper when configured.
-    // Credentials come from the AWS default chain. `archive = None`
-    // (the default) keeps the server entirely aws-free at runtime.
-    if let Some(arch_cfg) = config.archive.clone() {
-        match mm_dashboard::archive::ArchiveClient::from_config(arch_cfg.clone()).await {
-            Ok(client) => {
-                // Block D — share the client with the HTTP layer so
-                // the `/api/v1/archive/health` probe uses the same
-                // config + creds the shipper will.
-                dashboard_state.set_archive_client(client.clone());
-                let shipper_cfg = mm_dashboard::archive::shipper::ShipperConfig {
-                    interval: std::time::Duration::from_secs(arch_cfg.shipper_interval_secs),
-                    audit_log: arch_cfg
-                        .ship_audit_log
-                        .then(|| std::path::PathBuf::from("data/audit.jsonl")),
-                    fill_log: arch_cfg
-                        .ship_fills
-                        .then(|| std::path::PathBuf::from("data/fills.jsonl")),
-                    daily_reports_dir: arch_cfg
-                        .ship_daily_reports
-                        .then(|| std::path::PathBuf::from("data/reports/daily")),
-                    // Epic G — ship the sentiment article
-                    // JSONL when both pipelines are on.
-                    sentiment_log: config.sentiment.as_ref().and_then(|s| {
-                        s.persist_articles.then(|| std::path::PathBuf::from(&s.persist_path))
-                    }),
-                    offset_file: std::path::PathBuf::from("data/archive_offsets.json"),
-                };
-                let _handle = mm_dashboard::archive::shipper::spawn(client, shipper_cfg);
-                tracing::info!(
-                    bucket = %arch_cfg.s3_bucket,
-                    region = %arch_cfg.s3_region,
-                    endpoint = ?arch_cfg.s3_endpoint_url,
-                    "archive shipper spawned"
-                );
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "archive shipper init failed — continuing without S3 archive");
-            }
-        }
-    }
-    // Webhook dispatcher — shared across all engines.
-    let webhook_dispatcher = mm_dashboard::webhooks::WebhookDispatcher::new();
-    dashboard_state.set_webhook_dispatcher(webhook_dispatcher.clone());
-
-    // Enable persistent fill logging for client API fill history.
-    let fills_path = std::path::Path::new("data/fills.jsonl");
-    dashboard_state.load_fill_history(fills_path);
-    dashboard_state.enable_fill_log(fills_path);
     let ws_broadcast = Arc::new(WsBroadcast::new(1024));
-    // Let the dashboard state push typed updates (venue balance
-    // snapshots, etc.) through the same channel WS clients
-    // subscribe to. Without this the panel falls back to HTTP
-    // polling only.
-    dashboard_state.enable_ws_broadcast(ws_broadcast.clone());
 
-    // Epic 33 — hyperopt admin worker. Dashboard admin endpoint
-    // posts `HyperoptTrigger` through this channel; the worker
-    // runs the optimiser and stages the best trial as a
-    // `PendingCalibration` for operator review. Not guarded by
-    // a feature flag — if nobody posts to `/api/admin/optimize/trigger`,
-    // the worker idles.
-    let (hopt_tx, hopt_rx) = tokio::sync::mpsc::unbounded_channel();
-    dashboard_state.register_hyperopt_trigger_channel(hopt_tx);
-    let _hopt_handle = hyperopt_worker::spawn_worker(
-        hopt_rx,
-        dashboard_state.clone(),
-        config.clone(),
-    );
-    if config.dashboard_port > 0 {
-        let ds = dashboard_state.clone();
-        let wsb = ws_broadcast.clone();
-        let auth = auth_state.clone();
-        let port = config.dashboard_port;
-        tokio::spawn(async move {
-            if let Err(e) = mm_dashboard::server::start(ds, wsb, auth, port).await {
-                error!(error = %e, "dashboard server failed");
-            }
-        });
-        info!(
-            port = config.dashboard_port,
-            "dashboard + WebSocket + auth started"
-        );
-    }
-
-    // Shutdown signal.
-    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-    let mut handles = Vec::new();
-
-    // Shared multi-currency portfolio across all per-symbol
-    // engines. Reporting currency = USDT by default; override
-    // per-symbol FX factors inside individual strategies if you
-    // quote in a different quote asset.
-    let portfolio = Arc::new(std::sync::Mutex::new(mm_portfolio::Portfolio::new("USDT")));
-
-    // Shared factor covariance estimator (Epic 3). All engines
-    // push returns; portfolio risk task reads correlation matrix.
-    let shared_factor_cov = Arc::new(std::sync::Mutex::new(
-        mm_risk::hedge_optimizer::FactorCovarianceEstimator::new(vec![], 1440),
-    ));
-
-    // Shared per-client daily-loss circuit (Epic 6). Registered
-    // with every configured client's limit at startup; each
-    // engine holds an Arc clone and reports/checks on every
-    // summary + refresh tick. The synthetic "default" client
-    // (legacy single-client mode) always registers with `None`
-    // so existing deployments see the aggregate on the
-    // dashboard without enforcement changing behaviour.
-    let per_client_circuit = Arc::new(mm_risk::PerClientLossCircuit::new());
-    for client in config.effective_clients() {
-        per_client_circuit.register(&client.id, client.daily_loss_limit_usd);
-        info!(
-            client_id = %client.id,
-            limit = ?client.daily_loss_limit_usd,
-            "per-client loss circuit registered"
-        );
-    }
-    // Share the circuit with the dashboard state so the
-    // `/api/v1/clients/loss-state` endpoint can snapshot it.
-    dashboard_state.set_per_client_circuit(per_client_circuit.clone());
-
-    // P2.1 — build the shared per-asset-class kill switches
-    // up-front so every engine that maps to the same class
-    // receives the SAME `Arc<Mutex<KillSwitch>>` and a
-    // coordinated escalation halts the whole class
-    // simultaneously. Engines whose symbol does not appear in
-    // any class get `None` and run with the global kill
-    // switch only.
-    let asset_class_switches: std::collections::HashMap<
-        String,
-        Arc<std::sync::Mutex<mm_risk::KillSwitch>>,
-    > = config
-        .kill_switch
-        .asset_classes
-        .iter()
-        .map(|cfg| {
-            let ks_cfg = mm_risk::kill_switch::KillSwitchConfig {
-                daily_loss_limit: cfg.limits.daily_loss_limit,
-                daily_loss_warning: cfg.limits.daily_loss_warning,
-                max_position_value: cfg.limits.max_position_value,
-                max_message_rate: cfg.limits.max_message_rate,
-                max_consecutive_errors: cfg.limits.max_consecutive_errors,
-                ..Default::default()
-            };
-            (
-                cfg.name.clone(),
-                Arc::new(std::sync::Mutex::new(mm_risk::KillSwitch::new(ks_cfg))),
-            )
-        })
-        .collect();
-    let symbol_to_class: std::collections::HashMap<String, String> = config
-        .kill_switch
-        .asset_classes
-        .iter()
-        .flat_map(|cfg| {
-            let class = cfg.name.clone();
-            cfg.symbols.iter().map(move |s| (s.clone(), class.clone()))
-        })
-        .collect();
-
-    for symbol in &config.symbols {
-        let symbol = symbol.clone();
-        let config = config.clone();
-        let connector = connector.clone();
-        let shutdown_rx = shutdown_tx.subscribe();
-        let checkpoint = checkpoint.clone();
-        let dashboard_state = dashboard_state.clone();
-        let alerts = alert_manager.clone();
-        let portfolio = portfolio.clone();
-        let asset_class_switch = symbol_to_class
-            .get(&symbol)
-            .and_then(|c| asset_class_switches.get(c).cloned());
-        let wh = webhook_dispatcher.clone();
-        let shared_cov = shared_factor_cov.clone();
-        let circuit = per_client_circuit.clone();
-
-        let handle = tokio::spawn(async move {
-            if let Err(e) = run_symbol(
-                symbol.clone(),
-                config,
-                connector,
-                shutdown_rx,
-                checkpoint,
-                dashboard_state,
-                alerts,
-                portfolio,
-                asset_class_switch,
-                wh,
-                shared_cov,
-                circuit,
-            )
-            .await
-            {
-                error!(symbol = %symbol, error = %e, "market maker crashed");
-            }
-        });
-        handles.push(handle);
-    }
-
-    // Listing sniper background task (Epic F stage-2 + 3).
-    // Wired below, after the bundle has been built, so we
-    // can hand it every connector the operator configured
-    // (primary + hedge + sor_extra_venues).
-
-    // Portfolio risk background task (Epic 3). Evaluates factor
-    // deltas every 30s and broadcasts spread multipliers.
-    if let Some(ref pr_cfg) = config.portfolio_risk {
-        let pr_portfolio = portfolio.clone();
-        let pr_dashboard = dashboard_state.clone();
-        let pr_factor_cov = shared_factor_cov.clone();
-        let mut pr_shutdown = shutdown_tx.subscribe();
-        let pr_config = mm_risk::portfolio_risk::PortfolioRiskConfig {
-            max_total_delta_usd: pr_cfg.max_total_delta_usd,
-            factor_limits: pr_cfg
-                .factor_limits
-                .iter()
-                .map(|f| mm_risk::portfolio_risk::FactorLimitConfig {
-                    factor: f.factor.clone(),
-                    max_net_delta: f.max_net_delta,
-                    widen_mult: f.widen_mult,
-                    warn_pct: f.warn_pct,
-                })
-                .collect(),
-        };
-        let pr_manager = mm_risk::portfolio_risk::PortfolioRiskManager::new(pr_config);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        if let Ok(port) = pr_portfolio.lock() {
-                            let snap = port.snapshot();
-                            let factor_map: std::collections::HashMap<String, rust_decimal::Decimal> =
-                                snap.per_factor.into_iter().collect();
-                            let summary = pr_manager.evaluate(&factor_map);
-                            // Broadcast spread multiplier if needed.
-                            for action in &summary.actions {
-                                match action {
-                                    mm_risk::portfolio_risk::PortfolioRiskAction::WidenAll { mult, .. } => {
-                                        pr_dashboard.broadcast_config_override(
-                                            mm_dashboard::state::ConfigOverride::PortfolioRiskMult(*mult),
-                                        );
-                                    }
-                                    mm_risk::portfolio_risk::PortfolioRiskAction::HaltFactor { .. } => {
-                                        pr_dashboard.broadcast_config_override(
-                                            mm_dashboard::state::ConfigOverride::PauseQuoting,
-                                        );
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            pr_dashboard.set_portfolio_risk_summary(summary);
-                            // Push correlation matrix from shared estimator.
-                            if let Ok(cov) = pr_factor_cov.lock() {
-                                pr_dashboard.set_correlation_matrix(cov.correlation_matrix());
-                            }
-                        }
-                    }
-                    _ = pr_shutdown.changed() => break,
-                }
-            }
-        });
-        info!("portfolio risk monitor started (30s interval)");
-    }
-
-    // 22W-2 — portfolio-wide VaR guard. Samples total realised
-    // PnL every 30 s, feeds the rolling delta into a parametric
-    // Gaussian VaR, broadcasts the size multiplier to every
-    // engine via ConfigOverride::PortfolioVarMult. Complements
-    // the per-strategy var_guard (which runs inside each engine).
-    if let Some(ref pv_cfg) = config.portfolio_var {
-        let pv_portfolio = portfolio.clone();
-        let pv_dashboard = dashboard_state.clone();
-        let mut pv_shutdown = shutdown_tx.subscribe();
-        let pv_config = mm_risk::portfolio_var::PortfolioVarConfig {
-            var_limit_95: pv_cfg.var_limit_95,
-            var_limit_99: pv_cfg.var_limit_99,
-            max_samples: pv_cfg.max_samples,
-            min_samples: pv_cfg.min_samples,
-        };
-        let mut pv_guard = mm_risk::portfolio_var::PortfolioVarGuard::new(pv_config);
-        let mut pv_last_total: rust_decimal::Decimal = rust_decimal::Decimal::ZERO;
-        let mut pv_last_throttle: rust_decimal::Decimal = rust_decimal::Decimal::ONE;
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        if let Ok(port) = pv_portfolio.lock() {
-                            let snap = port.snapshot();
-                            let current_total = snap.total_realised_pnl;
-                            let delta = current_total - pv_last_total;
-                            pv_last_total = current_total;
-                            pv_guard.record_sample(delta);
-                            let throttle = pv_guard.throttle();
-                            if throttle != pv_last_throttle {
-                                pv_dashboard.broadcast_config_override(
-                                    mm_dashboard::state::ConfigOverride::PortfolioVarMult(throttle),
-                                );
-                                if throttle < rust_decimal::Decimal::ONE {
-                                    warn!(
-                                        throttle = %throttle,
-                                        samples = pv_guard.sample_count(),
-                                        "portfolio VaR throttle applied"
-                                    );
-                                } else {
-                                    info!(
-                                        samples = pv_guard.sample_count(),
-                                        "portfolio VaR throttle cleared"
-                                    );
-                                }
-                                pv_last_throttle = throttle;
-                            }
-                        }
-                    }
-                    _ = pv_shutdown.changed() => break,
-                }
-            }
-        });
-        info!("portfolio VaR guard started (30s interval)");
-    }
-
-    // Wait for Ctrl+C.
-    tokio::signal::ctrl_c().await?;
-    info!("shutdown signal received — cancelling all orders");
-    let _ = shutdown_tx.send(true);
-
-    for handle in handles {
-        let _ = handle.await;
-    }
-
-    // Final checkpoint flush.
-    if let Ok(cp) = checkpoint.lock() {
-        let _ = cp.flush();
-    }
-
-    info!("all engines shut down cleanly");
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_symbol(
-    symbol: String,
-    mut config: AppConfig,
-    connector: Arc<dyn ExchangeConnector>,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    _checkpoint: Arc<std::sync::Mutex<CheckpointManager>>,
-    dashboard_state: DashboardState,
-    alert_manager: AlertManager,
-    portfolio: Arc<std::sync::Mutex<mm_portfolio::Portfolio>>,
-    asset_class_switch: Option<Arc<std::sync::Mutex<mm_risk::KillSwitch>>>,
-    webhook_dispatcher: mm_dashboard::webhooks::WebhookDispatcher,
-    shared_factor_cov: Arc<std::sync::Mutex<mm_risk::hedge_optimizer::FactorCovarianceEstimator>>,
-    per_client_circuit: Arc<mm_risk::PerClientLossCircuit>,
-) -> Result<()> {
-    let product = product_for_symbol(&symbol, &connector).await;
-
-    // Epic 31 — classify the symbol once at startup so the pair
-    // class appears in the dashboard and so the per-class template
-    // (E31.3) can merge in before engine construction.
-    let pair_class = classify_and_maybe_apply_template(
-        &mut config,
-        &symbol,
-        &product,
-        &connector,
-    )
-    .await;
-
-    let strategy: Box<dyn Strategy> = match config.market_maker.strategy {
-        StrategyType::AvellanedaStoikov => {
-            info!(symbol = %symbol, "using Avellaneda-Stoikov strategy");
-            Box::new(AvellanedaStoikov)
-        }
-        StrategyType::Glft => {
-            info!(symbol = %symbol, "using GLFT strategy");
-            Box::new(GlftStrategy::new())
-        }
-        StrategyType::Grid => {
-            info!(symbol = %symbol, "using Grid strategy");
-            Box::new(GridStrategy)
-        }
-        StrategyType::Basis | StrategyType::FundingArb | StrategyType::StatArb => {
-            // 22A-1 — stat-arb's driver dispatches IOC legs of
-            // its own when the z-score fires; between signals we
-            // fall through to continuous BasisStrategy quoting
-            // on the primary (Y) leg. Same shape as FundingArb:
-            // one quoting strategy on primary, one driver on top.
-            let shift = config.market_maker.basis_shift;
-            let max_basis_bps = config
-                .hedge
-                .as_ref()
-                .map(|h| h.pair.basis_threshold_bps)
-                .unwrap_or(dec!(50));
-            info!(
-                symbol = %symbol,
-                %shift,
-                %max_basis_bps,
-                kind = ?config.market_maker.strategy,
-                "using Basis strategy (quoting leg) — requires hedge connector"
-            );
-            Box::new(BasisStrategy::new(shift, max_basis_bps))
-        }
-        StrategyType::CrossVenueBasis => {
-            let shift = config.market_maker.basis_shift;
-            let max_basis_bps = config
-                .hedge
-                .as_ref()
-                .map(|h| h.pair.basis_threshold_bps)
-                .unwrap_or(dec!(50));
-            let stale_ms = config.market_maker.cross_venue_basis_max_staleness_ms;
-            info!(
-                symbol = %symbol,
-                %shift,
-                %max_basis_bps,
-                stale_ms,
-                "using CrossVenueBasis strategy — requires hedge connector on a different venue"
-            );
-            Box::new(BasisStrategy::cross_venue(shift, max_basis_bps, stale_ms))
-        }
-        StrategyType::CrossExchange => {
-            let min_profit_bps = config.market_maker.cross_exchange_min_profit_bps;
-            // Seed the strategy's fee expectations from the
-            // primary product so a fresh connector does not quote
-            // through its own rebate/taker assumptions. A hedge
-            // connector is required — the factory falls through to
-            // an Err at subscribe time if `config.hedge` is unset
-            // (validate.rs enforces the check at startup).
-            let mut s = CrossExchangeStrategy::new(min_profit_bps);
-            // Primary venue: we're the maker, fee is typically a
-            // rebate. Use the configured maker fee from product
-            // spec resolved above.
-            s.set_fees(product.maker_fee, product.taker_fee);
-            info!(
-                symbol = %symbol,
-                %min_profit_bps,
-                maker_fee = %product.maker_fee,
-                hedge_taker_fee = %product.taker_fee,
-                "using CrossExchange strategy — make on primary, hedge on hedge venue"
-            );
-            Box::new(s)
-        }
-    };
-
-    // Subscribe to market data via the connector. The public
-    // `subscribe` task produces an `UnboundedReceiver` of
-    // `MarketEvent`s — order-book snapshots, deltas, and public
-    // trades. We merge it with the optional Binance user-data
-    // stream (listen-key) so out-of-band fills and balance
-    // updates arrive on the same channel the engine consumes
-    // in its run loop.
-    let public_rx = connector.subscribe(std::slice::from_ref(&symbol)).await?;
-    let ws_rx = spawn_event_merger(public_rx, &config, &symbol);
-
-    // Build the connector bundle: single-connector by default,
-    // dual when `config.hedge` is set (basis / funding-arb modes).
-    let (bundle, hedge_rx) = if let Some(hedge_cfg) = config.hedge.clone() {
-        let hedge_conn = create_hedge_connector(&hedge_cfg.exchange)?;
-        let hedge_symbol = hedge_cfg.pair.hedge_symbol.clone();
-        let hedge_rx = hedge_conn
-            .subscribe(std::slice::from_ref(&hedge_symbol))
-            .await?;
-        let pair = mm_common::types::InstrumentPair::from(hedge_cfg.pair);
-        info!(
-            primary = %symbol,
-            hedge = %pair.hedge_symbol,
-            "dual-connector bundle with hedge leg"
-        );
-        (
-            mm_engine::ConnectorBundle::dual(connector, hedge_conn, pair),
-            Some(hedge_rx),
-        )
-    } else {
-        (mm_engine::ConnectorBundle::single(connector), None)
-    };
-
-    // Epic B stage-2 — background pair-screener. Spawns a
-    // long-running task that polls a mid per configured
-    // symbol on a fast cadence, runs the Engle-Granger
-    // cointegration test on every configured pair on a
-    // slower cadence, and audits every result so operators
-    // can pick stat-arb candidates without re-running the
-    // test manually.
-    if let Some(scr_cfg) = config.pair_screener.clone() {
-        let primary_for_screener = bundle.primary.clone();
-        let screener_shutdown = shutdown_rx.clone();
-        let screener_audit = Arc::new(
-            mm_risk::audit::AuditLog::new(std::path::Path::new("data/audit.jsonl"))
-                .expect("audit log for pair screener"),
-        );
-        tokio::spawn(async move {
-            run_pair_screener_task(
-                primary_for_screener,
-                scr_cfg,
-                screener_audit,
-                screener_shutdown,
-            )
-            .await;
-        });
-        info!("pair screener spawned");
-    }
-
-    // Epic A stage-2 #3 — build and attach SOR-only extra
-    // venues. Each `SorVenueConfig` entry produces one
-    // connector via the same `create_hedge_connector` path
-    // (which takes an `ExchangeConfig`); the resulting list
-    // is appended to the bundle so the dispatcher can look
-    // them up by venue id. Per-venue `VenueSeed`s are
-    // prepared up-front and registered on the engine below.
-    let sor_extras = build_sor_extras(&config)?;
-    let sor_extra_seeds: Vec<(
-        mm_exchange_core::connector::VenueId,
-        mm_engine::sor::venue_state::VenueSeed,
-    )> = config
-        .sor_extra_venues
-        .iter()
-        .map(|v| {
-            let seed = mm_engine::sor::venue_state::VenueSeed::new(
-                &v.symbol,
-                product.clone(),
-                v.max_inventory,
-            );
-            (venue_id_from_exchange_type(v.exchange.exchange_type), seed)
-        })
-        .collect();
-    let mut bundle = bundle;
-    if !sor_extras.is_empty() {
-        info!(
-            count = sor_extras.len(),
-            "attaching SOR extra venues to bundle"
-        );
-        bundle = bundle.with_extra(sor_extras.into_iter().map(|(_, c)| c).collect());
-    }
-
-    // S6.4 — register every bundle connector against the
-    // dashboard so `/api/v1/rebalance/execute` can dispatch
-    // transfers. Primary + hedge + every SOR extra goes in.
-    // Re-registration is idempotent (keyed by venue lowercase),
-    // which means the loop over symbols at the end simply
-    // overwrites with the same Arc.
-    dashboard_state.register_venue_connector(
-        &bundle.primary.venue_id().to_string(),
-        bundle.primary.clone(),
-    );
-    if let Some(h) = bundle.hedge.as_ref() {
-        dashboard_state
-            .register_venue_connector(&h.venue_id().to_string(), h.clone());
-    }
-    for extra in &bundle.extra {
-        dashboard_state
-            .register_venue_connector(&extra.venue_id().to_string(), extra.clone());
-    }
-
-    // If the operator selected FundingArb, build the driver
-    // from the `funding_arb` config section and inject it into
-    // the engine. The engine's run loop picks up the periodic
-    // tick + event routing.
-    // Listing sniper background task (Epic F stage-2 + 3).
-    // Scans the primary connector plus any hedge and every
-    // `sor_extra_venues` entry so multi-venue deployments
-    // catch new listings across the whole surface, not just
-    // the primary. The sniper tolerates per-venue
-    // `list_symbols` errors (unsupported, timeout) and keeps
-    // scanning the rest — no fatal failure mode.
-    if config.listing_sniper.enabled {
-        let mut sniper_connectors: Vec<Arc<dyn ExchangeConnector>> = Vec::new();
-        sniper_connectors.push(bundle.primary.clone());
-        if let Some(h) = bundle.hedge.as_ref() {
-            sniper_connectors.push(h.clone());
-        }
-        for extra in &bundle.extra {
-            sniper_connectors.push(extra.clone());
-        }
-        let sniper_count = sniper_connectors.len();
-        let sniper_shutdown = shutdown_rx.clone();
-        let sniper_audit = Arc::new(
-            mm_risk::audit::AuditLog::new(std::path::Path::new("data/audit.jsonl"))
-                .expect("audit log for listing sniper"),
-        );
-        let sniper_alerts = Some(alert_manager.clone());
-        let scan_secs = config.listing_sniper.scan_interval_secs;
-        let alert_on_disc = config.listing_sniper.alert_on_discovery;
-        let entry_cfg = config.listing_sniper_entry.clone();
-        tokio::spawn(async move {
-            let mut runner = mm_engine::listing_sniper::ListingSniperRunner::new(
-                sniper_connectors,
-                sniper_audit,
-                sniper_alerts,
-                scan_secs,
-                alert_on_disc,
-            );
-            // Epic F stage-3 — attach the real-entry policy
-            // only when the operator explicitly configured
-            // it. Observer-only runs stay byte-identical
-            // without `listing_sniper_entry`.
-            if let Some(cfg) = entry_cfg {
-                runner = runner.with_entry_policy(cfg);
-            }
-            runner.run(sniper_shutdown).await;
-        });
-        info!(
-            scan_interval_secs = config.listing_sniper.scan_interval_secs,
-            venues = sniper_count,
-            "listing sniper started"
-        );
-    }
-
-    // 22A-1 — stat_arb driver wiring. Mirror of the funding_arb
-    // block below. Uses `NullStatArbSink` for v1 — dashboard
-    // bridge is a follow-up task (it would publish per-pair
-    // z-score + event counters to a new UI panel). The driver
-    // still logs every event via its internal tracing, and the
-    // audit trail records dispatched legs when stage-2 entry /
-    // exit dispatch fires.
-    let stat_arb_wiring = if matches!(config.market_maker.strategy, StrategyType::StatArb) {
-        let cfg = config.stat_arb.clone().ok_or_else(|| {
-            anyhow::anyhow!("strategy=stat_arb requires [stat_arb] section in config")
-        })?;
-        if !cfg.enabled {
-            warn!("stat_arb.enabled=false — driver wired but signals disabled");
-        }
-        let hedge_conn = bundle
-            .hedge
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("strategy=stat_arb requires a hedge connector"))?;
-        let pair = mm_strategy::stat_arb::StatArbPair {
-            y_symbol: cfg.y_symbol.clone(),
-            x_symbol: cfg.x_symbol.clone(),
-            strategy_class: format!("stat_arb_{}_{}", cfg.y_symbol, cfg.x_symbol),
-        };
-        let sink: Arc<dyn mm_strategy::stat_arb::StatArbEventSink> =
-            Arc::new(mm_strategy::stat_arb::NullStatArbSink);
-        let driver_cfg = mm_strategy::stat_arb::StatArbDriverConfig {
-            tick_interval: std::time::Duration::from_secs(cfg.tick_interval_secs),
-            zscore: mm_strategy::stat_arb::ZScoreConfig {
-                window: cfg.zscore_window,
-                entry_threshold: cfg.zscore_entry,
-                exit_threshold: cfg.zscore_exit,
-            },
-            kalman_transition_var: cfg.kalman_transition_var,
-            kalman_observation_var: cfg.kalman_observation_var,
-            leg_notional_usd: cfg.leg_notional_usd,
-        };
-        let driver = mm_strategy::stat_arb::StatArbDriver::new(
-            bundle.primary.clone(),
-            hedge_conn,
-            pair,
-            driver_cfg,
-            sink,
-        );
-        Some((
-            driver,
-            std::time::Duration::from_secs(cfg.tick_interval_secs),
-        ))
-    } else {
-        None
-    };
-
-    let funding_arb_wiring =
-        if matches!(config.market_maker.strategy, StrategyType::FundingArb) {
-            let cfg = config.funding_arb.clone().ok_or_else(|| {
-                anyhow::anyhow!("strategy=funding_arb requires [funding_arb] section in config")
-            })?;
-            if !cfg.enabled {
-                warn!("funding_arb.enabled=false — driver wired but signals disabled");
-            }
-            let hedge_conn = bundle.hedge.clone().ok_or_else(|| {
-                anyhow::anyhow!("strategy=funding_arb requires a hedge connector")
-            })?;
-            let pair = bundle.pair.clone().ok_or_else(|| {
-                anyhow::anyhow!("strategy=funding_arb requires an instrument pair")
-            })?;
-            // S5.2 — route driver events into the dashboard so
-            // the funding-arb monitor panel sees last-event +
-            // counts per pair. Pair key is `primary|hedge` so
-            // one engine's dispatches land under a stable,
-            // human-readable bucket on the panel.
-            let pair_key = format!("{}|{}", pair.primary_symbol, pair.hedge_symbol);
-            let sink: Arc<dyn mm_strategy::DriverEventSink> =
-                Arc::new(DashboardFundingArbSink::new(
-                    dashboard_state.clone(),
-                    pair_key,
-                ));
-            let driver = mm_strategy::FundingArbDriver::new(
-                bundle.primary.clone(),
-                hedge_conn,
-                pair,
-                mm_strategy::FundingArbDriverConfig {
-                    tick_interval: std::time::Duration::from_secs(cfg.tick_interval_secs),
-                    engine: mm_persistence::funding::FundingArbConfig {
-                        min_rate_annual_pct: cfg.min_rate_annual_pct,
-                        max_position: cfg.max_position,
-                        max_basis_bps: cfg.max_basis_bps,
-                        enabled: cfg.enabled,
-                        ..Default::default()
-                    },
-                },
-                sink,
-            );
-            Some((
-                driver,
-                std::time::Duration::from_secs(cfg.tick_interval_secs),
-            ))
-        } else {
-            None
-        };
-
-    // Hot config override channel — admin endpoints send
-    // overrides through the dashboard state; the engine polls
-    // the receiver in its select loop.
-    let (config_tx, config_rx) = tokio::sync::mpsc::unbounded_channel();
-    dashboard_state.register_config_channel(&symbol, config_tx);
-
-    let record_path = if config.record_market_data {
-        Some(format!("data/recorded/{}.jsonl", symbol.to_lowercase()))
-    } else {
-        None
-    };
-
-    // Block B — snapshot fields we need after the `config` /
-    // `symbol` values are moved into `MarketMakerEngine::new`.
-    let checkpoint_restore_enabled = config.checkpoint_restore;
-    let checkpoint_path = config.checkpoint_path.clone();
-    let symbol_for_restore = symbol.clone();
-    // Epic F #1 — capture lead-lag inputs before `config` is
-    // moved. The guard only makes sense with a hedge, so the
-    // presence flag is captured alongside the config.
-    let lead_lag_cfg = config.lead_lag.clone();
-    let hedge_configured = config.hedge.is_some();
-    // Epic F #2 — snapshot the news-retreat config. Headlines
-    // are pushed post-boot via `/api/admin/config` broadcast;
-    // here we just build the state machine.
-    let news_retreat_cfg = config.news_retreat.clone();
-    // Epic G — capture the social-risk sub-config so we can
-    // build a `SocialRiskEngine` per symbol after `config`
-    // is moved into `MarketMakerEngine::new`.
-    let social_risk_cfg = config.sentiment.as_ref().map(|s| s.risk.clone());
-
-    // Block D — resolve the owning client id via the dashboard
-    // state's reverse index. `None` in single-client mode; the
-    // engine then tags fills + audit events with the owning
-    // client so Epic 1 per-client audit trails are accurate.
-    let client_id_for_engine = dashboard_state.get_client_for_symbol(&symbol_for_restore);
-
-    let mut engine_builder = MarketMakerEngine::new(
-        symbol,
-        config,
-        product,
-        strategy,
-        bundle,
-        Some(dashboard_state),
-        Some(alert_manager),
-    )
-    .with_portfolio(portfolio)
-    .with_config_overrides(config_rx)
-    .with_webhooks(webhook_dispatcher)
-    .with_shared_factor_covariance(shared_factor_cov)
-    .with_per_client_circuit(per_client_circuit)
-    .with_pair_class(pair_class);
-    if let Some(cid) = client_id_for_engine {
-        engine_builder = engine_builder.with_client_id(cid);
-    }
-
-    // Epic F #1 — construct the lead-lag guard when the
-    // operator opted in AND a hedge connector is present (the
-    // guard needs a leader venue; without a hedge there's no
-    // leader mid to read). The engine's hedge-book event
-    // handler auto-feeds the mid into
-    // `update_lead_lag_from_mid`, no extra wiring required.
-    if let Some(ll_cfg) = lead_lag_cfg.as_ref() {
-        if hedge_configured {
-            use std::str::FromStr;
-            let parsed = mm_risk::lead_lag_guard::LeadLagGuardConfig {
-                half_life_events: ll_cfg.half_life_events,
-                z_min: rust_decimal::Decimal::from_str(&ll_cfg.z_min)
-                    .unwrap_or(rust_decimal::Decimal::new(2, 0)),
-                z_max: rust_decimal::Decimal::from_str(&ll_cfg.z_max)
-                    .unwrap_or(rust_decimal::Decimal::new(4, 0)),
-                max_mult: rust_decimal::Decimal::from_str(&ll_cfg.max_mult)
-                    .unwrap_or(rust_decimal::Decimal::new(3, 0)),
-            };
-            let guard = mm_risk::lead_lag_guard::LeadLagGuard::new(parsed);
-            engine_builder = engine_builder.with_lead_lag_guard(guard);
-            info!(symbol = %symbol_for_restore, "lead-lag guard attached");
-        } else {
-            warn!(
-                symbol = %symbol_for_restore,
-                "lead_lag config set but no hedge connector — guard skipped"
-            );
-        }
-    }
-
-    // Epic G — wire `SocialRiskEngine` when sentiment is
-    // configured. The orchestrator spawns separately at
-    // `main()` level and broadcasts ticks through
-    // `ConfigOverride::SentimentTick`; this is the per-engine
-    // receiver half.
-    if let Some(sr_cfg) = social_risk_cfg.as_ref() {
-        use std::str::FromStr;
-        let parsed = mm_risk::social_risk::SocialRiskConfig {
-            rate_warn: rust_decimal::Decimal::from_str(&sr_cfg.rate_warn)
-                .unwrap_or(rust_decimal::Decimal::new(2, 0)),
-            rate_alarm: rust_decimal::Decimal::from_str(&sr_cfg.rate_alarm)
-                .unwrap_or(rust_decimal::Decimal::new(5, 0)),
-            max_vol_multiplier: rust_decimal::Decimal::from_str(&sr_cfg.max_vol_multiplier)
-                .unwrap_or(rust_decimal::Decimal::new(3, 0)),
-            min_size_multiplier: rust_decimal::Decimal::from_str(&sr_cfg.min_size_multiplier)
-                .unwrap_or(rust_decimal::Decimal::new(5, 1)),
-            kill_mentions_rate: rust_decimal::Decimal::from_str(&sr_cfg.kill_mentions_rate)
-                .unwrap_or(rust_decimal::Decimal::new(10, 0)),
-            kill_vol_threshold: rust_decimal::Decimal::from_str(&sr_cfg.kill_vol_threshold)
-                .unwrap_or(rust_decimal::Decimal::new(8, 1)),
-            skew_threshold: rust_decimal::Decimal::from_str(&sr_cfg.skew_threshold)
-                .unwrap_or(rust_decimal::Decimal::new(3, 1)),
-            max_skew_bps: rust_decimal::Decimal::from_str(&sr_cfg.max_skew_bps)
-                .unwrap_or(rust_decimal::Decimal::new(15, 0)),
-            ofi_confirm_z: rust_decimal::Decimal::from_str(&sr_cfg.ofi_confirm_z)
-                .unwrap_or(rust_decimal::Decimal::new(15, 1)),
-            staleness: chrono::Duration::minutes(sr_cfg.staleness_mins),
-        };
-        engine_builder = engine_builder
-            .with_social_risk(mm_risk::social_risk::SocialRiskEngine::new(parsed));
-        info!(symbol = %symbol_for_restore, "social risk engine attached");
-    }
-
-    // Epic F #2 — news-retreat state machine. Input source:
-    // `POST /api/admin/config` broadcast with `field = "News"`
-    // which the dashboard routes through the existing
-    // per-symbol ConfigOverride channel.
-    if let Some(nr_cfg) = news_retreat_cfg.as_ref() {
-        use std::str::FromStr;
-        let parsed = mm_risk::news_retreat::NewsRetreatConfig {
-            critical_keywords: nr_cfg.critical_keywords.clone(),
-            high_keywords: nr_cfg.high_keywords.clone(),
-            low_keywords: nr_cfg.low_keywords.clone(),
-            critical_cooldown_ms: nr_cfg.critical_cooldown_ms,
-            high_cooldown_ms: nr_cfg.high_cooldown_ms,
-            low_cooldown_ms: nr_cfg.low_cooldown_ms,
-            high_multiplier: rust_decimal::Decimal::from_str(&nr_cfg.high_multiplier)
-                .unwrap_or(rust_decimal::Decimal::new(2, 0)),
-            critical_multiplier: rust_decimal::Decimal::from_str(&nr_cfg.critical_multiplier)
-                .unwrap_or(rust_decimal::Decimal::new(3, 0)),
-        };
-        match mm_risk::news_retreat::NewsRetreatStateMachine::new(parsed) {
-            Ok(sm) => {
-                engine_builder = engine_builder.with_news_retreat(sm);
-                info!(symbol = %symbol_for_restore, "news-retreat state machine attached");
-            }
-            Err(e) => {
-                warn!(
-                    symbol = %symbol_for_restore,
-                    error = %e,
-                    "news_retreat config invalid — state machine skipped"
-                );
-            }
-        }
-    }
-    if let Some(arc) = asset_class_switch {
-        engine_builder = engine_builder.with_asset_class_switch(arc);
-    }
-    if let Some(ref path) = record_path {
-        engine_builder = engine_builder.with_event_recorder(std::path::Path::new(path));
-    }
-
-    let engine_builder = match funding_arb_wiring {
-        Some((driver, tick)) => engine_builder.with_funding_arb_driver(driver, tick),
-        None => engine_builder,
-    };
-    let mut engine = match stat_arb_wiring {
-        Some((driver, tick)) => engine_builder.with_stat_arb_driver(driver, tick),
-        None => engine_builder,
-    };
-
-    // Block B — checkpoint restore + fill replay validation.
-    // Opt-in via `checkpoint_restore = true` in AppConfig. The
-    // engine rehydrates inventory + realised-PnL baseline from
-    // the last saved checkpoint, and when an audit log is
-    // present we replay OrderFilled events to cross-check the
-    // checkpoint wasn't stale or truncated. Discrepancy logs
-    // at WARN so operators can investigate without the engine
-    // refusing to start (a good checkpoint is better than no
-    // checkpoint; an inconsistent one is flagged + served).
-    if checkpoint_restore_enabled {
-        let cp_path = std::path::Path::new(&checkpoint_path);
-        let cp_mgr =
-            mm_persistence::checkpoint::CheckpointManager::new(cp_path, u64::MAX);
-        if let Some(symcp) = cp_mgr.get_symbol(&symbol_for_restore) {
-            let audit_path = std::path::Path::new("data/audit.jsonl");
-            if let Some(replay) =
-                mm_persistence::fill_replay::replay_fills_from_audit(audit_path)
-            {
-                let issues =
-                    mm_persistence::fill_replay::validate_checkpoint_against_replay(
-                        symcp,
-                        &replay,
-                        rust_decimal::Decimal::new(1, 6),
-                    );
-                if issues.is_empty() {
-                    info!(
-                        symbol = %symbol_for_restore,
-                        fills = replay.fill_count,
-                        "fill replay confirms checkpoint"
-                    );
-                } else {
-                    warn!(
-                        symbol = %symbol_for_restore,
-                        issues = ?issues,
-                        "fill replay found checkpoint discrepancies — restoring anyway"
-                    );
-                }
-            }
-            engine = engine.with_checkpoint_restore(symcp);
-        } else {
-            info!(symbol = %symbol_for_restore, "no checkpoint available for symbol");
-        }
-    }
-
-    // Register pre-built SOR seeds on the engine so the
-    // greedy router can see the extra venues. Per-venue
-    // best-bid/ask will be populated by the aggregator's
-    // live feed once the first L1 snapshot lands.
-    for (vid, seed) in sor_extra_seeds {
-        info!(
-            venue = ?vid,
-            symbol = %seed.symbol,
-            max_inv = %seed.available_qty,
-            "registered extra SOR venue"
-        );
-        engine = engine.with_sor_venue(vid, seed);
-    }
-
-    engine.run_with_hedge(ws_rx, hedge_rx, shutdown_rx).await
-}
-
-/// Map an `ExchangeType` to the corresponding runtime
-/// `VenueId` tag. Used by Epic A stage-2 #3 to bridge the
-/// `common` config layer (which knows ExchangeType) and the
-/// `exchange-core` runtime (which keys by VenueId).
-/// Epic B stage-2 — background cointegration pair-screener
-/// task. Polls one mid per configured symbol on the sample
-/// cadence, feeds the rolling buffer in
-/// `PairScreener::push_price`, and runs `screen_all()` on
-/// the scan cadence, writing one audit event per result.
-///
-/// Error policy: a per-symbol `get_orderbook` failure logs
-/// and moves on — the rolling buffer simply misses one
-/// sample. An unrecoverable (venue permanently down) failure
-/// just means the screener stays at warm-up forever, which
-/// is visible via the lack of audit rows.
-async fn run_pair_screener_task(
-    connector: Arc<dyn ExchangeConnector>,
-    cfg: mm_common::config::PairScreenerConfig,
-    audit: Arc<mm_risk::audit::AuditLog>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) {
-    use mm_risk::audit::AuditEventType;
-    use mm_strategy::stat_arb::screener::PairScreener;
-
-    let sample_secs = cfg.sample_interval_secs.max(1);
-    let scan_secs = cfg.scan_interval_secs.max(sample_secs);
-    let mut screener = PairScreener::new(cfg.pairs.clone());
-
-    // Union of every symbol referenced by any pair. Ordered
-    // + deduped so the poll sequence is deterministic across
-    // runs — eases post-mortem.
-    let mut symbols: Vec<String> = cfg
-        .pairs
-        .iter()
-        .flat_map(|(y, x)| [y.clone(), x.clone()])
-        .collect();
-    symbols.sort();
-    symbols.dedup();
-
-    let mut sample_interval =
-        tokio::time::interval(tokio::time::Duration::from_secs(sample_secs));
-    let mut scan_interval =
-        tokio::time::interval(tokio::time::Duration::from_secs(scan_secs));
-    // Skip the first immediate ticks on both clocks so we do
-    // not scan on a cold-start empty buffer.
-    sample_interval.tick().await;
-    scan_interval.tick().await;
-
-    loop {
-        tokio::select! {
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
-                    info!("pair screener shutting down");
-                    return;
-                }
-            }
-            _ = sample_interval.tick() => {
-                for sym in &symbols {
-                    match connector.get_orderbook(sym, 1).await {
-                        Ok((bids, asks, _seq)) => {
-                            let bid = bids.first().map(|l| l.price);
-                            let ask = asks.first().map(|l| l.price);
-                            if let (Some(b), Some(a)) = (bid, ask) {
-                                if b > rust_decimal::Decimal::ZERO
-                                    && a > rust_decimal::Decimal::ZERO
-                                {
-                                    let mid = (b + a) / rust_decimal::Decimal::from(2u32);
-                                    screener.push_price(sym, mid);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                symbol = %sym,
-                                error = %e,
-                                "pair screener sample fetch failed"
-                            );
-                        }
-                    }
-                }
-            }
-            _ = scan_interval.tick() => {
-                let results = screener.screen_all();
-                for r in results {
-                    let detail = match &r.cointegration {
-                        Some(c) => format!(
-                            "y={}, x={}, coint={}, adf={}, crit={}, beta={}, n={}",
-                            r.y_symbol,
-                            r.x_symbol,
-                            c.is_cointegrated,
-                            c.adf_statistic,
-                            c.critical_value_5pct,
-                            c.beta,
-                            r.sample_size,
-                        ),
-                        None => format!(
-                            "y={}, x={}, coint=insufficient_samples, n={}",
-                            r.y_symbol, r.x_symbol, r.sample_size,
-                        ),
-                    };
-                    info!(%detail, "pair screener scan");
-                    let audit_symbol = format!("{}_{}", r.y_symbol, r.x_symbol);
-                    audit.risk_event(
-                        &audit_symbol,
-                        AuditEventType::CointegrationScreened,
-                        &detail,
-                    );
-                }
-            }
-        }
-    }
-}
-
-/// S5.2 — funding-arb driver event sink that writes each
-/// `DriverEvent` into `DashboardState::record_funding_arb_event`
-/// so the monitor panel can render per-pair last-event + counts
-/// without tailing audit. Lives in the server crate because
-/// mm-dashboard doesn't depend on mm-strategy (and we'd rather
-/// keep that direction so the dashboard stays agnostic to
-/// individual strategy traits).
-struct DashboardFundingArbSink {
-    dashboard: DashboardState,
-    pair_key: String,
-}
-
-impl DashboardFundingArbSink {
-    fn new(dashboard: DashboardState, pair_key: String) -> Self {
-        Self { dashboard, pair_key }
-    }
-}
-
-impl mm_strategy::DriverEventSink for DashboardFundingArbSink {
-    fn on_event(&self, event: mm_strategy::DriverEvent) {
-        use mm_strategy::DriverEvent as D;
-        match event {
-            D::Entered { .. } => {
-                self.dashboard.record_funding_arb_event(
-                    &self.pair_key,
-                    "entered",
-                    None,
-                    false,
-                );
-            }
-            D::Exited { reason, .. } => {
-                self.dashboard.record_funding_arb_event(
-                    &self.pair_key,
-                    "exited",
-                    Some(&reason),
-                    false,
-                );
-            }
-            D::TakerRejected { reason } => {
-                self.dashboard.record_funding_arb_event(
-                    &self.pair_key,
-                    "taker_rejected",
-                    Some(&reason),
-                    false,
-                );
-            }
-            D::PairBreak { reason, compensated } => {
-                self.dashboard.record_funding_arb_event(
-                    &self.pair_key,
-                    "pair_break",
-                    Some(&reason),
-                    !compensated,
-                );
-            }
-            D::Hold => {
-                self.dashboard.record_funding_arb_event(
-                    &self.pair_key,
-                    "hold",
-                    None,
-                    false,
-                );
-            }
-            D::InputUnavailable { reason } => {
-                self.dashboard.record_funding_arb_event(
-                    &self.pair_key,
-                    "input_unavailable",
-                    Some(&reason),
-                    false,
-                );
-            }
-        }
-    }
-}
-
-fn venue_id_from_exchange_type(
-    ex: ExchangeType,
-) -> mm_exchange_core::connector::VenueId {
-    use mm_exchange_core::connector::VenueId;
-    match ex {
-        ExchangeType::Custom => VenueId::Custom,
-        ExchangeType::Binance | ExchangeType::BinanceTestnet => VenueId::Binance,
-        ExchangeType::Bybit | ExchangeType::BybitTestnet => VenueId::Bybit,
-        ExchangeType::HyperLiquid | ExchangeType::HyperLiquidTestnet => VenueId::HyperLiquid,
-    }
-}
-
-/// Epic A stage-2 #3 — build the list of `(venue, connector)`
-/// pairs for every `SorVenueConfig` entry. Rejects duplicates
-/// of the primary or hedge venue because the dispatcher's
-/// single-connector-per-venue lookup can't route two
-/// connectors to the same venue id.
-fn build_sor_extras(
-    config: &AppConfig,
-) -> Result<Vec<(mm_exchange_core::connector::VenueId, Arc<dyn ExchangeConnector>)>> {
-    use std::collections::HashSet;
-    let mut seen: HashSet<mm_exchange_core::connector::VenueId> = HashSet::new();
-    seen.insert(venue_id_from_exchange_type(config.exchange.exchange_type));
-    if let Some(h) = &config.hedge {
-        seen.insert(venue_id_from_exchange_type(h.exchange.exchange_type));
-    }
-
-    let mut out = Vec::with_capacity(config.sor_extra_venues.len());
-    for v in &config.sor_extra_venues {
-        let vid = venue_id_from_exchange_type(v.exchange.exchange_type);
-        if !seen.insert(vid) {
-            anyhow::bail!(
-                "sor_extra_venues references {vid:?} which is already \
-                 the primary or hedge venue — the dispatcher's \
-                 single-connector-per-venue lookup cannot route two \
-                 connectors to the same venue id"
-            );
-        }
-        // Reuse `create_hedge_connector` — same signature
-        // (`&ExchangeConfig`), same per-venue branching, no
-        // reason to duplicate.
-        let conn = create_hedge_connector(&v.exchange)?;
-        out.push((vid, conn));
-    }
-    Ok(out)
-}
-
-/// Build a hedge-leg connector from its `ExchangeConfig`.
-///
-/// Epic 40.6 — hedge direction defaults to **perp-short** when the
-/// user sets `[hedge.exchange] product = "spot"` *implicitly*
-/// (i.e. leaves it at the default). Research
-/// (`docs/research/spot-vs-perp-mm-apr17.md`, section 3 "Risk →
-/// Delta-hedging asymmetry") shows long-spot + short-perp is
-/// operationally clean, while short-spot + long-perp requires a
-/// borrow channel (5–20% APR, recall risk). Making perp the
-/// hedge default aligns the engine with the institutional
-/// XEMM / basis convention. Users who genuinely want spot-on-spot
-/// cross-exchange set `product = "spot"` explicitly — we warn
-/// once at startup so the choice is visible in the log.
-///
-/// Kept separate from `create_connector` so the primary and hedge
-/// paths can evolve independently — cross-venue basis trades
-/// (Binance spot vs HyperLiquid perps) live here.
-fn create_hedge_connector(
-    cfg: &mm_common::config::ExchangeConfig,
-) -> Result<Arc<dyn ExchangeConnector>> {
-    let api_key = cfg.api_key.clone().unwrap_or_default();
-    let api_secret = cfg.api_secret.clone().unwrap_or_default();
-
-    match cfg.exchange_type {
-        ExchangeType::Custom => Ok(Arc::new(mm_exchange_client::CustomConnector::new(
-            &cfg.rest_url,
-            &cfg.ws_url,
-        ))),
-        ExchangeType::Binance | ExchangeType::BinanceTestnet => match cfg.product {
-            ProductType::Spot => {
-                info!(
-                    "hedge leg on Binance spot — short-spot hedging requires a borrow \
-                     channel (borrow APR applies). Prefer `product = \"linear_perp\"` \
-                     for XEMM / basis (Epic 40.6)."
-                );
-                let testnet = matches!(cfg.exchange_type, ExchangeType::BinanceTestnet);
-                let connector = if testnet {
-                    mm_exchange_binance::BinanceConnector::testnet(&api_key, &api_secret)
-                } else {
-                    mm_exchange_binance::BinanceConnector::new(
-                        "https://api.binance.com",
-                        "wss://stream.binance.com:9443",
-                        &api_key,
-                        &api_secret,
-                    )
-                };
-                Ok(Arc::new(connector))
-            }
-            ProductType::LinearPerp => {
-                info!("hedge leg on Binance USDⓈ-M linear futures");
-                Ok(Arc::new(mm_exchange_binance::BinanceFuturesConnector::new(
-                    &api_key, &api_secret,
-                )))
-            }
-            ProductType::InversePerp => anyhow::bail!(
-                "Binance inverse (COIN-M) hedge leg not supported — use `linear_perp`"
-            ),
-        },
-        ExchangeType::Bybit | ExchangeType::BybitTestnet => {
-            let testnet = matches!(cfg.exchange_type, ExchangeType::BybitTestnet);
-            let connector = match (cfg.product, testnet) {
-                (ProductType::Spot, false) => {
-                    info!(
-                        "hedge leg on Bybit spot — short-spot hedging requires borrow. \
-                         Prefer `product = \"linear_perp\"` for XEMM (Epic 40.6)."
-                    );
-                    mm_exchange_bybit::BybitConnector::spot(&api_key, &api_secret)
-                }
-                (ProductType::Spot, true) => {
-                    mm_exchange_bybit::BybitConnector::testnet_spot(&api_key, &api_secret)
-                }
-                (ProductType::LinearPerp, false) => {
-                    info!("hedge leg on Bybit V5 linear perp");
-                    mm_exchange_bybit::BybitConnector::linear(&api_key, &api_secret)
-                }
-                (ProductType::LinearPerp, true) => {
-                    mm_exchange_bybit::BybitConnector::testnet(&api_key, &api_secret)
-                }
-                (ProductType::InversePerp, false) => {
-                    info!("hedge leg on Bybit V5 inverse perp");
-                    mm_exchange_bybit::BybitConnector::inverse(&api_key, &api_secret)
-                }
-                (ProductType::InversePerp, true) => {
-                    mm_exchange_bybit::BybitConnector::testnet_inverse(&api_key, &api_secret)
-                }
-            };
-            Ok(Arc::new(connector))
-        }
-        ExchangeType::HyperLiquid => Ok(Arc::new(
-            mm_exchange_hyperliquid::HyperLiquidConnector::new(&api_secret)?,
-        )),
-        ExchangeType::HyperLiquidTestnet => Ok(Arc::new(
-            mm_exchange_hyperliquid::HyperLiquidConnector::testnet(&api_secret)?,
-        )),
-    }
-}
-
-/// Create the exchange connector based on config.
-fn create_connector(config: &AppConfig) -> Result<Arc<dyn ExchangeConnector>> {
-    let api_key = config.exchange.api_key.clone().unwrap_or_default();
-    let api_secret = config.exchange.api_secret.clone().unwrap_or_default();
-    let whitelist = config.exchange.withdraw_whitelist.clone();
-    match &whitelist {
-        Some(list) if list.is_empty() => {
-            info!("withdraw_whitelist configured as empty — ALL withdraws will be blocked");
-        }
-        Some(list) => {
-            info!(addresses = list.len(), "withdraw_whitelist configured");
-        }
+    // JWT signing secret. Must be stable across restarts or
+    // every in-flight session token is invalidated. If unset we
+    // auto-generate a 32-byte random secret and persist it to
+    // `./auth-secret` (0600). Production: set MM_AUTH_SECRET
+    // explicitly so you control key rotation.
+    let jwt_secret = match std::env::var("MM_AUTH_SECRET").ok() {
+        Some(s) => s,
         None => {
-            info!("withdraw_whitelist not set — venue-side controls are the only guard");
+            let path = PathBuf::from("auth-secret");
+            load_or_generate_auth_secret(&path)?
+        }
+    };
+
+    // User store. First run: no users file → UI shows the
+    // bootstrap form; operator creates the root admin there. No
+    // hardcoded `admin-key-change-me` anywhere in the binary.
+    let users_path = std::env::var("MM_USERS").unwrap_or_else(|_| "users.json".to_string());
+    let mut auth_state = AuthState::new(&jwt_secret)
+        .with_users_path(&users_path)
+        .map_err(|e| anyhow::anyhow!("load users from {users_path}: {e}"))?;
+    // TOTP issuer — shown to operators in their authenticator app
+    // next to the account name. Default is the product brand; a
+    // multi-tenant deploy overrides via `MM_TOTP_ISSUER` so each
+    // controller's enrolled users see a deployment-specific label.
+    if let Ok(issuer) = std::env::var("MM_TOTP_ISSUER") {
+        auth_state = auth_state.with_totp_issuer(issuer);
+    }
+    // Controller-local audit sink — receives auth events
+    // (login succeeded/failed, logout, password-reset issued/
+    // completed) plus any other events the dashboard emits on
+    // the controller side. Agent engines write their own audit
+    // files; the fleet-aware fetcher (below) aggregates them
+    // for MiCA monthly exports. The H4 `/api/admin/auth/audit`
+    // readback reads only this local file because auth events
+    // are controller-scoped.
+    let audit_path_str = std::env::var("MM_AUDIT_PATH")
+        .unwrap_or_else(|_| "data/audit.jsonl".to_string());
+    let audit_path = PathBuf::from(&audit_path_str);
+    if let Some(parent) = audit_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).ok();
         }
     }
-
-    match config.exchange.exchange_type {
-        ExchangeType::Custom => {
-            info!(
-                rest_url = %config.exchange.rest_url,
-                ws_url = %config.exchange.ws_url,
-                "connecting to custom exchange"
+    let shared_audit = match mm_risk::audit::AuditLog::new(&audit_path) {
+        Ok(log) => {
+            info!(path = %audit_path.display(), "controller audit log opened");
+            Some(Arc::new(log))
+        }
+        Err(e) => {
+            warn!(
+                path = %audit_path.display(),
+                error = %e,
+                "failed to open controller audit log — auth events will not persist"
             );
-            Ok(Arc::new(mm_exchange_client::CustomConnector::new(
-                &config.exchange.rest_url,
-                &config.exchange.ws_url,
-            )))
+            None
         }
-        ExchangeType::Binance => {
-            // Epic 40.1 — product-aware routing. Default (spot)
-            // preserves legacy configs. Linear/inverse perp route
-            // to the USDⓈ-M futures connector (inverse is a
-            // Binance-side product type but our futures crate
-            // targets USDⓈ-M only; flag it as unsupported until
-            // the inverse-futures crate lands).
-            match config.exchange.product {
-                ProductType::Spot => {
-                    info!("connecting to Binance spot");
-                    Ok(Arc::new(
-                        mm_exchange_binance::BinanceConnector::new(
-                            "https://api.binance.com",
-                            "wss://stream.binance.com:9443",
-                            &api_key,
-                            &api_secret,
-                        )
-                        .with_withdraw_whitelist(whitelist),
-                    ))
-                }
-                ProductType::LinearPerp => {
-                    info!("connecting to Binance USDⓈ-M linear futures");
-                    Ok(Arc::new(mm_exchange_binance::BinanceFuturesConnector::new(
-                        &api_key, &api_secret,
-                    )))
-                }
-                ProductType::InversePerp => {
-                    anyhow::bail!(
-                        "Binance inverse (COIN-M) futures is not supported by the current \
-                         connector crate. Use `product = \"linear_perp\"` for USDⓈ-M or \
-                         run the symbol on Bybit inverse instead."
-                    )
-                }
-            }
-        }
-        ExchangeType::BinanceTestnet => {
-            info!("connecting to Binance Testnet (spot)");
-            Ok(Arc::new(
-                mm_exchange_binance::BinanceConnector::testnet(&api_key, &api_secret)
-                    .with_withdraw_whitelist(whitelist),
-            ))
-        }
-        ExchangeType::Bybit => {
-            // Epic 40.1 — Bybit category routes per-product:
-            // spot → `BybitCategory::Spot`, linear_perp →
-            // `::Linear` (USDT-margined), inverse_perp →
-            // `::Inverse` (coin-margined).
-            match config.exchange.product {
-                ProductType::Spot => {
-                    info!("connecting to Bybit V5 spot");
-                    Ok(Arc::new(
-                        mm_exchange_bybit::BybitConnector::spot(&api_key, &api_secret)
-                            .with_withdraw_whitelist(whitelist),
-                    ))
-                }
-                ProductType::LinearPerp => {
-                    info!("connecting to Bybit V5 linear perp");
-                    Ok(Arc::new(
-                        mm_exchange_bybit::BybitConnector::linear(&api_key, &api_secret)
-                            .with_withdraw_whitelist(whitelist),
-                    ))
-                }
-                ProductType::InversePerp => {
-                    info!("connecting to Bybit V5 inverse perp");
-                    Ok(Arc::new(
-                        mm_exchange_bybit::BybitConnector::inverse(&api_key, &api_secret)
-                            .with_withdraw_whitelist(whitelist),
-                    ))
-                }
-            }
-        }
-        ExchangeType::BybitTestnet => {
-            info!("connecting to Bybit Testnet ({:?})", config.exchange.product);
-            let ctor = match config.exchange.product {
-                ProductType::Spot => mm_exchange_bybit::BybitConnector::testnet_spot,
-                ProductType::LinearPerp => mm_exchange_bybit::BybitConnector::testnet,
-                ProductType::InversePerp => mm_exchange_bybit::BybitConnector::testnet_inverse,
-            };
-            Ok(Arc::new(ctor(&api_key, &api_secret).with_withdraw_whitelist(whitelist)))
-        }
-        ExchangeType::HyperLiquid => {
-            if api_secret.is_empty() {
-                anyhow::bail!(
-                    "HyperLiquid connector requires MM_API_SECRET to hold the \
-                     hex-encoded wallet private key (32 bytes, 0x prefix \
-                     optional). Public read-only endpoints work without a key \
-                     but MM trading does not — set the env var or switch to \
-                     `exchange_type = \"custom\"` for offline testing."
-                );
-            }
-            info!("connecting to HyperLiquid");
-            // For HL: api_secret holds the hex-encoded wallet private key.
-            // api_key is unused — the address is derived from the private key.
-            Ok(Arc::new(
-                mm_exchange_hyperliquid::HyperLiquidConnector::new(&api_secret).map_err(|e| {
-                    anyhow::anyhow!(
-                        "HyperLiquid init failed: {e}. Check MM_API_SECRET is a \
-                         valid 32-byte hex private key."
-                    )
-                })?,
-            ))
-        }
-        ExchangeType::HyperLiquidTestnet => {
-            if api_secret.is_empty() {
-                anyhow::bail!(
-                    "HyperLiquid Testnet requires MM_API_SECRET — see mainnet \
-                     error message for details."
-                );
-            }
-            info!("connecting to HyperLiquid Testnet");
-            Ok(Arc::new(
-                mm_exchange_hyperliquid::HyperLiquidConnector::testnet(&api_secret).map_err(
-                    |e| {
-                        anyhow::anyhow!(
-                            "HyperLiquid Testnet init failed: {e}. Check \
-                             MM_API_SECRET is a valid 32-byte hex private key."
-                        )
-                    },
-                )?,
-            ))
-        }
+    };
+    if let Some(audit) = shared_audit.as_ref() {
+        auth_state = auth_state.with_audit(audit.clone());
+        dashboard_state.set_audit_log_path(audit_path.clone());
     }
-}
+    // Wave H3 — optional hard-gate: admin login requires TOTP
+    // armed. `MM_REQUIRE_TOTP_FOR_ADMIN=1|true|yes` flips the
+    // switch. Default off so deployments migrate intentionally
+    // (admin enrolls TOTP first, operator flips the flag).
+    let require_totp_admin = std::env::var("MM_REQUIRE_TOTP_FOR_ADMIN")
+        .ok()
+        .map(|v| {
+            let s = v.trim().to_ascii_lowercase();
+            matches!(s.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false);
+    if require_totp_admin {
+        info!("admin login hardened: TOTP required (MM_REQUIRE_TOTP_FOR_ADMIN)");
+    }
+    auth_state = auth_state.with_require_totp_for_admin(require_totp_admin);
+    if auth_state.needs_bootstrap() {
+        warn!(
+            path = %users_path,
+            "no users configured — open the dashboard and create the root admin via the bootstrap form"
+        );
+    } else {
+        info!(path = %users_path, "user store loaded");
+    }
 
-/// Spawn a background task that forwards events from the
-/// connector's public feed into a new merged channel. When the
-/// configured venue has a private user-data stream and
-/// `user_stream_enabled` is on, this also spawns that venue's
-/// stream task and points it at the same merged channel — so
-/// out-of-band fills and balance updates arrive on the exact
-/// path the engine already knows how to consume.
-///
-/// Currently wired: Binance spot/futures (listen-key), Bybit V5
-/// (private WS auth). HyperLiquid `userEvents` is tracked under
-/// `ROADMAP.md` P0.1.
-fn spawn_event_merger(
-    mut public_rx: mpsc::UnboundedReceiver<MarketEvent>,
-    config: &AppConfig,
-    symbol: &str,
-) -> mpsc::UnboundedReceiver<MarketEvent> {
-    let (merged_tx, merged_rx) = mpsc::unbounded_channel::<MarketEvent>();
-    let forward_tx = merged_tx.clone();
-    // Forwarder: public ws_rx → merged channel.
-    tokio::spawn(async move {
-        while let Some(ev) = public_rx.recv().await {
-            if forward_tx.send(ev).is_err() {
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        http_addr = %http_addr,
+        ws_addr = %ws_addr,
+        has_vault = vault.is_some(),
+        "mm-server starting"
+    );
+
+    // Adapter — every 1s, project FleetState + per-agent
+    // deployment snapshots into the DashboardState so the
+    // legacy endpoints (status, inventory, pnl, venues, …) have
+    // something to serve.
+    adapter::spawn_fleet_to_dashboard_adapter(
+        fleet.clone(),
+        dashboard_state.clone(),
+        Duration::from_secs(1),
+    );
+
+    // Fleet audit fetcher — wire the controller registry + fleet
+    // snapshot into the dashboard so MiCA monthly reports read
+    // audit events from every agent instead of the (empty)
+    // local audit.jsonl. Build once as an Arc closure and
+    // install; dashboard's `build_monthly_report` picks it up.
+    {
+        let fleet_c = fleet.clone();
+        let registry_c = registry.clone();
+        let fetcher: mm_dashboard::state::AuditRangeFetcher = std::sync::Arc::new(
+            move |from_ms: i64, until_ms: i64, limit: usize| {
+                let fleet = fleet_c.clone();
+                let registry = registry_c.clone();
+                Box::pin(async move {
+                    fetch_fleet_audit_range(&fleet, &registry, from_ms, until_ms, limit).await
+                })
+            },
+        );
+        dashboard_state.set_audit_range_fetcher(fetcher);
+    }
+
+    // Wave B1 — fleet client-metrics fetcher. Fans out the
+    // `client_metrics` details topic across every running
+    // deployment, optionally filtered by the agent's tenant
+    // (`approvals.get(fp).profile.client_id`). Dashboard's
+    // /positions, /pnl, /sla, /client/{id}/* handlers prefer
+    // this over their narrow local projection.
+    {
+        let fleet_c = fleet.clone();
+        let registry_c = registry.clone();
+        let approvals_c = approvals.clone();
+        let fetcher: mm_dashboard::state::FleetClientMetricsFetcher = std::sync::Arc::new(
+            move |client_filter: Option<String>| {
+                let fleet = fleet_c.clone();
+                let registry = registry_c.clone();
+                let approvals = approvals_c.clone();
+                Box::pin(async move {
+                    fetch_fleet_client_metrics(
+                        &fleet,
+                        &registry,
+                        &approvals,
+                        client_filter.as_deref(),
+                    )
+                    .await
+                })
+            },
+        );
+        dashboard_state.set_fleet_client_metrics_fetcher(fetcher);
+    }
+
+    // Wave B5 — hot-register AddClient broadcaster. Admin
+    // `create_client` invokes this so a new tenant lands on
+    // every accepted agent's DashboardState immediately.
+    {
+        let fleet_c = fleet.clone();
+        let registry_c = registry.clone();
+        let broadcaster: mm_dashboard::state::FleetAddClientBroadcaster = std::sync::Arc::new(
+            move |client_id: String, symbols: Vec<String>| {
+                let fleet = fleet_c.clone();
+                let registry = registry_c.clone();
+                Box::pin(async move {
+                    broadcast_add_client(&fleet, &registry, &client_id, &symbols)
+                })
+            },
+        );
+        dashboard_state.set_fleet_add_client_broadcaster(broadcaster);
+    }
+
+    // Compose HTTP routes:
+    //   * controller routes (fleet, credentials, deployments) +
+    //     Svelte ServeDir fallback
+    //   * dashboard routes (status, inventory, pnl, /ws, /metrics,
+    //     auth flow, admin)
+    // axum Router::merge handles non-overlapping routes from
+    // both; each keeps its own state.
+    // Fix #6 — fleet-wide Telegram bridge. Controller-level
+    // dedup sender: agents don't fire Telegram (their
+    // AlertManager is constructed with `None` by the agent
+    // runner), so the single hop is here. Pulls the same
+    // fan-out the /api/v1/alerts/fleet endpoint uses, tracks
+    // which (severity, title) pairs it has already sent in a
+    // 10-minute window so a recurring kill doesn't spam the
+    // chat. Telegram creds come from env (MM_TELEGRAM_TOKEN +
+    // MM_TELEGRAM_CHAT); unset = task still runs but only
+    // logs, no network.
+    {
+        let fleet_c = fleet.clone();
+        let registry_c = registry.clone();
+        tokio::spawn(async move {
+            telegram_bridge_loop(fleet_c, registry_c).await;
+        });
+    }
+
+    // Fix #5 — violations auto-actions. Polls the same
+    // rollup the UI's ViolationsPanel consumes; when
+    // `tunables.auto_widen_on_violation` is set and a
+    // high-severity breach lands on a deployment that isn't
+    // already kill-escalated, dispatches L1 widen. Default
+    // off — operator must opt in via Platform tunables.
+    if let Some(tun) = tunables.clone() {
+        let fleet_c = fleet.clone();
+        let registry_c = registry.clone();
+        tokio::spawn(async move {
+            violation_auto_action_loop(fleet_c, registry_c, tun).await;
+        });
+    }
+
+    // I3 (2026-04-21) — distributed webhook fan-out. Every
+    // few seconds walks tenants with a registered dispatcher,
+    // pulls their fills from the fleet fetcher, and fires a
+    // `WebhookEvent::Fill` for every fill newer than the
+    // tenant's dispatch cursor. The tenant's dispatcher lives
+    // on the controller; fills live on agents; this loop is
+    // the missing edge that connects the two. Not gated behind
+    // a tunable — tenants who registered a URL already consented.
+    {
+        let ds_c = dashboard_state.clone();
+        tokio::spawn(async move {
+            webhook_fanout_loop(ds_c).await;
+        });
+    }
+
+    // SEC-1 — controller routes MUST layer auth + role gates.
+    // The 2026-04-21 product-journey smoke caught /api/v1/fleet,
+    // /api/v1/vault, /api/v1/approvals, and deploy POSTs all
+    // reachable anonymously. `http_router_full_authed` wraps
+    // read-tier in internal_view, control-tier in can_control,
+    // admin-tier (vault / approvals / tunables PUT) in admin.
+    let controller_router = http_router_full_authed(
+        fleet.clone(),
+        registry.clone(),
+        vault.clone(),
+        Some(approvals.clone()),
+        tunables.clone(),
+        auth_state.clone(),
+    );
+    let dashboard_router = mm_dashboard::server::build_app(
+        dashboard_state.clone(),
+        ws_broadcast.clone(),
+        auth_state.clone(),
+    );
+    let app: Router = controller_router.merge(dashboard_router);
+
+    let http_task = tokio::spawn(async move {
+        let listener = match tokio::net::TcpListener::bind(http_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                error!(error = %e, "HTTP bind failed");
                 return;
             }
+        };
+        info!(addr = %http_addr, "HTTP (Svelte + controller + dashboard) listening");
+        if let Err(e) = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        {
+            error!(error = %e, "HTTP server exited with error");
         }
     });
 
-    if !config.market_maker.user_stream_enabled {
-        return merged_rx;
-    }
-    let api_key = config.exchange.api_key.clone().unwrap_or_default();
-    let api_secret = config.exchange.api_secret.clone().unwrap_or_default();
-    if api_key.is_empty() {
-        // 22A-4 — this skip used to be silent. Paper mode with
-        // user_stream_enabled=true but no API key means the
-        // engine boots, subscribes to public data, and runs
-        // without ever seeing real account balances — PnL
-        // attribution, InventoryManager, VarGuard, BalanceCache
-        // all operate off empty state. Loud warn! so the
-        // operator notices before an audit chases a "PnL says
-        // zero" symptom back to this quiet return.
-        warn!(
-            symbol = symbol,
-            mode = %config.mode,
-            "user_stream_enabled=true but MM_API_KEY is empty — skipping \
-             user-data stream. In paper mode this means fills + inventory \
-             + balances run off an empty BalanceCache (paper_match_trade \
-             still emits fills, but PnL/VaR/portfolio risk are blind). In \
-             live mode validate_config would have already refused to boot."
-        );
-        return merged_rx;
-    }
+    let tls_cert = std::env::var("MM_TLS_CERT").ok().map(PathBuf::from);
+    let tls_key = std::env::var("MM_TLS_KEY").ok().map(PathBuf::from);
 
-    match config.exchange.exchange_type {
-        ExchangeType::Binance => {
-            let cfg = mm_exchange_binance::UserStreamConfig::spot(&api_key);
+    // Every accept-loop variant gets the ApprovalStore — admission
+    // control is not optional in this binary. Tests and
+    // library-level callers that want the bare behaviour use the
+    // lower-level `spawn_accept_loop*` helpers directly.
+    let ws_task = match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => {
+            let acceptor = mm_control::build_acceptor(&cert, &key)
+                .map_err(|e| anyhow::anyhow!("TLS acceptor build failed: {e}"))?;
             info!(
-                symbol = symbol,
-                "starting Binance listen-key user-data stream"
+                cert = %cert.display(),
+                has_vault = vault.is_some(),
+                "TLS enabled + admission control"
             );
-            let _handle = mm_exchange_binance::user_stream::start(cfg, merged_tx);
-        }
-        ExchangeType::BinanceTestnet => {
-            let mut cfg = mm_exchange_binance::UserStreamConfig::spot(&api_key);
-            cfg.rest_base = "https://testnet.binance.vision".into();
-            cfg.ws_host = "wss://testnet.binance.vision".into();
-            info!(
-                symbol = symbol,
-                "starting Binance testnet listen-key user-data stream"
-            );
-            let _handle = mm_exchange_binance::user_stream::start(cfg, merged_tx);
-        }
-        ExchangeType::Bybit if !api_secret.is_empty() => {
-            let cfg = mm_exchange_bybit::UserStreamConfig::mainnet(&api_key, &api_secret);
-            info!(symbol = symbol, "starting Bybit V5 private WS user stream");
-            let _handle = mm_exchange_bybit::user_stream::start(cfg, merged_tx);
-        }
-        ExchangeType::BybitTestnet if !api_secret.is_empty() => {
-            let cfg = mm_exchange_bybit::UserStreamConfig::testnet(&api_key, &api_secret);
-            info!(
-                symbol = symbol,
-                "starting Bybit V5 testnet private WS user stream"
-            );
-            let _handle = mm_exchange_bybit::user_stream::start(cfg, merged_tx);
-        }
-        _ => {}
-    }
-    merged_rx
-}
-
-/// Classify the symbol's pair class from the connector and
-/// (when `market_maker.apply_pair_class_template = true`) merge
-/// the matching template into the running config before the
-/// engine is built. Returns the detected `PairClass`.
-///
-/// Volume fetch + classifier are best-effort: venue doesn't
-/// support `get_24h_volume_usd` or the call fails → classifier
-/// treats the symbol as unknown-liquidity and falls back to its
-/// conservative `MemeSpot` / `AltPerp` default.
-async fn classify_and_maybe_apply_template(
-    cfg: &mut AppConfig,
-    symbol: &str,
-    product: &ProductSpec,
-    connector: &Arc<dyn ExchangeConnector>,
-) -> mm_common::PairClass {
-    use mm_common::pair_class::classify_symbol;
-    use mm_exchange_core::connector::VenueProduct;
-
-    let daily_vol = match connector.get_24h_volume_usd(symbol).await {
-        Ok(Some(v)) => Some(v),
-        Ok(None) => {
-            info!(symbol, "venue returned no 24h volume — classifier falls back to conservative defaults");
-            None
-        }
-        Err(e) => {
-            warn!(symbol, error = %e, "get_24h_volume_usd failed — classifier falls back");
-            None
-        }
-    };
-    let is_perp = matches!(
-        connector.product(),
-        VenueProduct::LinearPerp | VenueProduct::InversePerp
-    );
-    let class = classify_symbol(product, daily_vol, is_perp);
-    info!(symbol, class = %class, vol = ?daily_vol, "pair-class classified");
-
-    if cfg.market_maker.apply_pair_class_template {
-        let dir = std::path::Path::new("config/pair-classes");
-        match crate::pair_template::apply_pair_class_template(cfg, class, dir) {
-            Ok(n) => {
-                info!(
-                    symbol,
-                    class = %class,
-                    applied = n,
-                    "pair-class template merged into config"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    symbol,
-                    class = %class,
-                    error = %e,
-                    "pair-class template merge failed — continuing with user config only"
-                );
-            }
-        }
-    }
-    class
-}
-
-/// Fetch product spec from the connector. Falls back to a
-/// conservative default if the venue doesn't support
-/// `get_product_spec` — the fee-tier refresh task will
-/// overwrite these on its first tick.
-async fn product_for_symbol(symbol: &str, connector: &Arc<dyn ExchangeConnector>) -> ProductSpec {
-    match connector.get_product_spec(symbol).await {
-        Ok(spec) => {
-            info!(symbol, tick = %spec.tick_size, lot = %spec.lot_size, "loaded product spec from venue");
-            spec
-        }
-        Err(e) => {
-            warn!(symbol, error = %e, "get_product_spec failed — using conservative defaults");
-            product_fallback(symbol)
-        }
-    }
-}
-
-/// Conservative fallback specs for common symbols. Used when
-/// the venue doesn't support `get_product_spec`. Safe to trade
-/// against — tick/lot sizes are the largest (most conservative)
-/// values across known venues, and fees are set at retail-tier
-/// maximums.
-fn product_fallback(symbol: &str) -> ProductSpec {
-    // Try to split symbol into base/quote by known suffixes.
-    let (base, quote) = split_base_quote(symbol);
-    ProductSpec {
-        symbol: symbol.to_string(),
-        base_asset: base,
-        quote_asset: quote,
-        tick_size: dec!(0.01),
-        lot_size: dec!(0.001),
-        min_notional: dec!(10),
-        maker_fee: dec!(0.001),
-        taker_fee: dec!(0.002),
-        trading_status: Default::default(),
-    }
-}
-
-fn split_base_quote(symbol: &str) -> (String, String) {
-    for suffix in ["USDT", "USDC", "BUSD", "FDUSD", "TUSD", "DAI", "BTC", "ETH"] {
-        if let Some(base) = symbol.strip_suffix(suffix) {
-            return (base.to_string(), suffix.to_string());
-        }
-    }
-    (symbol.to_string(), "USDT".to_string())
-}
-
-/// Initialize logging + Sentry + optional OpenTelemetry OTLP.
-///
-/// Returns `(sentry_guard, otel_guard)`. Both must live for the
-/// program's lifetime: dropping them flushes in-flight Sentry
-/// events and OTLP spans respectively. `main` holds them until
-/// return.
-///
-/// Sentry gate: `MM_SENTRY_DSN` (unset = zero overhead).
-///
-/// OTLP gate: cargo feature `otel` at build time + env var
-/// `OTEL_EXPORTER_OTLP_ENDPOINT` at runtime. Default build omits
-/// the OTel deps entirely so the binary footprint stays flat for
-/// teams that don't want tracing infra.
-fn init_logging(
-    config: &AppConfig,
-) -> (Option<sentry::ClientInitGuard>, Option<otel::OtelGuard>) {
-    use tracing_subscriber::prelude::*;
-
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info,mm_engine=debug,mm_strategy=debug".into());
-
-    // Sentry first — so the tracing layer can attach. Gated on
-    // the env var so dev / paper builds do not pay network cost
-    // or accidentally leak crash data to a shared project.
-    let sentry_guard = std::env::var("MM_SENTRY_DSN")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|dsn| {
-            sentry::init((
-                dsn,
-                sentry::ClientOptions {
-                    release: Some(
-                        format!("mm-server@{}", env!("CARGO_PKG_VERSION")).into(),
-                    ),
-                    environment: Some(config.mode.clone().into()),
-                    // Traces sample rate left at 0 (errors only);
-                    // operators wanting performance traces can
-                    // override via `SENTRY_TRACES_SAMPLE_RATE`
-                    // handled by the sentry crate directly.
-                    ..Default::default()
-                },
-            ))
-        });
-    if sentry_guard.is_some() {
-        info!("Sentry enabled (MM_SENTRY_DSN set)");
-    }
-
-    // OTel layer — must sit directly on top of Registry because
-    // `OpenTelemetryLayer<Registry, Tracer>` only implements
-    // `Layer<Registry>` with a concrete tracer. Other layers stack
-    // on top of it afterward. On default builds the block compiles
-    // to nothing and `otel_guard` is always `None`.
-    #[cfg(feature = "otel")]
-    let (otel_layer, otel_guard) = match otel::init("mm-server") {
-        Some((l, g)) => (Some(l), Some(g)),
-        None => (None, None),
-    };
-    #[cfg(not(feature = "otel"))]
-    let otel_guard: Option<otel::OtelGuard> = None;
-
-    // Build the subscriber bottom-up: Registry → OTel (if enabled)
-    // → EnvFilter → fmt layers → sentry. Helper macros keep the
-    // two-path cfg noise local.
-    #[cfg(feature = "otel")]
-    macro_rules! with_otel {
-        ($base:expr) => {
-            $base.with(otel_layer)
-        };
-    }
-    #[cfg(not(feature = "otel"))]
-    macro_rules! with_otel {
-        ($base:expr) => {
-            $base
-        };
-    }
-
-    if config.log_file.is_empty() {
-        with_otel!(tracing_subscriber::registry())
-            .with(env_filter)
-            .with(tracing_subscriber::fmt::layer())
-            .with(sentry_tracing::layer())
-            .init();
-    } else {
-        let log_dir = std::path::Path::new(&config.log_file)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
-        let log_name = std::path::Path::new(&config.log_file)
-            .file_name()
-            .unwrap_or(std::ffi::OsStr::new("mm.log"));
-
-        let file_appender = tracing_appender::rolling::daily(log_dir, log_name);
-        let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
-        std::mem::forget(_guard);
-
-        with_otel!(tracing_subscriber::registry())
-            .with(env_filter)
-            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .json()
-                    .with_writer(file_writer),
+            spawn_accept_loop_tls_full(
+                ws_addr,
+                fleet.clone(),
+                registry.clone(),
+                vault.clone(),
+                approvals.clone(),
+                policy,
+                acceptor,
             )
-            .with(sentry_tracing::layer())
-            .init();
+        }
+        (None, None) => {
+            warn!(
+                has_vault = vault.is_some(),
+                "plain ws:// — admission control enabled, ensure network boundary is trusted"
+            );
+            spawn_accept_loop_with_credentials_and_approvals(
+                ws_addr,
+                fleet.clone(),
+                registry.clone(),
+                vault.clone(),
+                approvals.clone(),
+                policy,
+            )
+        }
+        _ => anyhow::bail!("MM_TLS_CERT and MM_TLS_KEY must be set together"),
+    };
 
-        info!(path = %config.log_file, "file logging enabled");
+    tokio::signal::ctrl_c().await?;
+    info!("SIGINT — shutting down");
+    ws_task.abort();
+    http_task.abort();
+    let _ = ws_task.await;
+    let _ = http_task.await;
+    Ok(())
+}
+
+/// Fan out an `audit_tail` request to every running deployment
+/// across the fleet, collect replies, merge + cap. Called by
+/// the dashboard's `build_monthly_report` via the
+/// `AuditRangeFetcher` closure installed at boot. The fan-out
+/// is parallel (one command per deployment) with a 5s per-call
+/// timeout — `build_monthly_report` is operator-initiated, so
+/// we prefer a thorough read over a low-latency one.
+async fn fetch_fleet_audit_range(
+    fleet: &mm_controller::FleetState,
+    registry: &mm_controller::AgentRegistry,
+    from_ms: i64,
+    until_ms: i64,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    use mm_control::messages::CommandPayload;
+
+    const PER_DEPLOYMENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let snapshot = fleet.snapshot();
+    let mut handles = Vec::new();
+    for view in snapshot {
+        let agent_id = view.agent_id.clone();
+        if !view.approval_state.is_empty() && view.approval_state != "accepted" {
+            continue;
+        }
+        for dep in &view.deployments {
+            if !dep.running {
+                continue;
+            }
+            let request_id = uuid::Uuid::new_v4();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            registry.pending_details_register(request_id, tx);
+            let mut args = serde_json::Map::new();
+            args.insert("from_ms".into(), serde_json::json!(from_ms));
+            args.insert("until_ms".into(), serde_json::json!(until_ms));
+            args.insert("limit".into(), serde_json::json!(limit));
+            if registry
+                .send(
+                    &agent_id,
+                    CommandPayload::FetchDeploymentDetails {
+                        deployment_id: dep.deployment_id.clone(),
+                        topic: "audit_tail".into(),
+                        request_id,
+                        args,
+                    },
+                )
+                .is_err()
+            {
+                // Command dispatch failed — agent session gone.
+                // Reclaim the pending slot so a late reply
+                // doesn't linger.
+                registry.pending_details_forget(request_id);
+                continue;
+            }
+            handles.push((request_id, tokio::time::timeout(PER_DEPLOYMENT_TIMEOUT, rx)));
+        }
     }
 
-    (sentry_guard, otel_guard)
+    let mut merged: Vec<serde_json::Value> = Vec::new();
+    for (request_id, future) in handles {
+        match future.await {
+            Ok(Ok(reply)) => {
+                if let Some(events) = reply
+                    .payload
+                    .get("events")
+                    .and_then(|v| v.as_array())
+                {
+                    merged.extend(events.iter().cloned());
+                }
+            }
+            _ => {
+                registry.pending_details_forget(request_id);
+            }
+        }
+    }
+
+    // Cap at `limit` after merge — per-deployment caps add up
+    // fast on a big fleet. Sort newest-first using millisecond
+    // `ts_ms` or RFC3339 `timestamp`, keep top-N.
+    fn ts_of(v: &serde_json::Value) -> i64 {
+        if let Some(n) = v.get("ts_ms").and_then(|x| x.as_i64()) {
+            return n;
+        }
+        if let Some(s) = v.get("timestamp").and_then(|x| x.as_str()) {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                return dt.timestamp_millis();
+            }
+        }
+        0
+    }
+    merged.sort_by(|a, b| ts_of(b).cmp(&ts_of(a)));
+    merged.truncate(limit);
+    merged
+}
+
+/// Wave B1 implementation — fan-out the `client_metrics`
+/// details topic across every live deployment in the fleet,
+/// optionally filtered to agents whose approval profile
+/// carries a matching `client_id`. Each reply is the compact
+/// JSON slice the agent's dashboard emits (decimal-string
+/// PnL fields, SLA scalars, book-depth sums). Returns one
+/// `Value` per deployment with `agent_id` + `deployment_id`
+/// + `client_id` injected so callers can group by tenant
+/// without another lookup.
+async fn fetch_fleet_client_metrics(
+    fleet: &mm_controller::FleetState,
+    registry: &mm_controller::AgentRegistry,
+    approvals: &mm_controller::ApprovalStore,
+    client_filter: Option<&str>,
+) -> Vec<serde_json::Value> {
+    use mm_control::messages::CommandPayload;
+
+    const PER_DEPLOYMENT_TIMEOUT: Duration = Duration::from_secs(3);
+
+    let snapshot = fleet.snapshot();
+    let mut handles = Vec::new();
+    for view in snapshot {
+        if !view.approval_state.is_empty() && view.approval_state != "accepted" {
+            continue;
+        }
+        // Resolve agent tenant via fingerprint. Matching
+        // `AgentProfile.client_id` is how the UI groups rows
+        // by tenant today; we mirror that on the server.
+        let tenant = if view.pubkey_fingerprint.is_empty() {
+            None
+        } else {
+            approvals
+                .get(&view.pubkey_fingerprint)
+                .and_then(|rec| rec.profile.client_id.clone())
+        };
+        if let Some(filter) = client_filter {
+            if tenant.as_deref() != Some(filter) {
+                continue;
+            }
+        }
+        let agent_id = view.agent_id.clone();
+        for dep in &view.deployments {
+            if !dep.running {
+                continue;
+            }
+            let request_id = uuid::Uuid::new_v4();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            registry.pending_details_register(request_id, tx);
+            if registry
+                .send(
+                    &agent_id,
+                    CommandPayload::FetchDeploymentDetails {
+                        deployment_id: dep.deployment_id.clone(),
+                        topic: "client_metrics".into(),
+                        request_id,
+                        args: serde_json::Map::new(),
+                    },
+                )
+                .is_err()
+            {
+                registry.pending_details_forget(request_id);
+                continue;
+            }
+            handles.push((
+                request_id,
+                agent_id.clone(),
+                dep.deployment_id.clone(),
+                tenant.clone(),
+                tokio::time::timeout(PER_DEPLOYMENT_TIMEOUT, rx),
+            ));
+        }
+    }
+
+    let mut merged: Vec<serde_json::Value> = Vec::new();
+    for (request_id, agent_id, deployment_id, tenant, future) in handles {
+        match future.await {
+            Ok(Ok(reply)) => {
+                // The agent emits a full JSON object (or null
+                // when it has no SymbolState yet). Skip nulls;
+                // inject ownership fields on the rest.
+                if !reply.payload.is_null() {
+                    if let Some(obj) = reply.payload.as_object() {
+                        let mut row = obj.clone();
+                        row.insert("agent_id".into(), serde_json::json!(agent_id));
+                        row.insert(
+                            "deployment_id".into(),
+                            serde_json::json!(deployment_id),
+                        );
+                        if let Some(t) = tenant {
+                            row.insert("client_id".into(), serde_json::json!(t));
+                        }
+                        merged.push(serde_json::Value::Object(row));
+                    }
+                }
+            }
+            _ => {
+                registry.pending_details_forget(request_id);
+            }
+        }
+    }
+    merged
+}
+
+/// I3 (2026-04-21) — webhook fan-out loop. Runs on the
+/// controller, polls tenants with registered dispatchers,
+/// fires `WebhookEvent::Fill` per new fill discovered in the
+/// fleet snapshot. Cursors advance per-tenant so a restart of
+/// the loop (but not of the controller itself — cursors live
+/// in DashboardState, in-memory) doesn't replay fills.
+/// On first pass for a fresh dispatcher the cursor is set to
+/// the newest-seen timestamp so historical fills don't flood
+/// a freshly registered endpoint.
+async fn webhook_fanout_loop(state: mm_dashboard::state::DashboardState) {
+    use mm_dashboard::webhooks::WebhookEvent;
+    const TICK: Duration = Duration::from_secs(5);
+    loop {
+        tokio::time::sleep(TICK).await;
+        let clients = state.client_ids_with_webhooks();
+        for client_id in clients {
+            let Some(dispatcher) = state.get_client_webhook_dispatcher(&client_id)
+            else {
+                continue;
+            };
+            // `get_client_fills` uses the same fleet-aware path
+            // that powers `/api/v1/client/self/fills` so we never
+            // read stale controller-local state.
+            let fills = if let Some(f) = state.fleet_client_metrics_fetcher() {
+                let metrics = f(Some(client_id.clone())).await;
+                let mut out = Vec::new();
+                for row in metrics {
+                    if let Some(arr) = row.get("recent_fills").and_then(|v| v.as_array()) {
+                        for raw in arr {
+                            if let Ok(fill) = serde_json::from_value::<
+                                mm_dashboard::state::FillRecord,
+                            >(raw.clone())
+                            {
+                                out.push(fill);
+                            }
+                        }
+                    }
+                }
+                out.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+                out
+            } else {
+                Vec::new()
+            };
+            if fills.is_empty() {
+                continue;
+            }
+            let cursor = state.webhook_fill_cursor(&client_id);
+            let newest = fills.last().map(|f| f.timestamp);
+            match cursor {
+                None => {
+                    // First pass for this dispatcher — mark the
+                    // cursor at the newest fill without firing,
+                    // so a tenant who just registered doesn't get
+                    // a burst of pre-existing events.
+                    if let Some(ts) = newest {
+                        state.set_webhook_fill_cursor(&client_id, ts);
+                    }
+                }
+                Some(last_ts) => {
+                    let mut max_ts = last_ts;
+                    for fill in fills.iter().filter(|f| f.timestamp > last_ts) {
+                        dispatcher.dispatch(WebhookEvent::Fill {
+                            symbol: fill.symbol.clone(),
+                            side: fill.side.clone(),
+                            price: fill.price,
+                            qty: fill.qty,
+                            timestamp: fill.timestamp.to_rfc3339(),
+                            is_maker: fill.is_maker,
+                            fee: fill.fee,
+                        });
+                        if fill.timestamp > max_ts {
+                            max_ts = fill.timestamp;
+                        }
+                    }
+                    if max_ts > last_ts {
+                        state.set_webhook_fill_cursor(&client_id, max_ts);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Fix #5 — violations auto-action loop. Walks the fleet
+/// snapshot every 10s, finds high-severity breaches (SLA
+/// uptime < 90%, manipulation combined ≥ 0.95) on
+/// deployments that are still RUNNING without kill
+/// escalation, and dispatches an L1 widen. Gated behind
+/// `tunables.auto_widen_on_violation` — when the flag is
+/// false the loop sleeps without touching anything.
+/// Tracks what's already been actioned in a 15-minute
+/// window so one breach doesn't trigger escalating widens.
+async fn violation_auto_action_loop(
+    fleet: mm_controller::FleetState,
+    registry: mm_controller::AgentRegistry,
+    tunables: mm_controller::TunablesStore,
+) {
+    use mm_control::messages::CommandPayload;
+    use std::collections::HashMap;
+    const TICK: Duration = Duration::from_secs(10);
+    const COOLDOWN_MS: i64 = 15 * 60 * 1000;
+
+    let mut last_action: HashMap<String, i64> = HashMap::new();
+
+    loop {
+        tokio::time::sleep(TICK).await;
+
+        let cur = tunables.current();
+        if !cur.auto_widen_on_violation {
+            continue;
+        }
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        last_action.retain(|_, ts| now_ms - *ts < COOLDOWN_MS);
+
+        let snapshot = fleet.snapshot();
+        for view in snapshot {
+            if !view.approval_state.is_empty() && view.approval_state != "accepted" {
+                continue;
+            }
+            for dep in &view.deployments {
+                if !dep.running {
+                    continue;
+                }
+                // Already escalated — nothing more to auto-do.
+                if dep.kill_level > 0 {
+                    continue;
+                }
+                let sla_uptime = dep.sla_uptime_pct.parse::<f64>().unwrap_or(100.0);
+                let manip_score = dep
+                    .manipulation_combined
+                    .parse::<f64>()
+                    .unwrap_or(0.0);
+                // Wave G3 — per-category gating. Each flag
+                // controls one trigger; order here is priority
+                // (SLA first, then manipulation) so if both
+                // breaches fire on the same tick, the SLA
+                // reason wins the audit message.
+                let breach = if cur.auto_widen_sla
+                    && !dep.sla_uptime_pct.is_empty()
+                    && sla_uptime > 0.0
+                    && sla_uptime < 90.0
+                {
+                    Some(format!("SLA uptime {:.2}% < 90%", sla_uptime))
+                } else if cur.auto_widen_manip && manip_score >= 0.95 {
+                    Some(format!(
+                        "manipulation combined {:.0}% ≥ 95%",
+                        manip_score * 100.0
+                    ))
+                } else {
+                    None
+                };
+                let Some(reason) = breach else { continue };
+                let key = format!("{}/{}", view.agent_id, dep.deployment_id);
+                if last_action.contains_key(&key) {
+                    continue;
+                }
+
+                let mut patch = serde_json::Map::new();
+                patch.insert("kill_level".into(), serde_json::json!(1));
+                patch.insert(
+                    "kill_reason".into(),
+                    serde_json::json!(format!("auto-widen: {reason}")),
+                );
+                if registry
+                    .send(
+                        &view.agent_id,
+                        CommandPayload::PatchDeploymentVariables {
+                            deployment_id: dep.deployment_id.clone(),
+                            patch,
+                        },
+                    )
+                    .is_ok()
+                {
+                    last_action.insert(key, now_ms);
+                    warn!(
+                        agent = %view.agent_id,
+                        deployment = %dep.deployment_id,
+                        symbol = %dep.symbol,
+                        reason = %reason,
+                        "auto-widen dispatched (L1 kill)"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Fix #6 — controller-side Telegram bridge loop. Wakes
+/// every 15 seconds, fan-outs `alerts_recent` to every agent,
+/// collapses duplicate `(severity, title)` entries, and fires
+/// Telegram once per unique key within a 10-minute window.
+/// Quiet-log no-op when `MM_TELEGRAM_TOKEN` is unset.
+async fn telegram_bridge_loop(
+    fleet: mm_controller::FleetState,
+    registry: mm_controller::AgentRegistry,
+) {
+    use mm_control::messages::CommandPayload;
+    use std::collections::HashMap;
+    const SEND_WINDOW_MS: i64 = 10 * 60 * 1000;
+    const TICK: Duration = Duration::from_secs(15);
+
+    let token = std::env::var("MM_TELEGRAM_TOKEN").ok();
+    let chat = std::env::var("MM_TELEGRAM_CHAT").ok();
+    let client = reqwest::Client::new();
+    // Track the last ts we sent for each (severity, title).
+    let mut last_sent: HashMap<(String, String), i64> = HashMap::new();
+
+    loop {
+        tokio::time::sleep(TICK).await;
+
+        // Fan out alerts_recent to every accepted agent's first
+        // running deployment (alerts live on agent-local
+        // DashboardState so any deployment works).
+        let mut collected: Vec<serde_json::Value> = Vec::new();
+        for view in fleet.snapshot() {
+            if !view.approval_state.is_empty() && view.approval_state != "accepted" {
+                continue;
+            }
+            let Some(dep) = view.deployments.iter().find(|d| d.running) else {
+                continue;
+            };
+            let request_id = uuid::Uuid::new_v4();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            registry.pending_details_register(request_id, tx);
+            let mut args = serde_json::Map::new();
+            args.insert("limit".into(), serde_json::json!(50));
+            if registry
+                .send(
+                    &view.agent_id,
+                    CommandPayload::FetchDeploymentDetails {
+                        deployment_id: dep.deployment_id.clone(),
+                        topic: "alerts_recent".into(),
+                        request_id,
+                        args,
+                    },
+                )
+                .is_err()
+            {
+                registry.pending_details_forget(request_id);
+                continue;
+            }
+            if let Ok(Ok(reply)) =
+                tokio::time::timeout(Duration::from_secs(3), rx).await
+            {
+                if let Some(arr) = reply.payload.get("alerts").and_then(|v| v.as_array())
+                {
+                    collected.extend(arr.iter().cloned());
+                }
+            }
+        }
+
+        // Dedup + send.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        // Drop old keys out of the window.
+        last_sent.retain(|_, ts| now_ms - *ts < SEND_WINDOW_MS);
+
+        for alert in &collected {
+            let ts_ms = alert.get("ts_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+            // Only consider alerts younger than the window.
+            if ts_ms < now_ms - SEND_WINDOW_MS {
+                continue;
+            }
+            let severity = alert
+                .get("severity")
+                .and_then(|v| v.as_str())
+                .unwrap_or("info")
+                .to_string();
+            let title = alert
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let key = (severity.clone(), title.clone());
+            if last_sent.contains_key(&key) {
+                continue;
+            }
+            last_sent.insert(key, now_ms);
+            let message = alert
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let symbol = alert
+                .get("symbol")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let emoji = match severity.as_str() {
+                "critical" => "🚨",
+                "high" | "warning" => "⚠️",
+                _ => "ℹ️",
+            };
+            let text = format!(
+                "{emoji} *{title}*{}\n{message}",
+                if symbol.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{symbol}]")
+                },
+            );
+
+            if let (Some(tok), Some(ch)) = (token.as_deref(), chat.as_deref()) {
+                let url = format!("https://api.telegram.org/bot{tok}/sendMessage");
+                let body = serde_json::json!({
+                    "chat_id": ch,
+                    "text": text,
+                    "parse_mode": "Markdown",
+                });
+                if let Err(e) = client.post(&url).json(&body).send().await {
+                    warn!(error = %e, title = %title, "telegram bridge: send failed");
+                }
+            } else {
+                info!(severity = %severity, title = %title, "telegram bridge: would send (no token configured)");
+            }
+        }
+    }
+}
+
+/// Wave B5 — push an `AddClient` command to every accepted
+/// agent in the fleet. Returns the number of successful
+/// dispatches (command enqueued; not an end-to-end ACK).
+/// `send` is synchronous in the registry so the broadcast
+/// returns as soon as every session's outbound queue has
+/// accepted the message.
+fn broadcast_add_client(
+    fleet: &mm_controller::FleetState,
+    registry: &mm_controller::AgentRegistry,
+    client_id: &str,
+    symbols: &[String],
+) -> usize {
+    use mm_control::messages::CommandPayload;
+    let mut count = 0usize;
+    for view in fleet.snapshot() {
+        if !view.approval_state.is_empty() && view.approval_state != "accepted" {
+            continue;
+        }
+        if registry
+            .send(
+                &view.agent_id,
+                CommandPayload::AddClient {
+                    client_id: client_id.to_string(),
+                    symbols: symbols.to_vec(),
+                },
+            )
+            .is_ok()
+        {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn load_or_generate_auth_secret(path: &PathBuf) -> Result<String> {
+    if path.exists() {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("read auth secret {}: {e}", path.display()))?;
+        let trimmed = raw.trim().to_string();
+        if trimmed.len() >= 32 {
+            return Ok(trimmed);
+        }
+        warn!(
+            path = %path.display(),
+            len = trimmed.len(),
+            "auth secret file too short — regenerating a stronger one"
+        );
+    }
+    use rand::RngCore;
+    let mut buf = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    let secret = hex::encode(buf);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("mkdir for auth secret: {e}"))?;
+        }
+    }
+    std::fs::write(path, &secret)
+        .map_err(|e| anyhow::anyhow!("write auth secret {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o600);
+            let _ = std::fs::set_permissions(path, perms);
+        }
+    }
+    warn!(
+        path = %path.display(),
+        "generated fresh auth secret — persist this file, losing it invalidates all session tokens"
+    );
+    Ok(secret)
 }

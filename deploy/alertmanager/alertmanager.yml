@@ -1,0 +1,134 @@
+# Alertmanager routing for the market-maker alert set.
+#
+# Three receivers correspond to the severity tiers emitted by
+# deploy/prometheus/mm-alerts.yml:
+#
+#   critical → pager (Telegram + optional PagerDuty / webhook)
+#   warning  → ops channel (Telegram)
+#   info     → default catch-all (logs only; promotes to Telegram
+#              when `SENTRY_DSN` or ops-channel creds are provided)
+#
+# Every credential comes from an env var so this file can ship in
+# git without leaking secrets. docker-compose injects them from
+# the host env; Helm overrides via values.yaml → Secret.
+#
+# Substitution is done by `alertmanager` at startup via the
+# `--config.file=/etc/alertmanager/alertmanager.yml` + the
+# `web.external-url` envsubst hook. For robustness we reference
+# env vars with the Go template escape `$(...)`: see docker-compose
+# and Helm templates for the actual value injection.
+
+global:
+  resolve_timeout: 5m
+  # Telegram bot / chat — required by every severity tier. Empty
+  # strings turn the Telegram receiver into a no-op so a fresh
+  # install does not fail to start.
+  telegram_api_url: https://api.telegram.org
+
+route:
+  # Group alerts that share (alertname, severity, symbol, venue)
+  # so one incident fires one notification, not twenty. 30s group
+  # wait lets related alerts settle before the first page;
+  # repeat_interval caps re-notification to once per hour so the
+  # on-call isn't spammed after an ack.
+  group_by: ["alertname", "severity", "symbol", "venue"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 1h
+  receiver: default
+
+  # Severity-routed children. `continue: true` is deliberately
+  # absent — an alert matches at most one receiver so a `critical`
+  # page never also spams the `info` ticket channel.
+  routes:
+    - matchers:
+        - severity = "critical"
+      receiver: critical
+      group_wait: 10s        # page fast
+      repeat_interval: 30m   # re-page every 30m until ack
+    - matchers:
+        - severity = "warning"
+      receiver: warning
+    - matchers:
+        - severity = "info"
+      receiver: info
+
+receivers:
+  # Default catch-all — anything without a severity label (shouldn't
+  # happen but we fail open on missing labels). Logged only.
+  - name: default
+
+  - name: critical
+    telegram_configs:
+      - bot_token: $TELEGRAM_BOT_TOKEN_CRITICAL
+        chat_id: $TELEGRAM_CHAT_ID_CRITICAL
+        parse_mode: MarkdownV2
+        send_resolved: true
+        # Message template: headline + severity + label table +
+        # links back to Grafana + Prometheus so on-call has
+        # one-click context.
+        message: |
+          *🚨 CRITICAL — {{ .GroupLabels.alertname }}*
+          {{ range .Alerts }}
+          {{ .Annotations.summary }}
+          `{{ .Labels.symbol }}{{ if .Labels.venue }}@{{ .Labels.venue }}{{ end }}`
+          {{ .Annotations.description }}
+          {{ end }}
+    # Optional: uncomment the pagerduty_configs block below when
+    # you have a PagerDuty service key. Fail-open: omitting it
+    # keeps Telegram as the sole critical channel.
+    # pagerduty_configs:
+    #   - service_key: $PAGERDUTY_SERVICE_KEY
+    #     severity: critical
+    #     description: "{{ .CommonAnnotations.summary }}"
+    #
+    # Optional: a generic webhook for Slack/Discord/custom. Point
+    # `url` at the incoming webhook; Alertmanager's default JSON
+    # body maps cleanly to Slack/Discord embeds.
+    # webhook_configs:
+    #   - url: $GENERIC_WEBHOOK_URL
+    #     send_resolved: true
+
+  - name: warning
+    telegram_configs:
+      - bot_token: $TELEGRAM_BOT_TOKEN_OPS
+        chat_id: $TELEGRAM_CHAT_ID_OPS
+        parse_mode: MarkdownV2
+        send_resolved: true
+        message: |
+          *⚠️ WARNING — {{ .GroupLabels.alertname }}*
+          {{ range .Alerts }}
+          {{ .Annotations.summary }}
+          {{ .Annotations.description }}
+          {{ end }}
+
+  - name: info
+    # Info-tier alerts default to a log-only sink. Uncomment the
+    # telegram_configs block to notify the ops channel; left off
+    # so operators aren't paged on slow-moving signals.
+    # telegram_configs:
+    #   - bot_token: $TELEGRAM_BOT_TOKEN_OPS
+    #     chat_id: $TELEGRAM_CHAT_ID_OPS
+    #     parse_mode: MarkdownV2
+    #     send_resolved: false
+    #     message: |
+    #       *ℹ️ INFO — {{ .GroupLabels.alertname }}*
+    #       {{ range .Alerts }}{{ .Annotations.summary }}{{ end }}
+
+# Inhibition — suppress noise cascades. When Disconnect (L5)
+# fires, every symbol-level warning on that venue becomes
+# redundant — suppress them until the L5 resolves.
+inhibit_rules:
+  - source_matchers:
+      - alertname = "MMKillSwitchDisconnected"
+    target_matchers:
+      - severity =~ "warning|info"
+    equal: ["symbol"]
+
+  # Similarly, a venue-wide archive failure dominates any
+  # symbol-level warning on the same venue.
+  - source_matchers:
+      - alertname = "MMArchiveUploadsFailing"
+    target_matchers:
+      - alertname =~ "MMStrategyGraphDeployRejected|MMSorDispatchErrorRate"
+    equal: []

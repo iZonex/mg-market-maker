@@ -95,11 +95,18 @@ impl BinanceConnector {
         self.ws_trader = Some(Arc::new(trader));
     }
 
-    /// Testnet constructor.
+    /// Testnet constructor. Binance's spot testnet splits
+    /// REST / WS across two subdomains: REST on
+    /// `testnet.binance.vision`, WS on
+    /// `stream.testnet.binance.vision`. The historical value
+    /// (`testnet.binance.vision/ws`) was wrong — the combined-
+    /// stream URL `testnet.binance.vision/stream?streams=…`
+    /// returned 404 and the whole engine sat on a stale book
+    /// warning loop.
     pub fn testnet(api_key: &str, api_secret: &str) -> Self {
         Self::new(
             "https://testnet.binance.vision",
-            "wss://testnet.binance.vision/ws",
+            "wss://stream.testnet.binance.vision/ws",
             api_key,
             api_secret,
         )
@@ -244,7 +251,13 @@ impl ExchangeConnector for BinanceConnector {
                         });
                     }
                     Err(e) => {
-                        warn!(error = %e, "Binance WS connect failed");
+                        // Include the dialed URL so operators can
+                        // diagnose 404 / host resolution /
+                        // prod-vs-testnet mismatches without
+                        // tcpdumping. Binance's public endpoints
+                        // change occasionally — exact URL in the
+                        // log is the first thing to check.
+                        warn!(url = %url, error = %e, "Binance WS connect failed");
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;

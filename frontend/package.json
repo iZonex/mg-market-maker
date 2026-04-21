@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@xyflow/svelte": "^1.5.2",
-    "lightweight-charts": "^5.0.0"
+    "lightweight-charts": "^5.0.0",
+    "qrcode": "^1.5.4"
   }
 }

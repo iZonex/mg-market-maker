@@ -1,0 +1,18 @@
+# Grafana datasource provisioning — points at the Prometheus
+# service that scrapes the market-maker /metrics endpoint.
+# UID is pinned so dashboards can reference it without manual
+# linking after a `docker compose down -v` / rebuild.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    uid: prometheus
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s
+      httpMethod: POST

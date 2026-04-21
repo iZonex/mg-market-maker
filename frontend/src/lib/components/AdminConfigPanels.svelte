@@ -120,6 +120,11 @@
   }
 
   // ── Sentiment headline override ───────────────────────────
+  // Posts to /api/admin/sentiment/headline — the handler lives
+  // on the controller now and fans the News override out to
+  // every running deployment via per-deployment variables
+  // PATCH (the agent translator maps `news` → ConfigOverride::News).
+  // Response carries per-deployment dispatch counts.
   let sentimentHeadline = $state('')
   let sentimentError = $state('')
   let sentimentStatus = $state('')
@@ -129,8 +134,8 @@
     if (!sentimentHeadline.trim()) return
     sentimentBusy = true
     try {
-      await api.postJson('/api/admin/sentiment/headline', { text: sentimentHeadline })
-      sentimentStatus = `pushed @ ${new Date().toLocaleTimeString()}`
+      const resp = await api.postJson('/api/admin/sentiment/headline', { text: sentimentHeadline })
+      sentimentStatus = `pushed @ ${new Date().toLocaleTimeString()} · recipients: ${resp.recipients ?? 0}`
       sentimentHeadline = ''
       sentimentError = ''
     } catch (e) {
@@ -268,7 +273,7 @@
   <div class="panel">
     <div class="panel-head">
       <span class="name">Sentiment headline</span>
-      <span class="stats">push ad-hoc news into NewsRetreat</span>
+      <span class="stats">push ad-hoc news into every deployment's NewsRetreat</span>
     </div>
     <div class="panel-body">
       <div class="row">

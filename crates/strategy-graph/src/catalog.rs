@@ -44,6 +44,7 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Book.L1" => Some(Box::new(sources::BookL1)),
         "Book.L2" => Some(Box::new(sources::BookL2)),
         "Trade.Tape" => Some(Box::new(sources::TradeTape)),
+        "Trade.OwnFill" => Some(Box::new(sources::TradeOwnFill)),
         "Balance" => Some(Box::new(sources::BalanceSource)),
         "Funding" => Some(Box::new(sources::FundingSource)),
         "Portfolio.NetDelta" => Some(Box::new(sources::PortfolioNetDelta)),
@@ -116,8 +117,12 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         // Phase 4 — graph-authored quoting
         "Quote.Grid" => Some(Box::new(quotes::Grid)),
         "Quote.Mux" => Some(Box::new(quotes::Mux)),
+        "Quote.Hedge" => {
+            quotes::Hedge::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
+        }
         "Out.Quotes" => Some(Box::new(sinks::Quotes)),
         "Out.VenueQuotes" => Some(Box::new(sinks::VenueQuotes)),
+        "Out.VenueQuotesIf" => Some(Box::new(sinks::VenueQuotesIf)),
         "Out.AtomicBundle" => Some(Box::new(sinks::AtomicBundle)),
         // Phase 4 composite strategies (engine overlays via source_inputs)
         "Strategy.Avellaneda" => Some(Box::new(strategies::Avellaneda)),
@@ -240,6 +245,7 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Book.L1"              => NodeMeta { label: "L1 book",             summary: "Top-of-book bid/ask price + size (optional venue/symbol/product)", group: "Sources" },
         "Book.L2"              => NodeMeta { label: "L2 book",             summary: "Top-N levels per side off the shared data bus", group: "Sources" },
         "Trade.Tape"           => NodeMeta { label: "Trade tape",          summary: "Rolling public-trade window (count + buy/sell volume + last px)", group: "Sources" },
+        "Trade.OwnFill"        => NodeMeta { label: "Own fill pulse",      summary: "Fires one tick per fill of our own order: side/qty/price + fired bool for reactive hedging", group: "Sources" },
         "Balance"              => NodeMeta { label: "Balance",             summary: "Wallet balance (total / available / reserved) per venue + asset", group: "Sources" },
         "Funding"              => NodeMeta { label: "Funding",             summary: "Per-perp funding rate + seconds to next funding", group: "Sources" },
         "Portfolio.NetDelta"   => NodeMeta { label: "Net delta",           summary: "Cross-venue net exposure for the asset (long spot + short perp = 0)", group: "Sources" },
@@ -294,6 +300,7 @@ pub fn meta(kind: &str) -> NodeMeta {
         // Phase 4 — graph-authored quoting.
         "Quote.Grid"           => NodeMeta { label: "Grid quotes",         summary: "Symmetric bid/ask grid around a mid (step + levels + size)", group: "Quotes" },
         "Quote.Mux"            => NodeMeta { label: "Quote mux",           summary: "Pick quote bundle a or b by a boolean selector", group: "Quotes" },
+        "Quote.Hedge"          => NodeMeta { label: "Hedge leg",           summary: "Invert Trade.OwnFill into a crossing hedge leg (opposite side + cross-bps offset, venue-tagged or local)", group: "Quotes" },
 
         // Phase 4 composite strategies — engine runs the real
         // Rust implementation, output feeds into the graph.
@@ -382,6 +389,7 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Out.Flatten"          => NodeMeta { label: "Flatten position",    summary: "Fire L4 flatten with the given exec policy", group: "Sinks" },
         "Out.Quotes"           => NodeMeta { label: "Quotes",              summary: "Replace strategy output with a graph-authored quote bundle", group: "Sinks" },
         "Out.VenueQuotes"      => NodeMeta { label: "Venue quotes",        summary: "Multi-venue quote bundle — each entry names its own venue/symbol/product", group: "Sinks" },
+        "Out.VenueQuotesIf"    => NodeMeta { label: "Venue quotes (gated)", summary: "Same as Venue quotes but emits only when trigger=true — pair with Trade.OwnFill for reactive hedging", group: "Sinks" },
         "Out.AtomicBundle"     => NodeMeta { label: "Atomic bundle",       summary: "Maker + hedge pair — both legs fill or both roll back within timeout_ms", group: "Sinks" },
 
         // Defensive fallback — every catalog kind should have its own
@@ -427,6 +435,7 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Book.L1",
         "Book.L2",
         "Trade.Tape",
+        "Trade.OwnFill",
         "Balance",
         "Funding",
         "Portfolio.NetDelta",
@@ -465,8 +474,10 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Out.Flatten",
         "Quote.Grid",
         "Quote.Mux",
+        "Quote.Hedge",
         "Out.Quotes",
         "Out.VenueQuotes",
+        "Out.VenueQuotesIf",
         "Out.AtomicBundle",
         "Strategy.Avellaneda",
         "Strategy.GLFT",
@@ -619,10 +630,11 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_127_nodes_after_r13_basket_push() {
-        // 125 after R7 + 2 (R13.1 Strategy.BasketPush,
-        // R13.2 Signal.FundingExtreme) = 127.
-        assert_eq!(kinds().len(), 127, "catalog drift");
+    fn catalog_has_130_nodes_after_quote_hedge() {
+        // 127 after R13 + 3 (Trade.OwnFill source + Out.VenueQuotesIf
+        // sink + Quote.Hedge transform — Phase IV graph-native
+        // reactive XEMM) = 130.
+        assert_eq!(kinds().len(), 130, "catalog drift");
     }
 
     /// GR-1 — every indicator with a `period` config field must

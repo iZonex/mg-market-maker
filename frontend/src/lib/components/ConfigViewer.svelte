@@ -1,297 +1,189 @@
 <script>
   /*
-   * UX-5 — read-only visualisation of the effective `AppConfig`
-   * the server booted with. Answers the operator question
-   * "what's configured, what's on defaults, what's disabled"
-   * without shelling into the host to `cat` the TOML.
+   * Variables snapshot viewer — drilldown edition.
    *
-   * Data comes from `/api/v1/config/snapshot`. Secrets never
-   * land in `AppConfig` (they're env-only), so the full struct
-   * is safe to render. For optional sections (hedge, margin,
-   * rebalancer, ...) we show a status chip — the operator sees
-   * at a glance which product features are actually wired.
+   * Shape contract: { row: DeploymentStateRow }
+   *
+   * Renders the effective `variables` map the deployment is
+   * running with right now. Top-level keys land in a scalar table;
+   * nested objects + arrays collapse into a raw JSON drawer so
+   * operators can still inspect them without shelling into the
+   * host to `cat` the TOML.
+   *
+   * No editing from here — ParamTuner owns the mutation path. This
+   * view is the authoritative "what is the strategy actually
+   * running with right now" read-out.
    */
 
-  import { createApiClient } from '../api.svelte.js'
   import Icon from './Icon.svelte'
 
-  let { auth } = $props()
-  const api = createApiClient(auth)
+  let { row } = $props()
 
-  let snapshot = $state(null)
-  let activeGraphs = $state([])
-  let error = $state('')
-  let loading = $state(true)
+  const variables = $derived(row?.variables || {})
+
   let expanded = $state(false)
 
-  async function load() {
-    loading = true
-    error = ''
-    try {
-      snapshot = await api.getJson('/api/v1/config/snapshot')
-    } catch (e) {
-      error = e?.message || String(e)
-      snapshot = null
-    } finally {
-      loading = false
+  const scalarEntries = $derived.by(() => {
+    const out = []
+    for (const [k, v] of Object.entries(variables)) {
+      if (v === null) { out.push([k, '—', 'muted']); continue }
+      const t = typeof v
+      if (t === 'string') out.push([k, v, 'str'])
+      else if (t === 'number') out.push([k, String(v), 'num'])
+      else if (t === 'boolean') out.push([k, v ? 'true' : 'false', v ? 'on' : 'muted'])
+      // Objects + arrays fall through to the raw drawer.
     }
-    // Graph-store may be disabled (503) on deployments without
-    // strategy graphs — swallow that cleanly so the main config
-    // viewer still renders.
-    try {
-      activeGraphs = await api.getJson('/api/v1/strategy/active')
-    } catch {
-      activeGraphs = []
+    out.sort((a, b) => a[0].localeCompare(b[0]))
+    return out
+  })
+
+  const nestedEntries = $derived.by(() => {
+    const out = {}
+    for (const [k, v] of Object.entries(variables)) {
+      if (v !== null && (typeof v === 'object')) {
+        out[k] = v
+      }
     }
-  }
+    return out
+  })
 
-  $effect(() => { load() })
-
-  function fmtTs(t) {
-    if (!t) return '—'
-    try {
-      return new Date(t).toLocaleString()
-    } catch {
-      return t
-    }
-  }
-
-  // Optional top-level sections we surface as "wired / not wired"
-  // chips. Each entry is [label, key, hint]. The backend hands
-  // back `null` for the ones left unset in TOML.
-  const optionalSections = [
-    ['Hedge connector',   'hedge',                 'cross-product strategies'],
-    ['Funding arb driver','funding_arb',           'atomic basis-shifted quoting'],
-    ['Paper fill sim',    'paper_fill',            'probabilistic filler params'],
-    ['Cross-venue rebalancer', 'rebalancer',       'auto-transfer between venues'],
-    ['Portfolio risk',    'portfolio_risk',        'factor limits + delta guard'],
-    ['Margin guard',      'margin',                'perp margin-ratio kill switch'],
-    ['Listing sniper entry', 'listing_sniper_entry', 'auto-enter new listings'],
-    ['Pair screener',     'pair_screener',         'stat-arb candidate discovery'],
-  ]
-
-  // Arrays we summarise as a count (expandable detail below).
-  const arraySections = [
-    ['Symbols',           'symbols'],
-    ['Clients',           'clients'],
-    ['Users',             'users'],
-    ['SOR extra venues',  'sor_extra_venues'],
-  ]
-
-  // Top-level top-N scalars worth surfacing.
-  const flags = [
-    ['Mode',              'mode'],
-    ['Dashboard port',    'dashboard_port'],
-    ['Checkpoint restore','checkpoint_restore'],
-    ['Record market data','record_market_data'],
-    ['Log file',          'log_file'],
-    ['Checkpoint path',   'checkpoint_path'],
-  ]
-
-  function sectionStatus(key) {
-    if (!snapshot) return 'unknown'
-    const v = snapshot[key]
-    if (v === null || v === undefined) return 'off'
-    if (Array.isArray(v)) return v.length > 0 ? 'on' : 'off'
-    if (typeof v === 'object' && Object.keys(v).length === 0) return 'off'
-    return 'on'
-  }
-
-  function loansCount() {
-    const l = snapshot?.loans
-    if (!l || typeof l !== 'object') return 0
-    return Object.keys(l).length
-  }
+  const nestedKeys = $derived(Object.keys(nestedEntries).sort())
 </script>
 
 <div class="viewer">
   <div class="top">
-    <div class="header">
-      <span class="label">Config snapshot</span>
-      <span class="hint">what's wired vs on defaults</span>
-    </div>
-    <div class="actions">
-      <button type="button" class="btn" onclick={load} disabled={loading}>
-        <Icon name="refresh" size={14} />
-        <span>{loading ? 'Loading…' : 'Reload'}</span>
-      </button>
-      <button type="button" class="btn ghost" onclick={() => expanded = !expanded}>
-        <span>{expanded ? 'Hide raw JSON' : 'Show raw JSON'}</span>
-      </button>
-    </div>
+    <span class="meta">
+      {scalarEntries.length} scalar · {nestedKeys.length} nested
+    </span>
+    <button
+      type="button"
+      class="btn ghost"
+      onclick={() => (expanded = !expanded)}
+    >
+      <span>{expanded ? 'Hide raw JSON' : 'Show raw JSON'}</span>
+    </button>
   </div>
 
-  {#if error}
-    <div class="error">Failed to load: {error}</div>
-  {:else if loading && !snapshot}
-    <div class="note">Loading config…</div>
-  {:else if snapshot}
-    <div class="section">
-      <div class="section-title">Runtime flags</div>
-      <div class="rows">
-        {#each flags as [label, key] (key)}
-          {@const raw = snapshot[key]}
-          <div class="row">
-            <span class="row-label">{label}</span>
-            <span class="row-value {raw === '' || raw == null ? 'muted' : ''}">
-              {raw === '' || raw == null ? '—' : String(raw)}
-            </span>
-          </div>
-        {/each}
+  {#if scalarEntries.length === 0 && nestedKeys.length === 0}
+    <div class="empty">
+      <Icon name="info" size={12} />
+      <span>No variables — the deployment is running on template defaults.</span>
+    </div>
+  {/if}
+
+  {#if scalarEntries.length > 0}
+    <div class="rows">
+      {#each scalarEntries as [k, v, cls] (k)}
         <div class="row">
-          <span class="row-label">Telegram alerts</span>
-          <span class="row-value {snapshot?.telegram?.enabled ? 'on' : 'muted'}">
-            {snapshot?.telegram?.enabled ? 'enabled' : 'disabled'}
-          </span>
+          <span class="row-label mono">{k}</span>
+          <span class="row-value mono {cls}">{v}</span>
         </div>
-        <div class="row">
-          <span class="row-label">Loan agreements</span>
-          <span class="row-value">{loansCount()} configured</span>
-        </div>
-      </div>
+      {/each}
     </div>
+  {/if}
 
+  {#if nestedKeys.length > 0}
     <div class="section">
-      <div class="section-title">Active strategy graphs</div>
-      {#if activeGraphs.length === 0}
-        <div class="note">No live graphs — engine is running default strategy config.</div>
-      {:else}
-        <div class="rows">
-          {#each activeGraphs as g (g.hash)}
-            <div class="row">
-              <span class="row-label">{g.name}</span>
-              <span class="row-value">
-                <code class="mono">{g.scope}</code>
-                <span class="muted"> · {g.hash.slice(0, 12)}… · {fmtTs(g.deployed_at)} · {g.operator}</span>
-              </span>
-            </div>
-          {/each}
-        </div>
-      {/if}
-    </div>
-
-    <div class="section">
-      <div class="section-title">Optional subsystems</div>
-      <div class="chips">
-        {#each optionalSections as [label, key, hint] (key)}
-          {@const st = sectionStatus(key)}
-          <div class="chip" class:on={st === 'on'} class:off={st === 'off'}>
-            <span class="dot"></span>
-            <div class="chip-body">
-              <span class="chip-label">{label}</span>
-              <span class="chip-hint">{hint}</span>
-            </div>
-            <span class="chip-state">{st === 'on' ? 'wired' : 'off'}</span>
-          </div>
-        {/each}
-      </div>
-    </div>
-
-    <div class="section">
-      <div class="section-title">Collections</div>
-      <div class="rows">
-        {#each arraySections as [label, key] (key)}
-          {@const arr = snapshot[key] ?? []}
-          <div class="row">
-            <span class="row-label">{label}</span>
-            <span class="row-value">
-              {arr.length}
-              {#if key === 'symbols' && arr.length > 0}
-                <span class="muted"> — {arr.slice(0, 4).join(', ')}{arr.length > 4 ? '…' : ''}</span>
-              {/if}
+      <div class="section-title">Nested</div>
+      <ul class="nested">
+        {#each nestedKeys as k (k)}
+          <li>
+            <span class="mono">{k}</span>
+            <span class="faint">
+              {Array.isArray(nestedEntries[k])
+                ? `[${nestedEntries[k].length}]`
+                : `{${Object.keys(nestedEntries[k]).length}}`}
             </span>
-          </div>
+          </li>
         {/each}
-      </div>
+      </ul>
     </div>
+  {/if}
 
-    {#if expanded}
-      <div class="section">
-        <div class="section-title">Raw snapshot</div>
-        <pre class="raw">{JSON.stringify(snapshot, null, 2)}</pre>
-      </div>
-    {/if}
+  {#if expanded}
+    <pre class="raw">{JSON.stringify(variables, null, 2)}</pre>
   {/if}
 </div>
 
 <style>
-  .viewer { display: flex; flex-direction: column; gap: var(--s-4); }
+  .viewer { display: flex; flex-direction: column; gap: var(--s-2); }
+
   .top {
     display: flex; justify-content: space-between; align-items: center;
     gap: var(--s-3);
   }
-  .header { display: flex; flex-direction: column; gap: 2px; }
-  .label {
-    font-size: var(--fs-sm); font-weight: 600; color: var(--fg-primary);
-    letter-spacing: var(--tracking-label); text-transform: uppercase;
-  }
-  .hint { font-size: var(--fs-xs); color: var(--fg-muted); }
-  .actions { display: flex; gap: var(--s-2); }
+  .meta { font-size: var(--fs-2xs); color: var(--fg-muted); }
+
   .btn {
     display: inline-flex; align-items: center; gap: var(--s-2);
-    padding: var(--s-2) var(--s-3);
-    background: var(--bg-chip); border: 1px solid var(--border-subtle);
-    border-radius: var(--r-md); color: var(--fg-primary);
-    font-size: var(--fs-xs); cursor: pointer;
-    transition: background var(--dur-fast) var(--ease-out);
+    padding: 2px 8px;
+    background: transparent; border: 1px solid var(--border-subtle);
+    border-radius: var(--r-sm); color: var(--fg-secondary);
+    font-size: var(--fs-2xs); cursor: pointer;
   }
-  .btn:hover:not(:disabled) { background: var(--bg-raised); }
-  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-  .btn.ghost { background: transparent; }
+  .btn:hover { background: var(--bg-base); color: var(--fg-primary); }
 
-  .error {
-    padding: var(--s-3); background: var(--danger-bg);
-    border-radius: var(--r-md); color: var(--danger); font-size: var(--fs-sm);
-  }
-  .note { padding: var(--s-3); color: var(--fg-muted); font-size: var(--fs-sm); }
-
-  .section { display: flex; flex-direction: column; gap: var(--s-2); }
-  .section-title {
-    font-size: var(--fs-xs); font-weight: 600; color: var(--fg-muted);
-    letter-spacing: var(--tracking-label); text-transform: uppercase;
-  }
-
-  .rows { display: flex; flex-direction: column; gap: 1px; background: var(--border-subtle);
-    border-radius: var(--r-md); overflow: hidden; }
-  .row {
-    display: flex; justify-content: space-between; align-items: center;
-    padding: var(--s-2) var(--s-3); background: var(--bg-raised);
-    font-size: var(--fs-sm);
-  }
-  .row-label { color: var(--fg-secondary); }
-  .row-value { color: var(--fg-primary); font-family: var(--font-mono); font-size: var(--fs-xs); }
-  .row-value.muted { color: var(--fg-muted); }
-  .row-value.on { color: var(--success); }
-  .muted { color: var(--fg-muted); }
-
-  .chips { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: var(--s-2); }
-  .chip {
+  .empty {
     display: flex; align-items: center; gap: var(--s-2);
     padding: var(--s-2) var(--s-3);
-    background: var(--bg-raised); border: 1px solid var(--border-subtle);
-    border-radius: var(--r-md);
+    background: var(--bg-base);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--r-sm);
+    color: var(--fg-muted);
+    font-size: var(--fs-xs);
   }
-  .chip .dot {
-    width: 8px; height: 8px; border-radius: 50%; background: var(--fg-muted);
-    flex-shrink: 0;
+
+  .rows {
+    display: flex; flex-direction: column; gap: 1px;
+    background: var(--border-subtle);
+    border-radius: var(--r-sm);
+    overflow: hidden;
   }
-  .chip.on .dot { background: var(--success); box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.18); }
-  .chip.off .dot { background: var(--fg-muted); }
-  .chip-body { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
-  .chip-label { font-size: var(--fs-sm); color: var(--fg-primary); font-weight: 500; }
-  .chip-hint { font-size: var(--fs-xs); color: var(--fg-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .chip-state {
-    font-size: var(--fs-xs); font-weight: 600; text-transform: uppercase;
-    letter-spacing: var(--tracking-label);
+  .row {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 4px var(--s-3);
+    background: var(--bg-base);
+    font-size: var(--fs-xs);
+    gap: var(--s-3);
   }
-  .chip.on .chip-state { color: var(--success); }
-  .chip.off .chip-state { color: var(--fg-muted); }
+  .row-label { color: var(--fg-secondary); }
+  .row-value {
+    font-size: var(--fs-2xs);
+    text-align: right;
+    word-break: break-all;
+  }
+  .row-value.on { color: var(--pos); }
+  .row-value.muted { color: var(--fg-muted); }
+  .row-value.str { color: var(--fg-primary); }
+  .row-value.num { color: var(--accent); }
+  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+
+  .section { display: flex; flex-direction: column; gap: 4px; }
+  .section-title {
+    font-size: 10px; font-weight: 600; color: var(--fg-muted);
+    letter-spacing: var(--tracking-label); text-transform: uppercase;
+  }
+  .nested {
+    list-style: none; margin: 0; padding: 0;
+    display: flex; flex-wrap: wrap; gap: var(--s-2);
+  }
+  .nested li {
+    display: inline-flex; gap: 4px; align-items: baseline;
+    padding: 2px 8px;
+    background: var(--bg-base);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--r-sm);
+    font-size: var(--fs-2xs);
+  }
+  .faint { color: var(--fg-muted); }
 
   .raw {
-    max-height: 480px; overflow: auto;
-    padding: var(--s-3); background: var(--bg-base);
-    border: 1px solid var(--border-subtle); border-radius: var(--r-md);
-    font-family: var(--font-mono); font-size: var(--fs-xs);
+    max-height: 320px; overflow: auto;
+    padding: var(--s-2) var(--s-3);
+    background: var(--bg-base);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--r-sm);
+    font-family: var(--font-mono); font-size: var(--fs-2xs);
     color: var(--fg-secondary); white-space: pre;
   }
 </style>

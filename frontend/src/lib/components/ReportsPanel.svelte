@@ -81,6 +81,38 @@
     return new Date().toISOString().slice(0, 10)
   }
 
+  // Wave D2 — fetch signed audit bundle for the selected
+  // range, serialise to JSON, and trigger a download. POSTs
+  // the window as millis; controller returns
+  // `{ manifest: { signature, ... }, events: [...] }`.
+  async function downloadSignedAudit() {
+    if (busy) return
+    busy = true
+    try {
+      const from_ms = new Date(mFrom + 'T00:00:00Z').getTime()
+      const until_ms = new Date(mTo + 'T23:59:59Z').getTime()
+      const body = { from_ms, until_ms }
+      if (mClientId.trim()) body.client_id = mClientId.trim()
+      const resp = await api.authedFetch('/api/v1/audit/export', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+      if (!resp.ok) throw new Error(`audit export → ${resp.status}`)
+      const json = await resp.json()
+      const blob = new Blob([JSON.stringify(json, null, 2)], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `audit-${mClientId.trim() || 'all'}-${mFrom}-to-${mTo}.signed.json`
+      document.body.appendChild(a); a.click(); a.remove()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      error = e?.message || String(e)
+    } finally {
+      busy = false
+    }
+  }
+
   function monthlyUrl(ext) {
     const p = new URLSearchParams({ from: mFrom, to: mTo })
     if (mClientId.trim()) p.set('client_id', mClientId.trim())
@@ -155,6 +187,20 @@
       </button>
       <button type="button" class="btn ghost" onclick={() => download(monthlyUrl('manifest'), monthlyName('manifest.json'))} disabled={busy}>
         <span>Manifest (HMAC)</span>
+      </button>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Signed audit export</div>
+    <div class="muted">
+      Arbitrary date-range signed export for tamper-evident regulatory hand-offs.
+      Same date + client selector as monthly; returns one JSON bundle with an
+      HMAC-SHA256 manifest over the events array.
+    </div>
+    <div class="actions">
+      <button type="button" class="btn" onclick={downloadSignedAudit} disabled={busy}>
+        <Icon name="shield" size={14} /> <span>Download signed audit</span>
       </button>
     </div>
   </div>

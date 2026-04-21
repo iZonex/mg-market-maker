@@ -8,6 +8,83 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::{DashboardState, FillRecord};
 
+/// Wave B2 — decoded view of the agent's `client_metrics`
+/// topic reply. One row per running deployment in the fleet.
+/// Decimals are strings on the wire (rust_decimal precision
+/// preservation); we parse lazily via `dec()` below.
+fn dec(v: &serde_json::Value, k: &str) -> Decimal {
+    v.get(k)
+        .and_then(|x| x.as_str())
+        .and_then(|s| s.parse::<Decimal>().ok())
+        .unwrap_or(Decimal::ZERO)
+}
+
+fn u64_field(v: &serde_json::Value, k: &str) -> u64 {
+    v.get(k).and_then(|x| x.as_u64()).unwrap_or(0)
+}
+
+fn str_field(v: &serde_json::Value, k: &str) -> String {
+    v.get(k)
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Wave B2 — read every running deployment's `client_metrics`
+/// slice across the fleet. Falls back to a synthesised view
+/// off the local DashboardState (single-engine mode / tests)
+/// when the controller hasn't installed a fetcher.
+async fn fleet_client_metrics(
+    state: &DashboardState,
+    client_filter: Option<&str>,
+) -> Vec<serde_json::Value> {
+    if let Some(fetcher) = state.fleet_client_metrics_fetcher() {
+        return fetcher(client_filter.map(|s| s.to_string())).await;
+    }
+    // Local-state fallback: project each symbol state into the
+    // same shape the agent emits over the wire. Legacy callers
+    // (unit tests, single-engine deploys) keep working.
+    let mut out = Vec::new();
+    let syms = match client_filter {
+        Some(cid) => state.get_client_symbols(cid),
+        None => state.get_all(),
+    };
+    for s in syms {
+        let bid_depth: Decimal = s.book_depth_levels.iter().map(|l| l.bid_depth_quote).sum();
+        let ask_depth: Decimal = s.book_depth_levels.iter().map(|l| l.ask_depth_quote).sum();
+        out.push(serde_json::json!({
+            "symbol": s.symbol,
+            "venue": s.venue,
+            "product": s.product,
+            "mode": s.mode,
+            "strategy": s.strategy,
+            "inventory": s.inventory.to_string(),
+            "inventory_value": s.inventory_value.to_string(),
+            "mid_price": s.mid_price.to_string(),
+            "spread_bps": s.spread_bps.to_string(),
+            "total_fills": s.total_fills,
+            "pnl_total": s.pnl.total.to_string(),
+            "pnl_spread": s.pnl.spread.to_string(),
+            "pnl_inventory": s.pnl.inventory.to_string(),
+            "pnl_rebates": s.pnl.rebates.to_string(),
+            "pnl_fees": s.pnl.fees.to_string(),
+            "pnl_volume": s.pnl.volume.to_string(),
+            "pnl_round_trips": s.pnl.round_trips,
+            "sla_uptime_pct": s.sla_uptime_pct.to_string(),
+            "sla_max_spread_bps": s.sla_max_spread_bps.to_string(),
+            "sla_min_depth_quote": s.sla_min_depth_quote.to_string(),
+            "spread_compliance_pct": s.spread_compliance_pct.to_string(),
+            "presence_pct_24h": s.presence_pct_24h.to_string(),
+            "two_sided_pct_24h": s.two_sided_pct_24h.to_string(),
+            "minutes_with_data_24h": s.minutes_with_data_24h,
+            "bid_depth_quote": bid_depth.to_string(),
+            "ask_depth_quote": ask_depth.to_string(),
+            "kill_level": s.kill_level,
+        }));
+    }
+    out
+}
+
 /// Client-facing API — what clients and exchanges expect to see.
 ///
 /// Endpoints:
@@ -34,7 +111,12 @@ pub fn client_routes() -> Router<DashboardState> {
         .route("/api/v1/report/history", get(get_report_history))
         .route("/api/v1/report/history/{date}", get(get_historical_report))
         .route("/api/v1/book/analytics", get(get_book_analytics))
-        .route("/api/v1/audit/recent", get(get_audit_recent))
+        // `/api/v1/audit/recent` removed in the 2026-04
+        // stabilization pass — it read a local data/audit.jsonl
+        // which doesn't exist in distributed mode (agents write
+        // audit to their own disks). AuditStream.svelte now
+        // fans out per-deployment via the details endpoint
+        // (topic `audit_tail`) and merges client-side.
         .route("/api/v1/system/diagnostics", get(get_diagnostics))
         .route("/api/v1/pnl/timeseries", get(get_pnl_timeseries))
         .route("/api/v1/spread/timeseries", get(get_spread_timeseries))
@@ -49,6 +131,14 @@ pub fn client_routes() -> Router<DashboardState> {
         .route("/api/v1/report/monthly.xlsx", get(get_monthly_xlsx))
         .route("/api/v1/report/monthly.pdf", get(get_monthly_pdf))
         .route("/api/v1/report/monthly.manifest", get(get_monthly_manifest))
+        // Wave D2 — signed arbitrary-range audit export. Body
+        // carries `from_ms`, `until_ms`, optional `client_id`.
+        // Uses the fleet audit fetcher to collect events across
+        // every accepted agent and produces a tamper-proof
+        // bundle: the raw events + an HMAC manifest (same
+        // signing secret as the monthly bundles). Consumers
+        // verify by recomputing the HMAC of the event body.
+        .route("/api/v1/audit/export", axum::routing::post(post_audit_export))
         .route("/api/v1/export/bundle", get(get_export_bundle))
         .route("/api/v1/archive/health", get(get_archive_health))
         .route("/api/v1/sentiment/snapshot", get(get_sentiment_snapshot))
@@ -96,6 +186,49 @@ pub fn client_routes() -> Router<DashboardState> {
         )
         .route("/api/v1/client/{id}/fills", get(get_client_fills))
         .route("/api/v1/client/{id}/pnl", get(get_client_pnl))
+        // Wave E3 — self-scope aliases for ClientReader. Each
+        // resolves the caller's client_id from TokenClaims and
+        // delegates to the /{id} handler. Requires a tenant-
+        // tagged token; untenanted access returns 401.
+        .route("/api/v1/client/self/sla", get(get_self_sla))
+        .route(
+            "/api/v1/client/self/sla/certificate",
+            get(get_self_sla_certificate),
+        )
+        .route("/api/v1/client/self/fills", get(get_self_fills))
+        .route("/api/v1/client/self/pnl", get(get_self_pnl))
+        .route(
+            "/api/v1/client/self/webhook-deliveries",
+            get(get_self_webhook_deliveries),
+        )
+        // Wave I1 — tenant-self webhook CRUD. Tenants register,
+        // list, remove, and test-fire their own delivery URLs
+        // without admin involvement. Dispatcher is auto-created
+        // on first add so clients onboarded without a webhook
+        // can opt in any time.
+        .route(
+            "/api/v1/client/self/webhooks",
+            get(list_self_webhooks)
+                .post(add_self_webhook)
+                .delete(remove_self_webhook),
+        )
+        .route(
+            "/api/v1/client/self/webhooks/test",
+            axum::routing::post(test_self_webhook),
+        )
+        // Wave G2/G4 — incident lifecycle.
+        .route(
+            "/api/v1/incidents",
+            get(list_incidents_handler).post(post_incident_handler),
+        )
+        .route(
+            "/api/v1/incidents/{id}/ack",
+            axum::routing::post(ack_incident_handler),
+        )
+        .route(
+            "/api/v1/incidents/{id}/resolve",
+            axum::routing::post(resolve_incident_handler),
+        )
 }
 
 /// Unified multi-currency portfolio snapshot in the reporting
@@ -120,20 +253,27 @@ struct PositionResponse {
 }
 
 async fn get_positions(State(state): State<DashboardState>) -> Json<Vec<PositionResponse>> {
-    let symbols = state.get_all();
-    let positions: Vec<PositionResponse> = symbols
+    let rows = fleet_client_metrics(&state, None).await;
+    let positions: Vec<PositionResponse> = rows
         .iter()
-        .map(|s| PositionResponse {
-            symbol: s.symbol.clone(),
-            inventory: s.inventory,
-            inventory_value: s.inventory_value,
-            avg_entry_price: if s.inventory.is_zero() {
-                dec!(0)
-            } else {
-                s.inventory_value / s.inventory.abs()
-            },
-            unrealized_pnl: s.pnl.inventory,
-            realized_pnl: s.pnl.spread + s.pnl.rebates - s.pnl.fees,
+        .map(|r| {
+            let inventory = dec(r, "inventory");
+            let inventory_value = dec(r, "inventory_value");
+            let pnl_spread = dec(r, "pnl_spread");
+            let pnl_rebates = dec(r, "pnl_rebates");
+            let pnl_fees = dec(r, "pnl_fees");
+            PositionResponse {
+                symbol: str_field(r, "symbol"),
+                inventory,
+                inventory_value,
+                avg_entry_price: if inventory.is_zero() {
+                    dec!(0)
+                } else {
+                    inventory_value / inventory.abs()
+                },
+                unrealized_pnl: dec(r, "pnl_inventory"),
+                realized_pnl: pnl_spread + pnl_rebates - pnl_fees,
+            }
         })
         .collect();
     Json(positions)
@@ -179,29 +319,31 @@ struct PnlPerLegRow {
 }
 
 async fn get_pnl_per_leg(State(state): State<DashboardState>) -> Json<Vec<PnlPerLegRow>> {
-    let symbols = state.get_all();
-    let rows: Vec<PnlPerLegRow> = symbols
-        .into_iter()
-        .map(|s| {
-            let efficiency = if s.pnl.volume > dec!(0) {
-                s.pnl.total / s.pnl.volume * dec!(10_000)
+    let metrics = fleet_client_metrics(&state, None).await;
+    let rows: Vec<PnlPerLegRow> = metrics
+        .iter()
+        .map(|r| {
+            let total = dec(r, "pnl_total");
+            let volume = dec(r, "pnl_volume");
+            let efficiency = if volume > dec!(0) {
+                total / volume * dec!(10_000)
             } else {
                 dec!(0)
             };
             PnlPerLegRow {
-                venue: s.venue,
-                symbol: s.symbol,
-                product: s.product,
-                mode: s.mode,
-                strategy: s.strategy,
-                total: s.pnl.total,
-                spread_capture: s.pnl.spread,
-                inventory_pnl: s.pnl.inventory,
-                rebate_income: s.pnl.rebates,
-                fees_paid: s.pnl.fees,
-                volume: s.pnl.volume,
-                round_trips: s.pnl.round_trips,
-                fills: s.total_fills,
+                venue: str_field(r, "venue"),
+                symbol: str_field(r, "symbol"),
+                product: str_field(r, "product"),
+                mode: str_field(r, "mode"),
+                strategy: str_field(r, "strategy"),
+                total,
+                spread_capture: dec(r, "pnl_spread"),
+                inventory_pnl: dec(r, "pnl_inventory"),
+                rebate_income: dec(r, "pnl_rebates"),
+                fees_paid: dec(r, "pnl_fees"),
+                volume,
+                round_trips: u64_field(r, "pnl_round_trips"),
+                fills: u64_field(r, "total_fills"),
                 efficiency_bps: efficiency,
             }
         })
@@ -210,23 +352,25 @@ async fn get_pnl_per_leg(State(state): State<DashboardState>) -> Json<Vec<PnlPer
 }
 
 async fn get_pnl(State(state): State<DashboardState>) -> Json<Vec<PnlResponse>> {
-    let symbols = state.get_all();
-    let pnl: Vec<PnlResponse> = symbols
+    let metrics = fleet_client_metrics(&state, None).await;
+    let pnl: Vec<PnlResponse> = metrics
         .iter()
-        .map(|s| {
-            let efficiency = if s.pnl.volume > dec!(0) {
-                s.pnl.total / s.pnl.volume * dec!(10_000)
+        .map(|r| {
+            let total = dec(r, "pnl_total");
+            let volume = dec(r, "pnl_volume");
+            let efficiency = if volume > dec!(0) {
+                total / volume * dec!(10_000)
             } else {
                 dec!(0)
             };
             PnlResponse {
-                total: s.pnl.total,
-                spread_capture: s.pnl.spread,
-                inventory_pnl: s.pnl.inventory,
-                rebate_income: s.pnl.rebates,
-                fees_paid: s.pnl.fees,
-                round_trips: s.pnl.round_trips,
-                volume: s.pnl.volume,
+                total,
+                spread_capture: dec(r, "pnl_spread"),
+                inventory_pnl: dec(r, "pnl_inventory"),
+                rebate_income: dec(r, "pnl_rebates"),
+                fees_paid: dec(r, "pnl_fees"),
+                round_trips: u64_field(r, "pnl_round_trips"),
+                volume,
                 efficiency_bps: efficiency,
             }
         })
@@ -251,25 +395,23 @@ struct SlaResponse {
 }
 
 async fn get_sla(State(state): State<DashboardState>) -> Json<Vec<SlaResponse>> {
-    let symbols = state.get_all();
-    let sla: Vec<SlaResponse> = symbols
+    let metrics = fleet_client_metrics(&state, None).await;
+    let sla: Vec<SlaResponse> = metrics
         .iter()
-        .map(|s| {
-            // Sum depth across all book levels for a total figure.
-            let bid_depth: Decimal = s.book_depth_levels.iter().map(|l| l.bid_depth_quote).sum();
-            let ask_depth: Decimal = s.book_depth_levels.iter().map(|l| l.ask_depth_quote).sum();
+        .map(|r| {
+            let uptime = dec(r, "sla_uptime_pct");
             SlaResponse {
-                symbol: s.symbol.clone(),
-                uptime_pct: s.sla_uptime_pct,
-                is_compliant: s.sla_uptime_pct >= dec!(95),
-                current_spread_bps: s.spread_bps,
-                bid_depth,
-                ask_depth,
-                sla_max_spread_bps: s.sla_max_spread_bps,
-                sla_min_depth_quote: s.sla_min_depth_quote,
-                spread_compliance_pct: s.spread_compliance_pct,
-                presence_pct_24h: s.presence_pct_24h,
-                two_sided_pct_24h: s.two_sided_pct_24h,
+                symbol: str_field(r, "symbol"),
+                uptime_pct: uptime,
+                is_compliant: uptime >= dec!(95),
+                current_spread_bps: dec(r, "spread_bps"),
+                bid_depth: dec(r, "bid_depth_quote"),
+                ask_depth: dec(r, "ask_depth_quote"),
+                sla_max_spread_bps: dec(r, "sla_max_spread_bps"),
+                sla_min_depth_quote: dec(r, "sla_min_depth_quote"),
+                spread_compliance_pct: dec(r, "spread_compliance_pct"),
+                presence_pct_24h: dec(r, "presence_pct_24h"),
+                two_sided_pct_24h: dec(r, "two_sided_pct_24h"),
             }
         })
         .collect();
@@ -575,17 +717,128 @@ async fn get_sla_certificate(State(state): State<DashboardState>) -> Json<SlaCer
     })
 }
 
-/// HMAC-SHA256 using a simple XOR-based implementation.
-/// Production deployments should use `ring` or `hmac` crate;
-/// this is a self-contained fallback that avoids adding a
-/// new dependency.
+/// Fix #1 — honest HMAC-SHA256 over the message with the
+/// configured signing secret as key. Previous implementation
+/// was `DefaultHasher` (SipHash13) keyed by hashing the key
+/// and message sequentially — not HMAC, not SHA-256, not
+/// cryptographically sound. Regulators / auditors verifying
+/// a signed manifest could not reproduce the signature;
+/// `monthly_report.rs` already used real HMAC, the rest of
+/// the compliance surface now matches. Hex-encoded 64 chars.
 fn hmac_sha256_hex(key: &str, message: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    key.hash(&mut hasher);
-    message.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes())
+        .expect("HMAC-SHA256 accepts any key length");
+    mac.update(message.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// Wave D2 — signed arbitrary-range audit export body.
+#[derive(Debug, Deserialize)]
+struct AuditExportRequest {
+    from_ms: i64,
+    until_ms: i64,
+    #[serde(default)]
+    client_id: Option<String>,
+    /// Event cap. Default 10_000, hard cap 100_000 to stop a
+    /// single request nuking the controller's memory.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct AuditExportManifest {
+    generated_at: String,
+    from_ms: i64,
+    until_ms: i64,
+    client_id: Option<String>,
+    event_count: usize,
+    /// Hex-encoded HMAC of the events array serialised as a
+    /// canonical JSON string. Recompute + compare to detect
+    /// tampering after the bundle leaves the controller.
+    signature: String,
+    signature_algo: String,
+    /// Byte length of the events array (as JSON) — helps the
+    /// consumer sanity-check the transfer before verifying.
+    body_bytes: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct AuditExportBundle {
+    manifest: AuditExportManifest,
+    events: Vec<serde_json::Value>,
+}
+
+async fn post_audit_export(
+    State(state): State<DashboardState>,
+    Json(req): Json<AuditExportRequest>,
+) -> Result<Json<AuditExportBundle>, (axum::http::StatusCode, String)> {
+    use axum::http::StatusCode;
+    if req.from_ms > req.until_ms {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "from_ms must be <= until_ms".into(),
+        ));
+    }
+    let limit = req.limit.unwrap_or(10_000).min(100_000);
+
+    // Fleet-aware path: reuse the existing audit-range fetcher
+    // installed at server boot. Falls back to the local file
+    // reader when the controller has no fleet wired (tests).
+    let events: Vec<serde_json::Value> =
+        if let Some(fetcher) = state.audit_range_fetcher() {
+            fetcher(req.from_ms, req.until_ms, limit).await
+        } else if let Some(path) = state.audit_log_path() {
+            let from_dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(req.from_ms)
+                .ok_or((StatusCode::BAD_REQUEST, "from_ms out of range".into()))?;
+            let until_dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(req.until_ms)
+                .ok_or((StatusCode::BAD_REQUEST, "until_ms out of range".into()))?;
+            mm_risk::audit_reader::read_audit_range(&path, from_dt, until_dt)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                .into_iter()
+                .filter_map(|ev| serde_json::to_value(ev).ok())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+    // Filter by client_id when requested. Audit events carry
+    // `client_id` as an optional field — empty when the event
+    // is tenant-less (shared infra) so we skip those on
+    // client-scoped exports.
+    let filtered: Vec<serde_json::Value> = match req.client_id.as_deref() {
+        Some(cid) if !cid.is_empty() => events
+            .into_iter()
+            .filter(|ev| {
+                ev.get("client_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == cid)
+                    .unwrap_or(false)
+            })
+            .collect(),
+        _ => events,
+    };
+
+    let body = serde_json::to_string(&filtered)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let secret_bytes = state.report_secret();
+    let secret = String::from_utf8(secret_bytes).unwrap_or_default();
+    let signature = hmac_sha256_hex(&secret, &body);
+
+    Ok(Json(AuditExportBundle {
+        manifest: AuditExportManifest {
+            generated_at: Utc::now().to_rfc3339(),
+            from_ms: req.from_ms,
+            until_ms: req.until_ms,
+            client_id: req.client_id,
+            event_count: filtered.len(),
+            signature,
+            signature_algo: "hmac-sha256-hex".into(),
+            body_bytes: body.len(),
+        },
+        events: filtered,
+    }))
 }
 
 /// Unified risk summary — all risk metrics in one endpoint.
@@ -1711,45 +1964,11 @@ async fn get_book_analytics(State(state): State<DashboardState>) -> Json<Vec<Boo
     Json(analytics)
 }
 
-/// Recent audit log entries. Reads the last N lines from the
-/// audit JSONL file. Filter by symbol or event type.
-#[derive(Debug, Deserialize)]
-struct AuditQuery {
-    limit: Option<usize>,
-    symbol: Option<String>,
-    event_type: Option<String>,
-}
-
-async fn get_audit_recent(Query(query): Query<AuditQuery>) -> Json<Vec<serde_json::Value>> {
-    let limit = query.limit.unwrap_or(100).min(500);
-    let path = std::path::Path::new("data/audit.jsonl");
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return Json(vec![]),
-    };
-
-    let entries: Vec<serde_json::Value> = content
-        .lines()
-        .rev()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|v| {
-            if let Some(sym) = &query.symbol {
-                if v.get("symbol").and_then(|s| s.as_str()) != Some(sym) {
-                    return false;
-                }
-            }
-            if let Some(et) = &query.event_type {
-                if v.get("event_type").and_then(|s| s.as_str()) != Some(et) {
-                    return false;
-                }
-            }
-            true
-        })
-        .take(limit)
-        .collect();
-
-    Json(entries)
-}
+// `get_audit_recent` removed — distributed AuditStream fans
+// out per-deployment via the details endpoint (see
+// `AuditStream.svelte` + agent's `audit_tail` topic handler in
+// `crates/agent/src/lib.rs`). No single process in the
+// distributed deployment owns an audit.jsonl file.
 
 /// List available historical report dates.
 async fn get_report_history(State(state): State<DashboardState>) -> Json<Vec<String>> {
@@ -1817,15 +2036,18 @@ async fn get_client_sla(
     State(state): State<DashboardState>,
     Path(client_id): Path<String>,
 ) -> Json<ClientSlaSummary> {
-    let syms = state.get_client_symbols(&client_id);
-    let symbol_slas: Vec<ClientSymbolSla> = syms
+    let metrics = fleet_client_metrics(&state, Some(&client_id)).await;
+    let symbol_slas: Vec<ClientSymbolSla> = metrics
         .iter()
-        .map(|s| ClientSymbolSla {
-            symbol: s.symbol.clone(),
-            presence_pct: s.presence_pct_24h,
-            two_sided_pct: s.two_sided_pct_24h,
-            spread_compliance_pct: s.spread_compliance_pct,
-            minutes_with_data: s.minutes_with_data_24h,
+        .map(|r| ClientSymbolSla {
+            symbol: str_field(r, "symbol"),
+            presence_pct: dec(r, "presence_pct_24h"),
+            two_sided_pct: dec(r, "two_sided_pct_24h"),
+            spread_compliance_pct: dec(r, "spread_compliance_pct"),
+            minutes_with_data: r
+                .get("minutes_with_data_24h")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
         })
         .collect();
 
@@ -1865,7 +2087,41 @@ async fn get_client_fills(
     Path(client_id): Path<String>,
     Query(q): Query<ClientFillsQuery>,
 ) -> Json<Vec<FillRecord>> {
-    Json(state.get_client_fills(&client_id, q.limit))
+    // 2026-04-21 journey smoke — the legacy implementation read
+    // `DashboardState.clients[cid].recent_fills`, but in the
+    // distributed model fills happen on agent-local dashboards,
+    // never on the controller's. Tenants opened the portal and
+    // saw an empty "Recent fills" card even while paper quotes
+    // were actively filling. Fan out to each agent via the
+    // `client_metrics` topic (which now carries a `recent_fills`
+    // array per deployment), flatten, sort newest-first, cap to
+    // the requested limit. Falls back to the local fill buffer
+    // when no fetcher is installed (unit tests).
+    let mut fills = collect_fleet_client_fills(&state, &client_id).await;
+    if fills.is_empty() {
+        fills = state.get_client_fills(&client_id, q.limit);
+    }
+    fills.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    fills.truncate(q.limit);
+    Json(fills)
+}
+
+async fn collect_fleet_client_fills(
+    state: &DashboardState,
+    client_id: &str,
+) -> Vec<FillRecord> {
+    let metrics = fleet_client_metrics(state, Some(client_id)).await;
+    let mut out = Vec::new();
+    for row in metrics {
+        if let Some(arr) = row.get("recent_fills").and_then(|v| v.as_array()) {
+            for raw in arr {
+                if let Ok(fill) = serde_json::from_value::<FillRecord>(raw.clone()) {
+                    out.push(fill);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Per-client PnL aggregate.
@@ -1890,21 +2146,33 @@ async fn get_client_pnl(
     State(state): State<DashboardState>,
     Path(client_id): Path<String>,
 ) -> Json<ClientPnlSummary> {
-    let syms = state.get_client_symbols(&client_id);
+    let metrics = fleet_client_metrics(&state, Some(&client_id)).await;
     let mut total_pnl = Decimal::ZERO;
     let mut total_volume = Decimal::ZERO;
     let mut total_fills = 0u64;
-    let symbol_pnls: Vec<ClientSymbolPnl> = syms
+    let symbol_pnls: Vec<ClientSymbolPnl> = metrics
         .iter()
-        .map(|s| {
-            total_pnl += s.pnl.total;
-            total_volume += s.pnl.volume;
-            total_fills += s.pnl.round_trips;
+        .map(|r| {
+            let pnl = dec(r, "pnl_total");
+            let volume = dec(r, "pnl_volume");
+            // PNL-COUNTER-1 — tenants expect "fills" to mean
+            // raw trade count, not round-trips. New agents emit
+            // `pnl_fill_count`; falls back to `pnl_round_trips`
+            // for older replies during rolling upgrades.
+            let fills = u64_field(r, "pnl_fill_count");
+            let fills = if fills > 0 {
+                fills
+            } else {
+                u64_field(r, "pnl_round_trips")
+            };
+            total_pnl += pnl;
+            total_volume += volume;
+            total_fills += fills;
             ClientSymbolPnl {
-                symbol: s.symbol.clone(),
-                pnl: s.pnl.total,
-                volume: s.pnl.volume,
-                fills: s.pnl.round_trips,
+                symbol: str_field(r, "symbol"),
+                pnl,
+                volume,
+                fills,
             }
         })
         .collect();
@@ -1933,16 +2201,19 @@ async fn get_client_sla_certificate(
     State(state): State<DashboardState>,
     Path(client_id): Path<String>,
 ) -> Json<ClientSlaCertificate> {
-    let syms = state.get_client_symbols(&client_id);
+    let metrics = fleet_client_metrics(&state, Some(&client_id)).await;
     let now = Utc::now();
-    let symbol_slas: Vec<ClientSymbolSla> = syms
+    let symbol_slas: Vec<ClientSymbolSla> = metrics
         .iter()
-        .map(|s| ClientSymbolSla {
-            symbol: s.symbol.clone(),
-            presence_pct: s.presence_pct_24h,
-            two_sided_pct: s.two_sided_pct_24h,
-            spread_compliance_pct: s.spread_compliance_pct,
-            minutes_with_data: s.minutes_with_data_24h,
+        .map(|r| ClientSymbolSla {
+            symbol: str_field(r, "symbol"),
+            presence_pct: dec(r, "presence_pct_24h"),
+            two_sided_pct: dec(r, "two_sided_pct_24h"),
+            spread_compliance_pct: dec(r, "spread_compliance_pct"),
+            minutes_with_data: r
+                .get("minutes_with_data_24h")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
         })
         .collect();
 
@@ -1974,6 +2245,291 @@ async fn get_client_sla_certificate(
         min_presence_pct: min_presence,
         signature,
     })
+}
+
+// ── Wave E3 — self-scope handlers for ClientReader ────────────
+//
+// Each resolves `token.client_id` from the request extensions
+// (populated by auth_middleware) and delegates to the existing
+// `/{id}` handler. The tenant_scope_middleware already admits
+// `/api/v1/client/self/*` for tokens carrying a client_id; here
+// we simply wire the id through to the body handler.
+
+use crate::auth::TokenClaims;
+
+/// Pull the caller's client_id from TokenClaims. Returns a 401
+/// body for tokens without a client_id (admin/operator who
+/// accidentally hit /self/ — they should be hitting /{id}).
+fn self_client_id(
+    claims: Option<&TokenClaims>,
+) -> Result<String, (axum::http::StatusCode, String)> {
+    let claims = claims.ok_or((
+        axum::http::StatusCode::UNAUTHORIZED,
+        "self endpoint requires an authenticated token".into(),
+    ))?;
+    claims.client_id.clone().ok_or((
+        axum::http::StatusCode::BAD_REQUEST,
+        "this endpoint is for tenant-scoped tokens; use /api/v1/client/{id}/* with an explicit id".into(),
+    ))
+}
+
+async fn get_self_sla(
+    axum::Extension(claims): axum::Extension<TokenClaims>,
+    State(state): State<DashboardState>,
+) -> Result<Json<ClientSlaSummary>, (axum::http::StatusCode, String)> {
+    let id = self_client_id(Some(&claims))?;
+    Ok(get_client_sla(State(state), Path(id)).await)
+}
+
+async fn get_self_sla_certificate(
+    axum::Extension(claims): axum::Extension<TokenClaims>,
+    State(state): State<DashboardState>,
+) -> Result<Json<ClientSlaCertificate>, (axum::http::StatusCode, String)> {
+    let id = self_client_id(Some(&claims))?;
+    Ok(get_client_sla_certificate(State(state), Path(id)).await)
+}
+
+async fn get_self_fills(
+    axum::Extension(claims): axum::Extension<TokenClaims>,
+    State(state): State<DashboardState>,
+    Query(q): Query<ClientFillsQuery>,
+) -> Result<Json<Vec<FillRecord>>, (axum::http::StatusCode, String)> {
+    let id = self_client_id(Some(&claims))?;
+    Ok(get_client_fills(State(state), Path(id), Query(q)).await)
+}
+
+async fn get_self_pnl(
+    axum::Extension(claims): axum::Extension<TokenClaims>,
+    State(state): State<DashboardState>,
+) -> Result<Json<ClientPnlSummary>, (axum::http::StatusCode, String)> {
+    let id = self_client_id(Some(&claims))?;
+    Ok(get_client_pnl(State(state), Path(id)).await)
+}
+
+/// Self-scoped webhook delivery log — ClientReader checks that
+/// their own webhooks fired successfully without needing admin
+/// access.
+async fn get_self_webhook_deliveries(
+    axum::Extension(claims): axum::Extension<TokenClaims>,
+    State(state): State<DashboardState>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let id = self_client_id(Some(&claims))?;
+    let dispatcher = state.get_client_webhook_dispatcher(&id);
+    let records = dispatcher
+        .map(|d| d.recent_deliveries())
+        .unwrap_or_default();
+    Ok(Json(serde_json::json!({
+        "client_id": id,
+        "count": records.len(),
+        "deliveries": records,
+    })))
+}
+
+/// Wave I1 — self-service webhook registration. Tenant lists,
+/// adds, removes, and test-fires their own webhook URLs without
+/// needing admin involvement. Auto-creates the dispatcher on
+/// first add so existing clients who were onboarded without a
+/// webhook can opt in at any time.
+
+#[derive(Debug, Deserialize)]
+struct SelfWebhookBody {
+    url: String,
+}
+
+/// Reject obviously wrong URLs before they land in the
+/// dispatcher state. Full SSRF hardening is out of scope here;
+/// this is a shape check so tenants get a clear 400 instead of
+/// silent retries on a typo. Admin-added URLs go through the
+/// same backend, which already trusts operator-curated config.
+fn validate_webhook_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("url must not be empty".into());
+    }
+    if trimmed.len() > 2048 {
+        return Err("url too long (> 2048 chars)".into());
+    }
+    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+        return Err("url must be http:// or https://".into());
+    }
+    Ok(trimmed.to_string())
+}
+
+async fn list_self_webhooks(
+    axum::Extension(claims): axum::Extension<TokenClaims>,
+    State(state): State<DashboardState>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let id = self_client_id(Some(&claims))?;
+    let urls = state
+        .get_client_webhook_dispatcher(&id)
+        .map(|d| d.list_urls())
+        .unwrap_or_default();
+    Ok(Json(serde_json::json!({
+        "client_id": id,
+        "urls": urls,
+    })))
+}
+
+async fn add_self_webhook(
+    axum::Extension(claims): axum::Extension<TokenClaims>,
+    State(state): State<DashboardState>,
+    Json(body): Json<SelfWebhookBody>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let id = self_client_id(Some(&claims))?;
+    let url = validate_webhook_url(&body.url)
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?;
+    let dispatcher = match state.get_client_webhook_dispatcher(&id) {
+        Some(d) => d,
+        None => {
+            // First-time opt-in: mint a dispatcher and register
+            // it against the tenant. Subsequent adds hit the
+            // existing instance.
+            let d = crate::webhooks::WebhookDispatcher::new();
+            state.set_client_webhook_dispatcher(&id, d.clone());
+            d
+        }
+    };
+    dispatcher.add_url(url.clone());
+    Ok(Json(serde_json::json!({
+        "client_id": id,
+        "url": url,
+        "urls": dispatcher.list_urls(),
+    })))
+}
+
+async fn remove_self_webhook(
+    axum::Extension(claims): axum::Extension<TokenClaims>,
+    State(state): State<DashboardState>,
+    Json(body): Json<SelfWebhookBody>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let id = self_client_id(Some(&claims))?;
+    let Some(dispatcher) = state.get_client_webhook_dispatcher(&id) else {
+        return Ok(Json(serde_json::json!({
+            "client_id": id,
+            "removed": false,
+            "urls": [],
+        })));
+    };
+    let url = body.url.trim().to_string();
+    dispatcher.remove_url(&url);
+    Ok(Json(serde_json::json!({
+        "client_id": id,
+        "removed": true,
+        "urls": dispatcher.list_urls(),
+    })))
+}
+
+async fn test_self_webhook(
+    axum::Extension(claims): axum::Extension<TokenClaims>,
+    State(state): State<DashboardState>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let id = self_client_id(Some(&claims))?;
+    let Some(dispatcher) = state.get_client_webhook_dispatcher(&id) else {
+        return Err((
+            axum::http::StatusCode::NOT_FOUND,
+            "no webhooks registered — add one first".into(),
+        ));
+    };
+    let results = dispatcher.test_dispatch().await;
+    Ok(Json(serde_json::json!({
+        "client_id": id,
+        "attempted": results.len(),
+        "succeeded": results.iter().filter(|r| r.ok).count(),
+        "results": results,
+    })))
+}
+
+// ── Wave G2/G4 — incident lifecycle endpoints ──────────────
+
+#[derive(Debug, Deserialize)]
+struct OpenIncidentRequest {
+    violation_key: String,
+    severity: String,
+    category: String,
+    target: String,
+    metric: String,
+    detail: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AckIncidentRequest {
+    #[serde(default)]
+    by: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolveIncidentRequest {
+    #[serde(default)]
+    by: Option<String>,
+    #[serde(default)]
+    root_cause: Option<String>,
+    #[serde(default)]
+    action_taken: Option<String>,
+    #[serde(default)]
+    preventive: Option<String>,
+}
+
+async fn list_incidents_handler(
+    State(state): State<DashboardState>,
+) -> Json<Vec<crate::state::OpenIncident>> {
+    Json(state.list_incidents())
+}
+
+async fn post_incident_handler(
+    axum::Extension(claims): axum::Extension<crate::auth::TokenClaims>,
+    State(state): State<DashboardState>,
+    axum::Json(body): axum::Json<OpenIncidentRequest>,
+) -> Json<crate::state::OpenIncident> {
+    let now_ms = Utc::now().timestamp_millis();
+    let inc = crate::state::OpenIncident {
+        id: uuid::Uuid::new_v4().to_string(),
+        opened_at_ms: now_ms,
+        opened_by: claims.user_id.clone(),
+        violation_key: body.violation_key,
+        severity: body.severity,
+        category: body.category,
+        target: body.target,
+        metric: body.metric,
+        detail: body.detail,
+        state: "open".into(),
+        acked_by: None,
+        acked_at_ms: None,
+        resolved_by: None,
+        resolved_at_ms: None,
+        root_cause: None,
+        action_taken: None,
+        preventive: None,
+    };
+    Json(state.open_incident(inc))
+}
+
+async fn ack_incident_handler(
+    axum::Extension(claims): axum::Extension<crate::auth::TokenClaims>,
+    State(state): State<DashboardState>,
+    Path(id): Path<String>,
+    axum::Json(body): axum::Json<AckIncidentRequest>,
+) -> Result<Json<crate::state::OpenIncident>, (axum::http::StatusCode, String)> {
+    let actor = body.by.unwrap_or_else(|| claims.user_id.clone());
+    state
+        .ack_incident(&id, &actor)
+        .map(Json)
+        .ok_or((axum::http::StatusCode::CONFLICT, "incident not open".into()))
+}
+
+async fn resolve_incident_handler(
+    axum::Extension(claims): axum::Extension<crate::auth::TokenClaims>,
+    State(state): State<DashboardState>,
+    Path(id): Path<String>,
+    axum::Json(body): axum::Json<ResolveIncidentRequest>,
+) -> Result<Json<crate::state::OpenIncident>, (axum::http::StatusCode, String)> {
+    let actor = body.by.unwrap_or_else(|| claims.user_id.clone());
+    state
+        .resolve_incident(&id, &actor, body.root_cause, body.action_taken, body.preventive)
+        .map(Json)
+        .ok_or((
+            axum::http::StatusCode::NOT_FOUND,
+            "incident not found or already resolved".into(),
+        ))
 }
 
 // ── System preflight health (Pre-Flight Toolkit) ────────────
@@ -2058,4 +2614,99 @@ async fn get_portfolio_risk(
     State(state): State<DashboardState>,
 ) -> Json<Option<mm_risk::portfolio_risk::PortfolioRiskSummary>> {
     Json(state.get_portfolio_risk_summary())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_webhook_url_accepts_http_and_https() {
+        assert!(validate_webhook_url("https://a.example/hook").is_ok());
+        assert!(validate_webhook_url("http://a.example/hook").is_ok());
+    }
+
+    #[test]
+    fn validate_webhook_url_rejects_empty_and_bad_scheme() {
+        assert!(validate_webhook_url("").is_err());
+        assert!(validate_webhook_url("   ").is_err());
+        assert!(validate_webhook_url("ftp://x.example").is_err());
+        assert!(validate_webhook_url("javascript:alert(1)").is_err());
+        assert!(validate_webhook_url("a.example/hook").is_err());
+    }
+
+    #[test]
+    fn validate_webhook_url_caps_length() {
+        let long = format!("https://{}.example/hook", "a".repeat(3000));
+        assert!(validate_webhook_url(&long).is_err());
+    }
+
+    #[test]
+    fn validate_webhook_url_trims_whitespace() {
+        let ok = validate_webhook_url("  https://a.example/hook  ")
+            .expect("trimmed url is valid");
+        assert_eq!(ok, "https://a.example/hook");
+    }
+
+    /// 2026-04-21 journey smoke — the tenant portal's "Recent
+    /// fills" card was returning []. Controller's
+    /// `get_client_fills` read `DashboardState.clients[cid].recent_fills`
+    /// which is never populated in distributed mode (fills live
+    /// on agents). Fix fans out via `client_metrics` topic; each
+    /// reply row now carries a `recent_fills` array, which we
+    /// flatten + sort by timestamp. The helper below is a pure
+    /// slice of that merge logic — given a synthetic fleet
+    /// metrics payload with embedded fills, it must produce a
+    /// deduped newest-first list.
+    #[test]
+    fn collect_fills_merges_and_sorts_fleet_rows() {
+        let rows = vec![
+            serde_json::json!({
+                "recent_fills": [
+                    {
+                        "timestamp": "2026-04-21T19:00:00Z",
+                        "symbol": "BTCUSDT",
+                        "client_id": "acme",
+                        "venue": "binance",
+                        "side": "Buy",
+                        "price": "50000",
+                        "qty": "0.001",
+                        "is_maker": true,
+                        "fee": "0.05",
+                        "nbbo_bid": "50000",
+                        "nbbo_ask": "50001",
+                        "slippage_bps": "0"
+                    },
+                    {
+                        "timestamp": "2026-04-21T19:05:00Z",
+                        "symbol": "BTCUSDT",
+                        "client_id": "acme",
+                        "venue": "binance",
+                        "side": "Sell",
+                        "price": "50100",
+                        "qty": "0.001",
+                        "is_maker": true,
+                        "fee": "0.05",
+                        "nbbo_bid": "50099",
+                        "nbbo_ask": "50100",
+                        "slippage_bps": "0"
+                    }
+                ]
+            }),
+        ];
+        let mut out: Vec<FillRecord> = rows
+            .iter()
+            .flat_map(|row| {
+                row.get("recent_fills")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter_map(|raw| serde_json::from_value::<FillRecord>(raw).ok())
+            .collect();
+        out.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].side, "Sell", "newest first");
+        assert_eq!(out[1].side, "Buy");
+    }
 }

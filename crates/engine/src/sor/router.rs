@@ -57,6 +57,13 @@ use crate::sor::venue_state::VenueSnapshot;
 pub struct RouteLeg {
     /// Venue tag the dispatcher should route to.
     pub venue: VenueId,
+    /// Product-type discriminator. `None` → any product on
+    /// that venue (legacy single-product-per-venue deploys);
+    /// `Some(p)` → dispatch ONLY to the connector whose
+    /// `product()` equals `p`. Lets a single process carry
+    /// Binance spot AND Binance linear perp connectors
+    /// without `connector_for` picking the wrong one.
+    pub venue_product: Option<mm_exchange_core::connector::VenueProduct>,
     /// Signed qty to dispatch — always positive; the side
     /// is carried separately on [`RouteDecision::target_side`].
     pub qty: Decimal,
@@ -181,6 +188,7 @@ impl GreedyRouter {
             }
             legs.push(RouteLeg {
                 venue: snap.venue,
+                venue_product: None,
                 qty: take,
                 is_taker,
                 expected_cost_bps: cost.effective_cost_bps,
@@ -374,6 +382,7 @@ impl ConvexRouter {
             let avg_cost = *fee + *slip * take / Decimal::from(2u32);
             legs.push(RouteLeg {
                 venue: snap.venue,
+                venue_product: None,
                 qty: take,
                 is_taker,
                 expected_cost_bps: avg_cost,
@@ -641,12 +650,14 @@ mod tests {
             legs: vec![
                 RouteLeg {
                     venue: VenueId::Binance,
+                    venue_product: None,
                     qty: dec!(2),
                     is_taker: true,
                     expected_cost_bps: dec!(5),
                 },
                 RouteLeg {
                     venue: VenueId::Bybit,
+                    venue_product: None,
                     qty: dec!(1),
                     is_taker: true,
                     expected_cost_bps: dec!(10),

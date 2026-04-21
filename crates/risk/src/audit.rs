@@ -325,6 +325,23 @@ pub enum AuditEventType {
     /// offending kind(s) so the regulator can confirm the gate
     /// actually fired rather than being silently suppressed.
     StrategyGraphDeployRejected,
+    /// 23-P2-3 — an operator live-patched a single node's config
+    /// on an already-deployed graph. Emitted in lieu of a full
+    /// `StrategyGraphDeployed` row because the swap is scoped to
+    /// one node; `detail` carries
+    /// `graph={name} from_hash={sha256} to_hash={sha256}
+    ///  node_id={uuid} operator={op}` so regulators can trace
+    /// parameter drift as finely as full redeploys.
+    StrategyGraphNodePatched,
+    /// 23-P2-2 — a restricted graph deploy was ACCEPTED: env gate
+    /// was set AND the operator provided the explicit ack token.
+    /// Emitted in addition to `StrategyGraphDeployed` so compliance
+    /// can filter pentest deploys out of the audit log with a
+    /// single grep. `detail` carries
+    /// `graph={name} hash={sha256} operator={op}
+    ///  restricted_nodes={kind1,kind2,…}` so a regulator knows
+    /// exactly which pentest nodes the operator opted in to.
+    StrategyGraphRestrictedDeployAcked,
     /// A sink node (`Out.Flatten`, `Out.KillEscalate`, `Out.SpreadMult`,
     /// `Out.SizeMult`) fired on a tick of a live graph. `detail`
     /// carries `action=... hash={sha256}` so the regulator can trace
@@ -403,6 +420,17 @@ pub enum AuditEventType {
     /// advisory; the event exists to mark the operator's intent
     /// for post-incident review.
     LogoutSucceeded,
+    /// Wave H1 — admin minted a one-shot password-reset token
+    /// for a user. `detail` carries `target=<user_id>,by=<admin>`
+    /// so compliance can review which admin reset which account
+    /// and when. The reset URL itself is NOT audited since it
+    /// carries a signed credential.
+    PasswordResetIssued,
+    /// Wave H1 — a password-reset token was consumed and the
+    /// user's password was updated. `detail` carries
+    /// `user_id=…,ip=…`. The admin who minted the token is
+    /// recorded in the paired `PasswordResetIssued` event.
+    PasswordResetCompleted,
 
     // Epic 40.3 — perp funding accrual.
     /// A funding-settlement instant booked a `realised_delta`
@@ -743,6 +771,72 @@ impl AuditLog {
         });
     }
 
+    /// 23-P2-3 — log a live node-config patch on an already-deployed
+    /// graph. Emits a dedicated row so regulators see parameter
+    /// tweaks with the same granularity as full deploys. `node_id`
+    /// is the UUID the operator targeted; `from_hash` + `to_hash`
+    /// let a downstream exporter rebuild the exact before/after
+    /// graph from history.
+    pub fn strategy_graph_node_patched(
+        &self,
+        graph_name: &str,
+        from_hash: &str,
+        to_hash: &str,
+        node_id: &str,
+        operator: &str,
+    ) {
+        let detail = format!(
+            "graph={graph_name} from_hash={from_hash} to_hash={to_hash} \
+             node_id={node_id} operator={operator}"
+        );
+        self.log(AuditEvent {
+            seq: 0,
+            timestamp: Utc::now(),
+            event_type: AuditEventType::StrategyGraphNodePatched,
+            symbol: String::new(),
+            client_id: None,
+            order_id: None,
+            side: None,
+            price: None,
+            qty: None,
+            detail: Some(detail),
+            prev_hash: None,
+        });
+    }
+
+    /// 23-P2-2 — log an accepted restricted-node deploy. Fires
+    /// once per successful deploy that contained pentest-only
+    /// node kinds, after the env gate + operator ack both
+    /// passed. Emitted alongside `strategy_graph_deployed` so
+    /// regulators can filter pentest activations from the audit
+    /// log with a single grep. `restricted_nodes` is the list of
+    /// node kinds that triggered the gate.
+    pub fn strategy_graph_restricted_deploy_acked(
+        &self,
+        graph_name: &str,
+        hash: &str,
+        operator: &str,
+        restricted_nodes: &[String],
+    ) {
+        let detail = format!(
+            "graph={graph_name} hash={hash} operator={operator} restricted_nodes={}",
+            restricted_nodes.join(",")
+        );
+        self.log(AuditEvent {
+            seq: 0,
+            timestamp: Utc::now(),
+            event_type: AuditEventType::StrategyGraphRestrictedDeployAcked,
+            symbol: String::new(),
+            client_id: None,
+            order_id: None,
+            side: None,
+            price: None,
+            qty: None,
+            detail: Some(detail),
+            prev_hash: None,
+        });
+    }
+
     /// Convenience: log a refused deploy. Fires when a graph
     /// references a restricted node kind (pentest-only strategies)
     /// and the runtime was not started with the explicit opt-in.
@@ -968,11 +1062,23 @@ fn is_critical(ty: &AuditEventType) -> bool {
             | AuditEventType::StrategyGraphDeployed
             | AuditEventType::StrategyGraphRolledBack
             | AuditEventType::StrategyGraphDeployRejected
+            | AuditEventType::StrategyGraphRestrictedDeployAcked
+            | AuditEventType::StrategyGraphNodePatched
             | AuditEventType::StrategyGraphSinkFired
             // Surveillance alerts are regulator-visible signals the
             // MM detected itself as the suspect actor — get them on
             // disk before the next page of the log rotates.
             | AuditEventType::SurveillanceAlert
+            // Auth events — credential-stuffing / account-recovery
+            // traces must survive an immediate process kill.
+            // Login attempts come in at human cadence (< 1/s in
+            // practice) so fsync cost is negligible vs. the cost
+            // of losing the attack-in-progress trail in a crash.
+            | AuditEventType::LoginSucceeded
+            | AuditEventType::LoginFailed
+            | AuditEventType::LogoutSucceeded
+            | AuditEventType::PasswordResetIssued
+            | AuditEventType::PasswordResetCompleted
     )
 }
 
@@ -1173,6 +1279,62 @@ mod chain_verify_tests {
         let report = verify_chain(&p).expect("missing = empty");
         assert_eq!(report.rows_checked, 0);
         assert_eq!(report.last_hash, None);
+    }
+
+    /// 23-P2-2 — restricted-deploy ack event writes with the
+    /// dedicated event type + restricted-node list in the detail
+    /// field. Regulators can filter pentest deploys with a single
+    /// grep on `StrategyGraphRestrictedDeployAcked`.
+    #[test]
+    fn restricted_deploy_acked_writes_with_node_list() {
+        let p = tmp_audit_path("restricted_acked");
+        {
+            let log = AuditLog::new(&p).expect("open audit");
+            log.strategy_graph_restricted_deploy_acked(
+                "pentest-spoof",
+                "abc123",
+                "operator-1",
+                &["Strategy.SpoofMaker".to_string(), "Strategy.WashTrader".to_string()],
+            );
+            drop(log);
+        }
+        let content = std::fs::read_to_string(&p).unwrap();
+        // Serde renames enum variants with snake_case — the audit
+        // log writes `strategy_graph_restricted_deploy_acked`.
+        assert!(content.contains("strategy_graph_restricted_deploy_acked"));
+        assert!(content.contains("Strategy.SpoofMaker"));
+        assert!(content.contains("Strategy.WashTrader"));
+        assert!(content.contains("operator-1"));
+        // Ensure chain-verify still passes end-to-end.
+        let report = verify_chain(&p).expect("chain verifies");
+        assert_eq!(report.rows_checked, 1);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 23-P2-3 — node-patch event captures both hashes + node id
+    /// so a regulator can reconstruct the before/after graph by
+    /// pulling from history.
+    #[test]
+    fn node_patched_writes_both_hashes_and_node_id() {
+        let p = tmp_audit_path("node_patched");
+        {
+            let log = AuditLog::new(&p).expect("open audit");
+            log.strategy_graph_node_patched(
+                "mm-graph",
+                "hash_before",
+                "hash_after",
+                "node-uuid-123",
+                "operator-1",
+            );
+            drop(log);
+        }
+        let content = std::fs::read_to_string(&p).unwrap();
+        assert!(content.contains("strategy_graph_node_patched"));
+        assert!(content.contains("hash_before"));
+        assert!(content.contains("hash_after"));
+        assert!(content.contains("node-uuid-123"));
+        assert!(content.contains("operator-1"));
+        let _ = std::fs::remove_file(&p);
     }
 
     /// Malformed JSON on row N points at row N.

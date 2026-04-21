@@ -22,8 +22,46 @@
 
   async function refresh() {
     try {
-      const data = await api.getJson('/api/v1/funding-arb/pairs')
-      pairs = data?.pairs ?? []
+      const fleet = await api.getJson('/api/v1/fleet')
+      const fetches = []
+      for (const a of Array.isArray(fleet) ? fleet : []) {
+        for (const d of a.deployments || []) {
+          if (!d.running) continue
+          const path = `/api/v1/agents/${encodeURIComponent(a.agent_id)}`
+            + `/deployments/${encodeURIComponent(d.deployment_id)}`
+            + `/details/funding_arb_pairs`
+          fetches.push(
+            api.getJson(path)
+              .then(resp => resp.payload?.pairs || [])
+              .catch(() => []),
+          )
+        }
+      }
+      // Dedup by pair key — same pair may appear on two
+      // deployments (primary on one agent, hedge on another).
+      // Max counters across copies and keep the latest-event
+      // record.
+      const all = (await Promise.all(fetches)).flat()
+      const byPair = new Map()
+      for (const p of all) {
+        const key = p.pair
+        const prev = byPair.get(key)
+        if (!prev) {
+          byPair.set(key, { ...p })
+          continue
+        }
+        const m = { ...prev }
+        for (const k of ['entered', 'exited', 'hold', 'taker_rejected', 'pair_break', 'pair_break_uncompensated', 'input_unavailable']) {
+          m[k] = Math.max(prev[k] || 0, p[k] || 0)
+        }
+        if ((p.last_event_at_ms || 0) > (prev.last_event_at_ms || 0)) {
+          m.last_event_at_ms = p.last_event_at_ms
+          m.last_event = p.last_event
+          m.last_reason = p.last_reason
+        }
+        byPair.set(key, m)
+      }
+      pairs = Array.from(byPair.values())
       error = null
       lastFetch = new Date()
       loading = false

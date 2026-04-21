@@ -1,0 +1,218 @@
+# Base values for the mm Helm chart. Override per environment
+# via `-f values-dev.yaml` / `-f values-prod.yaml` or direct
+# --set flags. Every field is documented inline so operators
+# can tune without digging into templates.
+
+# ── Image ──────────────────────────────────────────────────
+image:
+  repository: ghcr.io/your-org/market-maker
+  tag: "0.4.0"
+  pullPolicy: IfNotPresent
+# Image pull secrets — reference to an existing Secret of type
+# `kubernetes.io/dockerconfigjson`. Most registries don't need this.
+imagePullSecrets: []
+
+# ── Release identity ──────────────────────────────────────
+# Helm release name defaults to `.Release.Name`; override the
+# label prefix here if you run multiple releases in the same
+# namespace (e.g. `symbol-btcusdt`, `symbol-ethusdt`).
+nameOverride: ""
+fullnameOverride: ""
+
+# ── Replicas (danger zone) ────────────────────────────────
+# NEVER set > 1 per symbol. Two pods on the same symbol double-
+# book the venue. StatefulSet isn't used here because the chart
+# is single-instance by contract.
+replicaCount: 1
+
+# ── Engine env ────────────────────────────────────────────
+# MM_CONFIG points at the ConfigMap mount (rendered below).
+# MM_MODE flips between "live" / "paper" / "smoke".
+env:
+  MM_CONFIG: /etc/mm/default.toml
+  MM_MODE: paper
+  RUST_LOG: info,mm_engine=info,mm_exchange_binance=warn
+  # Optional: pin the dashboard's CORS origin list. Empty string
+  # disables CORS entirely (same-origin fetches only).
+  MM_DASHBOARD_CORS_ORIGINS: ""
+  # Observability — leave empty to disable. Sentry hook is
+  # compiled in unconditionally; OTel requires `--features otel`
+  # at build time. See docs/guides/obs-sanity.md for the smoke
+  # procedure.
+  MM_SENTRY_DSN: ""
+  OTEL_EXPORTER_OTLP_ENDPOINT: ""
+
+# ── Secrets (credentials) ─────────────────────────────────
+# Two modes supported:
+#   1. `create: true`  — chart materialises a Secret from
+#      `stringData` below. Convenient for smoke runs but NEVER
+#      for production (secrets end up in Helm history + tiller
+#      backing store).
+#   2. `create: false` — chart references an existing Secret by
+#      `existingSecretName`. Use with SealedSecrets / SOPS /
+#      External Secrets Operator / Vault Agent.
+secret:
+  create: false
+  existingSecretName: mm-secrets
+  stringData:
+    MM_BINANCE_API_KEY: ""
+    MM_BINANCE_API_SECRET: ""
+    MM_BYBIT_API_KEY: ""
+    MM_BYBIT_API_SECRET: ""
+    MM_HL_PRIVATE_KEY: ""
+    MM_READ_KEY: ""
+    MM_READ_SECRET: ""
+    MM_AUTH_SECRET: ""         # REQUIRED in live mode — 32-byte random
+    MM_CHECKPOINT_SECRET: ""   # REQUIRED — 32-byte random
+    MM_TELEGRAM_TOKEN: ""
+    MM_TELEGRAM_CHAT: ""
+    # Optional — Sentry DSN sits in the secret so it's not
+    # visible in the ConfigMap / values-prod.yaml. Empty →
+    # sentry hook stays a no-op.
+    MM_SENTRY_DSN: ""
+
+# ── ConfigMap (TOML) ──────────────────────────────────────
+# Either inline the TOML body OR reference an existing ConfigMap.
+config:
+  create: true
+  existingConfigMapName: ""
+  # Minimal inline body. Copy from the project's config/default.toml
+  # and trim to only the sections your deployment needs.
+  body: |
+    symbols = ["BTCUSDT"]
+    mode = "paper"
+    dashboard_port = 9090
+    checkpoint_path = "/var/lib/mm/checkpoint.json"
+    log_file = ""
+
+    [exchange]
+    exchange_type = "binance"
+
+    [market_maker]
+    strategy = "avellaneda_stoikov"
+    gamma = "0.1"
+    kappa = "1.5"
+    sigma = "0.02"
+    num_levels = 3
+    order_size = "0.001"
+    refresh_interval_ms = 500
+    min_spread_bps = "5"
+    max_distance_bps = "100"
+
+    [risk]
+    max_inventory = "0.1"
+    max_exposure_quote = "10000"
+    max_drawdown_quote = "500"
+
+    [kill_switch]
+    daily_loss_limit = "1000"
+    daily_loss_warning = "500"
+
+    [sla]
+    max_spread_bps = "100"
+    min_depth_quote = "2000"
+    min_uptime_pct = "95"
+
+# ── Persistent volume (checkpoint + audit) ────────────────
+# RWO because there's exactly one pod. Size is generous for a
+# single-symbol engine — bump if you turn on record_market_data.
+persistence:
+  enabled: true
+  storageClass: ""      # empty = cluster default
+  accessMode: ReadWriteOnce
+  size: 20Gi
+  mountPath: /var/lib/mm
+  # Set to an existing PVC to reuse (e.g. after a chart reinstall
+  # that should preserve the checkpoint).
+  existingClaim: ""
+
+# ── Service ───────────────────────────────────────────────
+service:
+  type: ClusterIP
+  port: 9090
+  # Override the name for operator dashboards that hardcode a
+  # service name (keep blank otherwise).
+  nameOverride: ""
+  annotations: {}
+
+# ── Health probes ─────────────────────────────────────────
+# Startup = 90s cold-start window; liveness = hard failure only;
+# readiness gates the Service until first book snapshot. Override
+# periodSeconds/failureThreshold if your connector warms up
+# faster / slower.
+probes:
+  startup:
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    failureThreshold: 18
+  readiness:
+    periodSeconds: 10
+    failureThreshold: 3
+  liveness:
+    periodSeconds: 30
+    failureThreshold: 3
+
+# ── Resources ─────────────────────────────────────────────
+# Baseline sized for a single-symbol Avellaneda engine. Scale up
+# memory when you enable the onchain crate + surveillance stack.
+resources:
+  requests:
+    cpu: "500m"
+    memory: "512Mi"
+  limits:
+    cpu: "2"
+    memory: "2Gi"
+
+# ── Security context ──────────────────────────────────────
+# Non-root, read-only root FS, no capabilities. The /var/lib/mm
+# PVC mount provides the only writable path. Don't loosen these
+# without a concrete reason.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+
+# Pod-level overrides (fsGroup etc.) — usually left empty.
+podSecurityContext: {}
+
+# ── Scheduling hints ──────────────────────────────────────
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+
+# ── Grace period ──────────────────────────────────────────
+# Matches the systemd unit's graceful-shutdown window (30s
+# cancel-all + 15s buffer). Don't drop below 30s — the engine
+# needs time to cancel live orders cleanly.
+terminationGracePeriodSeconds: 45
+
+# ── PodDisruptionBudget ───────────────────────────────────
+# minAvailable: 1 keeps the engine from being evicted on a
+# voluntary disruption (node drain, cluster upgrade) without
+# operator acknowledgement.
+pdb:
+  enabled: true
+  minAvailable: 1
+
+# ── ServiceMonitor (Prometheus Operator) ──────────────────
+# Toggle off when running with a raw Prometheus (docker-compose
+# stack). When the Prometheus Operator CRDs aren't installed the
+# template emits nothing.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  # Labels Prometheus selectors match on — adjust to your stack's
+  # release label (`prometheus` / `kube-prometheus-stack` / etc.).
+  labels:
+    release: prometheus
+  # Bearer-token file path if /metrics is auth-gated. Leave empty
+  # for unauthenticated scrape (never on a public interface).
+  bearerTokenFile: ""
+
+# ── Pod annotations + labels ─────────────────────────────
+podAnnotations: {}
+podLabels: {}

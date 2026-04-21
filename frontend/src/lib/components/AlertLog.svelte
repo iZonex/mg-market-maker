@@ -1,18 +1,65 @@
 <script>
+  /*
+   * AlertLog — shows alerts from both sources:
+   *   - Local ws DashboardState (single-engine fallback).
+   *   - Wave D4 fleet dedup endpoint `/api/v1/alerts/fleet` —
+   *     one row per collapsed `(severity, title)` group with
+   *     occurrence count + distinct agents. Preferred when
+   *     `auth` prop is provided so we can hit HTTP.
+   */
   import Icon from './Icon.svelte'
-  let { data } = $props()
-  const alerts = $derived(data.state.alerts || [])
+  import { createApiClient } from '../api.svelte.js'
+
+  let { data = null, auth = null } = $props()
+  const api = auth ? createApiClient(auth) : null
+
+  let fleetAlerts = $state([])
+
+  async function refreshFleet() {
+    if (!api) return
+    try {
+      const r = await api.getJson('/api/v1/alerts/fleet')
+      fleetAlerts = Array.isArray(r) ? r : []
+    } catch {
+      fleetAlerts = []
+    }
+  }
+
+  $effect(() => {
+    refreshFleet()
+    if (!api) return
+    const iv = setInterval(refreshFleet, 5000)
+    return () => clearInterval(iv)
+  })
+
+  // Prefer the fleet dedup feed when available + non-empty.
+  // Falls back to ws local state so single-engine tests still
+  // render something.
+  const alerts = $derived.by(() => {
+    if (fleetAlerts.length > 0) {
+      return fleetAlerts.map(a => ({
+        title: a.title,
+        message: a.message,
+        severity: a.severity,
+        symbol: a.symbol,
+        timestamp: new Date(a.ts_ms).toISOString(),
+        agents: a.agents || [],
+        count: a.count || 1,
+      }))
+    }
+    return (data?.state?.alerts || []).map(a => ({ ...a, agents: [], count: 1 }))
+  })
 
   function sev(severity) {
     const s = (severity || '').toLowerCase()
     if (s === 'critical') return 'neg'
-    if (s === 'warning')  return 'warn'
+    if (s === 'warning' || s === 'high')  return 'warn'
     return 'info'
   }
   function icon(severity) {
     const s = (severity || '').toLowerCase()
     if (s === 'critical') return 'alert'
-    if (s === 'warning')  return 'bolt'
+    if (s === 'warning' || s === 'high')  return 'bolt'
     return 'info'
   }
   function fmtTime(t) {
@@ -35,14 +82,24 @@
         <div class="alert-body">
           <div class="alert-head">
             <span class="alert-title">{a.title}</span>
+            {#if a.count > 1}
+              <span class="count-chip" title={`${a.count} occurrences in dedup window from ${a.agents.length} agent(s)`}>
+                ×{a.count}
+              </span>
+            {/if}
             <span class="alert-time num">{fmtTime(a.timestamp)}</span>
           </div>
           {#if a.message}
             <div class="alert-msg">{a.message}</div>
           {/if}
-          {#if a.symbol}
-            <span class="chip">{a.symbol}</span>
-          {/if}
+          <div class="alert-tags">
+            {#if a.symbol}
+              <span class="chip">{a.symbol}</span>
+            {/if}
+            {#each a.agents as ag (ag)}
+              <span class="chip mono">{ag}</span>
+            {/each}
+          </div>
         </div>
       </div>
     {/each}
@@ -104,4 +161,12 @@
     color: var(--fg-secondary);
     line-height: var(--lh-snug);
   }
+  .alert-tags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 2px; }
+  .count-chip {
+    font-size: 10px; font-family: var(--font-mono);
+    padding: 1px 6px; border-radius: var(--r-sm);
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    color: var(--accent);
+  }
+  .mono { font-family: var(--font-mono); }
 </style>

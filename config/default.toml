@@ -126,3 +126,153 @@ autotune_enabled = true
 enabled = false                 # periodic venue scanning for new listings
 scan_interval_secs = 300        # scan every 5 minutes
 alert_on_discovery = true       # Telegram alert on new/removed symbols
+
+# ─── Optional feature configs ─────────────────────────────────
+# Sections below are OFF by default (either the block is absent,
+# or `enabled = false`). Uncomment and tune per deployment. Every
+# section is validated at boot — bad values hard-fail in live mode
+# and warn-only in paper mode.
+
+# [protections]
+# Per-pair guard stack (22W-1). Any sub-block can appear on its
+# own; a missing block disables that guard. Lock semantics:
+# `refresh_quotes` short-circuits while the pair is locked — no
+# new quotes placed, existing orders cancel via the normal
+# pathway when the operator escalates.
+#
+# [protections.stoploss_guard]
+# window_secs  = 600             # rolling window to count stop events in
+# max_stops    = 3               # ≥ this many stops in the window → lock
+# lockout_secs = 1800            # how long the lockout lasts after trip
+#
+# [protections.cooldown]
+# duration_secs = 120            # mandatory pause after every stop event
+#
+# [protections.max_drawdown]
+# max_drawdown_quote = "250"     # peak-to-trough in quote asset
+# lockout_secs       = 3600
+# recovery_fraction  = "0.95"    # early unlock at 95% of peak recovered
+#
+# [protections.low_profit_pairs]
+# window_secs    = 86400         # 24h rolling window
+# min_pnl_quote  = "50"          # demote below this
+# min_trades     = 30
+# lockout_secs   = 21600         # 6h sideline
+
+# [portfolio_var]
+# Portfolio-wide parametric Gaussian VaR guard (22W-2). Engine
+# samples PnL every 30 s into a rolling `max_samples` window and
+# trips kill-switch L2 when VaR crosses `var_limit_*`. Absent
+# limits → guard is observability-only.
+#
+# var_limit_95 = "500"           # 1-tail 95% VaR cap in quote asset
+# var_limit_99 = "1000"          # 1-tail 99% VaR cap
+# max_samples  = 1440            # 12h at 30s cadence
+# min_samples  = 30              # warm-up threshold
+
+# [paper_fill]
+# Paper-mode fill simulation (`ProbabilisticFiller`). Takes
+# effect ONLY when `mode = "paper"`. Without this section paper
+# mode fills every crossing trade deterministically — useful for
+# unit/smoke, misleading for capacity planning. Seed is derived
+# from the symbol so runs are reproducible.
+#
+# prob_fill_on_touch = "0.6"     # fraction of touches that actually fill
+# prob_slippage      = "0.05"    # chance of adverse slippage on a fill
+# slippage_bps       = "1"       # slippage magnitude in bps of quote price
+# latency_ms         = 5         # simulated round-trip latency
+
+# [ab_split]
+# A/B split parameter tests (23-P2-1). Engine applies the active
+# variant's multipliers to `gamma`/`spread`/`order_size` every
+# tick and tracks per-variant PnL. Pick winner via `/api/v1/...`
+# (see operations.md). Modes: "time_based" alternates every
+# `period_ticks`; "symbol_based" partitions by symbol hash.
+#
+# mode         = "time_based"
+# period_ticks = 60
+#
+# [ab_split.variant_a]
+# name        = "baseline"
+# gamma_mult  = "1"
+# spread_mult = "1"
+# size_mult   = "1"
+#
+# [ab_split.variant_b]
+# name        = "tighter"
+# gamma_mult  = "0.7"
+# spread_mult = "0.8"
+# size_mult   = "1.2"
+
+# [execution]
+# Kill-switch L4 flatten execution algo (22A-3). Replaces the
+# hardcoded TWAP 60 s / 10 slices / 5 bps defaults. Bigger
+# inventory or thinner books typically want duration 300-1800 s.
+#
+# algo               = "twap"
+# duration_secs      = 300
+# num_slices         = 20
+# aggressiveness_bps = "5"        # 0 = at mid, 10+ = passive limit
+
+# [margin]
+# Perp margin guard (Epic 40.4). Polls `account_margin_info()`
+# every `refresh_interval_secs` and escalates kill switch when
+# `margin_ratio` crosses a threshold. `reduce_ratio` triggers
+# proactive reduce-only IoC slices (Phase IV P0). Per-symbol
+# overrides go under `[margin.per_symbol.BTCUSDT]`.
+#
+# refresh_interval_secs            = 5
+# widen_ratio                      = "0.50"
+# reduce_ratio                     = "0.65"   # proactive reduce here
+# stop_ratio                       = "0.80"
+# cancel_ratio                     = "0.90"
+# max_stale_secs                   = 30
+# default_mode                     = "isolated"  # or "cross"
+# default_leverage                 = 5
+# default_maintenance_margin_rate  = "0.005"     # fallback MMR
+#
+# [margin.per_symbol.BTCUSDT]
+# mode     = "isolated"
+# leverage = 10
+
+# [funding_arb]
+# Funding-arb driver (Epic 2). Atomic spot-maker + perp-taker
+# pair dispatch when annualised funding rate ≥ `min_rate_annual_pct`.
+# Pair-break fires a compensating reduce-only market order (see
+# docs/guides/funding-arb.md for the full flow). Configure hedge
+# venue via `[hedge]`.
+#
+# enabled               = false
+# tick_interval_secs    = 60
+# min_rate_annual_pct   = "10"
+# max_position          = "0.1"
+# max_basis_bps         = "50"
+
+# [stat_arb]
+# Cointegrated pair driver (Epic B). Regresses Y=α+βX, runs a
+# Kalman filter on (α,β), trades z-score reversion. Y/X must both
+# feed the engine (primary + hedge connectors). Pair screener in
+# `[pair_screener]` finds cointegrated pairs offline; operators
+# promote the ones they trust into this section.
+#
+# enabled                 = false
+# tick_interval_secs      = 60
+# y_symbol                = "ETHUSDT"
+# x_symbol                = "SOLUSDT"
+# zscore_window           = 120
+# zscore_entry            = "2"
+# zscore_exit             = "0.5"
+# kalman_transition_var   = "0.000001"
+# kalman_observation_var  = "0.001"
+# leg_notional_usd        = "1000"
+
+# [xemm]
+# XEMM cross-exchange executor (22W-5). Takes effect when
+# `strategy = "cross_exchange"` AND a hedge connector is
+# configured. `max_slippage_bps` rejects a hedge fill that would
+# violate the band; `min_edge_bps` flags (does NOT reject) thin
+# crosses.
+#
+# enabled         = false
+# max_slippage_bps = "20"
+# min_edge_bps     = "0"

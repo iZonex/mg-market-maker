@@ -1,0 +1,107 @@
+# Binance USDⓈ-M futures paper-trading config. Mirrors the
+# layout of binance-paper.toml but targets the futures connector
+# (`product = "linear_perp"`). Used alongside bybit-perp-paper
+# + binance-paper in the 3-venue smoke run — see
+# docs/guides/paper-smoke-two-venue.md for the observation
+# checklist.
+
+symbols = ["BTCUSDT"]
+mode = "paper"
+dashboard_port = 9091                                 # distinct from spot/bybit
+checkpoint_path = "data/checkpoint-binance-perp.json"
+log_file = ""
+
+[exchange]
+exchange_type = "binance"
+# product selects the futures connector. Without this field the
+# engine defaults to spot — verified against
+# mm-common::config::ProductType::Spot default.
+product = "linear_perp"
+rest_url = "https://fapi.binance.com"
+ws_url = "wss://fstream.binance.com"
+
+[market_maker]
+strategy = "avellaneda_stoikov"
+
+# Conservative perp defaults. Real γ / κ / σ want a calibration
+# pass against live futures data (mm-calibrate) — start loose so
+# the engine doesn't over-cross on the first feed minute.
+gamma = "0.12"
+kappa = "30"
+sigma = "0.0001"
+time_horizon_secs = 300
+
+num_levels = 3
+order_size = "0.001"
+refresh_interval_ms = 500
+min_spread_bps = "4"
+max_distance_bps = "100"
+
+momentum_enabled = true
+momentum_window = 200
+market_resilience_enabled = true
+otr_enabled = true
+hma_enabled = true
+hma_window = 9
+
+user_stream_enabled = false
+inventory_drift_tolerance = "0.00005"
+inventory_drift_auto_correct = false
+adaptive_enabled = true
+apply_pair_class_template = true
+
+[risk]
+# Perp caps sized for observability — deliberately tiny so a
+# rogue live path (shouldn't happen under paper gate) would
+# hit the brake fast.
+max_inventory = "0.005"
+max_exposure_quote = "100"
+max_drawdown_quote = "10"
+inventory_skew_factor = "1.0"
+max_spread_bps = "200"
+stale_book_timeout_secs = 10
+max_order_size = "0.002"
+max_daily_volume_quote = "500"
+max_hourly_volume_quote = "150"
+
+[kill_switch]
+daily_loss_limit = "100"
+daily_loss_warning = "50"
+max_position_value = "2000"
+max_message_rate = 60
+max_consecutive_errors = 10
+
+[sla]
+max_spread_bps = "100"
+min_depth_quote = "5000"
+min_uptime_pct = "95"
+two_sided_required = true
+max_requote_secs = 5
+min_order_rest_secs = 3
+
+[toxicity]
+vpin_bucket_size = "100000"
+vpin_num_buckets = 50
+vpin_threshold = "0.7"
+kyle_window = 100
+adverse_selection_lookback_ms = 3000
+autotune_enabled = true
+
+[listing_sniper]
+enabled = false
+scan_interval_secs = 300
+alert_on_discovery = true
+
+# Perp-only — margin guard. Tripping thresholds are deliberately
+# aggressive for the smoke run so the operator sees the guard
+# escalate in real time when the (paper) position grows.
+[margin]
+refresh_interval_secs = 5
+widen_ratio = "0.50"
+reduce_ratio = "0.65"      # PERP-1 proactive reduce-only kicks here
+stop_ratio = "0.80"
+cancel_ratio = "0.90"
+max_stale_secs = 30
+default_mode = "isolated"
+default_leverage = 5
+default_maintenance_margin_rate = "0.005"

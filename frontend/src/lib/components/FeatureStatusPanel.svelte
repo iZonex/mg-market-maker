@@ -1,162 +1,102 @@
 <script>
   /*
-   * Feature status panel (UX-3).
+   * Feature status panel — drilldown edition.
    *
-   * One-stop board for every engine-level feature: shows
-   * current state, splits features into "runtime-togglable"
-   * (ConfigOverride wire is in place) and "config-only"
-   * (reads `config.toml` at startup — requires restart to
-   * flip). Runtime toggles fire through the existing
-   * `/api/admin/config/{symbol}` path used by `ParamTuner`;
-   * config-only features are read-only status rows with a
-   * breadcrumb to the TOML key so the operator knows where
-   * to look.
+   * Shape contract:
+   *   { row: DeploymentStateRow, onPatch: (patch) => Promise, canControl: bool }
    *
-   * This is deliberately honest — surfacing a fake toggle
-   * on a feature that doesn't listen to it would strand
-   * operators. Stage-2b wave can wire ConfigOverride paths
-   * for the remaining features one by one.
+   * Reads the `features` map + `variables` map off the row. Runtime
+   * toggles shape a variables PATCH (e.g. `momentum_enabled: true`)
+   * that the agent's `translate_variable_override` maps to the
+   * matching `ConfigOverride` variant. Unknown keys (config-only
+   * features, TOML-driven toggles) render as status rows with a
+   * breadcrumb — operators see which flags are truly runtime-
+   * togglable vs which require a redeploy.
    */
 
-  import { createApiClient } from '../api.svelte.js'
   import Icon from './Icon.svelte'
 
-  let { data, auth } = $props()
-  const api = createApiClient(auth)
+  let { row, onPatch, canControl = false } = $props()
 
-  const s = $derived(data.state)
-  const sym = $derived(s.activeSymbol || s.symbols[0] || '')
-  const d = $derived(s.data[sym] || {})
-  const tunable = $derived(d.tunable_config || {})
+  const features = $derived(row?.features || {})
+  const variables = $derived(row?.variables || {})
 
-  let busy = $state('')
-  let status = $state('')
+  let busyKey = $state('')
+  let statusLine = $state('')
 
-  async function toggle(field, value) {
-    busy = field
-    status = ''
+  async function toggle(varKey, value) {
+    busyKey = varKey
+    statusLine = ''
     try {
-      await api.postJson(`/api/admin/config/${encodeURIComponent(sym)}`, {
-        field,
-        value: String(value),
-      })
-      status = `${field} set to ${value}`
+      await onPatch({ [varKey]: value })
+      statusLine = `${varKey} → ${value}`
     } catch (e) {
-      status = `Error: ${e.message}`
+      statusLine = `Error: ${e.message || e}`
     } finally {
-      busy = ''
+      busyKey = ''
     }
   }
 
-  // Runtime-togglable features — these map to
-  // `ConfigOverride::*` variants the engine already honors.
+  // Boolean helper — features map wins over variables map for
+  // the current state because the agent mirrors `variables.*_enabled`
+  // keys into `features` exactly so the dashboard has one source
+  // of truth. Variables fallback is in case the feature didn't
+  // make it into the harvested map.
+  function readBool(varKey) {
+    if (typeof features[varKey] === 'boolean') return features[varKey]
+    const v = variables[varKey]
+    if (typeof v === 'boolean') return v
+    return false
+  }
+
+  // Runtime-togglable features — variable keys recognised by the
+  // agent's `translate_variable_override()`. Keep in sync with the
+  // match arms in `crates/agent/src/registry.rs`.
   const RUNTIME_TOGGLES = [
     {
-      field: 'MomentumEnabled',
+      varKey: 'momentum_enabled',
       label: 'Momentum alpha',
       hint: 'Book imbalance + trade-flow + microprice signal blend.',
-      read: 'momentum_enabled',
     },
     {
-      field: 'MarketResilienceEnabled',
+      varKey: 'market_resilience_enabled',
       label: 'Market resilience widening',
       hint: 'Auto-widen spreads on liquidity-shock detection.',
-      read: 'market_resilience_enabled',
     },
     {
-      field: 'AmendEnabled',
+      varKey: 'amend_enabled',
       label: 'Amend in-place',
       hint: 'Preserve queue priority via venue amend; off = cancel+replace.',
-      read: 'amend_enabled',
     },
     {
-      field: 'OtrEnabled',
+      varKey: 'otr_enabled',
       label: 'OTR snapshots',
       hint: 'Order-to-trade ratio audit writes (MiCA surveillance).',
-      read: 'otr_enabled',
     },
   ]
 
-  // Config-only features — surfaced read-only. Each entry
-  // carries the TOML key operators flip + the expected
-  // process-restart consequence.
-  //
-  // Runtime state is pulled from `symData` / `tunable` where
-  // the engine publishes it; missing fields render as "—".
-  const CONFIG_ONLY_ROWS = $derived([
-    {
-      label: 'OFI tracker (CKS)',
-      toml: 'market_maker.momentum_ofi_enabled',
-      value: d.momentum_ofi_ewma !== undefined && d.momentum_ofi_ewma !== null,
-    },
-    {
-      label: 'Learned microprice (offline fit)',
-      toml: 'market_maker.momentum_learned_microprice_path',
-      value: d.momentum_learned_mp_drift !== undefined
-        && d.momentum_learned_mp_drift !== null,
-    },
-    {
-      label: 'Online lMP refit',
-      toml: 'market_maker.momentum_learned_microprice_online',
-      value: null, // Not surfaced on dashboard state yet.
-    },
-    {
-      label: 'BVC volume classifier',
-      toml: 'toxicity.bvc_enabled',
-      value: null,
-    },
-    {
-      label: 'SOR inline dispatch',
-      toml: 'market_maker.sor_inline_enabled',
-      value: null,
-    },
-    {
-      label: 'Margin guard (perp)',
-      toml: 'margin.*',
-      value: d.margin_ratio !== undefined && d.margin_ratio !== null,
-    },
-    {
-      label: 'Funding accrual (perp)',
-      toml: 'exchange.product',
-      // Surfaced when engine_product publishes a perp tag.
-      value: s.engineProduct === 'linear_perp' || s.engineProduct === 'inverse_perp',
-    },
-    {
-      label: 'Pair screener',
-      toml: 'pair_screener',
-      value: null,
-    },
-    {
-      label: 'Listing sniper — observer',
-      toml: 'listing_sniper.enabled',
-      value: null,
-    },
-    {
-      label: 'Listing sniper — auto entry',
-      toml: 'listing_sniper_entry.enter_on_discovery',
-      value: null,
-    },
-  ])
-
-  const canControl = $derived(auth?.canControl?.() ?? false)
+  // Extra features the agent surfaces through the `features` map
+  // but that are not runtime-togglable. Rendered read-only with a
+  // breadcrumb to where they get configured. Deployment-level
+  // features the template opted into stay in this list regardless
+  // of whether they currently report `true`.
+  const FEATURE_HINTS = {
+    momentum_ofi: { label: 'OFI tracker (CKS)', source: 'template: momentum.ofi' },
+    bvc_classifier: { label: 'BVC volume classifier', source: 'toxicity.bvc_enabled' },
+    sor_inline: { label: 'SOR inline dispatch', source: 'market_maker.sor_inline_enabled' },
+  }
 </script>
 
 <div class="panel">
-  <header class="head">
-    <span class="label">Engine features</span>
-    <span class="sym num">{sym || '—'}</span>
-  </header>
-
   <section class="section">
-    <h3 class="section-title">Runtime-togglable</h3>
+    <h4 class="section-title">Runtime-togglable</h4>
     <p class="section-hint">
-      Flip from the UI — change takes effect on the next
-      engine tick via <code>ConfigOverride</code>.
+      Flips on the next engine tick via <code>ConfigOverride</code>.
     </p>
     <ul class="rows">
-      {#each RUNTIME_TOGGLES as t (t.field)}
-        {@const v = !!tunable[t.read]}
-        {@const disabled = !canControl || busy === t.field}
+      {#each RUNTIME_TOGGLES as t (t.varKey)}
+        {@const v = readBool(t.varKey)}
+        {@const disabled = !canControl || busyKey === t.varKey}
         <li class="row">
           <div class="row-left">
             <span class="row-label">{t.label}</span>
@@ -171,7 +111,7 @@
                 type="checkbox"
                 checked={v}
                 {disabled}
-                onchange={(e) => toggle(t.field, e.currentTarget.checked)}
+                onchange={(e) => toggle(t.varKey, e.currentTarget.checked)}
               />
               <span class="track" class:on={v}></span>
             </label>
@@ -182,23 +122,22 @@
   </section>
 
   <section class="section">
-    <h3 class="section-title">Config-only</h3>
+    <h4 class="section-title">Template features</h4>
     <p class="section-hint">
-      Read at process start from <code>config.toml</code> —
-      edit the listed key and restart <code>mm-server</code>
-      to apply.
+      Set at deploy time — change the template config and redeploy to flip.
     </p>
     <ul class="rows">
-      {#each CONFIG_ONLY_ROWS as r}
+      {#each Object.entries(FEATURE_HINTS) as [key, meta] (key)}
+        {@const state = features[key]}
         <li class="row">
           <div class="row-left">
-            <span class="row-label">{r.label}</span>
-            <code class="row-toml">{r.toml}</code>
+            <span class="row-label">{meta.label}</span>
+            <code class="row-src">{meta.source}</code>
           </div>
           <div class="row-right">
-            {#if r.value === true}
+            {#if state === true}
               <span class="chip chip-pos">ACTIVE</span>
-            {:else if r.value === false}
+            {:else if state === false}
               <span class="chip chip-muted">IDLE</span>
             {:else}
               <span class="chip chip-muted">—</span>
@@ -209,40 +148,28 @@
     </ul>
   </section>
 
-  {#if status}
+  {#if statusLine}
     <div class="status-line">
       <Icon name="info" size={12} />
-      <span>{status}</span>
+      <span>{statusLine}</span>
     </div>
   {/if}
 
   {#if !canControl}
     <div class="status-line">
       <Icon name="info" size={12} />
-      <span>Read-only — log in as an operator or admin to flip runtime toggles.</span>
+      <span>Read-only — operator role required to flip toggles.</span>
     </div>
   {/if}
 </div>
 
 <style>
-  .panel { display: flex; flex-direction: column; gap: var(--s-4); }
-
-  .head {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: var(--s-3);
-  }
-  .sym {
-    font-size: var(--fs-sm);
-    font-weight: 600;
-    color: var(--accent);
-  }
+  .panel { display: flex; flex-direction: column; gap: var(--s-3); }
 
   .section { display: flex; flex-direction: column; gap: var(--s-2); }
   .section-title {
     margin: 0;
-    font-size: var(--fs-xs);
+    font-size: 10px;
     text-transform: uppercase;
     letter-spacing: var(--tracking-label);
     color: var(--fg-muted);
@@ -258,25 +185,26 @@
     font-family: var(--font-mono);
     font-size: var(--fs-2xs);
     padding: 1px 4px;
-    background: var(--bg-chip);
+    background: var(--bg-base);
     border-radius: var(--r-sm);
     color: var(--fg-secondary);
   }
 
-  .rows { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--s-1); }
+  .rows {
+    list-style: none; margin: 0; padding: 0;
+    display: flex; flex-direction: column; gap: var(--s-1);
+  }
   .row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
+    display: flex; align-items: center; justify-content: space-between;
     gap: var(--s-3);
     padding: var(--s-2) var(--s-3);
-    background: var(--bg-chip);
+    background: var(--bg-base);
     border: 1px solid var(--border-subtle);
-    border-radius: var(--r-md);
+    border-radius: var(--r-sm);
   }
   .row-left { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
   .row-label {
-    font-size: var(--fs-sm);
+    font-size: var(--fs-xs);
     font-weight: 500;
     color: var(--fg-primary);
   }
@@ -285,12 +213,21 @@
     color: var(--fg-muted);
     line-height: var(--lh-snug);
   }
-  .row-toml {
+  .row-src {
     font-family: var(--font-mono);
     font-size: var(--fs-2xs);
     color: var(--fg-secondary);
   }
   .row-right { display: flex; align-items: center; gap: var(--s-2); }
+
+  .chip {
+    font-family: var(--font-mono); font-size: 10px;
+    text-transform: uppercase; letter-spacing: var(--tracking-label);
+    font-weight: 600; padding: 2px 6px; border-radius: var(--r-sm);
+    border: 1px solid currentColor;
+  }
+  .chip-pos { color: var(--pos); }
+  .chip-muted { color: var(--fg-muted); }
 
   .switch {
     position: relative;
@@ -327,9 +264,9 @@
     padding: var(--s-2) var(--s-3);
     background: var(--bg-base);
     border: 1px solid var(--border-subtle);
-    border-radius: var(--r-md);
+    border-radius: var(--r-sm);
     font-family: var(--font-mono);
-    font-size: var(--fs-xs);
+    font-size: var(--fs-2xs);
     color: var(--fg-secondary);
     word-break: break-word;
   }

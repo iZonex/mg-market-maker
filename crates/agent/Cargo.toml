@@ -1,0 +1,64 @@
+[package]
+name = "mm-agent"
+version.workspace = true
+edition.workspace = true
+
+# Colo-resident data-plane binary. Owns a local engine pool, the
+# WS feeds it needs, the kill switch, audit log, and the fleet
+# identity key. Talks up to a single mm-controller over the control
+# channel.
+#
+# PR-1 scope: lease client library + stub binary. Follow-up PRs
+# wire the engine + exchange stack into this crate and migrate
+# `crates/server/main.rs` startup into the agent path.
+
+[lib]
+name = "mm_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mm-agent"
+path = "src/main.rs"
+
+[dependencies]
+mm-common = { workspace = true }
+mm-control = { workspace = true }
+mm-exchange-core = { workspace = true }
+mm-exchange-client = { workspace = true }
+mm-exchange-binance = { workspace = true }
+mm-exchange-bybit = { workspace = true }
+mm-exchange-hyperliquid = { workspace = true }
+mm-engine = { workspace = true }
+mm-strategy = { workspace = true }
+# ConfigOverride type (hot-reload channel payload) lives in
+# mm-dashboard for historical reasons — the engine's select
+# loop reads an `UnboundedReceiver<ConfigOverride>`. Agent
+# needs the enum to construct overrides for live variable
+# patches; pulls the crate as a types-only dep (no axum /
+# dashboard UI compiled into the agent).
+mm-dashboard = { workspace = true }
+# audit::verify_chain for the `audit_chain_verify` details
+# topic — agent verifies its own JSONL file on demand.
+mm-risk = { workspace = true }
+prometheus = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = "1"
+toml = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+# rustls CryptoProvider install at agent startup — needed
+# because venue WSS handshakes (Binance testnet, Bybit, …)
+# otherwise panic when multiple providers are present in the
+# dep graph (aws-lc-rs + ring both come in transitively).
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+
+[dev-dependencies]
+tokio = { workspace = true }

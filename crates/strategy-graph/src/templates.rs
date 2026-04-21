@@ -44,6 +44,7 @@ static LIQUIDITY_BURN_GUARD: &str = include_str!("../templates/liquidity-burn-gu
 static COST_GATED_QUOTER: &str = include_str!("../templates/cost-gated-quoter.json");
 static GLFT_VIA_GRAPH: &str = include_str!("../templates/glft-via-graph.json");
 static CROSS_EXCHANGE_BASIC: &str = include_str!("../templates/cross-exchange-basic.json");
+static XEMM_REACTIVE: &str = include_str!("../templates/xemm-reactive.json");
 
 const BUILTIN: &[BuiltinTemplate] = &[
     BuiltinTemplate {
@@ -116,6 +117,11 @@ const BUILTIN: &[BuiltinTemplate] = &[
         name: "cross-exchange-basic",
         description: "CrossExchange make-A / hedge-B single-strategy starter (mirror of legacy strategy=cross_exchange).",
         body: CROSS_EXCHANGE_BASIC,
+    },
+    BuiltinTemplate {
+        name: "xemm-reactive",
+        description: "Phase IV graph-native XEMM: Strategy.Avellaneda posts maker quotes on the primary venue; on every own-fill the Trade.OwnFill pulse drives a Quote.Hedge → Out.VenueQuotesIf chain that fires an IoC crossing hedge on the configured hedge venue. Clone + edit the hedge_venue / hedge_symbol on Quote.Hedge and the venue filter on Trade.OwnFill to retarget.",
+        body: XEMM_REACTIVE,
     },
     // R2.14 — operator-ready composite rug detector. Wraps the
     // engine's Avellaneda quoter with a Surveillance.RugScore

@@ -5,7 +5,11 @@
   import SpreadChart from '../components/SpreadChart.svelte'
   import OrderBook from '../components/OrderBook.svelte'
   import SignalsPanel from '../components/SignalsPanel.svelte'
-  import AdaptivePanel from '../components/AdaptivePanel.svelte'
+  // Adaptive tuner panel removed — read γ / pair_class from
+  // the Per-deployment drilldown once telemetry uplift lands
+  // (audit Wave 3). AdaptivePanel was reading `tunable_config`
+  // straight off DashboardState which is a default in adapter.rs
+  // after the controller split.
   import InventoryPanel from '../components/InventoryPanel.svelte'
   import InventoryChart from '../components/InventoryChart.svelte'
   import CrossVenuePortfolio from '../components/CrossVenuePortfolio.svelte'
@@ -13,15 +17,38 @@
   import PerLegInventoryChart from '../components/PerLegInventoryChart.svelte'
   import PerLegPnl from '../components/PerLegPnl.svelte'
   import BasisMonitor from '../components/BasisMonitor.svelte'
+  import AdverseSelectionBanner from '../components/AdverseSelectionBanner.svelte'
+  import VenueOrdersStrip from '../components/VenueOrdersStrip.svelte'
+  import VenueMarketStrip from '../components/VenueMarketStrip.svelte'
+  import FirstInstallWizard from '../components/FirstInstallWizard.svelte'
 
-  let { ws, auth } = $props()
+  let { ws, auth, onNavigate } = $props()
+  const isAdmin = $derived(auth?.state?.role === 'admin')
 
   const sym = $derived(ws.state.activeSymbol || ws.state.symbols[0] || '')
   const symData = $derived(ws.state.data[sym] || {})
 </script>
 
 <div class="overview scroll">
+  {#if isAdmin}
+    <FirstInstallWizard {auth} {onNavigate} />
+  {/if}
+  <!-- Adverse-flow banner: stays invisible when nothing is toxic.
+       One-click drill-down to the full AdverseSelection panel on
+       Admin so the operator doesn't context-switch the moment
+       the signal warrants investigation. -->
+  <AdverseSelectionBanner {auth} route={onNavigate} />
+
   <HeroKpis data={symData} />
+  <!-- Per-venue market state: one row per (venue, product,
+       symbol) showing mid / spread / feed age. Lives immediately
+       below the KPIs because "what price do I see on each venue"
+       is the single most common operator question in a 3-venue
+       setup and was effectively invisible before. -->
+  <VenueMarketStrip {auth} />
+  <!-- Per-venue order breakdown: visible only when ≥ 2 venues
+       are active, so single-venue runs stay uncluttered. -->
+  <VenueOrdersStrip data={ws} />
 
   <!-- Row 1: PnL chart (2) · Orderbook (1) -->
   <div class="row row-2-1">
@@ -83,14 +110,17 @@
     <Card title="Inventory" subtitle="position">
       {#snippet children()}<InventoryPanel data={ws} />{/snippet}
     </Card>
-    <Card title="Adaptive tuner" subtitle="γ feedback">
-      {#snippet children()}<AdaptivePanel data={ws} />{/snippet}
-    </Card>
-    <Card title="Market quality" subtitle="regime">
+    <Card title="Market quality" subtitle="primary venue only">
       {#snippet children()}
         <div class="mq">
+          <!-- Regime is computed by the primary-venue engine
+               from its own mid-stream. Hedge + SOR-extra venues
+               appear as feeds only; their per-venue market state
+               lives in the Per-venue market strip at the top of
+               Overview. Label makes the scope unambiguous so
+               operators don't read "Quiet" as a cross-venue claim. -->
           <div class="mq-row">
-            <span class="label">Regime</span>
+            <span class="label">Regime <span class="scope">primary</span></span>
             <span class="chip"
                   class:chip-info={symData.regime === 'Quiet'}
                   class:chip-warn={symData.regime === 'Volatile'}
@@ -100,7 +130,7 @@
             </span>
           </div>
           <div class="mq-row">
-            <span class="label">Venue</span>
+            <span class="label">Primary venue</span>
             <span class="mq-val num">{symData.venue || '—'} · {symData.product || '—'}</span>
           </div>
           <div class="mq-row">
@@ -181,6 +211,18 @@
     font-size: var(--fs-sm);
     font-weight: 500;
     color: var(--fg-primary);
+  }
+  .scope {
+    display: inline-block;
+    margin-left: 4px;
+    padding: 0 5px;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    letter-spacing: var(--tracking-label);
+    text-transform: uppercase;
+    border-radius: var(--r-pill);
+    background: var(--bg-chip);
+    color: var(--fg-muted);
   }
   .graph-tag {
     display: inline-block;

@@ -12,21 +12,55 @@
   let pausePoll = $state(false)
   let lastSeq = 0
 
+  // Audit lives on each agent's disk (engine writes to
+  // `data/audit/{symbol}.jsonl` in the agent's CWD). To show a
+  // unified feed we fan out across the fleet, fetch each
+  // deployment's audit tail via the per-deployment details
+  // endpoint, and merge by `seq` (audit entries are
+  // monotonic). Controller serves the per-deployment fetch
+  // over its existing request/reply protocol with a 5s
+  // per-call timeout.
   async function refresh() {
     if (pausePoll) return
     try {
-      const data = await api.getJson('/api/v1/audit/recent')
-      const fresh = data.events || data || []
-      const byId = new Map(events.map((e) => [e.seq, e]))
-      for (const ev of fresh) {
-        byId.set(ev.seq, ev)
+      const fleet = await api.getJson('/api/v1/fleet')
+      const tailFetches = []
+      for (const a of Array.isArray(fleet) ? fleet : []) {
+        for (const d of a.deployments || []) {
+          if (!d.running) continue
+          const path = `/api/v1/agents/${encodeURIComponent(a.agent_id)}`
+            + `/deployments/${encodeURIComponent(d.deployment_id)}/details/audit_tail`
+          tailFetches.push(
+            api.getJson(path)
+              .then(resp => (resp.payload?.events || []).map(ev => ({
+                ...ev,
+                _source_agent: a.agent_id,
+                _source_deployment: d.deployment_id,
+              })))
+              .catch(() => []),
+          )
+        }
+      }
+      const perDeployment = await Promise.all(tailFetches)
+      const merged = perDeployment.flat()
+      // Dedup by seq within each source (seq is engine-scoped;
+      // across agents seqs can collide so include source in key).
+      const byId = new Map(events.map(e => [`${e._source_agent}#${e.seq}`, e]))
+      for (const ev of merged) {
+        byId.set(`${ev._source_agent}#${ev.seq}`, ev)
         if (ev.seq > lastSeq) lastSeq = ev.seq
       }
-      const sorted = Array.from(byId.values()).sort((a, b) => b.seq - a.seq)
+      // Sort newest-first by timestamp since seq isn't globally
+      // comparable across agents.
+      const sorted = Array.from(byId.values()).sort((a, b) => {
+        const at = Date.parse(a.timestamp) || 0
+        const bt = Date.parse(b.timestamp) || 0
+        return bt - at
+      })
       events = sorted.slice(0, MAX)
       error = ''
     } catch (e) {
-      error = e.message
+      error = e.message || String(e)
     }
   }
 
@@ -36,10 +70,85 @@
     return () => clearInterval(id)
   })
 
+  // Fix #2 — real SHA-256 chain verify (backend). Button
+  // triggers POST /api/v1/audit/verify; controller fan-outs to
+  // every running deployment so each agent verifies its own
+  // file. We render the aggregate result inline.
+  let verifyReport = $state(null)
+  let verifyBusy = $state(false)
+
+  async function runVerify() {
+    if (verifyBusy) return
+    verifyBusy = true
+    verifyReport = { phase: 'pending' }
+    try {
+      const resp = await api.authedFetch('/api/v1/audit/verify', { method: 'POST' })
+      if (!resp.ok) throw new Error(`${resp.status} ${await resp.text()}`)
+      const body = await resp.json()
+      verifyReport = { phase: 'done', ...body }
+    } catch (e) {
+      verifyReport = { phase: 'err', error: e.message || String(e) }
+    } finally {
+      verifyBusy = false
+    }
+  }
+
+  // Wave D1 — hash-chain verification. The audit JSONL carries
+  // `prev_hash` on every row (risk::audit::AuditEvent). For each
+  // (agent, deployment) source we walk the row sequence oldest-
+  // first: a break shows when two consecutive rows share the
+  // same prev_hash (missing row between), when a non-first row
+  // carries `prev_hash: null` (truncation), or when the seq
+  // jumps backwards. We annotate events with `_chain_broken`
+  // so the UI renders them in a distinct band.
+  const eventsWithChainStatus = $derived.by(() => {
+    const bySource = new Map()
+    for (const ev of events) {
+      const key = `${ev._source_agent}#${ev._source_deployment}`
+      if (!bySource.has(key)) bySource.set(key, [])
+      bySource.get(key).push(ev)
+    }
+    const brokenKeys = new Set()
+    let totalSources = 0
+    let brokenSources = 0
+    for (const [, list] of bySource) {
+      totalSources += 1
+      // sort oldest-first
+      list.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
+      let thisBroken = false
+      let prevPrev = undefined
+      for (let i = 0; i < list.length; i++) {
+        const curr = list[i]
+        const k = `${curr._source_agent}#${curr._source_deployment}#${curr.seq}`
+        // Non-first row with null prev_hash — truncation point.
+        if (i > 0 && (curr.prev_hash === null || curr.prev_hash === undefined)) {
+          brokenKeys.add(k); thisBroken = true
+        }
+        // Two consecutive rows sharing the same prev_hash —
+        // implies a row was deleted between them.
+        if (i > 0 && prevPrev === curr.prev_hash) {
+          brokenKeys.add(k); thisBroken = true
+        }
+        prevPrev = curr.prev_hash
+      }
+      if (thisBroken) brokenSources += 1
+    }
+    return {
+      events: events.map(ev => ({
+        ...ev,
+        _chain_broken: brokenKeys.has(`${ev._source_agent}#${ev._source_deployment}#${ev.seq}`),
+      })),
+      totalSources,
+      brokenSources,
+      brokenRowCount: brokenKeys.size,
+    }
+  })
+
   const filtered = $derived.by(() => {
-    if (!filter) return events
+    const src = eventsWithChainStatus.events
+    if (!filter) return src
     const q = filter.toLowerCase()
-    return events.filter(
+    return src.filter(
       (e) =>
         (e.event_type || '').toLowerCase().includes(q) ||
         (e.symbol || '').toLowerCase().includes(q) ||
@@ -68,22 +177,70 @@
       </span>
       <span class="count num">{filtered.length}</span>
       <span class="label">events</span>
-    </div>
-    <button
-      type="button"
-      class="btn btn-ghost btn-sm"
-      onclick={() => (pausePoll = !pausePoll)}
-      aria-label={pausePoll ? 'Resume' : 'Pause'}
-    >
-      {#if pausePoll}
-        <Icon name="pulse" size={12} />
-        <span>Resume</span>
-      {:else}
-        <Icon name="clock" size={12} />
-        <span>Pause</span>
+      {#if eventsWithChainStatus.brokenRowCount > 0}
+        <span class="chain-chip chain-broken" title={`${eventsWithChainStatus.brokenSources} source(s) have a broken hash chain`}>
+          chain broken: {eventsWithChainStatus.brokenRowCount}
+        </span>
+      {:else if events.length > 0}
+        <span class="chain-chip chain-ok" title="Every audit source has a continuous hash chain">
+          chain ok
+        </span>
       {/if}
-    </button>
+    </div>
+    <div class="head-actions">
+      <button
+        type="button"
+        class="btn btn-ghost btn-sm"
+        onclick={runVerify}
+        disabled={verifyBusy}
+        title="Run real SHA-256 hash-chain verify across every deployment's audit file"
+      >
+        <Icon name="shield" size={12} />
+        <span>{verifyBusy ? 'Verifying…' : 'Verify chain'}</span>
+      </button>
+      <button
+        type="button"
+        class="btn btn-ghost btn-sm"
+        onclick={() => (pausePoll = !pausePoll)}
+        aria-label={pausePoll ? 'Resume' : 'Pause'}
+      >
+        {#if pausePoll}
+          <Icon name="pulse" size={12} />
+          <span>Resume</span>
+        {:else}
+          <Icon name="clock" size={12} />
+          <span>Pause</span>
+        {/if}
+      </button>
+    </div>
   </header>
+
+  {#if verifyReport}
+    <div class="verify-report" class:err={verifyReport.phase === 'err' || (verifyReport.broken ?? 0) > 0}>
+      {#if verifyReport.phase === 'pending'}
+        <span>Verifying…</span>
+      {:else if verifyReport.phase === 'err'}
+        <span>verify failed: {verifyReport.error}</span>
+      {:else}
+        <span>
+          ✓ {verifyReport.valid}/{verifyReport.total_deployments} valid
+          {#if verifyReport.broken > 0}· <strong>{verifyReport.broken} broken</strong>{/if}
+          {#if verifyReport.missing > 0}· {verifyReport.missing} missing{/if}
+        </span>
+        {#if verifyReport.broken > 0}
+          <div class="verify-broken-list">
+            {#each verifyReport.rows.filter(r => r.exists && !r.valid) as r (r.agent_id + '/' + r.deployment_id)}
+              <div class="verify-broken">
+                <span class="mono">{r.agent_id}/{r.symbol}</span>
+                <span class="err-kind">{r.error_kind}</span>
+                {#if r.break_row}<span class="mono">row #{r.break_row}</span>{/if}
+              </div>
+            {/each}
+          </div>
+        {/if}
+      {/if}
+    </div>
+  {/if}
 
   <div class="search">
     <span class="search-icon"><Icon name="search" size={13} /></span>
@@ -120,10 +277,15 @@
     </div>
   {:else}
     <div class="log scroll">
-      {#each filtered as e (e.seq)}
-        <div class="log-row" data-sev={severity(e.event_type)}>
+      {#each filtered as e (e._source_agent + '#' + e.seq)}
+        <div class="log-row" data-sev={severity(e.event_type)} class:chain-break={e._chain_broken}>
           <span class="dot"></span>
           <span class="ts num">{fmtTime(e.timestamp)}</span>
+          {#if e._chain_broken}
+            <span class="chain-break-chip" title="Hash chain break — prev_hash doesn't match the expected predecessor. Indicates insertion / deletion / truncation in the log.">
+              ✗ chain
+            </span>
+          {/if}
           <span class="type">{e.event_type}</span>
           {#if e.symbol}<span class="sym num">{e.symbol}</span>{/if}
           {#if e.detail}<span class="detail">{e.detail}</span>{/if}
@@ -193,6 +355,39 @@
     color: var(--neg);
     font-size: var(--fs-xs);
   }
+
+  .chain-chip {
+    font-size: 10px; font-family: var(--font-mono);
+    padding: 2px 8px; border-radius: var(--r-sm);
+  }
+  .chain-chip.chain-ok     { background: color-mix(in srgb, var(--ok) 15%, transparent); color: var(--ok); }
+  .chain-chip.chain-broken { background: color-mix(in srgb, var(--danger) 20%, transparent); color: var(--danger); font-weight: 600; }
+
+  .log-row.chain-break {
+    background: color-mix(in srgb, var(--danger) 10%, transparent);
+    border-left: 2px solid var(--danger);
+  }
+  .chain-break-chip {
+    font-size: 10px; font-family: var(--font-mono);
+    padding: 1px 5px; border-radius: var(--r-sm);
+    background: color-mix(in srgb, var(--danger) 20%, transparent);
+    color: var(--danger); font-weight: 600;
+  }
+
+  .head-actions { display: flex; gap: var(--s-2); }
+  .verify-report {
+    padding: var(--s-2) var(--s-3);
+    background: color-mix(in srgb, var(--ok) 12%, transparent);
+    color: var(--ok); border-radius: var(--r-sm);
+    font-size: var(--fs-xs); font-family: var(--font-mono);
+  }
+  .verify-report.err {
+    background: color-mix(in srgb, var(--danger) 15%, transparent);
+    color: var(--danger);
+  }
+  .verify-broken-list { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
+  .verify-broken { display: flex; gap: var(--s-2); font-size: 10px; }
+  .err-kind { color: var(--danger); font-weight: 600; text-transform: uppercase; }
 
   .log {
     display: flex;

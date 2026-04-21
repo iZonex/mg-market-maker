@@ -11,11 +11,14 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{info, warn};
 
 use crate::auth::{
-    admin_middleware, auth_middleware, internal_view_middleware, login_handler, logout_handler,
-    ApiUser, AuthState, Role,
+    admin_middleware, auth_middleware, auth_status_handler, bootstrap_handler,
+    change_password_handler, client_signup_handler, create_invite_handler,
+    create_password_reset_handler, internal_view_middleware, login_handler, logout_handler,
+    me_handler, password_reset_handler, tenant_scope_middleware, totp_disable_handler,
+    totp_enroll_handler, totp_verify_handler, ApiUser, AuthState, Role,
 };
 use crate::rate_limit::{rate_limit_middleware, RateLimiter};
-use crate::state::{ConfigOverride, DashboardState, SymbolState, VenueBalanceSnapshot};
+use crate::state::{DashboardState, SymbolState};
 use crate::websocket::{ws_handler, WsBroadcast};
 
 /// Start the dashboard HTTP + WebSocket server with authentication.
@@ -34,13 +37,43 @@ use crate::websocket::{ws_handler, WsBroadcast};
 ///   - WebSocket (`/ws`): token passed as `?token=` query param,
 ///     verified inside `ws_handler` (browsers cannot set headers on
 ///     the WS upgrade request).
+/// Build the full dashboard Router without binding. Exposed so
+/// the `mm-server` controller can merge these routes into its
+/// own HTTP surface + serve the Svelte frontend on the same
+/// port. The thin `start` wrapper below preserves the
+/// bind-and-serve behaviour for any caller that still wants it.
+pub fn build_app(
+    state: DashboardState,
+    ws_broadcast: Arc<WsBroadcast>,
+    auth_state: AuthState,
+) -> Router {
+    crate::metrics::init();
+    build_router_inner(state, ws_broadcast, auth_state)
+}
+
 pub async fn start(
     state: DashboardState,
     ws_broadcast: Arc<WsBroadcast>,
     auth_state: AuthState,
     port: u16,
 ) -> anyhow::Result<()> {
-    crate::metrics::init();
+    let app = build_app(state, ws_broadcast, auth_state);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    info!(%addr, "dashboard server starting");
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
+    Ok(())
+}
+
+fn build_router_inner(
+    state: DashboardState,
+    ws_broadcast: Arc<WsBroadcast>,
+    auth_state: AuthState,
+) -> Router {
 
     // Rate limiters — admin gets a stricter budget; login is
     // throttled by source IP to slow credential-stuffing.
@@ -60,6 +93,18 @@ pub async fn start(
 
     let login = Router::new()
         .route("/api/auth/login", post(login_handler))
+        .route("/api/auth/bootstrap", post(bootstrap_handler))
+        .route("/api/auth/status", get(auth_status_handler))
+        // Wave E4 — public client-signup endpoint. Verifies a
+        // signed invite token + creates the ClientReader user.
+        // Rate-limited same as login because brute-forcing
+        // random tokens is the attack surface.
+        .route("/api/auth/client-signup", post(client_signup_handler))
+        // Wave H1 — public password-reset consumer. Takes a
+        // signed reset_token (minted by an admin) + a new
+        // password. Same rate limit as login since random
+        // reset_id brute-force is the attack surface.
+        .route("/api/auth/password-reset", post(password_reset_handler))
         .route_layer(middleware::from_fn_with_state(
             login_rl,
             rate_limit_middleware,
@@ -76,14 +121,24 @@ pub async fn start(
     let protected_api = Router::new()
         .route("/api/status", get(get_status))
         .route("/api/v1/venues/status", get(venues_status))
-        .route("/api/v1/inventory/venues", get(inventory_venues_all))
-        .route(
-            "/api/v1/inventory/venues/{symbol}",
-            get(inventory_venues_symbol),
-        )
+        // `/api/v1/inventory/venues` endpoints removed —
+        // per-deployment venue legs are served via the
+        // `venue_inventory` details topic. Frontend fans out
+        // across fleet and merges.
         .route("/api/v1/clients/loss-state", get(clients_loss_state))
-        .route("/api/v1/surveillance/scores", get(surveillance_scores))
-        .route("/api/v1/decisions/recent", get(decisions_recent))
+        // LEGACY-1 (2026-04-21) — `/api/v1/surveillance/scores`
+        // and `/api/v1/active-graphs` removed. Both read the
+        // controller-local DashboardState which is never
+        // populated in distributed mode; frontend reads the
+        // fleet-aware `/api/v1/surveillance/fleet` + the
+        // per-deployment `active_graph` field on the fleet row.
+        // `/api/v1/decisions/recent` removed — DecisionLedger
+        // lives inside each engine. DecisionsLedger.svelte now
+        // fans out per-deployment via the details endpoint
+        // (topic `decisions_recent`). Engine mirrors its
+        // ledger.recent(200) into the process-global details
+        // store on every publish tick so the agent can serve
+        // the reply without reaching into engine state.
         .route("/api/v1/plans/active", get(active_plans))
         .route("/api/v1/otr/tiered", get(otr_tiered))
         .route("/api/v1/portfolio/cross_venue", get(portfolio_cross_venue))
@@ -94,20 +149,40 @@ pub async fn start(
             get(per_leg_inventory_history),
         )
         .route("/api/v1/basis", get(basis_monitor))
+        .route("/api/v1/venues/book_state", get(venues_book_state))
         .route("/api/v1/clients", get(list_clients_public))
-        .route("/api/v1/sor/decisions/recent", get(sor_decisions_recent))
-        .route("/api/v1/atomic-bundles/inflight", get(atomic_bundles_inflight))
-        .route("/api/v1/rebalance/recommendations", get(rebalance_recommendations))
+        // `/api/v1/sor/decisions/recent` removed — SOR
+        // decisions live in each engine. SorDecisions.svelte
+        // fans out per-deployment via the `sor_decisions_recent`
+        // details topic.
+        // `/api/v1/atomic-bundles/inflight`, `/api/v1/funding-arb/pairs`,
+        // `/api/v1/rebalance/recommendations` removed in the
+        // 2026-04 stabilization pass — all three read engine-
+        // local state that doesn't exist in distributed mode.
+        // Frontend now fans out per-deployment via the details
+        // protocol (topics: `atomic_bundles_inflight`,
+        // `funding_arb_pairs`, `rebalance_recommendations`).
         .route("/api/v1/rebalance/execute", post(rebalance_execute))
         .route("/api/v1/rebalance/log", get(rebalance_log))
-        .route("/api/v1/funding-arb/pairs", get(funding_arb_pairs))
-        .route("/api/v1/adverse-selection", get(adverse_selection_snapshot))
+        // `/api/v1/adverse-selection` removed — per-deployment
+        // `adverse_selection` details topic serves distributed
+        // clients (agent reads from its own shared DashboardState
+        // populated by the running engine).
         .route("/api/v1/calibration/status", get(calibration_status))
-        .route("/api/v1/active-graphs", get(active_graphs_snapshot))
-        .route("/api/v1/manipulation/scores", get(manipulation_scores))
-        .route("/api/v1/onchain/scores", get(onchain_scores))
+        // /api/v1/active-graphs and /api/v1/manipulation/scores
+        // removed as part of LEGACY-1. Frontend reads
+        // /api/v1/surveillance/fleet (ManipulationScores) and
+        // per-deployment `active_graph` on the fleet row.
+        // `/api/v1/onchain/scores` removed — served via the
+        // `onchain_scores` details topic per deployment.
         .merge(crate::client_api::client_routes())
         .merge(crate::client_portal::client_portal_routes())
+        // Wave E2 — tenant scope enforcement runs AFTER auth
+        // middleware (TokenClaims already in extensions). Rejects
+        // cross-tenant access and blocks ClientReader role from
+        // hitting non-client endpoints like /api/v1/fleet or
+        // /api/v1/pnl. Admin/operator tokens pass through.
+        .route_layer(middleware::from_fn(tenant_scope_middleware))
         .route_layer(middleware::from_fn_with_state(
             auth_state.clone(),
             auth_middleware,
@@ -119,6 +194,22 @@ pub async fn start(
     // tokens are stateless HMAC.
     let logout = Router::new()
         .route("/api/auth/logout", post(logout_handler))
+        .route_layer(middleware::from_fn_with_state(
+            auth_state.clone(),
+            auth_middleware,
+        ))
+        .with_state(auth_state.clone());
+
+    // Authenticated profile self-service: current-user info,
+    // password change, 2FA enrollment / verify / disable. All
+    // gated by the same token middleware as the rest of the
+    // protected API surface.
+    let profile = Router::new()
+        .route("/api/auth/me", get(me_handler))
+        .route("/api/auth/password", post(change_password_handler))
+        .route("/api/auth/totp/enroll", post(totp_enroll_handler))
+        .route("/api/auth/totp/verify", post(totp_verify_handler))
+        .route("/api/auth/totp/disable", post(totp_disable_handler))
         .route_layer(middleware::from_fn_with_state(
             auth_state.clone(),
             auth_middleware,
@@ -138,37 +229,30 @@ pub async fn start(
     // alerts, loans, optimization, clients. Admin role ONLY plus
     // user-scoped rate limit.
     let admin_config = Router::new()
-        .route("/api/v1/ops/widen/{symbol}", post(ops_widen))
-        .route("/api/v1/ops/stop/{symbol}", post(ops_stop))
-        .route("/api/v1/ops/cancel-all/{symbol}", post(ops_cancel_all))
-        .route("/api/v1/ops/flatten/{symbol}", post(ops_flatten))
-        .route("/api/v1/ops/disconnect/{symbol}", post(ops_disconnect))
-        .route("/api/v1/ops/reset/{symbol}", post(ops_kill_reset))
+        // Per-symbol kill / pause / emulator / DCA endpoints were
+        // removed in the 2026-04 stabilization pass. In the
+        // distributed model a symbol isn't unique across agents,
+        // so the canonical ops surface is per-deployment:
+        //   POST /api/v1/agents/{agent_id}/deployments/{deployment_id}/ops/{op}
+        // served by the controller crate. Frontend uses the
+        // DeploymentDrilldown panel to target a specific
+        // deployment; there's no operator path that still needs
+        // symbol-based routing.
         .route("/api/v1/ops/client-reset/{client_id}", post(ops_client_reset))
+        // 23-UX-6 — venue-scoped kill switch control. Operators
+        // quench one venue without disturbing sibling venues
+        // on the same engine. Read endpoint is admin-only too
+        // because elevated venue state is PII-adjacent
+        // (positions exposure).
         .route(
-            "/api/v1/ops/emulator/{symbol}",
-            post(ops_register_emulated_order),
+            "/api/v1/ops/venue-kill/{venue}",
+            post(ops_set_venue_kill_level),
         )
-        .route(
-            "/api/v1/ops/emulator/{symbol}/{id}",
-            axum::routing::delete(ops_cancel_emulated_order),
-        )
-        .route("/api/v1/ops/dca/{symbol}", post(ops_start_dca_reduction))
-        .route(
-            "/api/v1/ops/dca/{symbol}",
-            axum::routing::delete(ops_cancel_dca_reduction),
-        )
-        .route("/api/admin/config/{symbol}", post(admin_config_override))
-        .route("/api/admin/config", post(admin_config_broadcast))
-        .route("/api/admin/config/bulk", post(admin_config_bulk))
-        .route(
-            "/api/admin/symbols/{symbol}/pause",
-            post(admin_pause_symbol),
-        )
-        .route(
-            "/api/admin/symbols/{symbol}/resume",
-            post(admin_resume_symbol),
-        )
+        .route("/api/v1/kill/venues", get(list_venue_kill_levels))
+        // `/api/admin/config/*` routes removed post controller/agent
+        // split — they broadcast to a server-embedded engine that
+        // no longer exists. Per-deployment config overrides land in
+        // Wave 2 as PATCH /api/v1/agents/{id}/deployments/{dep_id}/variables.
         .route("/api/admin/webhooks", get(admin_list_webhooks))
         .route("/api/admin/webhooks", post(admin_add_webhook))
         .route("/api/admin/alerts", get(admin_list_alerts))
@@ -177,13 +261,27 @@ pub async fn start(
         .route("/api/admin/symbols", get(admin_list_symbols))
         .route("/api/admin/loans", axum::routing::post(admin_create_loan))
         .route("/api/admin/loans", get(admin_list_loans))
+        // Hyperopt review loop — parameter auto-calibration.
+        // Worker records a JSONL of market events, sweeps params,
+        // suggests the best trial; operator reviews + applies.
+        // In the distributed 2026-04 model the worker observes
+        // DashboardState that no local engine populates, and
+        // `apply` routes via a dead ConfigOverride channel —
+        // surfaced in the response as `applied: 0 / skipped: [..]`
+        // so the operator sees the gap rather than silent failure.
+        // Full distributed hyperopt (worker observes agent
+        // telemetry + applies via per-deployment variables PATCH)
+        // is tracked as a follow-up; endpoints + UI stay wired
+        // so the catalog and manual trigger flow are reachable.
         .route("/api/admin/optimize/status", get(admin_optimize_status))
         .route("/api/admin/optimize/results", get(admin_optimize_results))
         .route("/api/admin/optimize/trigger", post(admin_optimize_trigger))
         .route("/api/admin/optimize/pending", get(admin_optimize_pending))
         .route("/api/admin/optimize/apply", post(admin_optimize_apply))
         .route("/api/admin/optimize/discard", post(admin_optimize_discard))
-        .route("/api/admin/sentiment/headline", post(admin_sentiment_headline))
+        // `/api/admin/sentiment/headline` lives on the controller
+        // crate (needs FleetState for fan-out) — see
+        // `post_sentiment_headline` there.
         .merge(crate::admin_clients::admin_client_routes())
         .with_state(state.clone());
 
@@ -192,7 +290,21 @@ pub async fn start(
     // Split into its own router so the stricter limiter layers
     // cleanly without double-counting against `admin_rl`.
     let admin_graph_deploy = Router::new()
-        .route("/api/admin/strategy/graph", post(admin_deploy_strategy_graph))
+        // Saves the graph + returns a content hash. No longer
+        // broadcasts — distributed engines receive the graph via
+        // the per-deployment `ops/graph-swap` endpoint on the
+        // controller. Frontend calls the save, then fires
+        // graph-swap at a specific (agent, deployment) target.
+        .route("/api/admin/strategy/graph", post(admin_save_strategy_graph))
+        // Per-node config patch — edits a single node's config
+        // in the stored graph catalog. Save-only in distributed
+        // mode (no in-process engine to hot-swap); operator
+        // redeploys via `ops/graph-swap` to push the patched
+        // graph to a specific deployment.
+        .route(
+            "/api/admin/strategy/graph/{name}/nodes/{node_id}/config",
+            axum::routing::patch(admin_patch_strategy_node_config),
+        )
         .route_layer(middleware::from_fn_with_state(
             graph_deploy_rl,
             rate_limit_middleware,
@@ -208,10 +320,32 @@ pub async fn start(
     let admin_users = Router::new()
         .route("/api/admin/users", get(list_users))
         .route("/api/admin/users", post(create_user))
+        // Wave E4 — admin mints a client invite URL.
+        .route(
+            "/api/admin/clients/{id}/invite",
+            post(create_invite_handler),
+        )
+        // Wave H1 — admin mints a password-reset URL for a
+        // target user. Returned URL is one-shot, 1h-expiring,
+        // signed. Admin delivers out-of-band.
+        .route(
+            "/api/admin/users/{id}/reset-password",
+            post(create_password_reset_handler),
+        )
         .with_state(auth_state.clone());
+
+    // Wave H4 — admin auth-audit readback. Reads login /
+    // logout / password-reset rows from the shared MiCA audit
+    // trail so operators can spot credential-stuffing
+    // patterns and account for recovery flows. Needs
+    // DashboardState so it can resolve the audit file path.
+    let admin_auth_audit = Router::new()
+        .route("/api/admin/auth/audit", get(admin_auth_audit_handler))
+        .with_state(state.clone());
 
     let admin = admin_config
         .merge(admin_users)
+        .merge(admin_auth_audit)
         .route_layer(middleware::from_fn_with_state(
             admin_rl,
             rate_limit_middleware,
@@ -229,28 +363,18 @@ pub async fn start(
 
     let cors = build_cors_layer();
 
-    let app = Router::new()
+    Router::new()
         .merge(public)
         .merge(login)
         .merge(logout)
+        .merge(profile)
         .merge(probes)
         .merge(protected_api)
         .merge(metrics_route)
         .merge(admin)
         .merge(admin_graph_deploy)
         .merge(ws_routes)
-        .layer(cors);
-
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!(%addr, "dashboard server starting");
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
-    Ok(())
+        .layer(cors)
 }
 
 /// Build a CORS layer from `MM_DASHBOARD_CORS_ORIGINS` — a
@@ -338,22 +462,10 @@ async fn get_status(State(state): State<DashboardState>) -> Json<Vec<SymbolState
 }
 
 /// Per-venue inventory drilldown for a single symbol. Returns the
-/// balance snapshots the engine last published from each connector
-/// in the bundle (primary, hedge, SOR extras).
-async fn inventory_venues_symbol(
-    State(state): State<DashboardState>,
-    Path(symbol): Path<String>,
-) -> Json<Vec<VenueBalanceSnapshot>> {
-    Json(state.venue_balances(&symbol))
-}
-
-/// All per-venue inventory snapshots keyed by symbol. Used by the
-/// overview panel to render the cross-symbol picture in one shot.
-async fn inventory_venues_all(
-    State(state): State<DashboardState>,
-) -> Json<std::collections::HashMap<String, Vec<VenueBalanceSnapshot>>> {
-    Json(state.all_venue_balances())
-}
+// Per-venue inventory readback handlers removed — distributed
+// deployments serve these via the `venue_inventory` details
+// topic (per deployment). The frontend panel does the cross-
+// symbol join.
 
 async fn prometheus_metrics() -> String {
     let encoder = TextEncoder::new();
@@ -380,97 +492,18 @@ async fn prometheus_metrics() -> String {
 //         }
 //     }
 
-#[derive(serde::Serialize)]
-struct SurveillanceScoreRow {
-    score: f64,
-    alerts_total: u64,
-}
+// LEGACY-1 (2026-04-21) — surveillance_scores / active_graphs /
+// manipulation_scores handlers removed. They read the
+// controller-local DashboardState + Prometheus registry, both of
+// which stay empty in distributed mode (engine gauges live on
+// agents). Frontend now fans out via `/api/v1/surveillance/fleet`
+// and reads per-deployment `active_graph` directly off the
+// fleet row.
 
-#[derive(serde::Serialize)]
-struct SurveillanceScoresResponse {
-    patterns: std::collections::BTreeMap<
-        String,
-        std::collections::BTreeMap<String, SurveillanceScoreRow>,
-    >,
-}
-
-async fn surveillance_scores() -> Json<SurveillanceScoresResponse> {
-    use prometheus::proto::MetricType;
-    use std::collections::BTreeMap;
-
-    let families = prometheus::gather();
-    let mut scores: BTreeMap<(String, String), f64> = BTreeMap::new();
-    let mut alerts: BTreeMap<(String, String), u64> = BTreeMap::new();
-
-    for fam in &families {
-        match fam.get_name() {
-            "mm_surveillance_score" if fam.get_field_type() == MetricType::GAUGE => {
-                for m in fam.get_metric() {
-                    let (Some(pattern), Some(symbol)) = label_pair(m) else {
-                        continue;
-                    };
-                    scores.insert((pattern, symbol), m.get_gauge().get_value());
-                }
-            }
-            "mm_surveillance_alerts_total"
-                if fam.get_field_type() == MetricType::COUNTER =>
-            {
-                for m in fam.get_metric() {
-                    let (Some(pattern), Some(symbol)) = label_pair(m) else {
-                        continue;
-                    };
-                    alerts.insert(
-                        (pattern, symbol),
-                        m.get_counter().get_value().round() as u64,
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mut patterns: BTreeMap<String, BTreeMap<String, SurveillanceScoreRow>> =
-        BTreeMap::new();
-    for ((pattern, symbol), score) in &scores {
-        let alerts_total = alerts.get(&(pattern.clone(), symbol.clone())).copied().unwrap_or(0);
-        patterns
-            .entry(pattern.clone())
-            .or_default()
-            .insert(symbol.clone(), SurveillanceScoreRow { score: *score, alerts_total });
-    }
-    // Union in symbols that have alerts but never reported a score
-    // this tick (e.g. detector ran once, hasn't fired since a
-    // restart).
-    for ((pattern, symbol), alerts_total) in alerts {
-        patterns
-            .entry(pattern)
-            .or_default()
-            .entry(symbol)
-            .or_insert(SurveillanceScoreRow { score: 0.0, alerts_total });
-    }
-    Json(SurveillanceScoresResponse { patterns })
-}
-
-// ── INT-1: decision ledger readback ─────────────────────
-
-#[derive(serde::Deserialize)]
-struct DecisionsQuery {
-    #[serde(default)]
-    symbol: Option<String>,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-#[derive(serde::Serialize)]
-struct DecisionsResponse {
-    /// Decisions keyed by symbol, newest-first within each
-    /// symbol. When `?symbol=X` is supplied the map has at most
-    /// one key; otherwise every registered symbol is included.
-    symbols: std::collections::BTreeMap<
-        String,
-        Vec<mm_risk::decision_ledger::DecisionSnapshot>,
-    >,
-}
+// INT-1 decision-ledger readback removed — replaced by the
+// per-deployment `decisions_recent` details topic (see agent's
+// FetchDeploymentDetails handler). DecisionsLedger.svelte fans
+// out across fleet and merges client-side.
 
 #[derive(serde::Serialize)]
 struct ActivePlansResponse {
@@ -646,64 +679,16 @@ async fn venues_latency_p95() -> Json<VenueLatencyResponse> {
     Json(VenueLatencyResponse { venues })
 }
 
-/// S1.3 — SOR routing decision log query. `?limit=N` clamps
-/// the response size (default 50, max equals the state's
-/// `MAX_SOR_DECISIONS` capacity). Newest-first.
-#[derive(serde::Deserialize)]
-struct SorDecisionsQuery {
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-#[derive(serde::Serialize)]
-struct SorDecisionsResponse {
-    decisions: Vec<crate::state::SorDecisionRecord>,
-}
-
-async fn sor_decisions_recent(
-    State(state): State<DashboardState>,
-    axum::extract::Query(q): axum::extract::Query<SorDecisionsQuery>,
-) -> Json<SorDecisionsResponse> {
-    let limit = q.limit.unwrap_or(50).min(256);
-    Json(SorDecisionsResponse {
-        decisions: state.sor_decisions_recent(limit),
-    })
-}
+// S1.3 SOR routing decision log — handler removed. See
+// details-protocol `sor_decisions_recent` topic on the agent.
 
 /// S2.2 — inflight atomic bundle snapshot for the monitor
 /// panel. Returns every bundle currently tracked on the
-/// shared DashboardState ack map (originator + remote legs),
-/// paired up by bundle id.
-#[derive(serde::Serialize)]
-struct AtomicBundlesResponse {
-    bundles: Vec<crate::state::AtomicBundleSnapshot>,
-}
-
-async fn atomic_bundles_inflight(
-    State(state): State<DashboardState>,
-) -> Json<AtomicBundlesResponse> {
-    Json(AtomicBundlesResponse {
-        bundles: state.atomic_bundles_inflight(),
-    })
-}
-
-/// S5.1 — cross-venue rebalance recommendations. Always safe to
-/// poll: with no rebalancer config registered the response is
-/// an empty list. Each recommendation is advisory — the
-/// operator clicks an "Execute" button elsewhere (deferred) to
-/// actually trigger a transfer.
-#[derive(Debug, serde::Serialize)]
-struct RebalanceRecommendationsResponse {
-    recommendations: Vec<mm_risk::rebalancer::RebalanceRecommendation>,
-}
-
-async fn rebalance_recommendations(
-    State(state): State<DashboardState>,
-) -> Json<RebalanceRecommendationsResponse> {
-    Json(RebalanceRecommendationsResponse {
-        recommendations: state.rebalance_recommendations(),
-    })
-}
+// Atomic-bundles / rebalance-recommendations snapshot handlers
+// removed — distributed clients fetch per-deployment via the
+// details protocol (topics: `atomic_bundles_inflight`,
+// `rebalance_recommendations`). See agent's FetchDetails
+// handler in `crates/agent/src/lib.rs`.
 
 /// S6.4 — rebalance execute request. Operator-approved transfer.
 /// Intra-venue wallet transfers dispatch through the venue's
@@ -910,39 +895,12 @@ async fn rebalance_log(
     Json(RebalanceLogResponse { records })
 }
 
-/// S5.2 — per-pair funding-arb driver state. Response order is
-/// stable (pair-key ASC) so the UI doesn't re-order rows on
-/// every poll.
-#[derive(Debug, serde::Serialize)]
-struct FundingArbPairsResponse {
-    pairs: Vec<crate::state::FundingArbPairState>,
-}
+// S5.2 funding-arb pairs snapshot handler removed — distributed
+// clients fetch per-deployment via the `funding_arb_pairs`
+// details topic.
 
-async fn funding_arb_pairs(
-    State(state): State<DashboardState>,
-) -> Json<FundingArbPairsResponse> {
-    Json(FundingArbPairsResponse {
-        pairs: state.funding_arb_pairs(),
-    })
-}
-
-/// S5.3 — per-symbol adverse-selection view. Surfaces the
-/// Cartea-spread inputs the engine already publishes on each
-/// `SymbolState` so operators can see which symbols are in the
-/// toxic-flow regime without scraping Prometheus. Sort order is
-/// symbol ASC for stability.
-#[derive(Debug, serde::Serialize)]
-struct AdverseSelectionRow {
-    symbol: String,
-    adverse_bps: rust_decimal::Decimal,
-    as_prob_bid: Option<rust_decimal::Decimal>,
-    as_prob_ask: Option<rust_decimal::Decimal>,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct AdverseSelectionResponse {
-    rows: Vec<AdverseSelectionRow>,
-}
+// S5.3 adverse-selection view replaced by the per-deployment
+// `adverse_selection` details topic. Frontend panel fans out.
 
 /// S5.4 — live-calibration status endpoint. Returns one row per
 /// symbol whose active strategy publishes calibration
@@ -967,116 +925,9 @@ async fn calibration_status(
 /// show "Graph: X (hash abc…)". Symbols without a deployed graph
 /// are skipped — empty response means the whole system is on
 /// legacy strategies.
-#[derive(Debug, serde::Serialize)]
-struct ActiveGraphRow {
-    symbol: String,
-    strategy: String,
-    name: String,
-    hash: String,
-    scope: String,
-    deployed_at_ms: i64,
-    node_count: usize,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct ActiveGraphsResponse {
-    rows: Vec<ActiveGraphRow>,
-}
-
-/// R2.6 — per-symbol CEX-side manipulation detector snapshot.
-/// Shape matches `ManipulationScoreSnapshot` (four sub-scores +
-/// combined). Symbols without a snapshot are skipped.
-#[derive(Debug, serde::Serialize)]
-struct ManipulationScoreRow {
-    symbol: String,
-    pump_dump: rust_decimal::Decimal,
-    wash: rust_decimal::Decimal,
-    thin_book: rust_decimal::Decimal,
-    combined: rust_decimal::Decimal,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct ManipulationScoresResponse {
-    rows: Vec<ManipulationScoreRow>,
-}
-
-/// R3.8 — per-symbol on-chain surveillance snapshot: holder
-/// concentration + CEX inflow from suspect wallets.
-#[derive(Debug, serde::Serialize)]
-struct OnchainScoresResponse {
-    rows: Vec<crate::state::OnchainSnapshot>,
-}
-
-async fn onchain_scores(
-    State(state): State<DashboardState>,
-) -> Json<OnchainScoresResponse> {
-    Json(OnchainScoresResponse {
-        rows: state.onchain_snapshots(),
-    })
-}
-
-async fn manipulation_scores(
-    State(state): State<DashboardState>,
-) -> Json<ManipulationScoresResponse> {
-    let mut rows: Vec<ManipulationScoreRow> = state
-        .get_all()
-        .into_iter()
-        .filter_map(|s| {
-            let m = s.manipulation_score?;
-            Some(ManipulationScoreRow {
-                symbol: s.symbol,
-                pump_dump: m.pump_dump,
-                wash: m.wash,
-                thin_book: m.thin_book,
-                combined: m.combined,
-            })
-        })
-        .collect();
-    // Highest combined first — operators care about the worst
-    // offenders, not alphabetical order.
-    rows.sort_by(|a, b| b.combined.cmp(&a.combined));
-    Json(ManipulationScoresResponse { rows })
-}
-
-async fn active_graphs_snapshot(
-    State(state): State<DashboardState>,
-) -> Json<ActiveGraphsResponse> {
-    let mut rows: Vec<ActiveGraphRow> = state
-        .get_all()
-        .into_iter()
-        .filter_map(|s| {
-            let ag = s.active_graph?;
-            Some(ActiveGraphRow {
-                symbol: s.symbol,
-                strategy: s.strategy,
-                name: ag.name,
-                hash: ag.hash,
-                scope: ag.scope,
-                deployed_at_ms: ag.deployed_at_ms,
-                node_count: ag.node_count,
-            })
-        })
-        .collect();
-    rows.sort_by(|a, b| a.symbol.cmp(&b.symbol));
-    Json(ActiveGraphsResponse { rows })
-}
-
-async fn adverse_selection_snapshot(
-    State(state): State<DashboardState>,
-) -> Json<AdverseSelectionResponse> {
-    let mut rows: Vec<AdverseSelectionRow> = state
-        .get_all()
-        .into_iter()
-        .map(|s| AdverseSelectionRow {
-            symbol: s.symbol,
-            adverse_bps: s.adverse_bps,
-            as_prob_bid: s.as_prob_bid,
-            as_prob_ask: s.as_prob_ask,
-        })
-        .collect();
-    rows.sort_by(|a, b| a.symbol.cmp(&b.symbol));
-    Json(AdverseSelectionResponse { rows })
-}
+// LEGACY-1 (2026-04-21) — active_graphs_snapshot +
+// manipulation_scores handlers removed. See top-of-file note;
+// frontend reads fleet endpoints instead.
 
 async fn otr_tiered() -> Json<TieredOtrResponse> {
     use prometheus::proto::MetricType;
@@ -1125,37 +976,107 @@ async fn active_plans(State(state): State<DashboardState>) -> Json<ActivePlansRe
     })
 }
 
-async fn decisions_recent(
-    State(state): State<DashboardState>,
-    axum::extract::Query(q): axum::extract::Query<DecisionsQuery>,
-) -> Json<DecisionsResponse> {
-    let limit = q.limit.unwrap_or(100).min(1_000);
-    let symbols = if let Some(sym) = q.symbol.as_deref() {
-        let mut m = std::collections::BTreeMap::new();
-        if let Some(rows) = state.decisions_recent(sym, limit) {
-            m.insert(sym.to_string(), rows);
-        }
-        m
-    } else {
-        state.decisions_all_symbols(limit)
-    };
-    Json(DecisionsResponse { symbols })
-}
-
-fn label_pair(m: &prometheus::proto::Metric) -> (Option<String>, Option<String>) {
-    let mut pattern = None;
-    let mut symbol = None;
-    for lbl in m.get_label() {
-        match lbl.get_name() {
-            "pattern" => pattern = Some(lbl.get_value().to_string()),
-            "symbol" => symbol = Some(lbl.get_value().to_string()),
-            _ => {}
-        }
-    }
-    (pattern, symbol)
-}
+// `label_pair` helper removed with surveillance_scores handler.
 
 // --- Admin: User Management ---
+
+// Wave H4 — admin auth-audit readback.
+//
+// Returns login / logout / password-reset rows from the
+// shared MiCA audit trail so operators can review who
+// signed in from where, spot credential-stuffing patterns,
+// and correlate password-reset activity with account
+// recoveries. Admin-only, rate-limited with the rest of the
+// admin surface. Uses the plain local file reader — events
+// live on the controller's filesystem already (agents
+// stream their audit events to the controller via the
+// pump). No fleet fan-out needed.
+#[derive(serde::Deserialize, Default)]
+struct AuthAuditQuery {
+    /// Inclusive upper bound (default: now). Milliseconds since epoch.
+    until_ms: Option<i64>,
+    /// Inclusive lower bound (default: 24h before `until_ms`).
+    from_ms: Option<i64>,
+    /// Max rows returned (default 200, hard cap 5000).
+    limit: Option<usize>,
+    /// Filter by substring in detail (e.g. user_id=u-abc, ip=1.2.3.4).
+    contains: Option<String>,
+}
+
+async fn admin_auth_audit_handler(
+    State(state): State<DashboardState>,
+    Query(q): Query<AuthAuditQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, (axum::http::StatusCode, String)> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let until_ms = q.until_ms.unwrap_or(now_ms);
+    let from_ms = q
+        .from_ms
+        .unwrap_or_else(|| until_ms - 24 * 60 * 60 * 1000);
+    if from_ms > until_ms {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "from_ms must be <= until_ms".into(),
+        ));
+    }
+    let limit = q.limit.unwrap_or(200).min(5000);
+    let contains = q.contains.as_deref().map(|s| s.to_string());
+
+    let Some(path) = state.audit_log_path() else {
+        return Ok(Json(Vec::new()));
+    };
+    let from_dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(from_ms).ok_or((
+        axum::http::StatusCode::BAD_REQUEST,
+        "from_ms out of range".into(),
+    ))?;
+    let until_dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(until_ms).ok_or((
+        axum::http::StatusCode::BAD_REQUEST,
+        "until_ms out of range".into(),
+    ))?;
+
+    use mm_risk::audit::AuditEventType as T;
+    let types = [
+        T::LoginSucceeded,
+        T::LoginFailed,
+        T::LogoutSucceeded,
+        T::PasswordResetIssued,
+        T::PasswordResetCompleted,
+    ];
+    let events = mm_risk::audit_reader::read_audit_filtered(
+        &path,
+        from_dt,
+        until_dt,
+        Some(&types),
+        None,
+    )
+    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Filter against both the event_type tag and the detail
+    // string so operators can narrow by "password_reset" /
+    // "login_failed" AND by user_id / ip / role within the same
+    // query. Event-type value is rendered via serde as the
+    // snake_case tag so a simple Debug-based substring match
+    // works on both the enum name and the canonical tag.
+    let filtered: Vec<serde_json::Value> = events
+        .into_iter()
+        .rev() // newest first
+        .filter(|ev| {
+            contains.as_deref().is_none_or(|needle| {
+                let tag = serde_json::to_value(&ev.event_type)
+                    .ok()
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                tag.contains(needle)
+                    || ev
+                        .detail
+                        .as_deref()
+                        .is_some_and(|d| d.contains(needle))
+            })
+        })
+        .take(limit)
+        .filter_map(|ev| serde_json::to_value(ev).ok())
+        .collect();
+    Ok(Json(filtered))
+}
 
 async fn list_users(State(auth): State<AuthState>) -> Json<Vec<UserInfo>> {
     let users = auth.list_users();
@@ -1190,6 +1111,10 @@ async fn create_user(
         name: req.name.clone(),
         role,
         api_key: api_key.clone(),
+        password_hash: None,
+        totp_secret: None,
+        totp_pending: None,
+        created_at_ms: chrono::Utc::now().timestamp_millis(),
         allowed_symbols: if req.allowed_symbols.is_empty() {
             None
         } else {
@@ -1244,162 +1169,11 @@ struct CreateUserResponse {
     api_key: String,
 }
 
-// ── Admin config override endpoints ─────────────────────────
-
-/// Apply a config override to a specific symbol.
-/// POST /api/admin/config/:symbol
-/// Body: `{"field": "Gamma", "value": "0.15"}`
-#[derive(serde::Serialize)]
-struct ConfigOverrideResponse {
-    symbol: String,
-    applied: bool,
-}
-
-#[derive(serde::Serialize)]
-struct ConfigBroadcastResponse {
-    engines_updated: usize,
-}
-
-async fn admin_config_override(
-    State(state): State<DashboardState>,
-    Path(symbol): Path<String>,
-    Json(ovr): Json<ConfigOverride>,
-) -> Json<ConfigOverrideResponse> {
-    let ok = state.send_config_override(&symbol, ovr);
-    Json(ConfigOverrideResponse {
-        symbol,
-        applied: ok,
-    })
-}
-
-/// Broadcast a config override to ALL running engines.
-/// POST /api/admin/config
-/// Body: `{"field": "MinSpreadBps", "value": "10"}`
-async fn admin_config_broadcast(
-    State(state): State<DashboardState>,
-    Json(ovr): Json<ConfigOverride>,
-) -> Json<ConfigBroadcastResponse> {
-    let count = state.broadcast_config_override(ovr);
-    Json(ConfigBroadcastResponse {
-        engines_updated: count,
-    })
-}
-
-/// Bulk config override — apply to all symbols matching a
-/// substring pattern. POST /api/admin/config/bulk
-/// Body: `{"pattern": "USDT", "override": {"field": "MinSpreadBps", "value": "10"}}`
-#[derive(serde::Deserialize)]
-struct BulkConfigRequest {
-    /// Substring pattern to match symbol names against.
-    pattern: String,
-    /// Config override to apply to all matching symbols.
-    #[serde(rename = "override")]
-    config_override: ConfigOverride,
-}
-
-#[derive(serde::Serialize)]
-struct BulkConfigResponse {
-    matched_symbols: Vec<String>,
-    applied: usize,
-}
-
-async fn admin_config_bulk(
-    State(state): State<DashboardState>,
-    Json(req): Json<BulkConfigRequest>,
-) -> Json<BulkConfigResponse> {
-    let all_symbols = state.config_symbols();
-    let matched: Vec<String> = all_symbols
-        .into_iter()
-        .filter(|s| s.contains(&req.pattern))
-        .collect();
-    let mut applied = 0;
-    for symbol in &matched {
-        if state.send_config_override(symbol, req.config_override.clone()) {
-            applied += 1;
-        }
-    }
-    Json(BulkConfigResponse {
-        matched_symbols: matched,
-        applied,
-    })
-}
-
-/// 22W-3 — register a client-side emulated order
-/// (stop/trailing/OCO/GTD) against the per-symbol engine. The
-/// body is the `EmulatorOrderSpec` JSON from
-/// `mm-risk::order_emulator`; we pass it through as an opaque
-/// string so this crate stays free of the `mm-risk` dependency.
-/// The engine's `apply_config_override` path parses + registers.
-///
-/// Example body:
-/// ```json
-/// {"kind":"stop_market","side":"sell","trigger_price":"99.5","qty":"0.1"}
-/// ```
-async fn ops_register_emulated_order(
-    State(state): State<DashboardState>,
-    Path(symbol): Path<String>,
-    body: axum::body::Bytes,
-) -> Json<ConfigOverrideResponse> {
-    // Keep payload as a raw JSON string — parse is the engine's
-    // concern so the dashboard doesn't pull mm-risk types in.
-    let spec_json = String::from_utf8(body.to_vec()).unwrap_or_default();
-    let ok = state.send_config_override(
-        &symbol,
-        ConfigOverride::RegisterEmulatedOrder(spec_json),
-    );
-    Json(ConfigOverrideResponse { symbol, applied: ok })
-}
-
-/// 22W-3 — cancel a previously-registered emulated order.
-async fn ops_cancel_emulated_order(
-    State(state): State<DashboardState>,
-    Path((symbol, id)): Path<(String, u64)>,
-) -> Json<ConfigOverrideResponse> {
-    let ok = state.send_config_override(&symbol, ConfigOverride::CancelEmulatedOrder(id));
-    Json(ConfigOverrideResponse { symbol, applied: ok })
-}
-
-/// 22W-4 — start a DCA reduction schedule on the symbol. Body
-/// is `DcaSpec` JSON (see mm-risk::dca). Engine plans slices
-/// from the current inventory toward `target`, then drains the
-/// schedule on subsequent refresh_quotes ticks.
-///
-/// Example body:
-/// ```json
-/// {"target":"0","num_slices":5,"interval_secs":30,"curve":{"kind":"flat"}}
-/// ```
-async fn ops_start_dca_reduction(
-    State(state): State<DashboardState>,
-    Path(symbol): Path<String>,
-    body: axum::body::Bytes,
-) -> Json<ConfigOverrideResponse> {
-    let spec_json = String::from_utf8(body.to_vec()).unwrap_or_default();
-    let ok = state.send_config_override(
-        &symbol,
-        ConfigOverride::StartDcaReduction(spec_json),
-    );
-    Json(ConfigOverrideResponse { symbol, applied: ok })
-}
-
-/// 22W-4 — cancel an in-flight DCA schedule. No body.
-async fn ops_cancel_dca_reduction(
-    State(state): State<DashboardState>,
-    Path(symbol): Path<String>,
-) -> Json<ConfigOverrideResponse> {
-    let ok = state.send_config_override(&symbol, ConfigOverride::CancelDcaReduction);
-    Json(ConfigOverrideResponse { symbol, applied: ok })
-}
-
-async fn admin_pause_symbol(
-    State(state): State<DashboardState>,
-    Path(symbol): Path<String>,
-) -> Json<ConfigOverrideResponse> {
-    let ok = state.send_config_override(&symbol, ConfigOverride::PauseQuoting);
-    Json(ConfigOverrideResponse {
-        symbol,
-        applied: ok,
-    })
-}
+// Per-symbol ops (kill / pause / resume / emulator / DCA) were
+// removed in the 2026-04 stabilization pass. Canonical path:
+// POST /api/v1/agents/{a}/deployments/{d}/ops/{op} served by
+// the controller. Nothing in this module dispatches per-symbol
+// ConfigOverride any more.
 
 #[derive(serde::Serialize)]
 struct WebhookListResponse {
@@ -1500,17 +1274,6 @@ async fn admin_list_symbols(State(state): State<DashboardState>) -> Json<Vec<ser
     )
 }
 
-async fn admin_resume_symbol(
-    State(state): State<DashboardState>,
-    Path(symbol): Path<String>,
-) -> Json<ConfigOverrideResponse> {
-    let ok = state.send_config_override(&symbol, ConfigOverride::ResumeQuoting);
-    Json(ConfigOverrideResponse {
-        symbol,
-        applied: ok,
-    })
-}
-
 // ── Loan admin endpoints (Epic 2) ───────────────────────────
 
 #[derive(serde::Deserialize)]
@@ -1596,7 +1359,28 @@ async fn admin_list_loans(
     axum::Json(state.get_all_loan_agreements())
 }
 
-// ── Optimization admin endpoints (Epic 6) ───────────────────
+// ── Optimization admin endpoints (Epic 6 + 33) ──────────────
+//
+// Hyperopt review loop. Worker lives as a tokio task in
+// `mm-server` / `mm-dashboard`; it reads `HyperoptTrigger`
+// payloads off a channel registered at startup, runs the
+// optimiser against a pre-recorded JSONL, and stages the
+// best trial as `PendingCalibration` in DashboardState.
+//
+// The `apply` path translates pending entries into
+// `ConfigOverride::*` variants and dispatches through
+// `state.send_config_override`, which is a no-op in the
+// distributed deployment (engines live on agents, the
+// process-local ConfigOverride channel map is empty). The
+// response surfaces this as `applied: 0, skipped: [...]` so
+// the operator sees the gap rather than silent failure.
+//
+// Distributed port (follow-up): rewire `apply` to iterate
+// the fleet and PATCH `gamma` / `order_size` / etc. variables
+// into the target deployment(s); rewire `trigger` to kick a
+// worker that observes agent telemetry + audit-log recordings.
+// Endpoints + frontend card stay wired meanwhile so the
+// catalog + history flow remain reachable.
 
 async fn admin_optimize_status(
     State(state): State<DashboardState>,
@@ -1620,13 +1404,6 @@ async fn admin_optimize_results(
     }
 }
 
-// ── Epic 33 — hyperopt re-calibrate flow ────────────────────
-
-/// Kick off a hyperopt run against a pre-recorded JSONL. The
-/// worker task in the server reads `HyperoptTrigger` payloads
-/// from the channel registered at startup, runs the optimiser,
-/// and stages the best trial as `PendingCalibration` for
-/// operator review.
 async fn admin_optimize_trigger(
     State(state): State<DashboardState>,
     axum::Json(trigger): axum::Json<crate::state::HyperoptTrigger>,
@@ -1651,8 +1428,6 @@ async fn admin_optimize_trigger(
     .into_response()
 }
 
-/// List pending calibrations — one per symbol if any hyperopt
-/// runs have completed since the last apply / discard.
 async fn admin_optimize_pending(
     State(state): State<DashboardState>,
 ) -> axum::Json<Vec<crate::state::PendingCalibration>> {
@@ -1664,9 +1439,6 @@ struct SymbolBody {
     symbol: String,
 }
 
-/// Apply the pending calibration for `symbol`: convert each
-/// suggested parameter into the matching `ConfigOverride` and
-/// dispatch. Clears the pending entry.
 async fn admin_optimize_apply(
     State(state): State<DashboardState>,
     axum::Json(body): axum::Json<SymbolBody>,
@@ -1692,10 +1464,6 @@ async fn admin_optimize_apply(
                 ConfigOverride::NumLevels(n)
             }
             "max_inventory" => ConfigOverride::MaxInventory(*value),
-            // κ and σ are strategy inputs but not hot-reloadable
-            // through the existing ConfigOverride surface yet —
-            // skip with a note so the operator can patch config
-            // manually if they were part of the suggestion.
             _ => {
                 skipped.push(key.clone());
                 continue;
@@ -1704,7 +1472,7 @@ async fn admin_optimize_apply(
         if state.send_config_override(&body.symbol, ovr) {
             applied += 1;
         } else {
-            skipped.push(format!("{key} (send failed)"));
+            skipped.push(format!("{key} (no local engine — distributed apply not yet wired)"));
         }
     }
     state.clear_calibration(&body.symbol);
@@ -1727,60 +1495,21 @@ async fn admin_optimize_discard(
     }))
 }
 
-// ── Epic G follow-up — manual headline push ────────────────
-//
-// Operators with faster eyes than the RSS / Twitter poll
-// cycle can inject a headline directly. The endpoint
-// broadcasts `ConfigOverride::News(text)` so every engine's
-// `NewsRetreatStateMachine` re-evaluates on it — same path
-// the automated pipeline uses. The distinction is purely
-// provenance: automated pipeline goes via the orchestrator's
-// SentimentTick; this endpoint skips straight to the
-// retreat-state-machine branch for immediate effect.
 
-#[derive(serde::Deserialize)]
-struct HeadlinePayload {
-    /// Free text — regex tables in `NewsRetreatConfig` decide
-    /// the severity class.
-    text: String,
-}
-
-async fn admin_sentiment_headline(
-    State(state): State<DashboardState>,
-    axum::Json(body): axum::Json<HeadlinePayload>,
-) -> axum::Json<serde_json::Value> {
-    if body.text.trim().is_empty() {
-        return axum::Json(serde_json::json!({
-            "status": "rejected",
-            "reason": "empty text",
-        }));
-    }
-    let recipients = state.broadcast_config_override(
-        crate::state::ConfigOverride::News(body.text.clone()),
-    );
-    tracing::info!(
-        chars = body.text.len(),
-        recipients,
-        "operator-pushed headline broadcast"
-    );
-    axum::Json(serde_json::json!({
-        "status": "broadcast",
-        "recipients": recipients,
-        "chars": body.text.len(),
-    }))
-}
-
-// ── Epic H — strategy graph deploy ─────────────────────────
+// ── Epic H — strategy graph save ───────────────────────────
 //
 // `POST /api/admin/strategy/graph` body: the full graph JSON.
 // Flow:
 //   1. parse + compile (runs full validation via `Evaluator::build`).
 //   2. persist via `GraphStore::save` — atomic tmp+rename + deploy
 //      log append + SHA-256 hash.
-//   3. broadcast `ConfigOverride::StrategyGraphSwap(json)` to every
-//      engine; engines whose scope matches swap in the new graph,
-//      engines that don't match silently skip.
-//   4. respond with `{ hash, recipients }`.
+//   3. respond with `{ hash, name }`.
+//
+// No broadcast — distributed engines live on agents. After a
+// save, the frontend fires a per-deployment graph-swap op
+// against a specific (agent, deployment) target. That's the
+// correct shape: "strategy" means a single deployment, not a
+// fleet-wide scope string.
 
 /// `?rollback_from=<prev_hash>` query parameter distinguishes a
 /// rollback-to-a-known-historical-version from a fresh forward
@@ -1820,7 +1549,7 @@ fn known_venue_names(cfg: &mm_common::config::AppConfig) -> Vec<String> {
     out
 }
 
-async fn admin_deploy_strategy_graph(
+async fn admin_save_strategy_graph(
     State(state): State<DashboardState>,
     Query(q): Query<DeployQuery>,
     headers: axum::http::HeaderMap,
@@ -1980,8 +1709,10 @@ async fn admin_deploy_strategy_graph(
         }
     };
 
-    // Scope key string — compact, matches the form the engine uses
-    // when routing ConfigOverride messages.
+    // Scope key string — compact, matches the form the engine
+    // once used when routing ConfigOverride messages. Still
+    // audit-logged because the catalog entry is scoped even
+    // though actual engine dispatch is now per-deployment.
     let scope_key = match &graph.scope {
         mm_strategy_graph::Scope::Symbol(s) => format!("Symbol({s})"),
         mm_strategy_graph::Scope::AssetClass(c) => format!("AssetClass({c})"),
@@ -1989,14 +1720,11 @@ async fn admin_deploy_strategy_graph(
         mm_strategy_graph::Scope::Global => "Global".to_string(),
     };
 
-    // Broadcast. ConfigOverride clones are cheap (String body).
-    let recipients = state.broadcast_config_override(
-        crate::state::ConfigOverride::StrategyGraphSwap(body.clone()),
-    );
-
-    // Audit trail — rollback (if flagged by the UI) precedes the
-    // deploy row so a grepper who reads top-to-bottom sees intent
-    // before result.
+    // Audit trail — rollback precedes the save row so a grepper
+    // reading top-to-bottom sees intent before result.
+    // `recipients` is left at 0 because the save itself doesn't
+    // dispatch; the per-deployment graph-swap op records its
+    // own audit event at dispatch time.
     if let Some(audit) = state.audit_log() {
         if let Some(from_hash) = q.rollback_from.as_deref() {
             audit.strategy_graph_rolled_back(&graph.name, from_hash, &hash, &operator);
@@ -2006,143 +1734,277 @@ async fn admin_deploy_strategy_graph(
             &hash,
             &scope_key,
             &operator,
-            recipients,
+            0,
         );
+        if !offenders.is_empty() {
+            audit.strategy_graph_restricted_deploy_acked(
+                &graph.name,
+                &hash,
+                &operator,
+                &offenders,
+            );
+        }
     }
 
     tracing::info!(
         name = %graph.name,
         hash = %hash,
-        recipients,
         operator = %operator,
         rollback_from = ?q.rollback_from,
-        "strategy graph deployed"
+        "strategy graph saved — operator still needs to dispatch to a deployment via /ops/graph-swap"
     );
 
     (
         StatusCode::OK,
         axum::Json(serde_json::json!({
-            "status": "deployed",
+            "status": "saved",
             "hash": hash,
-            "recipients": recipients,
             "name": graph.name,
         })),
     )
         .into_response()
 }
 
-// ── Ops endpoints — manual kill switch control ───────────────
-//
-// These power the Controls.svelte panel in the dashboard frontend.
-// Every endpoint routes through the existing `ConfigOverride`
-// mpsc channel so the engine applies the change on its next
-// select-loop tick. Admin role only + per-user rate limit, both
-// enforced by the admin router's route_layers.
+/// `PATCH /api/admin/strategy/graph/{name}/nodes/{node_id}/config`.
+/// Edits one node's config in the stored graph catalog.
+/// Save-only in distributed mode — the historical broadcast
+/// through ConfigOverride is gone; after patching, the
+/// operator redeploys via `POST .../deployments/.../ops/graph-swap`
+/// to push the patched graph onto a specific deployment.
+/// Restricted-kind + env gate still apply because a patch can
+/// introduce pentest kinds that weren't in the original graph.
+async fn admin_patch_strategy_node_config(
+    State(state): State<DashboardState>,
+    Path((name, node_id_str)): Path<(String, String)>,
+    Query(q): Query<DeployQuery>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
 
+    let operator = headers
+        .get("X-MM-User")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let new_config: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": "parse",
+                    "detail": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let target_node_id = match uuid::Uuid::parse_str(&node_id_str) {
+        Ok(u) => mm_strategy_graph::NodeId(u),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": "bad_node_id",
+                    "detail": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let Some(store) = state.strategy_graph_store() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "error": "strategy graphs not configured",
+            })),
+        )
+            .into_response();
+    };
+    let mut graph = match store.load(&name) {
+        Ok(g) => g,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({
+                    "error": "graph_not_found",
+                    "detail": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let from_hash = graph.content_hash();
+    let Some(node) = graph.nodes.iter_mut().find(|n| n.id == target_node_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": "node_not_found",
+                "detail": format!("node {node_id_str} not in graph {name}"),
+            })),
+        )
+            .into_response();
+    };
+    node.config = new_config;
+    if let Err(e) = mm_strategy_graph::Evaluator::build(&graph) {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "validate",
+                "detail": e.to_string(),
+            })),
+        )
+            .into_response();
+    }
+    // Restricted-kind gate — mirrors the full-deploy path.
+    let allow_restricted = std::env::var("MM_ALLOW_RESTRICTED")
+        .map(|v| v == "yes-pentest-mode")
+        .unwrap_or(false);
+    let offenders: Vec<String> = graph
+        .nodes
+        .iter()
+        .filter(|n| {
+            mm_strategy_graph::catalog::shape(&n.kind)
+                .map(|s| s.restricted)
+                .unwrap_or(false)
+        })
+        .map(|n| n.kind.clone())
+        .collect();
+    if !allow_restricted && !offenders.is_empty() {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "error": "restricted",
+                "detail": format!("patch introduced restricted nodes: {}", offenders.join(",")),
+            })),
+        )
+            .into_response();
+    }
+    if allow_restricted && !offenders.is_empty() {
+        let acked = q.restricted_ack.as_deref() == Some("yes-pentest-mode");
+        if !acked {
+            return (
+                StatusCode::PRECONDITION_REQUIRED,
+                axum::Json(serde_json::json!({
+                    "error": "restricted_ack_required",
+                    "detail": "operator must explicitly acknowledge the restricted nodes before patch",
+                    "restricted_nodes": offenders,
+                })),
+            )
+                .into_response();
+        }
+    }
+    let to_hash = match store.save(&graph, Some(&operator)) {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "error": "persist",
+                    "detail": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    if let Some(audit) = state.audit_log() {
+        audit.strategy_graph_node_patched(
+            &graph.name,
+            &from_hash,
+            &to_hash,
+            &node_id_str,
+            &operator,
+        );
+    }
+    tracing::info!(
+        name = %graph.name,
+        from_hash = %from_hash,
+        to_hash = %to_hash,
+        node_id = %node_id_str,
+        operator = %operator,
+        "strategy graph node patched (save-only — redeploy via ops/graph-swap to push)"
+    );
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "status": "patched",
+            "from_hash": from_hash,
+            "to_hash": to_hash,
+            "node_id": node_id_str,
+            "name": graph.name,
+        })),
+    )
+        .into_response()
+}
+
+
+/// 23-UX-6 — set the kill-switch level for a single venue. Body
+/// carries `{level: u8}` on the 0..=5 scale (same as the
+/// per-symbol kill). `level = 0` clears the entry. The engine
+/// consumes this via `DashboardState::venue_kill_level` on every
+/// connector dispatch; level ≥ 3 short-circuits placement +
+/// triggers a cancel-all on that venue's connector.
 #[derive(serde::Deserialize)]
-struct OpsRequest {
-    /// Free-form reason string captured in the audit trail and
-    /// incident log. Required so every manual escalation has a
-    /// human-readable justification for regulator review.
+struct VenueKillRequest {
+    level: u8,
     #[serde(default)]
     reason: String,
 }
 
 #[derive(serde::Serialize)]
-struct OpsResponse {
-    symbol: String,
+struct VenueKillResponse {
+    venue: String,
     level: u8,
     applied: bool,
 }
 
-async fn ops_kill_at_level(
-    state: &DashboardState,
-    symbol: &str,
-    level: u8,
-    reason: &str,
-) -> Json<OpsResponse> {
-    let effective_reason = if reason.is_empty() {
-        "dashboard operator".to_string()
-    } else {
-        reason.to_string()
-    };
-    let ok = state.send_config_override(
-        symbol,
-        ConfigOverride::ManualKillSwitch {
-            level,
-            reason: effective_reason,
-        },
-    );
-    Json(OpsResponse {
-        symbol: symbol.to_string(),
-        level,
-        applied: ok,
+async fn ops_set_venue_kill_level(
+    State(state): State<DashboardState>,
+    Path(venue): Path<String>,
+    Json(req): Json<VenueKillRequest>,
+) -> Json<VenueKillResponse> {
+    if req.level > 5 {
+        return Json(VenueKillResponse {
+            venue,
+            level: req.level,
+            applied: false,
+        });
+    }
+    state.set_venue_kill_level(&venue, req.level);
+    if let Some(audit) = state.audit_log() {
+        audit.risk_event(
+            "",
+            mm_risk::audit::AuditEventType::KillSwitchEscalated,
+            &format!(
+                "venue_kill venue={venue} level={} reason={}",
+                req.level,
+                if req.reason.is_empty() { "n/a" } else { &req.reason }
+            ),
+        );
+    }
+    Json(VenueKillResponse {
+        venue,
+        level: req.level,
+        applied: true,
     })
 }
 
-async fn ops_widen(
+async fn list_venue_kill_levels(
     State(state): State<DashboardState>,
-    Path(symbol): Path<String>,
-    body: Option<Json<OpsRequest>>,
-) -> Json<OpsResponse> {
-    let reason = body.map(|b| b.reason.clone()).unwrap_or_default();
-    ops_kill_at_level(&state, &symbol, 1, &reason).await
-}
-
-async fn ops_stop(
-    State(state): State<DashboardState>,
-    Path(symbol): Path<String>,
-    body: Option<Json<OpsRequest>>,
-) -> Json<OpsResponse> {
-    let reason = body.map(|b| b.reason.clone()).unwrap_or_default();
-    ops_kill_at_level(&state, &symbol, 2, &reason).await
-}
-
-async fn ops_cancel_all(
-    State(state): State<DashboardState>,
-    Path(symbol): Path<String>,
-    body: Option<Json<OpsRequest>>,
-) -> Json<OpsResponse> {
-    let reason = body.map(|b| b.reason.clone()).unwrap_or_default();
-    ops_kill_at_level(&state, &symbol, 3, &reason).await
-}
-
-async fn ops_flatten(
-    State(state): State<DashboardState>,
-    Path(symbol): Path<String>,
-    body: Option<Json<OpsRequest>>,
-) -> Json<OpsResponse> {
-    let reason = body.map(|b| b.reason.clone()).unwrap_or_default();
-    ops_kill_at_level(&state, &symbol, 4, &reason).await
-}
-
-async fn ops_disconnect(
-    State(state): State<DashboardState>,
-    Path(symbol): Path<String>,
-    body: Option<Json<OpsRequest>>,
-) -> Json<OpsResponse> {
-    let reason = body.map(|b| b.reason.clone()).unwrap_or_default();
-    ops_kill_at_level(&state, &symbol, 5, &reason).await
-}
-
-async fn ops_kill_reset(
-    State(state): State<DashboardState>,
-    Path(symbol): Path<String>,
-    body: Option<Json<OpsRequest>>,
-) -> Json<OpsResponse> {
-    let reason = body
-        .map(|b| b.reason.clone())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "dashboard operator".to_string());
-    let ok = state.send_config_override(
-        &symbol,
-        ConfigOverride::ManualKillSwitchReset { reason },
-    );
-    Json(OpsResponse {
-        symbol,
-        level: 0,
-        applied: ok,
-    })
+) -> Json<serde_json::Value> {
+    let levels = state.all_venue_kill_levels();
+    // Sort by venue name so the response is deterministic.
+    let mut rows: Vec<(String, u8)> = levels.into_iter().collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    Json(serde_json::json!({
+        "venues": rows
+            .into_iter()
+            .map(|(v, lvl)| serde_json::json!({"venue": v, "level": lvl}))
+            .collect::<Vec<_>>(),
+    }))
 }
 
 // ── Connectivity matrix ─────────────────────────────────────
@@ -2273,6 +2135,58 @@ async fn list_clients_public(State(state): State<DashboardState>) -> Json<Vec<Cl
             ClientPublicRow { id, symbols: syms }
         })
         .collect();
+    Json(rows)
+}
+
+/// Per-venue book-state row. One snapshot per (venue, symbol,
+/// product) with L1 mid/spread plus feed age so the Overview can
+/// show operators "what market each venue sees" without them
+/// having to scroll through four different panels to compare.
+#[derive(serde::Serialize)]
+struct VenueBookStateRow {
+    venue: String,
+    symbol: String,
+    product: String,
+    bid: Option<rust_decimal::Decimal>,
+    ask: Option<rust_decimal::Decimal>,
+    mid: Option<rust_decimal::Decimal>,
+    spread_bps: Option<rust_decimal::Decimal>,
+    /// Milliseconds since last L1 update. `null` when no update
+    /// has been seen yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    age_ms: Option<i64>,
+}
+
+async fn venues_book_state(
+    State(state): State<DashboardState>,
+) -> Json<Vec<VenueBookStateRow>> {
+    let now = chrono::Utc::now();
+    let mut rows: Vec<VenueBookStateRow> = state
+        .data_bus()
+        .l1_entries()
+        .into_iter()
+        .map(|(key, snap)| VenueBookStateRow {
+            venue: key.0,
+            symbol: key.1,
+            product: format!("{:?}", key.2).to_lowercase(),
+            bid: snap.bid_px,
+            ask: snap.ask_px,
+            mid: snap.mid,
+            spread_bps: snap.spread_bps,
+            age_ms: snap
+                .ts
+                .map(|t| (now - t).num_milliseconds().max(0)),
+        })
+        .collect();
+    // Deterministic ordering: spot first, then perp classes, then
+    // alphabetical by venue within a product class. Makes the
+    // frontend render stable between polls.
+    rows.sort_by(|a, b| {
+        a.product
+            .cmp(&b.product)
+            .then_with(|| a.venue.cmp(&b.venue))
+            .then_with(|| a.symbol.cmp(&b.symbol))
+    });
     Json(rows)
 }
 
@@ -2462,28 +2376,6 @@ async fn ops_client_reset(
     }
 }
 
-#[cfg(test)]
-mod surveillance_tests {
-    use super::*;
-    use crate::metrics::{SURVEILLANCE_ALERTS_TOTAL, SURVEILLANCE_SCORE};
-
-    /// Sprint 4 companion — endpoint reflects the live gauge +
-    /// counter values for the given (pattern, symbol).
-    #[tokio::test]
-    async fn surveillance_scores_reflects_metric_state() {
-        SURVEILLANCE_SCORE
-            .with_label_values(&["spoofing", "UISURV1"])
-            .set(0.73);
-        SURVEILLANCE_ALERTS_TOTAL
-            .with_label_values(&["spoofing", "UISURV1"])
-            .inc_by(3);
-        let Json(out) = surveillance_scores().await;
-        let spoof = out
-            .patterns
-            .get("spoofing")
-            .expect("spoofing bucket present");
-        let row = spoof.get("UISURV1").expect("symbol bucket present");
-        assert!((row.score - 0.73).abs() < 1e-9, "score round-trips");
-        assert_eq!(row.alerts_total, 3, "alerts counter surfaces");
-    }
-}
+// LEGACY-1 (2026-04-21) — `surveillance_tests` module removed
+// with its handler. Fleet endpoint coverage lives in
+// `mm-controller` integration tests.

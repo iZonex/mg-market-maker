@@ -388,6 +388,31 @@ impl Evaluator {
                         sinks.push(SinkAction::VenueQuotes(qs.clone()));
                     }
                 }
+                "Out.VenueQuotesIf" => {
+                    // Phase IV reactive-hedge gate. Only emit when
+                    // the trigger fires; accept both VenueQuotes
+                    // (tagged per-leg) and plain Quotes (untagged —
+                    // the engine dispatcher tags them against the
+                    // caller's primary venue). Missing trigger or
+                    // quotes → no-op, so a stale upstream source
+                    // never fires an unguarded hedge.
+                    let trigger = input_vec
+                        .first()
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    if !trigger {
+                        continue;
+                    }
+                    if let Some(qs) = input_vec.get(1).and_then(Value::as_venue_quotes) {
+                        if !qs.is_empty() {
+                            sinks.push(SinkAction::VenueQuotes(qs.clone()));
+                        }
+                    } else if let Some(qs) = input_vec.get(1).and_then(Value::as_quotes) {
+                        if !qs.is_empty() {
+                            sinks.push(SinkAction::Quotes(qs.clone()));
+                        }
+                    }
+                }
                 "Out.AtomicBundle" => {
                     // Inputs: maker Quotes, hedge Quotes, timeout_ms
                     // Number. Takes the first entry of each bundle.

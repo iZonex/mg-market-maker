@@ -1,5 +1,29 @@
 global:
   scrape_interval: 5s
+  # Evaluate alert rules at a slightly slower cadence than
+  # scrape — 15s is a good floor for a single-node setup; tune
+  # up if rule evaluation becomes the scrape bottleneck.
+  evaluation_interval: 15s
+
+# Mount deploy/prometheus/mm-alerts.yml at /etc/prometheus/mm-alerts.yml
+# (docker-compose already does this) so the engine's critical /
+# warning / info alerts fire through the standard Alertmanager
+# pipeline. Copy + tune per deployment — every threshold is
+# documented inline in mm-alerts.yml.
+rule_files:
+  - /etc/prometheus/mm-alerts.yml
+
+# Forward firing alerts to Alertmanager. The docker-compose +
+# Helm stack ships a pre-configured Alertmanager at
+# `alertmanager:9093`; out-of-the-box the Telegram routes are
+# no-ops until operators populate the env vars in
+# deploy/alertmanager/alertmanager.yml. See docs/guides/operations.md
+# § "Alertmanager routing" for the setup.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
 
 scrape_configs:
   - job_name: market-maker

@@ -82,19 +82,31 @@ pub fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
 
     // --- Exchange ---
     // HyperLiquid hardcodes endpoints inside the connector, so rest_url/ws_url
-    // in the config are ignored there. Other venues still require them.
+    // in the config are ignored there. For every KNOWN venue the
+    // connector carries its own default URL per (venue, product)
+    // pair — operator only supplies URLs for `exchange_type =
+    // "custom"` or to override testnet endpoints. The previous
+    // hard-require of rest_url/ws_url was a config ergonomics
+    // problem flagged during the cross-exchange paper smoke.
     let hl = matches!(
         config.exchange.exchange_type,
         ExchangeType::HyperLiquid | ExchangeType::HyperLiquidTestnet
     );
-    if !hl {
+    let custom = matches!(config.exchange.exchange_type, ExchangeType::Custom);
+    if custom {
         if config.exchange.rest_url.is_empty() {
-            errors.push("exchange.rest_url is required".to_string());
+            errors.push(
+                "exchange.rest_url is required for exchange_type = \"custom\"".to_string(),
+            );
         }
         if config.exchange.ws_url.is_empty() {
-            errors.push("exchange.ws_url is required".to_string());
+            errors.push(
+                "exchange.ws_url is required for exchange_type = \"custom\"".to_string(),
+            );
         }
-    } else if config
+    }
+    if hl
+        && config
         .exchange
         .api_secret
         .as_deref()

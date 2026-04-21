@@ -1,0 +1,90 @@
+# Production overrides. Layer on top of values.yaml:
+#
+#   helm install mm-prod ./deploy/helm/mm -f values.yaml -f values-prod.yaml
+#
+# This file contains NO SECRETS. Credentials must come from an
+# External-Secrets-Operator / SealedSecrets / Vault backing store
+# materialised under `secret.existingSecretName`. Commit history
+# of values-prod.yaml is not a credential leak surface.
+
+image:
+  # Pin a version tag, NEVER "latest" in prod — Helm rollbacks
+  # require an immutable image reference to be meaningful.
+  tag: "0.4.0"
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+env:
+  MM_MODE: live
+  RUST_LOG: info,mm_engine=info,mm_exchange_binance=warn
+  MM_DASHBOARD_CORS_ORIGINS: "https://mm-dashboard.prod.internal"
+  # ── Observability ────────────────────────────────────────
+  # Sentry DSN — error aggregation. Pull from a Secret via
+  # `secret.existingSecretName` rather than hardcoding here;
+  # the value below is a placeholder that gets overridden by
+  # `envFrom.secretRef` at pod start.
+  MM_SENTRY_DSN: ""
+  # OTLP gRPC endpoint — point at a cluster-local OTel
+  # Collector that forwards to your vendor (Datadog,
+  # Honeycomb, Grafana Tempo). Requires image built with
+  # `--features otel`.
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.monitoring:4317"
+
+secret:
+  create: false
+  existingSecretName: mm-prod-secrets    # managed by ESO / SealedSecrets
+
+resources:
+  requests:
+    cpu: "1"
+    memory: "1Gi"
+  limits:
+    cpu: "4"
+    memory: "4Gi"
+
+persistence:
+  enabled: true
+  storageClass: "fast-ssd"      # tune to the cluster's SSD class
+  size: 50Gi
+
+pdb:
+  enabled: true
+  minAvailable: 1
+
+serviceMonitor:
+  enabled: true
+  interval: 15s
+  labels:
+    release: prometheus         # matches kube-prometheus-stack default
+
+# Schedule on dedicated MM nodes if you've tainted them so the
+# engine doesn't co-tenant with noisy neighbours.
+nodeSelector:
+  workload: market-maker
+
+tolerations:
+  - key: workload
+    operator: Equal
+    value: market-maker
+    effect: NoSchedule
+
+# Harden scheduling — prefer spreading across zones if the cluster
+# is multi-AZ. Single pod makes this a weak hint; real HA would
+# require a different architecture (active/passive with DB-backed
+# leader election).
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: topology.kubernetes.io/zone
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: mm
+
+priorityClassName: "high-priority-trading"
+
+# Slightly longer grace window in prod — gives the engine
+# headroom to cancel larger order books cleanly.
+terminationGracePeriodSeconds: 60

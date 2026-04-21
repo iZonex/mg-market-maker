@@ -1,0 +1,12 @@
+# Patterns to ignore when packaging. Mirrors upstream Helm
+# defaults — trimmed to what matters for this chart.
+.DS_Store
+.git/
+.gitignore
+.idea/
+*.tmproj
+.vscode/
+# Don't include env-specific values in the packaged tarball;
+# operators layer them in via `-f` at install time.
+values-dev.yaml
+values-prod.yaml
