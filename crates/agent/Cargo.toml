@@ -30,6 +30,13 @@ mm-exchange-bybit = { workspace = true }
 mm-exchange-hyperliquid = { workspace = true }
 mm-engine = { workspace = true }
 mm-strategy = { workspace = true }
+# R1-TEMPLATE-3 (2026-04-22) — agent loads bundled graph templates
+# (`templates::load(name)`) so `-via-graph` templates actually
+# route through the graph evaluator. Before this, the template
+# name was only used for a plain-strategy mapping; graph JSONs
+# (rug-detector-composite, cross-asset-regime, etc.) sat on disk
+# but never evaluated.
+mm-strategy-graph = { workspace = true }
 # ConfigOverride type (hot-reload channel payload) lives in
 # mm-dashboard for historical reasons — the engine's select
 # loop reads an `UnboundedReceiver<ConfigOverride>`. Agent

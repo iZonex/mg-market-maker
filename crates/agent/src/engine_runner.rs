@@ -353,6 +353,7 @@ impl EngineFactory for RealEngineFactory {
             let runner = MarketMakerRunner {
                 symbol: symbol.clone(),
                 deployment_id: deployment_id.clone(),
+                template: desired.template.clone(),
                 config,
                 connector: connector.clone(),
                 hedge_connector,

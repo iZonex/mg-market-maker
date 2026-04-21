@@ -270,6 +270,18 @@ pub struct MarketMakerEngine {
     /// `false` until the first inside crossing; flips on
     /// every threshold crossing thereafter. P1.4 stage-1.
     cross_venue_basis_inside: bool,
+    /// R1.2/R1.3 (2026-04-22) — one-shot flag for the
+    /// `auto_scale_order_size` pass. Default `order_size=0.001`
+    /// base units was tuned for BTCUSDT (~$75 notional per
+    /// quote). On lower-priced pairs (ETHUSDT, SOLUSDT, etc.)
+    /// `0.001 * mid < min_notional` → every quote failed
+    /// `ProductSpec::meets_min_notional` → `live_orders=0`
+    /// with zero user-visible error. First tick where mid is
+    /// known, we bump `config.market_maker.order_size` to
+    /// `1.2 * min_notional / mid`, rounded to lot, and log
+    /// a warning. Operator-configured sizes that already clear
+    /// the check are left alone.
+    auto_scaled_order_size: bool,
     /// Per-asset-class kill switch (P2.1). Shared via
     /// `Arc<Mutex<KillSwitch>>` across every engine that maps to
     /// the same class — escalating one engine's asset-class
@@ -945,6 +957,7 @@ impl MarketMakerEngine {
             hedge_book,
             borrow_manager,
             cross_venue_basis_inside: false,
+            auto_scaled_order_size: false,
             asset_class_switch: None,
             pair_lifecycle: if config.market_maker.pair_lifecycle_enabled {
                 Some(PairLifecycleManager::new())
@@ -6589,6 +6602,21 @@ impl MarketMakerEngine {
                         count = ghosts.len(),
                         "reconciliation: removing ghost orders (tracked locally but absent on venue)"
                     );
+                    // R4-DRIFT-2 (2026-04-22) — ghost orders
+                    // indicate a tracking drift that can mask a
+                    // venue-side cancellation (venue dropped the
+                    // order, we never saw the notification). Fire
+                    // an incident so operators see it in the
+                    // Violations / Incidents panel.
+                    self.record_incident(
+                        "medium",
+                        &format!(
+                            "Reconciliation: {} ghost order(s) on {} \
+                             (tracked locally but absent from venue)",
+                            ghosts.len(),
+                            self.symbol
+                        ),
+                    );
                     for id in &ghosts {
                         // Epic R 1.2b — record cancel-to-nearby-trade
                         // gap for CancelOnReaction scoring.
@@ -6606,6 +6634,22 @@ impl MarketMakerEngine {
                     warn!(
                         count = phantoms.len(),
                         "reconciliation: detected phantom orders (live on venue but not tracked)"
+                    );
+                    // R4-DRIFT-2 — phantom orders are even worse
+                    // than ghosts: the venue is holding our
+                    // capital on an order WE DON'T KNOW about.
+                    // Diff-based cancel can still reap them, but
+                    // the operator needs to know they happened so
+                    // they can investigate whether a past restart
+                    // dropped tracking state.
+                    self.record_incident(
+                        "high",
+                        &format!(
+                            "Reconciliation: {} phantom order(s) on {} \
+                             (live on venue, not tracked locally — potential state loss)",
+                            phantoms.len(),
+                            self.symbol
+                        ),
                     );
                     // Track phantom orders so the next diff can
                     // cancel them if they're not in the desired set.
@@ -6748,6 +6792,30 @@ impl MarketMakerEngine {
             AuditEventType::InventoryDriftDetected,
             &detail,
         );
+        // R4-DRIFT-1 (2026-04-22) — surface drift to the incident
+        // feed so operators see it in the Incidents / Violations
+        // panel without tailing logs. Severity depends on whether
+        // auto-correct is on: corrected drift is "medium" (risk
+        // survived, PnL attribution mildly degraded); uncorrected
+        // drift is "high" (tracker is out of sync with reality —
+        // every downstream decision is based on a stale inventory
+        // value).
+        let severity = if report.corrected { "medium" } else { "high" };
+        self.record_incident(
+            severity,
+            &format!(
+                "Inventory drift detected on {}: tracked={} expected={} drift={} {}",
+                report.asset,
+                report.tracked_inventory,
+                report.expected_inventory,
+                report.drift,
+                if report.corrected {
+                    "(auto-corrected)"
+                } else {
+                    "(not corrected — inventory_drift_auto_correct is off)"
+                }
+            ),
+        );
         if report.corrected {
             // Operator opted into auto-correction — force the
             // tracker to match the wallet delta. PnL attribution
@@ -6876,10 +6944,57 @@ impl MarketMakerEngine {
             }
 
             // TWAP execution (if active).
+            //
+            // R3-FLATTEN-1 (2026-04-22) — before this, the branch
+            // only called `twap.next_slice` and logged the result.
+            // The actual `order_manager` placement was missing, so
+            // kill-switch L4 flatten + any other TWAP-driven
+            // unwind generated "TWAP slice" log lines every ~6 s
+            // forever without ever placing an order. Inventory
+            // would stay locked at whatever value triggered the
+            // flatten; the position could not be unwound by any
+            // engine-side path. For perp products we use the
+            // reduce-only variant so the venue refuses fills that
+            // would flip or increase position direction.
             if let Some(twap) = &mut self.twap {
                 if let Some(quote) = twap.next_slice(mid) {
-                    // Execute TWAP slice via order manager.
-                    info!(side = ?quote.side, price = %quote.price, qty = %quote.qty, "TWAP slice");
+                    info!(
+                        side = ?quote.side,
+                        price = %quote.price,
+                        qty = %quote.qty,
+                        "TWAP slice"
+                    );
+                    let is_perp = matches!(
+                        self.config.exchange.product,
+                        mm_common::config::ProductType::LinearPerp
+                            | mm_common::config::ProductType::InversePerp
+                    );
+                    let result = if is_perp {
+                        self.order_manager
+                            .execute_reduce_slice(
+                                &self.symbol,
+                                &quote,
+                                &self.product,
+                                &self.connectors.primary,
+                            )
+                            .await
+                    } else {
+                        self.order_manager
+                            .execute_unwind_slice(
+                                &self.symbol,
+                                &quote,
+                                &self.product,
+                                &self.connectors.primary,
+                            )
+                            .await
+                    };
+                    if let Err(e) = result {
+                        warn!(
+                            symbol = %self.symbol,
+                            error = %e,
+                            "TWAP slice dispatch failed"
+                        );
+                    }
                 }
             }
 
@@ -8179,8 +8294,72 @@ impl MarketMakerEngine {
     }
 
     #[instrument(skip(self), fields(symbol = %self.symbol, tick = self.tick_count))]
+    /// R1.2/R1.3 (2026-04-22) — bump `config.market_maker.order_size`
+    /// above the product's `min_notional` when the operator left
+    /// the built-in default. Runs once on the first tick where
+    /// mid price is known. No-op if:
+    /// - mid price not yet available (book still loading)
+    /// - product has no min_notional (set to 0)
+    /// - current order_size already clears 1.2 × min_notional
+    /// - scaler already applied this session
+    ///
+    /// Silent GLFT/grid on non-BTC symbols was visible only by
+    /// `live_orders=0` with no error — fixing it in one place in
+    /// the engine is cheaper than wiring per-symbol defaults in
+    /// every template.
+    fn auto_scale_order_size(&mut self) {
+        if self.auto_scaled_order_size {
+            return;
+        }
+        let Some(mid) = self.book_keeper.book.mid_price() else {
+            return;
+        };
+        if mid.is_zero() || self.product.min_notional.is_zero() {
+            self.auto_scaled_order_size = true;
+            return;
+        }
+        let current = self.config.market_maker.order_size;
+        let current_notional = current * mid;
+        let safety_mult = dec!(1.2);
+        let min_notional = self.product.min_notional;
+        if current_notional >= min_notional * safety_mult {
+            // Already sized correctly.
+            self.auto_scaled_order_size = true;
+            return;
+        }
+        // Required raw size + round UP to lot_size, otherwise
+        // `round_qty` could round back down under the threshold.
+        let raw = (min_notional * safety_mult) / mid;
+        let lot = self.product.lot_size.max(dec!(0.00000001));
+        let rounded = if lot.is_zero() {
+            raw
+        } else {
+            // ceil(raw / lot) * lot
+            let ratio = raw / lot;
+            let ceiled = ratio.ceil();
+            ceiled * lot
+        };
+        let new_size = rounded.max(current);
+        if new_size > current {
+            tracing::warn!(
+                symbol = %self.symbol,
+                old = %current,
+                new = %new_size,
+                mid = %mid,
+                min_notional = %min_notional,
+                "auto-scaling order_size above min_notional — default \
+                 tuned for BTCUSDT notionals. Set a larger `order_size` \
+                 in variables to silence this."
+            );
+            self.config.market_maker.order_size = new_size;
+        }
+        self.auto_scaled_order_size = true;
+    }
+
     async fn refresh_quotes(&mut self) -> Result<()> {
         self.tick_count += 1;
+        // R1.2/R1.3 — size-up quotes on first tick with mid.
+        self.auto_scale_order_size();
 
         // 22W-1 — protections stack gate. Before we do ANY
         // work this tick, check whether a per-pair guard has
@@ -10924,6 +11103,74 @@ mod dual_connector_tests {
             funding_interval_secs: Some(28_800),
             basis_threshold_bps: dec!(20),
         }
+    }
+
+    /// R1.2/R1.3 regression — `auto_scale_order_size` must
+    /// bump `order_size` above `min_notional` when the default
+    /// 0.001-base-unit size is below the venue's threshold at
+    /// the current mid.
+    #[tokio::test(flavor = "current_thread")]
+    async fn auto_scale_order_size_bumps_under_min_notional() {
+        let mock = Arc::new(MockConnector::new(
+            VenueId::Binance,
+            VenueProduct::Spot,
+        ));
+        let bundle = ConnectorBundle::single(mock);
+        let mut cfg = sample_config();
+        cfg.market_maker.order_size = dec!(0.001);
+        let mut product = sample_product("SOLUSDT");
+        product.min_notional = dec!(10);
+        product.lot_size = dec!(0.01);
+        let mut engine = MarketMakerEngine::new(
+            "SOLUSDT".to_string(),
+            cfg,
+            product,
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        let ev = snapshot("SOLUSDT", VenueId::Binance, dec!(85), dec!(85.02));
+        engine.book_keeper.on_event(&ev);
+        assert!(engine.book_keeper.book.mid_price().is_some());
+        engine.auto_scale_order_size();
+        let bumped = engine.config.market_maker.order_size;
+        assert!(
+            bumped * dec!(85) >= dec!(10),
+            "bumped size {bumped} * 85 must clear $10 min_notional"
+        );
+        engine.auto_scale_order_size();
+        assert_eq!(engine.config.market_maker.order_size, bumped);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auto_scale_order_size_leaves_adequate_config_alone() {
+        let mock = Arc::new(MockConnector::new(
+            VenueId::Binance,
+            VenueProduct::Spot,
+        ));
+        let bundle = ConnectorBundle::single(mock);
+        let mut cfg = sample_config();
+        cfg.market_maker.order_size = dec!(0.5);
+        let mut product = sample_product("SOLUSDT");
+        product.min_notional = dec!(10);
+        let mut engine = MarketMakerEngine::new(
+            "SOLUSDT".to_string(),
+            cfg,
+            product,
+            Box::new(AvellanedaStoikov),
+            bundle,
+            None,
+            None,
+        );
+        let ev = snapshot("SOLUSDT", VenueId::Binance, dec!(85), dec!(85.02));
+        engine.book_keeper.on_event(&ev);
+        engine.auto_scale_order_size();
+        assert_eq!(
+            engine.config.market_maker.order_size,
+            dec!(0.5),
+            "operator-sized config must not be touched"
+        );
     }
 
     fn snapshot(symbol: &str, venue: VenueId, bid: Decimal, ask: Decimal) -> MarketEvent {

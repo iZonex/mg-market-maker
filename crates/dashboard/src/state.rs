@@ -2037,6 +2037,25 @@ impl DashboardState {
         crate::metrics::KILL_SWITCH_LEVEL
             .with_label_values(&[&state.symbol])
             .set(state.kill_level as f64);
+        // R2-REGIME-1 (2026-04-22) — `mm_regime` gauge was
+        // defined in metrics.rs but never set. Agent registry
+        // reads it via `read_gauge_by_symbol` and decodes into a
+        // label (`regime_label`) for DeploymentStateRow. Without
+        // this emission, fleet API returned `regime: ""` even
+        // though the engine log said `regime=Quiet`. Encoding
+        // mirrors the agent's `regime_label` table.
+        let regime_code: f64 = match state.regime.as_str() {
+            "Quiet" => 0.0,
+            "Trending" => 1.0,
+            "Volatile" => 2.0,
+            "MeanReverting" => 3.0,
+            _ => -1.0,
+        };
+        if regime_code >= 0.0 {
+            crate::metrics::REGIME
+                .with_label_values(&[&state.symbol])
+                .set(regime_code);
+        }
         crate::metrics::SLA_UPTIME
             .with_label_values(&[&state.symbol])
             .set(decimal_to_f64(state.sla_uptime_pct));

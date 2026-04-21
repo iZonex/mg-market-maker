@@ -2996,6 +2996,7 @@ dependencies = [
  "mm-exchange-hyperliquid",
  "mm-risk",
  "mm-strategy",
+ "mm-strategy-graph",
  "prometheus",
  "rust_decimal",
  "rust_decimal_macros",

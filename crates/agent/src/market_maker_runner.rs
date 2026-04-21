@@ -57,6 +57,15 @@ use crate::AuthorityHandle;
 pub struct MarketMakerRunner {
     pub symbol: String,
     pub deployment_id: String,
+    /// R1-TEMPLATE-3 — template name the deployment was spawned
+    /// with. The runner looks it up in `mm_strategy_graph::templates`
+    /// and, when a graph body exists, attaches it via
+    /// `MarketMakerEngine::with_strategy_graph` before the first
+    /// tick. This is what makes `rug-detector-composite`,
+    /// `cost-gated-quoter`, `liquidity-burn-guard`, etc. behave
+    /// the way their catalog blurbs promise rather than silently
+    /// falling back to plain Avellaneda-Stoikov.
+    pub template: String,
     pub config: AppConfig,
     pub connector: Arc<dyn ExchangeConnector>,
     pub hedge_connector: Option<Arc<dyn ExchangeConnector>>,
@@ -100,6 +109,7 @@ impl MarketMakerRunner {
         let MarketMakerRunner {
             symbol,
             deployment_id,
+            template,
             config,
             connector,
             hedge_connector,
@@ -142,6 +152,35 @@ impl MarketMakerRunner {
         // credential, unknown exchange) we refuse to start the
         // deployment — cross-exchange strategies quietly running
         // single-sided is a known dangerous failure mode.
+        // R1-CROSS-1 (2026-04-22) — refuse to start dual-venue
+        // strategies on a single-venue bundle. The old `(None, None)`
+        // branch built a single-venue bundle regardless of the
+        // strategy type: operators would deploy `cross-exchange-basic`
+        // / `basis-carry-spot-perp` / `funding-aware-quoter` /
+        // `stat_arb` with only a primary credential and the engine
+        // would quote primary-only while the catalog promised a
+        // hedge leg. Inventory builds unchecked on the primary side
+        // and the operator sees "running=True, live_orders=6" with
+        // no indication anything is wrong.
+        //
+        // The right safety net is right here — fail the deploy at
+        // runner construction before market data starts streaming.
+        // `config.hedge` gets populated by `app_config::build` iff
+        // a hedge credential resolved; if the strategy type
+        // structurally requires a hedge and it didn't, stop now.
+        if strategy_requires_hedge(&config.market_maker.strategy)
+            && config.hedge.is_none()
+        {
+            return Err(anyhow::anyhow!(
+                "strategy {:?} requires a hedge credential \
+                 (AppConfig.hedge) but none was configured — \
+                 refusing to start single-sided to avoid unhedged \
+                 exposure. Set `variables.hedge_credential` on the \
+                 deployment to bind a second venue.",
+                config.market_maker.strategy
+            ));
+        }
+
         let (mut bundle, hedge_rx) = match (config.hedge.as_ref(), hedge_connector.clone()) {
             (Some(hedge_cfg), Some(hedge_conn)) => {
                 let hedge_symbol = hedge_cfg.pair.hedge_symbol.clone();
@@ -236,6 +275,48 @@ impl MarketMakerRunner {
             dashboard, // agent-local scratchpad state; populated for distributed details topics
             None,      // alerts — PR-2f wiring
         );
+        // R1-TEMPLATE-3 (2026-04-22) — attach the bundled graph
+        // when the template has one. Any template under
+        // `crates/strategy-graph/templates/*.json` routes through
+        // the graph evaluator; a plain strategy still runs for
+        // templates without a graph (or when the graph fails
+        // validation / is Restricted without the env gate). A
+        // rejection logs a warning but never fails the deploy:
+        // the plain strategy continues to produce quotes.
+        // Uses `swap_strategy_graph(&mut self)` (in-place) rather
+        // than the builder-style `with_strategy_graph` so we can
+        // gracefully fall back to the plain strategy on validate
+        // failure without losing the constructed engine.
+        match mm_strategy_graph::templates::load(&template) {
+            Some(Ok(graph)) => {
+                let node_count = graph.nodes.len();
+                match engine.swap_strategy_graph(&graph) {
+                    Ok(()) => tracing::info!(
+                        deployment = %deployment_id,
+                        template = %template,
+                        nodes = node_count,
+                        "attached strategy graph from template"
+                    ),
+                    Err(e) => tracing::warn!(
+                        deployment = %deployment_id,
+                        template = %template,
+                        error = ?e,
+                        "graph compile rejected — falling back to plain strategy"
+                    ),
+                }
+            }
+            Some(Err(e)) => tracing::warn!(
+                deployment = %deployment_id,
+                template = %template,
+                error = %e,
+                "graph JSON parse failed — falling back to plain strategy"
+            ),
+            None => tracing::debug!(
+                deployment = %deployment_id,
+                template = %template,
+                "no bundled graph for template — plain strategy only"
+            ),
+        }
         if let Some(rx) = config_override_rx {
             engine = engine.with_config_overrides(rx);
         }
@@ -259,6 +340,54 @@ impl MarketMakerRunner {
 
 fn is_terminal(state: &LeaseState) -> bool {
     matches!(state, LeaseState::Expired(_) | LeaseState::Revoked { .. })
+}
+
+/// R1-CROSS-1 — which `StrategyType`s structurally require a
+/// second (hedge) venue. Extracted so the predicate is testable
+/// without spinning up an engine; the runner uses it to fail the
+/// deploy early when `AppConfig.hedge` is absent.
+pub fn strategy_requires_hedge(s: &mm_common::config::StrategyType) -> bool {
+    use mm_common::config::StrategyType::*;
+    matches!(
+        s,
+        Basis | FundingArb | CrossVenueBasis | CrossExchange | StatArb
+    )
+}
+
+#[cfg(test)]
+mod hedge_predicate_tests {
+    use super::*;
+    use mm_common::config::StrategyType;
+
+    #[test]
+    fn strategies_needing_hedge_are_enumerated() {
+        for s in [
+            StrategyType::Basis,
+            StrategyType::FundingArb,
+            StrategyType::CrossVenueBasis,
+            StrategyType::CrossExchange,
+            StrategyType::StatArb,
+        ] {
+            assert!(
+                strategy_requires_hedge(&s),
+                "{s:?} must require hedge"
+            );
+        }
+    }
+
+    #[test]
+    fn single_venue_strategies_do_not_need_hedge() {
+        for s in [
+            StrategyType::AvellanedaStoikov,
+            StrategyType::Glft,
+            StrategyType::Grid,
+        ] {
+            assert!(
+                !strategy_requires_hedge(&s),
+                "{s:?} must not require hedge"
+            );
+        }
+    }
 }
 
 /// Fall-back [`ProductSpec`] used when the venue doesn't

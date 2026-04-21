@@ -113,6 +113,7 @@ mm-hyperopt = { path = "crates/hyperopt" }
 mm-indicators = { path = "crates/indicators" }
 mm-portfolio = { path = "crates/portfolio" }
 mm-strategy = { path = "crates/strategy" }
+mm-strategy-graph = { path = "crates/strategy-graph" }
 mm-risk = { path = "crates/risk" }
 mm-engine = { path = "crates/engine" }
 mm-backtester = { path = "crates/backtester" }
