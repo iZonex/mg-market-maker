@@ -221,6 +221,33 @@ Avellaneda / GLFT quoter paths.
 
 No bugs.
 
+## Final journey verification (2026-04-22 evening)
+
+After all R1–R6 + R3/calibration follow-ups landed, re-ran the
+full product journey to confirm every fix holds end-to-end.
+Multi-strategy deploy on one agent: BTCUSDT / ETHUSDT / SOLUSDT,
+tenant `acme` with a webhook registered to an external sink,
+then trigger flatten. Results:
+
+| Check | Observed |
+|---|---|
+| Auto-scale warnings (R1-QUOTE-1) | ETH 0.001→0.0026, SOL 0.001→0.069, BTC untouched ✅ |
+| Graph attach (R1-TEMPLATE-3) | all 3 deploys log `attached strategy graph from template` (4/11/4 nodes) ✅ |
+| Cross-venue refusal (R1-CROSS-1) | `cross-exchange-basic` deploy w/o hedge → `running=False` + refusal message ✅ |
+| Regime gauge (R2-REGIME-1) | fleet row shows `regime: "Quiet"` for BTC + ETH ✅ |
+| Fill count (PNL-COUNTER-1 + FILL-1) | tenant `/self/pnl.total_fills=16`, matches engine's 17 FILL events ✅ |
+| Recent fills in portal | real records with timestamps + fees + slippage_bps ✅ |
+| Webhook fan-out (I3) | 17 unique Fill events delivered to external sink ✅ |
+| Calibration fleet fan-out | `/api/v1/calibration/status` returns GLFT row `{a:1.0, k:1.5, samples:8}` ✅ |
+| Kill switch quiet (R3-IDLE-PAPER) | `kill=0` after 2+ min paper running ✅ |
+| L4 flatten (R3-FLATTEN-1) | `ops/flatten` → `[PAPER] placed unwind slice` orders on book ✅ |
+
+Test sweep: 2219 workspace tests green.
+
+Summary — 19 bug fixes delivered across today's three commits
+(0445cdd, a9f400a, 8f28d4e). Eight P0 production hazards, seven
+P1 user-visible defects, four cosmetic / cleanup items.
+
 After R1-QUOTE-1 fix, three strategies live concurrently:
 - `major-spot-basic` BTCUSDT: live=2 orders, mid=75600
 - `glft-via-graph` ETHUSDT: live=2, mid=2315
