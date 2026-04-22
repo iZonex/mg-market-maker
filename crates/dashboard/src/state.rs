@@ -529,7 +529,7 @@ impl std::fmt::Debug for StateInner {
 /// variant here via `publish_calibration`. Fields kept
 /// 1:1 with the trait shape so the UI renders the same thing
 /// regardless of transport.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CalibrationSnapshot {
     pub symbol: String,
     pub strategy: String,

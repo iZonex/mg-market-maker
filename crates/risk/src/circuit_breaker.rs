@@ -82,12 +82,47 @@ impl CircuitBreaker {
     }
 
     /// Check if the spread is abnormally wide (possible manipulation).
+    ///
+    /// Self-healing symmetric with [`Self::check_stale_book`]:
+    /// when the spread returns to a sane range AND the current
+    /// trip is `WideSpread`, auto-reset. Transient wide-spread
+    /// blips during a book resync or thin-book volatility spike
+    /// shouldn't park the engine in a dead state forever.
     pub fn check_spread(&mut self, spread_bps: Option<Decimal>, config: &RiskConfig) {
-        if let Some(bps) = spread_bps {
-            if bps > config.max_spread_bps {
+        match spread_bps {
+            Some(bps) if bps > config.max_spread_bps => {
                 warn!(%bps, max = %config.max_spread_bps, "spread too wide");
                 self.trip(TripReason::WideSpread);
             }
+            Some(_) if matches!(self.reason, Some(TripReason::WideSpread)) => {
+                self.reset();
+            }
+            _ => {}
+        }
+    }
+
+    /// R3-CB-EXPOSURE (2026-04-22) — self-healing on exposure /
+    /// drawdown conditions. Before this, `trip(MaxExposure)` on
+    /// refresh_quotes left the breaker tripped indefinitely
+    /// even after flatten brought the inventory back under the
+    /// limit. Combined with R3-FLATTEN-1 (L4 TWAP unwind now
+    /// actually places orders), the operator can escape a
+    /// runaway position — but only if the breaker clears when
+    /// the unwind succeeds.
+    ///
+    /// Takes `currently_breached` from the caller so the
+    /// exposure/drawdown math stays with its owner
+    /// (`ExposureManager`) and the breaker just records the
+    /// observation.
+    pub fn check_condition(
+        &mut self,
+        reason: TripReason,
+        currently_breached: bool,
+    ) {
+        if currently_breached {
+            self.trip(reason);
+        } else if self.reason.as_ref() == Some(&reason) {
+            self.reset();
         }
     }
 }
@@ -207,6 +242,57 @@ mod tests {
             "StaleBook trip must auto-reset when book is fresh again"
         );
         assert!(cb.reason().is_none());
+    }
+
+    /// R3-CB-EXPOSURE regression — `check_condition` auto-
+    /// resets the matching trip when the condition clears.
+    /// Covers MaxExposure, MaxDrawdown, and verifies that an
+    /// unmatched trip reason isn't affected (e.g. current trip
+    /// is MaxDrawdown, exposure condition clears → breaker
+    /// stays tripped).
+    #[test]
+    fn check_condition_self_heals_matching_trip_only() {
+        let mut cb = CircuitBreaker::new();
+        cb.trip(TripReason::MaxExposure);
+        // Condition cleared → auto-reset.
+        cb.check_condition(TripReason::MaxExposure, false);
+        assert!(!cb.is_tripped());
+
+        // Matching re-trip when condition is back.
+        cb.check_condition(TripReason::MaxExposure, true);
+        assert_eq!(cb.reason(), Some(&TripReason::MaxExposure));
+
+        // MaxDrawdown check with condition=false must not
+        // reset a MaxExposure trip.
+        cb.check_condition(TripReason::MaxDrawdown, false);
+        assert!(cb.is_tripped());
+        assert_eq!(cb.reason(), Some(&TripReason::MaxExposure));
+    }
+
+    /// R3-CB-EXPOSURE regression — `check_spread` auto-resets
+    /// `WideSpread` when spread is back under the limit. Covers
+    /// the same pattern for spread blips during book resync.
+    #[test]
+    fn check_spread_self_heals_wide_spread() {
+        use mm_common::config::RiskConfig;
+        use rust_decimal_macros::dec;
+        let mut cb = CircuitBreaker::new();
+        let risk = RiskConfig {
+            max_inventory: dec!(1),
+            max_exposure_quote: dec!(10000),
+            max_drawdown_quote: dec!(500),
+            inventory_skew_factor: dec!(1),
+            max_spread_bps: dec!(100),
+            max_spread_to_quote_bps: None,
+            stale_book_timeout_secs: 5,
+            max_order_size: dec!(0),
+            max_daily_volume_quote: dec!(0),
+            max_hourly_volume_quote: dec!(0),
+        };
+        cb.check_spread(Some(dec!(200)), &risk);
+        assert_eq!(cb.reason(), Some(&TripReason::WideSpread));
+        cb.check_spread(Some(dec!(50)), &risk);
+        assert!(!cb.is_tripped(), "WideSpread must auto-reset on fresh narrow spread");
     }
 
     /// Non-stale trips (MaxDrawdown, MaxExposure, WideSpread,

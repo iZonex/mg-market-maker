@@ -965,6 +965,26 @@ impl<T: Transport> LeaseClient<T> {
                                             "ask_depth_quote": ask_depth.to_string(),
                                             "kill_level": s.kill_level,
                                             "recent_fills": recent,
+                                            // CalibrationStatus fleet fan-out
+                                            // (2026-04-22) — ship the per-symbol
+                                            // calibration snapshot inline so the
+                                            // controller's `calibration_status`
+                                            // endpoint can read it via the same
+                                            // fleet fetcher used for PnL/SLA
+                                            // aggregation. Before this, the
+                                            // CalibrationStatus panel read
+                                            // controller-local state that nothing
+                                            // writes in distributed mode —
+                                            // operators saw an empty table even
+                                            // when GLFT had a real (a, k, N).
+                                            "calibration": self
+                                                .dashboard
+                                                .as_ref()
+                                                .map(|d| d.calibration_snapshots()
+                                                    .into_iter()
+                                                    .find(|c| c.symbol == s.symbol))
+                                                .and_then(|opt| opt)
+                                                .and_then(|cs| serde_json::to_value(cs).ok()),
                                         })
                                     }
                                     None => serde_json::json!(null),

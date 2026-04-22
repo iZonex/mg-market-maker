@@ -914,9 +914,34 @@ struct CalibrationStatusResponse {
 async fn calibration_status(
     State(state): State<DashboardState>,
 ) -> Json<CalibrationStatusResponse> {
-    Json(CalibrationStatusResponse {
-        rows: state.calibration_snapshots(),
-    })
+    // CalibrationStatus fleet fan-out (2026-04-22) — in
+    // distributed mode the controller's local
+    // `calibration_snapshots` is never populated (calibration
+    // lives on agents). Fan out via the `client_metrics` topic,
+    // collect the `calibration` field each agent embeds, and
+    // merge newest-first. Falls back to controller-local state
+    // when no fetcher is installed (unit tests).
+    let mut rows: Vec<crate::state::CalibrationSnapshot> = Vec::new();
+    if let Some(fetcher) = state.fleet_client_metrics_fetcher() {
+        let metrics = fetcher(None).await;
+        for row in metrics {
+            if let Some(cal) = row.get("calibration") {
+                if !cal.is_null() {
+                    if let Ok(snap) = serde_json::from_value::<
+                        crate::state::CalibrationSnapshot,
+                    >(cal.clone())
+                    {
+                        rows.push(snap);
+                    }
+                }
+            }
+        }
+    }
+    if rows.is_empty() {
+        rows = state.calibration_snapshots();
+    }
+    rows.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    Json(CalibrationStatusResponse { rows })
 }
 
 /// S6.1 — which graph is driving each symbol. Compact projection

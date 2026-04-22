@@ -903,6 +903,18 @@ impl MarketMakerEngine {
             max_position_value: config.kill_switch.max_position_value,
             max_message_rate: config.kill_switch.max_message_rate,
             max_consecutive_errors: config.kill_switch.max_consecutive_errors,
+            // R3-IDLE-PAPER (2026-04-22) — paper mode runs with
+            // tiny-notional quotes that realistically don't get
+            // hit by live market trades for long stretches. The
+            // 300 s idleness default escalates to L1 WIDEN every
+            // 5 min, spamming the audit trail + incident feed.
+            // Disable idleness for paper; live keeps the
+            // production 300 s default.
+            no_fill_timeout_secs: if config.mode.eq_ignore_ascii_case("paper") {
+                0
+            } else {
+                300
+            },
             ..Default::default()
         };
 
@@ -8676,30 +8688,53 @@ impl MarketMakerEngine {
         if let Some(mid) = self.book_keeper.book.mid_price() {
             let equity = self.exposure_manager_equity(mid);
             self.exposure_manager.update_equity(equity);
-            if self
+            // R3-CB-EXPOSURE (2026-04-22) — use the self-healing
+            // `check_condition` path so the trip clears as soon
+            // as the breach clears. Audit + incident still fire
+            // on the rising edge; we gate them on the `was_tripped`
+            // snapshot so a healed breaker doesn't re-spam the
+            // incident feed.
+            let dd_breach = self
                 .exposure_manager
-                .is_drawdown_breached(equity, &self.config.risk)
-            {
-                self.circuit_breaker.trip(TripReason::MaxDrawdown);
+                .is_drawdown_breached(equity, &self.config.risk);
+            let dd_was_tripped = matches!(
+                self.circuit_breaker.reason(),
+                Some(TripReason::MaxDrawdown)
+            );
+            self.circuit_breaker
+                .check_condition(TripReason::MaxDrawdown, dd_breach);
+            if dd_breach && !dd_was_tripped {
                 self.audit.risk_event(
                     &self.symbol,
                     AuditEventType::CircuitBreakerTripped,
                     "drawdown",
                 );
-                self.record_incident("high", "Circuit breaker tripped: max drawdown exceeded");
+                self.record_incident(
+                    "high",
+                    "Circuit breaker tripped: max drawdown exceeded",
+                );
             }
-            if self.exposure_manager.is_exposure_breached(
+            let exp_breach = self.exposure_manager.is_exposure_breached(
                 self.inventory_manager.inventory(),
                 mid,
                 &self.config.risk,
-            ) {
-                self.circuit_breaker.trip(TripReason::MaxExposure);
+            );
+            let exp_was_tripped = matches!(
+                self.circuit_breaker.reason(),
+                Some(TripReason::MaxExposure)
+            );
+            self.circuit_breaker
+                .check_condition(TripReason::MaxExposure, exp_breach);
+            if exp_breach && !exp_was_tripped {
                 self.audit.risk_event(
                     &self.symbol,
                     AuditEventType::CircuitBreakerTripped,
                     "exposure",
                 );
-                self.record_incident("high", "Circuit breaker tripped: max exposure exceeded");
+                self.record_incident(
+                    "high",
+                    "Circuit breaker tripped: max exposure exceeded",
+                );
             }
         }
 

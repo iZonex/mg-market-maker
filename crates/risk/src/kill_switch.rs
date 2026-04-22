@@ -281,6 +281,18 @@ impl KillSwitch {
         self.message_count_this_second = 0;
 
         // Check no-fill timeout.
+        //
+        // R3-IDLE-PAPER (2026-04-22) — `no_fill_timeout_secs == 0`
+        // disables the idleness escalation. Paper deployments on
+        // real market data commonly sit with tiny-notional quotes
+        // that don't get traded for ~5 min at a time; the default
+        // 300 s escalation would fire constantly and trash the
+        // smoke-run log. Engine boot maps paper mode to
+        // `no_fill_timeout_secs = 0` unless the operator already
+        // set a non-default value.
+        if self.config.no_fill_timeout_secs == 0 {
+            return;
+        }
         if let Some(last_fill) = self.last_fill_at {
             let elapsed = (Utc::now() - last_fill).num_seconds() as u64;
             if elapsed > self.config.no_fill_timeout_secs {
@@ -322,6 +334,40 @@ impl KillSwitch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R3-IDLE-PAPER regression — `no_fill_timeout_secs = 0`
+    /// disables idleness escalation. Kick the clock forward
+    /// via `last_fill_at` and confirm no escalation fires.
+    #[test]
+    fn zero_no_fill_timeout_disables_idleness_escalation() {
+        let mut cfg = KillSwitchConfig::default();
+        cfg.no_fill_timeout_secs = 0;
+        let mut ks = KillSwitch::new(cfg);
+        // Seed a fill in the distant past so the idleness check
+        // *would* fire if it were enabled.
+        ks.on_fill();
+        ks.last_fill_at = Some(Utc::now() - chrono::Duration::hours(1));
+        ks.tick_second();
+        assert_eq!(
+            ks.level(),
+            KillLevel::Normal,
+            "paper-mode idleness must stay silent when timeout=0"
+        );
+    }
+
+    /// Positive case — non-zero timeout still escalates after
+    /// the deadline. Catches a regression where the zero-check
+    /// would accidentally short-circuit live deployments.
+    #[test]
+    fn non_zero_no_fill_timeout_still_escalates_after_deadline() {
+        let mut cfg = KillSwitchConfig::default();
+        cfg.no_fill_timeout_secs = 10;
+        let mut ks = KillSwitch::new(cfg);
+        ks.on_fill();
+        ks.last_fill_at = Some(Utc::now() - chrono::Duration::seconds(30));
+        ks.tick_second();
+        assert_eq!(ks.level(), KillLevel::WidenSpreads);
+    }
 
     /// P2.1 multiplier helpers — pin the per-level constants
     /// so a future contributor cannot silently change them out
