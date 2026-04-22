@@ -11,7 +11,7 @@
   import { createApiClient } from '../api.svelte.js'
 
   let { auth } = $props()
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   // ── Webhooks ──────────────────────────────────────────────
   let webhooks = $state({ url_count: 0, events_sent: 0, events_failed: 0 })
@@ -175,6 +175,9 @@
         </button>
       </div>
       {#if webhookError}<div class="error">{webhookError}</div>{/if}
+      {#if webhooks.url_count === 0}
+        <div class="muted small">No webhook URLs registered — alerts won't fan out until you add one.</div>
+      {/if}
     </div>
   </div>
 
@@ -223,6 +226,8 @@
             {/each}
           </tbody>
         </table>
+      {:else}
+        <div class="muted small">No alert rules configured — add the first one above.</div>
       {/if}
     </div>
   </div>
@@ -265,6 +270,11 @@
             {/each}
           </tbody>
         </table>
+        {#if loans.length > 8}
+          <div class="muted small">{loans.length - 8} more loan(s) truncated</div>
+        {/if}
+      {:else}
+        <div class="muted small">No active loan agreements — fill the form above to create one.</div>
       {/if}
     </div>
   </div>

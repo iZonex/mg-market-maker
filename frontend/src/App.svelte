@@ -8,10 +8,11 @@
   import CalibrationPage from './lib/pages/CalibrationPage.svelte'
   import CompliancePage from './lib/pages/CompliancePage.svelte'
   import SurveillancePage from './lib/pages/SurveillancePage.svelte'
-  import SettingsPage from './lib/pages/SettingsPage.svelte'
   import UsersPage from './lib/pages/UsersPage.svelte'
   import StrategyPage from './lib/pages/StrategyPage.svelte'
-  import AdminPage from './lib/pages/AdminPage.svelte'
+  import VenuesPage from './lib/pages/VenuesPage.svelte'
+  import RulesPage from './lib/pages/RulesPage.svelte'
+  import KillSwitchPage from './lib/pages/KillSwitchPage.svelte'
   import FleetPage from './lib/pages/FleetPage.svelte'
   import ClientPage from './lib/pages/ClientPage.svelte'
   import ClientPortalPage from './lib/pages/ClientPortalPage.svelte'
@@ -38,7 +39,60 @@
     auth.state.token = 'demo'
   }
 
-  let route = $state('overview')
+  // M2-GOBS — `?live=<agentId>/<deploymentId>` opens StrategyPage
+  // in Live mode with the given deployment's graph under observation.
+  // Operator lands here from DeploymentDrilldown → "Open graph (live)".
+  // The route itself is `strategy` — the query string carries the
+  // target so the main-app URL doesn't pattern-proliferate.
+  let liveTarget = $state.raw(parseLiveTarget())
+  // M4-GOBS — `?tick=<tick_num>` deep link pre-pins a frame
+  // so operators landing from Incidents see the exact tick.
+  let liveTick = $state.raw(parseLiveTick())
+  let route = $state(liveTarget ? 'strategy' : 'overview')
+  function parseLiveTarget() {
+    try {
+      const q = new URL(window.location.href).searchParams.get('live')
+      if (!q) return null
+      const [agentId, deploymentId] = q.split('/')
+      if (!agentId || !deploymentId) return null
+      return { agentId, deploymentId }
+    } catch {
+      return null
+    }
+  }
+  function parseLiveTick() {
+    try {
+      const q = new URL(window.location.href).searchParams.get('tick')
+      if (!q) return null
+      const n = Number(q)
+      return Number.isFinite(n) ? n : null
+    } catch {
+      return null
+    }
+  }
+  function navigateLiveGraph(agentId, deploymentId, tickNum = null) {
+    const url = new URL(window.location.href)
+    url.searchParams.set('live', `${agentId}/${deploymentId}`)
+    if (tickNum != null) url.searchParams.set('tick', String(tickNum))
+    else url.searchParams.delete('tick')
+    window.history.replaceState(null, '', url.toString())
+    liveTarget = { agentId, deploymentId }
+    liveTick = tickNum
+    route = 'strategy'
+  }
+  function clearLiveTargetOnRouteChange() {
+    const url = new URL(window.location.href)
+    if (url.searchParams.has('live')) url.searchParams.delete('live')
+    if (url.searchParams.has('tick')) url.searchParams.delete('tick')
+    window.history.replaceState(null, '', url.toString())
+    liveTarget = null
+    liveTick = null
+  }
+  $effect(() => {
+    // Leaving the strategy page cancels the live binding so a
+    // subsequent click on Strategy opens plain Authoring mode.
+    if (route !== 'strategy' && liveTarget) clearLiveTargetOnRouteChange()
+  })
 
   const activeSymbol = $derived(ws.state.activeSymbol || ws.state.symbols[0] || '')
   const symData = $derived(ws.state.data[activeSymbol] || {})
@@ -112,7 +166,7 @@
         {route}
         {symData}
         {maxKillLevel}
-        onKillClick={() => (route = 'admin')}
+        onKillClick={() => (route = 'kill-switch')}
         onNavigate={(r) => (route = r)}
       />
       {#if demo}
@@ -135,21 +189,35 @@
         {:else if route === 'surveillance'}
           <SurveillancePage {auth} />
         {:else if route === 'strategy' && auth.canControl()}
-          <StrategyPage {auth} />
-        {:else if route === 'settings' && auth.canControl()}
-          <SettingsPage {auth} onNavigate={(r) => (route = r)} />
+          <StrategyPage
+            {auth}
+            liveAgent={liveTarget?.agentId ?? null}
+            liveDeployment={liveTarget?.deploymentId ?? null}
+            liveTick={liveTick}
+          />
+        {:else if route === 'rules' && auth.canControl()}
+          <RulesPage {auth} />
+        {:else if route === 'venues' && auth.canControl()}
+          <VenuesPage {auth} />
+        {:else if route === 'kill-switch' && auth.state.role === 'admin'}
+          <KillSwitchPage {auth} onNavigate={(r) => (route = r)} />
         {:else if route === 'users' && auth.state.role === 'admin'}
           <UsersPage {auth} />
-        {:else if route === 'admin' && auth.canControl()}
-          <AdminPage {ws} {auth} onNavigate={(r) => (route = r)} />
         {:else if route === 'fleet'}
-          <FleetPage {auth} onNavigate={(r) => (route = r)} />
+          <FleetPage
+            {auth}
+            onNavigate={(r) => (route = r)}
+            onOpenGraphLive={(a, d) => navigateLiveGraph(a, d)}
+          />
         {:else if route === 'clients'}
           <ClientPage {auth} onNavigate={(r) => (route = r)} />
         {:else if route === 'reconciliation'}
           <ReconciliationPage {auth} />
         {:else if route === 'incidents'}
-          <IncidentsPage {auth} />
+          <IncidentsPage
+            {auth}
+            onOpenGraphLive={(a, d, t) => navigateLiveGraph(a, d, t)}
+          />
         {:else if route === 'vault' && auth.state.role === 'admin'}
           <VaultPage {auth} />
         {:else if route === 'platform' && auth.state.role === 'admin'}

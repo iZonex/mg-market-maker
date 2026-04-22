@@ -24,7 +24,7 @@
   import { createApiClient } from '../api.svelte.js'
 
   let { auth } = $props()
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   // ── Catalogue of kinds. Drives the dropdown + dynamic form.
   const KINDS = [

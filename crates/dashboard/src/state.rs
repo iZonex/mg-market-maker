@@ -911,6 +911,16 @@ pub struct OpenIncident {
     pub action_taken: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preventive: Option<String>,
+    /// M4-4 GOBS — optional graph deep-link context. Populated
+    /// when an incident is filed from a strategy-graph-carrying
+    /// deployment so the post-mortem UI can jump straight to
+    /// the exact tick in the Live mode canvas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_deployment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_tick_num: Option<u64>,
 }
 
 /// Per-symbol state snapshot.

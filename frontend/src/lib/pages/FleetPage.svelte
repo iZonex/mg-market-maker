@@ -24,8 +24,8 @@
   import EmptyStateGuide from '../components/EmptyStateGuide.svelte'
   import { createApiClient } from '../api.svelte.js'
 
-  let { auth, onNavigate = () => {} } = $props()
-  const api = createApiClient(auth)
+  let { auth, onNavigate = () => {}, onOpenGraphLive = () => {} } = $props()
+  const api = $derived(createApiClient(auth))
 
   const REFRESH_MS = 2_000
 
@@ -888,12 +888,32 @@
     agent={drilldownTarget.agent}
     deployment={drilldownTarget.deployment}
     onClose={() => (drilldownTarget = null)}
+    onOpenGraphLive={(agentId, depId) => {
+      drilldownTarget = null
+      onOpenGraphLive(agentId, depId)
+    }}
+    {onNavigate}
   />
 {/if}
 
 {#if revokeModal}
-  <div class="modal-backdrop" onclick={closeRevokeModal}>
-    <div class="revoke-card" onclick={(e) => e.stopPropagation()}>
+  <div
+    class="modal-backdrop"
+    role="button"
+    tabindex="-1"
+    aria-label="Close modal"
+    onclick={closeRevokeModal}
+    onkeydown={(e) => { if (e.key === 'Escape') closeRevokeModal() }}
+  >
+    <div
+      class="revoke-card"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Revoke agent"
+      tabindex="-1"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.stopPropagation()}
+    >
       <div class="revoke-title">
         {#if revokeModal.phase === 'confirm'}Revoke agent with live deployments
         {:else if revokeModal.phase === 'stopping'}Cancelling orders…
@@ -970,8 +990,23 @@
 {/if}
 
 {#if preApproveOpen}
-  <div class="modal-backdrop" onclick={closePreApprove}>
-    <div class="preapprove-card" onclick={(e) => e.stopPropagation()}>
+  <div
+    class="modal-backdrop"
+    role="button"
+    tabindex="-1"
+    aria-label="Close modal"
+    onclick={closePreApprove}
+    onkeydown={(e) => { if (e.key === 'Escape') closePreApprove() }}
+  >
+    <div
+      class="preapprove-card"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Pre-approve fingerprint"
+      tabindex="-1"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.stopPropagation()}
+    >
       <div class="preapprove-title">Pre-approve fingerprint</div>
       <div class="preapprove-body">
         <p class="preapprove-lead">
@@ -988,7 +1023,6 @@
             bind:value={preApproveForm.fingerprint}
             placeholder="d5d0bf4df0ad14f5"
             disabled={preApproveBusy}
-            autofocus
           />
         </label>
         <label class="field">
@@ -1279,13 +1313,13 @@
     color: var(--fg-primary);
   }
 
-  .dep-table, .cred-table {
+  .dep-table {
     width: 100%; border-collapse: collapse; font-size: var(--fs-xs);
   }
-  .dep-table th, .dep-table td, .cred-table th, .cred-table td {
+  .dep-table th, .dep-table td {
     padding: var(--s-2); text-align: left; border-bottom: 1px solid var(--border-subtle);
   }
-  .dep-table th, .cred-table th {
+  .dep-table th {
     color: var(--fg-muted); text-transform: uppercase;
     letter-spacing: var(--tracking-label); font-size: 10px; font-weight: 600;
   }

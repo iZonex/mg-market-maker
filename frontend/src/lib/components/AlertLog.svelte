@@ -11,7 +11,7 @@
   import { createApiClient } from '../api.svelte.js'
 
   let { data = null, auth = null } = $props()
-  const api = auth ? createApiClient(auth) : null
+  const api = $derived(auth ? createApiClient(auth) : null)
 
   let fleetAlerts = $state([])
 

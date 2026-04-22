@@ -18,6 +18,7 @@
    * render a slice of the row.
    */
 
+  import { untrack } from 'svelte'
   import { createApiClient } from '../api.svelte.js'
   import FeatureStatusPanel from './FeatureStatusPanel.svelte'
   import AdaptivePanel from './AdaptivePanel.svelte'
@@ -25,12 +26,22 @@
   import ParamTuner from './ParamTuner.svelte'
   import Icon from './Icon.svelte'
 
-  let { auth, agent, deployment, onClose } = $props()
-  const api = createApiClient(auth)
+  let {
+    auth,
+    agent,
+    deployment,
+    onClose,
+    onOpenGraphLive = null,
+    onNavigate = () => {},
+  } = $props()
+  const api = $derived(createApiClient(auth))
 
   const POLL_MS = 2_000
 
-  let row = $state(deployment)
+  // `deployment` is the initial snapshot passed in when the
+  // drilldown opens; the modal owns `row` from there, with
+  // refresh() merging in fresh telemetry.
+  let row = $state(untrack(() => deployment))
   let error = $state(null)
   let lastFetch = $state(null)
   let patchStatus = $state(null)
@@ -189,6 +200,52 @@
     flattenPreview = null
   }
 
+  // M4-4 GOBS — file an incident stamped with the deployment's
+  // latest graph tick. Reads `graph_trace_recent?limit=1` so the
+  // incident row later opens the live canvas at the exact frame
+  // the operator filed against. No form: category + detail
+  // autogenerate from kill_level / graph hash / symbol.
+  let incidentBusy = $state(false)
+  async function fileIncident() {
+    if (incidentBusy) return
+    incidentBusy = true
+    try {
+      let tickNum = null
+      try {
+        const traceResp = await api.getJson(
+          `/api/v1/agents/${encodeURIComponent(agent.agent_id)}` +
+            `/deployments/${encodeURIComponent(deployment.deployment_id)}` +
+            `/details/graph_trace_recent?limit=1`,
+        )
+        tickNum = traceResp?.payload?.traces?.[0]?.tick_num ?? null
+      } catch { /* leave null — engine may not have ticked yet */ }
+
+      const severity = (row?.kill_level ?? 0) >= 3 ? 'critical' : 'warning'
+      const detail =
+        (row?.kill_level ?? 0) > 0
+          ? `kill_level=L${row.kill_level}`
+          : `graph ${row?.active_graph?.name ?? 'unknown'} @ ${row?.active_graph?.hash?.slice(0, 12) ?? '?'}`
+      const body = {
+        violation_key: `graph#${agent.agent_id}/${deployment.deployment_id}`,
+        severity,
+        category: 'strategy-graph',
+        target: `${agent.agent_id}/${deployment.deployment_id}`,
+        metric: row?.active_graph?.name ?? 'graph',
+        detail,
+        graph_agent_id: agent.agent_id,
+        graph_deployment_id: deployment.deployment_id,
+        graph_tick_num: tickNum,
+      }
+      await api.postJson('/api/v1/incidents', body)
+      onClose()
+      onNavigate('incidents')
+    } catch (e) {
+      patchStatus = { phase: 'err', error: `file-incident failed: ${e}` }
+    } finally {
+      incidentBusy = false
+    }
+  }
+
   /**
    * Ship a patch map (`{ gamma: "0.02", momentum_enabled: false }`)
    * at the agent. The controller validates admission + forwards
@@ -255,9 +312,34 @@
       <span class="subtitle mono">{subtitle}</span>
       <span class="subtitle mono faint">{deployment.deployment_id}</span>
     </div>
-    <button type="button" class="close" onclick={onClose} aria-label="Close drilldown">
-      <Icon name="close" size={16} />
-    </button>
+    <div class="head-actions">
+      {#if onOpenGraphLive && row?.active_graph?.name}
+        <button
+          type="button"
+          class="btn ghost small"
+          onclick={() => onOpenGraphLive(agent.agent_id, deployment.deployment_id)}
+          title="Open this deployment's strategy graph in Live mode"
+        >
+          <Icon name="pulse" size={12} />
+          <span>Open graph (live)</span>
+        </button>
+      {/if}
+      {#if row?.active_graph?.name}
+        <button
+          type="button"
+          class="btn ghost small"
+          onclick={fileIncident}
+          disabled={incidentBusy}
+          title="File an incident stamped with this deployment's latest tick so a post-mortem can jump straight to the live graph at that frame"
+        >
+          <Icon name="alert" size={12} />
+          <span>{incidentBusy ? 'Filing…' : 'File incident'}</span>
+        </button>
+      {/if}
+      <button type="button" class="close" onclick={onClose} aria-label="Close drilldown">
+        <Icon name="close" size={16} />
+      </button>
+    </div>
   </header>
 
   <div class="meta">
@@ -551,8 +633,23 @@
 </div>
 
 {#if flattenPreview}
-  <div class="flatten-backdrop" onclick={closeFlattenPreview}>
-    <div class="flatten-card" onclick={(e) => e.stopPropagation()}>
+  <div
+    class="flatten-backdrop"
+    role="button"
+    tabindex="-1"
+    aria-label="Close preview"
+    onclick={closeFlattenPreview}
+    onkeydown={(e) => { if (e.key === 'Escape') closeFlattenPreview() }}
+  >
+    <div
+      class="flatten-card"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Flatten preview"
+      tabindex="-1"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.stopPropagation()}
+    >
       <div class="flatten-title">Flatten preview · L4 kill</div>
       {#if flattenPreview.phase === 'loading'}
         <div class="flatten-body muted">fetching current position + book…</div>
@@ -705,6 +802,8 @@
     display: inline-flex; align-items: center; justify-content: center;
   }
   .close:hover { color: var(--fg-primary); background: var(--bg-chip); }
+  .head-actions { display: inline-flex; align-items: center; gap: var(--s-2); }
+  .btn.small { padding: 4px 10px; font-size: 11px; }
 
   .meta {
     display: flex; flex-wrap: wrap; gap: var(--s-3);

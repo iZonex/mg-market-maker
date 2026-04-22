@@ -14,7 +14,7 @@
   import { createApiClient } from '../api.svelte.js'
 
   let { auth, onNavigate = () => {} } = $props()
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   const STORAGE_KEY = 'mm_install_wizard_dismissed'
 

@@ -11,7 +11,7 @@
   import LegDetailModal from './LegDetailModal.svelte'
 
   let { auth } = $props()
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   // 23-UX-7 — click-through leg detail modal state.
   let modalOpen = $state(false)

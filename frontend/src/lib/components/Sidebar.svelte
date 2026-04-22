@@ -4,54 +4,66 @@
 
   let { route = $bindable('overview'), auth, connected = false, mode = 'paper' } = $props()
 
-  // 23-UX-11 — four thematic groups. Flat list felt like admin
-  // debug tools; grouping maps operator intent (Live = watch,
-  // Operations = act, Configure = author, Admin = system).
+  // IA regroup (apr22) — split action vs. watch, lift venue/exec
+  // observability out of the old Admin dumping ground, and make
+  // Kill-switch / Rules / Calibration first-class nav entries.
+  //
+  //   Live         — watch-only dashboards.
+  //   Operations   — act: deploy, retire, ack, investigate.
+  //   Venues       — cross-venue execution quality (was AdminPage cards).
+  //   Compliance   — review / surveillance.
+  //   Configure    — author: strategy graphs + runtime rules.
+  //   Admin        — system: kill-switch, platform, vault, users.
+  //   Account      — personal (profile, 2FA).
   const groups = [
     {
       label: 'Live',
       items: [
-        { id: 'overview',       label: 'Overview',       icon: 'overview',    roles: ['admin','operator','viewer'] },
-        { id: 'fleet',          label: 'Fleet',          icon: 'pulse',       roles: ['admin','operator','viewer'] },
-        { id: 'clients',        label: 'Clients',        icon: 'users',       roles: ['admin','operator','viewer'] },
-        { id: 'reconciliation', label: 'Reconciliation', icon: 'shield',      roles: ['admin','operator','viewer'] },
-        { id: 'orderbook',      label: 'Orderbook',      icon: 'orderbook',   roles: ['admin','operator','viewer'] },
-        { id: 'history',        label: 'History',        icon: 'history',     roles: ['admin','operator','viewer'] },
+        { id: 'overview',       label: 'Overview',       icon: 'overview',  roles: ['admin','operator','viewer'] },
+        { id: 'orderbook',      label: 'Orderbook',      icon: 'orderbook', roles: ['admin','operator','viewer'] },
+        { id: 'history',        label: 'History',        icon: 'history',   roles: ['admin','operator','viewer'] },
       ],
     },
-    // Wave F3 — Compliance / Surveillance moved back into the
-    // sidebar as dedicated sections. Both exist as Svelte pages
-    // that fleet-aggregate via fleet-wide endpoints. Calibration
-    // is still best served from a per-deployment drilldown and
-    // stays out of the top-level nav until that drilldown lands.
+    {
+      label: 'Operations',
+      items: [
+        { id: 'fleet',          label: 'Fleet',          icon: 'pulse',   roles: ['admin','operator','viewer'] },
+        { id: 'clients',        label: 'Clients',        icon: 'users',   roles: ['admin','operator','viewer'] },
+        { id: 'reconciliation', label: 'Reconciliation', icon: 'shield',  roles: ['admin','operator','viewer'] },
+        { id: 'incidents',      label: 'Incidents',      icon: 'alert',   roles: ['admin','operator'] },
+      ],
+    },
+    {
+      label: 'Venues & Execution',
+      items: [
+        { id: 'venues',      label: 'Venues',      icon: 'orderbook', roles: ['admin','operator'] },
+        { id: 'calibration', label: 'Calibration', icon: 'graph',     roles: ['admin','operator'] },
+      ],
+    },
     {
       label: 'Compliance',
       items: [
-        { id: 'compliance',   label: 'Compliance',   icon: 'doc',     roles: ['admin','operator','viewer'] },
-        { id: 'surveillance', label: 'Surveillance', icon: 'alert',   roles: ['admin','operator'] },
-        { id: 'incidents',    label: 'Incidents',    icon: 'alert',   roles: ['admin','operator'] },
+        { id: 'compliance',   label: 'Compliance',   icon: 'doc',   roles: ['admin','operator','viewer'] },
+        { id: 'surveillance', label: 'Surveillance', icon: 'alert', roles: ['admin','operator'] },
       ],
     },
     {
       label: 'Configure',
       items: [
-        { id: 'strategy',    label: 'Strategy',    icon: 'graph',       roles: ['admin','operator'] },
-        { id: 'settings',    label: 'Settings',    icon: 'settings',    roles: ['admin','operator'] },
+        { id: 'strategy', label: 'Strategy', icon: 'graph',    roles: ['admin','operator'] },
+        { id: 'rules',    label: 'Rules',    icon: 'settings', roles: ['admin','operator'] },
       ],
     },
     {
       label: 'Admin',
       items: [
-        { id: 'platform', label: 'Platform', icon: 'settings', roles: ['admin'] },
-        { id: 'vault', label: 'Vault', icon: 'shield', roles: ['admin'] },
-        { id: 'users', label: 'Users', icon: 'users', roles: ['admin'] },
-        { id: 'login-audit', label: 'Auth audit', icon: 'history', roles: ['admin'] },
-        { id: 'admin', label: 'Admin', icon: 'admin', roles: ['admin'] },
+        { id: 'kill-switch', label: 'Kill switch', icon: 'alert',    roles: ['admin'] },
+        { id: 'platform',    label: 'Platform',    icon: 'settings', roles: ['admin'] },
+        { id: 'vault',       label: 'Vault',       icon: 'shield',   roles: ['admin'] },
+        { id: 'users',       label: 'Users',       icon: 'users',    roles: ['admin'] },
+        { id: 'login-audit', label: 'Auth audit',  icon: 'history',  roles: ['admin'] },
       ],
     },
-    // Wave F3 — Profile accessible from every role. Needs its
-    // own nav entry: operators change their password + enroll
-    // 2FA from here, no admin involvement.
     {
       label: 'Account',
       items: [
@@ -132,16 +144,6 @@
     margin-bottom: var(--s-6);
     white-space: nowrap;
   }
-  .mark {
-    display: inline-flex;
-    align-items: baseline;
-    font-family: var(--font-sans);
-    font-size: var(--fs-xl);
-    font-weight: 700;
-    color: var(--fg-primary);
-    line-height: 1;
-  }
-  .mark-pipe { color: var(--accent); font-weight: 500; margin-left: 1px; }
   .brand-name {
     font-family: var(--font-sans);
     font-size: var(--fs-sm);

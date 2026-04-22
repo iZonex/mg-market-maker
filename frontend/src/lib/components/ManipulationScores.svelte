@@ -18,7 +18,7 @@
   import { createApiClient } from '../api.svelte.js'
 
   let { auth } = $props()
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   const REFRESH_MS = 5_000
 

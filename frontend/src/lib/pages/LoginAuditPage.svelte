@@ -14,7 +14,7 @@
   import { createApiClient } from '../api.svelte.js'
 
   let { auth } = $props()
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   const DEFAULT_WINDOW_HOURS = 24
   const WINDOW_OPTIONS = [

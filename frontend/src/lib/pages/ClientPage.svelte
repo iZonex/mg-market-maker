@@ -18,10 +18,11 @@
    */
   import Card from '../components/Card.svelte'
   import EmptyStateGuide from '../components/EmptyStateGuide.svelte'
+  import ClientOnboardingPanel from '../components/ClientOnboardingPanel.svelte'
   import { createApiClient } from '../api.svelte.js'
 
   let { auth, onNavigate = () => {} } = $props()
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   const REFRESH_MS = 5000
 
@@ -126,7 +127,7 @@
       }
       const body = await r.json()
       webhookTestStatus = {
-        phase: body.attempted === 0 ? 'warn' : body.succeeded === body.attempted ? 'ok' : 'warn',
+        phase: body.attempted === 0 ? 'info' : body.succeeded === body.attempted ? 'ok' : 'warn',
         text: body.attempted === 0
           ? 'No webhook URLs configured for this client.'
           : `${body.succeeded}/${body.attempted} URLs acknowledged`,
@@ -189,6 +190,7 @@
     if (n >= 95) return 'warn'
     return 'bad'
   }
+  const SLA_LEGEND = '≥99% compliant · 95–99% warning · <95% breach'
 </script>
 
 <div class="page scroll">
@@ -199,8 +201,7 @@
       steps={[
         {
           title: 'Register the client',
-          description: 'Open Admin → Config surfaces → Client onboarding. Enter client_id, name, symbols they trade, jurisdiction, and webhook URLs.',
-          action: { label: 'Open Admin', route: 'admin' },
+          description: 'Use the "Register client" card below. Enter client_id, name, symbols they trade, jurisdiction, and webhook URLs.',
         },
         {
           title: 'Tag credentials with client_id',
@@ -214,6 +215,11 @@
       ]}
       {onNavigate}
     />
+    <div class="grid onboard-only">
+      <Card title="Register client" subtitle="jurisdiction-gated onboarding" span={3}>
+        {#snippet children()}<ClientOnboardingPanel {auth} />{/snippet}
+      </Card>
+    </div>
   {:else}
   <div class="grid">
     <Card title="Clients" subtitle="registered tenants · click to drill down" span={1}>
@@ -297,19 +303,19 @@
             <div class="muted">No SLA data yet.</div>
           {:else}
             <div class="kv-row">
-              <div class="kv-cell">
+              <div class="kv-cell" title={SLA_LEGEND}>
                 <span class="k">avg presence</span>
                 <span class="v mono tone-{slaTone(sla.avg_presence_pct)}">
                   {fmtDec(sla.avg_presence_pct, 2)}%
                 </span>
               </div>
-              <div class="kv-cell">
+              <div class="kv-cell" title={SLA_LEGEND}>
                 <span class="k">avg two-sided</span>
                 <span class="v mono tone-{slaTone(sla.avg_two_sided_pct)}">
                   {fmtDec(sla.avg_two_sided_pct, 2)}%
                 </span>
               </div>
-              <div class="kv-cell">
+              <div class="kv-cell" title={SLA_LEGEND}>
                 <span class="k">min presence</span>
                 <span class="v mono tone-{slaTone(sla.min_presence_pct)}">
                   {fmtDec(sla.min_presence_pct, 2)}%
@@ -321,6 +327,9 @@
                   {sla.is_compliant ? 'YES' : 'NO'}
                 </span>
               </div>
+            </div>
+            <div class="legend muted" title={SLA_LEGEND}>
+              Compliance bands: ≥99% ok · 95–99% warn · &lt;95% breach
             </div>
             {#if sla.symbols?.length > 0}
               <table class="sym-table">
@@ -433,6 +442,10 @@
         {/snippet}
       </Card>
 
+      <Card title="Register new client" subtitle="jurisdiction-gated onboarding" span={3}>
+        {#snippet children()}<ClientOnboardingPanel {auth} />{/snippet}
+      </Card>
+
       <Card title="Agents carrying this tenant" subtitle={`${tenantAgents.length} approved · matched by profile.client_id`} span={3}>
         {#snippet children()}
           {#if tenantAgents.length === 0}
@@ -486,6 +499,7 @@
     grid-template-columns: minmax(240px, 1fr) repeat(2, minmax(0, 1fr));
     gap: var(--s-3);
   }
+  .grid.onboard-only { margin-top: var(--s-3); }
   .error { color: var(--neg); font-size: var(--fs-sm); }
   .muted { color: var(--fg-muted); font-size: var(--fs-xs); }
   .empty {
@@ -566,7 +580,9 @@
   .wh-status.pending { background: var(--bg-raised); color: var(--fg-muted); }
   .wh-status.ok      { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
   .wh-status.warn    { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+  .wh-status.info    { background: var(--bg-raised); color: var(--fg-secondary); }
   .wh-status.err     { background: color-mix(in srgb, var(--danger) 18%, transparent); color: var(--danger); }
+  .legend { font-size: 10px; margin-top: var(--s-2); }
 
   .invite-row { display: flex; align-items: center; gap: var(--s-2); flex-wrap: wrap; margin-bottom: var(--s-2); }
   .invite-detail { display: flex; align-items: center; gap: var(--s-2); flex-wrap: wrap; }

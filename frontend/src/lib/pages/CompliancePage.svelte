@@ -8,9 +8,18 @@
   import SentimentPanel from '../components/SentimentPanel.svelte'
   import ViolationsPanel from '../components/ViolationsPanel.svelte'
   let { ws, auth } = $props()
+
+  let mounted = $state(false)
+  $effect(() => {
+    const t = setTimeout(() => (mounted = true), 1200)
+    return () => clearTimeout(t)
+  })
 </script>
 
 <div class="page scroll">
+  {#if !mounted}
+    <div class="hydrating">Loading compliance surfaces…</div>
+  {/if}
   <div class="grid">
     <Card title="Open violations" subtitle="fleet rollup · SLA · kill · recon · manipulation" span={3}>
       {#snippet children()}<ViolationsPanel {auth} />{/snippet}
@@ -39,4 +48,12 @@
 <style>
   .page { padding: var(--s-6); height: calc(100vh - 57px); overflow-y: auto; }
   .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s-4); }
+  .hydrating {
+    padding: var(--s-2) var(--s-3);
+    margin-bottom: var(--s-3);
+    background: var(--bg-raised);
+    color: var(--fg-muted);
+    border-radius: var(--r-sm);
+    font-size: var(--fs-xs);
+  }
 </style>

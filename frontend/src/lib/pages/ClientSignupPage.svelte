@@ -12,7 +12,7 @@
   import { createApiClient } from '../api.svelte.js'
 
   let { auth, inviteToken } = $props()
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   let name = $state('')
   let password = $state('')

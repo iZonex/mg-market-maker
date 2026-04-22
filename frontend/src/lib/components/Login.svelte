@@ -92,7 +92,7 @@
   <div class="bg-orb orb-a" aria-hidden="true"></div>
   <div class="bg-orb orb-b" aria-hidden="true"></div>
 
-  <main class="login-card" role="main">
+  <main class="login-card">
     <div class="brand">
       <BrandMark size={34} withText={true} />
       <div class="brand-sub">

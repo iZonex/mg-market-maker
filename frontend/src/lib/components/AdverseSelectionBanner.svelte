@@ -18,7 +18,7 @@
   import { createApiClient } from '../api.svelte.js'
 
   let { auth, route } = $props()
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   const REFRESH_MS = 6_000
 
@@ -77,8 +77,8 @@
   })
 
   function onClick() {
-    // Jump to the full Admin panel for drill-down.
-    if (route) route('admin')
+    // Jump to Venues for the full adverse-selection drilldown.
+    if (route) route('venues')
   }
 </script>
 

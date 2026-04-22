@@ -17,7 +17,7 @@
   import { createApiClient } from '../api.svelte.js'
 
   let { auth, base = null } = $props()
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   let container
   let chart

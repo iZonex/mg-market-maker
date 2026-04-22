@@ -65,3 +65,69 @@ critical holes (UI-DEPLOY-1 silent-stop + UI-STOP-1 no-retire)
 both closed. Remaining gaps are mostly documentation (template
 disambiguation) and test tooling (no multi-tick preview
 sandbox) — not blocking for production UX.
+
+## Per-page walk
+
+Systematic per-page read after the lifecycle fixes. Endpoint
+list captured from `/tmp/mm-journey/ui_probe.py` against a
+live controller+agent. Every page hits 200 OK for ADMIN and CR
+roles respectively.
+
+### Live group
+
+| Page | Endpoints | Renders | Empty/loading | Notes |
+|------|-----------|---------|---------------|-------|
+| Overview | indirect via sub-components (HeroKpis, VenueMarketStrip, CrossVenuePortfolio, BasisMonitor, FundingPanel, SignalsPanel, InventoryPanel, PerLeg*, PnlChart, SpreadChart, OrderBook) + WS state | 3-column dashboard + "Market quality" KV card | placeholders "—" for null; FirstInstallWizard for new admins | Pure layout; if WS stale everything reads empty — no page-level skeleton |
+| Fleet | `/fleet`, `/approvals`, `/agents/{id}/credentials`, `/agents/{id}/deployments`, `/approvals/{fp}/{accept\|reject\|revoke}`, `/ops/fleet/{pause\|resume}`, PUT `/agents/{fp}/profile` | pending approvals, agent cards with profile+deployments, drilldown modal, revoke modal, pre-approve modal, Retire button per row | EmptyStateGuide when zero agents; per-row busy flags | Retire (UI-STOP-1) and merge-deploy (UI-DEPLOY-1) both landed; profile PUT endpoint verified correct (backend uses `{fingerprint}`) |
+| Clients | `/admin/clients`, `/client/{id}/pnl`, `/client/{id}/sla`, `/client/{id}/sla/certificate`, `/admin/clients/{id}/webhooks/deliveries`, `/admin/clients/{id}/webhooks/test`, `/admin/clients/{id}/invite`, `/fleet`, `/approvals` | client list + PnL / SLA / invite / webhooks / tenant-agents cards | EmptyStateGuide; section-level "No data yet" | SLA thresholds hardcoded (99% / 95%) without legend; webhook `attempted=0` tone reads as warn but often just means no URLs configured |
+| Reconciliation | `/reconciliation/fleet` | summary KVs, drift table, collapsible clean-rows section | "Clean — no drift detected" | clean rows collapsed by default — low discovery; ghost/phantom chips title-tooltip only (no drill) |
+| Orderbook | WS state only | L2 book, open orders, inventory (global + per-venue) | — (assumes WS live) | No symbol selector; if WS stale the whole page is blank. Candidate for a "WS stale" banner reuse. |
+| History | `/decisions/recent` fan-out via `/agents/{a}/deployments/{d}/details/decisions_recent`, WS for fills/open-orders | open orders, fills(20), decisions ledger, audit stream | component-scoped; ledger silently slices to 200 | Ledger slice has no "… N more" indicator |
+
+### Compliance group
+
+| Page | Endpoints | Notes |
+|------|-----------|-------|
+| Compliance | via children: ViolationsPanel / AlertLog / ConnectivityPanel / ReportsPanel / ClientCircuitPanel / SentimentPanel / AuditStream | Pure layout — no page-level loading/error surface; operator sees nothing until every child hydrates |
+| Surveillance | `/surveillance/fleet` (3s poll) | Production-grade: loading spinner, empty-state message explaining detector warm-up, kill-level badges, score bars. Thresholds 0.8 alert / 0.5 watch align with `risk::manipulation` enum |
+| Incidents | `/incidents` (5s poll), `/incidents/{id}/ack`, `/incidents/{id}/resolve` | Filter tabs (open/acked/resolved/all), resolve modal requires root_cause; clean state machine |
+
+### Configure group
+
+| Page | Endpoints | Notes |
+|------|-----------|-------|
+| Strategy | `/strategy/catalog` (130 nodes), `/strategy/templates` (19 graph JSONs), `/strategy/custom_templates`, `/strategy/validate` (300ms debounce), POST `/admin/strategy/graph` with optional `rollback_from` / `restricted_ack` query params, `/strategy/graphs/{name}/history/{hash}`, `/strategy/preview`, `/fleet` (for deploy targets) | Draft auto-saved to `localStorage["mm.strategy.draft.v1"]`. Two-phase deploy modal (pick targets → dispatch parallel). Restricted-node (412) triggers ack modal. Preview decorates edges with live tick values. Rollback-by-hash wired. No stubs |
+| Settings | `/fleet` (3s poll) | Hub/launcher — 4 tiles (Platform, Vault, Fleet, Profile) + fleet-wide rollup. Correctly disclaims per-strategy tuning lives in Fleet drilldown |
+| Calibration | ws state only; children PendingCalibrationCard + SignalsPanel | Minimal layout; AdaptivePanel + ParamTuner moved to Settings/Fleet respectively post-refactor |
+
+### Admin group
+
+| Page | Endpoints | Notes |
+|------|-----------|-------|
+| Platform | `/tunables/schema`, GET/PUT `/tunables` | Schema-driven form, per-field dirty tracking, semver/bool/number inputs. Clean |
+| Vault | GET/POST/PUT/DELETE `/vault` (5s poll) | Kind gallery (7 secret kinds); pick-kind → create flow; rotate UX. Expiry logic tagged Wave C6 |
+| Users | delegates to `<UserManagementPanel>` | Page is a 1-component wrapper; depth lives in the panel (not audited here) |
+| Auth audit | `/admin/auth/audit?from_ms&until_ms&limit&contains` (30s poll) | Window selector (1h/24h/7d/30d), substring filter, event counts rollup |
+| Admin | `/fleet` (5s poll for kill-level escalations) + 10 subcomponents (VenuesHealth, SorDecisions, AtomicBundles, RebalanceRecommendations, FundingArbPairs, AdverseSelection, CalibrationStatus, ManipulationScores, OnchainScores, AdminConfigPanels, ClientOnboardingPanel) | Kill-switch panel lists every deployment with `kill_level > 0` and routes one-click to Fleet drilldown. Subcomponents not re-audited here — depth varies |
+
+### Account group
+
+| Page | Endpoints | Notes |
+|------|-----------|-------|
+| Profile | `/auth/me`, POST `/auth/password`, `/auth/totp/{enroll,verify,disable}` | Three TOTP states (disabled / enrollment-with-QR / enabled); password dirty/validation; copy-secret UX |
+| ClientPortal | `/client/self/{pnl,sla,sla/certificate,fills,webhook-deliveries,webhooks}` (5s poll), test-fire | Webhook CRUD + test-fire with detailed result; signed SLA cert download |
+| ClientSignup | POST `/auth/client-signup` with `invite_token` | Minimal form; replaces URL on success. Token validation backend-side |
+| PasswordReset | POST `/auth/password-reset` with `reset_token` | Two-state (form / done); no auto-login by design |
+
+## UI-PAGE-* findings (from the per-page walk)
+
+| # | Severity | Finding | Suggested fix |
+|---|----------|---------|---------------|
+| UI-PAGE-1 | 🟡 P2 | `Compliance` is a pure layout; if ViolationsPanel or AlertLog is slow/broken the whole page looks dead. No page-level error boundary or "loading…" banner. | Tiny skeleton/banner at page level that clears once any child reports ready. |
+| UI-PAGE-2 | 🟡 P2 | `Orderbook` page assumes WS is live. If WS is reconnecting, every card renders empty with no hint why. | Reuse the "stream stale" banner pattern (already used on HeroKpis) at the page level. |
+| UI-PAGE-3 | 🟡 P2 | `History.DecisionsLedger` silently caps at 200 rows across fleet-wide fan-out. Large fleets lose older decisions with no "N more" affordance. | Either show a "…N older truncated" footer with a "Load more" button, or surface as a per-agent drilldown instead of flat fan-out. |
+| UI-PAGE-4 | 🟡 P2 | `Reconciliation` collapses clean rows behind a button by default. Operators reviewing a specific deployment may assume it wasn't reported. | Invert default to "Show clean" expanded when total row count is under ~20. |
+| UI-PAGE-5 | 🟢 P3 | `Clients` SLA tone uses hardcoded 99% / 95% thresholds with no legend. | Add tooltip on the SLA % showing the compliance band. |
+| UI-PAGE-6 | 🟢 P3 | `Clients` webhook test-fire shows `attempted=0` in the warn tone, even when the tenant has no URLs configured (which is not a warning). | Detect "no URLs" separately and use the info tone. |
+
+None of these block operator flow — all are polish / discoverability. The critical lifecycle holes were UI-DEPLOY-1 and UI-STOP-1, both already closed.

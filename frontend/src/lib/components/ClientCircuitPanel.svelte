@@ -3,7 +3,7 @@
   import Icon from './Icon.svelte'
 
   let { auth } = $props()
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   let rows = $state([])
   let error = $state('')
@@ -118,12 +118,4 @@
   tr.tripped td.cid { color: var(--neg); }
   .pos { color: var(--pos); }
   .neg { color: var(--neg); }
-  code {
-    font-family: var(--font-mono);
-    font-size: var(--fs-2xs);
-    padding: 1px 4px;
-    background: var(--bg-chip);
-    border-radius: var(--r-sm);
-    color: var(--fg-secondary);
-  }
 </style>

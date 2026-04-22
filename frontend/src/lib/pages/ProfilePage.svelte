@@ -14,7 +14,7 @@
   import { createApiClient } from '../api.svelte.js'
 
   let { auth } = $props()
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   let me = $state(null)
   let loadError = $state(null)
@@ -283,7 +283,7 @@
               <div class="qr-frame">{@html enrollment.qrSvg}</div>
               <div class="enroll-right">
                 <div class="secret-block">
-                  <label>Can't scan? Enter this secret manually</label>
+                  <span class="secret-label">Can't scan? Enter this secret manually</span>
                   <div class="secret-row">
                     <code class="secret">{enrollment.secret_base32}</code>
                     <button type="button" class="btn ghost small" onclick={copySecret}>
@@ -685,7 +685,7 @@
   .enroll-right { display: flex; flex-direction: column; gap: var(--s-3); min-width: 0; }
 
   .secret-block { display: flex; flex-direction: column; gap: 6px; }
-  .secret-block label {
+  .secret-block .secret-label {
     font-size: 11px;
     color: var(--fg-muted);
     letter-spacing: 0.02em;

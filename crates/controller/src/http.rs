@@ -99,6 +99,10 @@ pub fn router_full_authed(
             get(get_deployment_details),
         )
         .route(
+            "/api/v1/agents/{agent_id}/deployments/{deployment_id}/replay",
+            axum::routing::post(post_deployment_replay),
+        )
+        .route(
             "/api/v1/agents/{agent_id}/credentials",
             get(get_agent_credentials),
         )
@@ -274,6 +278,10 @@ pub fn router_full(
         .route(
             "/api/v1/agents/{agent_id}/deployments/{deployment_id}/details/{topic}",
             get(get_deployment_details),
+        )
+        .route(
+            "/api/v1/agents/{agent_id}/deployments/{deployment_id}/replay",
+            axum::routing::post(post_deployment_replay),
         )
         // Legacy thin-proxy for the pre-distributed `/api/admin/config/{symbol}`
         // endpoint. Tools and scripts that already hit this URL
@@ -2066,6 +2074,96 @@ async fn get_deployment_details(
                 StatusCode::GATEWAY_TIMEOUT,
                 format!(
                     "no reply for details '{topic}' on deployment '{deployment_id}' within {}s",
+                    DETAILS_TIMEOUT.as_secs()
+                ),
+            ))
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ReplayRequestBody {
+    candidate_graph: serde_json::Value,
+    #[serde(default)]
+    ticks: Option<u32>,
+}
+
+/// M5-GOBS — POST sibling of `get_deployment_details`. Exists
+/// because the replay request body carries a full candidate
+/// strategy graph JSON — too bulky to smuggle through
+/// `?args=` on the GET path. Otherwise the plumbing is
+/// identical: fan-out to the target agent with topic
+/// `graph_replay`, wait on the oneshot, return the reply.
+async fn post_deployment_replay(
+    State(state): State<AppState>,
+    Path((agent_id, deployment_id)): Path<(String, String)>,
+    axum::Json(body): axum::Json<ReplayRequestBody>,
+) -> Result<Json<DetailsResponse>, (StatusCode, String)> {
+    if let Some(view) = state.fleet.get(&agent_id) {
+        if !view.approval_state.is_empty() && view.approval_state != "accepted" {
+            return Err((
+                StatusCode::PRECONDITION_FAILED,
+                format!(
+                    "agent '{agent_id}' is in approval state '{}' — replay requires 'accepted'",
+                    view.approval_state
+                ),
+            ));
+        }
+    }
+
+    let request_id = uuid::Uuid::new_v4();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state.registry.pending_details_register(request_id, tx);
+
+    let mut args = serde_json::Map::new();
+    args.insert("candidate_graph".to_string(), body.candidate_graph);
+    if let Some(t) = body.ticks {
+        args.insert("ticks".to_string(), serde_json::json!(t));
+    }
+
+    if let Err(e) = state.registry.send(
+        &agent_id,
+        CommandPayload::FetchDeploymentDetails {
+            deployment_id: deployment_id.clone(),
+            topic: "graph_replay".to_string(),
+            request_id,
+            args,
+        },
+    ) {
+        state.registry.pending_details_forget(request_id);
+        return Err(match e {
+            RegistryError::NotFound => (
+                StatusCode::NOT_FOUND,
+                format!("agent {agent_id} is not currently connected"),
+            ),
+            RegistryError::AgentGone => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("agent {agent_id} session is shutting down"),
+            ),
+        });
+    }
+
+    match tokio::time::timeout(DETAILS_TIMEOUT, rx).await {
+        Ok(Ok(reply)) => Ok(Json(DetailsResponse {
+            agent_id,
+            deployment_id: reply.deployment_id,
+            topic: reply.topic,
+            payload: reply.payload,
+            error: reply.error,
+        })),
+        Ok(Err(_)) => {
+            state.registry.pending_details_forget(request_id);
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("agent {agent_id} session dropped while waiting for replay"),
+            ))
+        }
+        Err(_) => {
+            state.registry.pending_details_forget(request_id);
+            Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "no reply for replay on deployment '{deployment_id}' within {}s",
                     DETAILS_TIMEOUT.as_secs()
                 ),
             ))

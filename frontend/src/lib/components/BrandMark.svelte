@@ -16,8 +16,8 @@
    *               glyph; default false (just the glyph)
    */
   let { size = 28, withText = false } = $props()
-  const w = size * 2.4
-  const h = size
+  const w = $derived(size * 2.4)
+  const h = $derived(size)
 </script>
 
 <span class="brandmark" style:gap="{Math.max(8, size * 0.4)}px">
@@ -62,24 +62,6 @@
   }
   .glyph { flex-shrink: 0; display: block; }
 
-  .wordmark {
-    display: inline-flex;
-    align-items: baseline;
-    gap: 0;
-    font-family: var(--font-sans);
-    letter-spacing: -0.01em;
-  }
-  .brand-m {
-    font-size: var(--fs-xl);
-    font-weight: 700;
-    color: var(--fg-primary);
-  }
-  .brand-pipe {
-    font-size: var(--fs-xl);
-    font-weight: 500;
-    color: var(--accent);
-    margin: 0 4px 0 2px;
-  }
   .brand-rest {
     font-size: var(--fs-sm);
     font-weight: 500;

@@ -1703,6 +1703,359 @@ a concrete extension point.
   Sentiment compound-match on first run; both fixed in the
   same commit.
 
+## Strategy-graph observability (design: docs/research/graph-observability.md)
+
+Operator built a graph, deployed it, but can't see what flows
+through each node/edge in real time. Closes stories 1–4 and 6
+in the doc. Prometheus explicitly NOT involved — trace lives
+only in our UI via details-store / HTTP. Milestones:
+
+### M1 — engine telemetry + new details topics (landed)
+
+- [x] **GOBS-M1-1** `Evaluator::tick_with_full_trace` — fills a
+  `TickTrace` by reusing the per-tick outputs map. `tick_inner`
+  now takes `&mut Option<TickTrace>`; legacy `tick_with_trace`
+  projects down to the preview `EvalTrace`. Zero-cost when the
+  caller passes `None`.
+- [x] **GOBS-M1-2** New module `crates/strategy-graph/src/trace.rs`
+  with `TickTrace`, `NodeExec`, `ExecStatus`, `GraphAnalysis`.
+  All serde-round-trip-tested. `SinkAction` gained adjacent-tag
+  serde derives (`{kind, data}`) so tagged serialisation handles
+  `Decimal` newtype variants.
+- [x] **GOBS-M1-3** `DeploymentDetailsStore` gained
+  `graph_traces: HashMap<Symbol, VecDeque<TickTrace>>` capped at
+  `GRAPH_TRACE_CAP=256` + `graph_analysis: HashMap<Symbol, GraphAnalysis>`.
+  New methods: `push_graph_trace`, `graph_traces(limit)`,
+  `clear_graph_traces`, `set_graph_analysis`, `graph_analysis`.
+- [x] **GOBS-M1-4** Engine tick hook at `market_maker.rs:5027`:
+  switched `graph.tick()` → `graph.tick_with_full_trace()`,
+  stamps tick counter + wall-clock ms + graph hash (the
+  evaluator is clock-free), pushes into details store.
+  New field `strategy_graph_tick_counter: u64`.
+- [x] **GOBS-M1-5** Swap hook + first-deploy hook
+  (`with_strategy_graph` and `swap_strategy_graph`) compute
+  `Evaluator::analyze(graph_hash)` once and store via
+  `set_graph_analysis`. Swap also calls `clear_graph_traces`
+  so fresh subscribers don't see stale ticks from the prior
+  DAG.
+- [x] **GOBS-M1-6** Agent match arms in `agent/src/lib.rs` for
+  `"graph_trace_recent"` (returns `{ traces: [...], graph_analysis: {...} }`,
+  honours optional `limit` arg, default 20) and
+  `"graph_analysis"` (returns the analysis struct or an
+  explicit error payload when no graph is attached).
+- [x] **GOBS-M1-7** Regression tests landed in
+  `strategy-graph/src/lib.rs`:
+  `tick_with_full_trace_captures_every_node_and_sinks` +
+  `analyze_flags_dead_branch_and_unconsumed_outputs`, plus
+  `trace::tests::serde_roundtrip_tick_trace`. Workspace full
+  test sweep green.
+
+### M2 — UI Live mode: canvas overlay + inspector (landed)
+
+- [x] **GOBS-M2-1** StrategyPage: `mode: 'authoring' | 'live'`
+  state, segmented toggle in top-right chunk, Live button
+  disabled until a `liveTarget` is bound (via URL param or
+  deployment drilldown). Simulate/Deploy disabled while in Live
+  mode. CSS `@keyframes live-pulse` drives the indicator dot.
+- [x] **GOBS-M2-2** Live-mode entry points landed:
+  - `?live=<agentId>/<deploymentId>` URL param parsed in
+    `App.svelte::parseLiveTarget()`, cleared on route change.
+  - `DeploymentDrilldown` gained "Open graph (live)" button in
+    head-actions, gated on `row.active_graph?.name`.
+  - New `onOpenGraphLive` prop chain
+    App.svelte → FleetPage → DeploymentDrilldown.
+- [x] **GOBS-M2-3** `createGraphLiveStore(auth, agentId, deploymentId)`
+  at `frontend/src/lib/graphLiveStore.svelte.js`. 2 s poll against
+  `/details/graph_trace_recent?limit=20`, reactive `{ traces,
+  graphAnalysis, error, loading, lastFetch }`, `stop()` on
+  unmount. Helpers `edgeValuesFromTrace` / `nodeStatsFromTraces` /
+  `formatValue` for UI rendering.
+- [x] **GOBS-M2-4** StrategyNode.svelte:
+  - `data.live` contract (latest value, status, hitRate, dead,
+    dormant, tickCount) rendered via `live-badge` row + status
+    dot in header.
+  - Fire-pulse via `.fired header` CSS animation (0.35s ease-out
+    accent fade).
+  - `.dead` → red dashed border + "dead branch" banner.
+  - `.dormant` → diagonal-stripe background + "dormant source"
+    banner.
+  - Errored status dot in red; ok/source tones differentiated.
+- [x] **GOBS-M2-5** `decorateEdgesLive()` reads from
+  `liveEdgeValues` (derived from latest TickTrace), applies
+  dashed red stroke when either endpoint is in
+  `graphAnalysis.dead_nodes`. Reuses the svelte-flow label
+  shape as the preview path.
+- [x] **GOBS-M2-6** `GraphInspector.svelte` sidebar replaces
+  `StrategyNodeConfig` in Live mode: per-node sparkline (last
+  20 numeric outputs, min/max range shown), status chip
+  (ok/source/error), hit-rate %, avg elapsed µs, dead-branch
+  badge. No-selection view summarises ticks-in-window +
+  dead/unconsumed counts. "Back to authoring" button flips mode.
+- [x] **GOBS-M2-7** `$effect` reads `graphAnalysis` — dead nodes
+  flagged on both canvas (StrategyNode `.dead` class) and edges
+  (dashed red). Dormant sources get diagonal-stripe when a
+  `required_sources` set is known and the node's kind is absent
+  from it. Frontend build green with 0 Svelte warnings;
+  workspace 2200+ Rust tests pass.
+
+### M2.5 — Playwright E2E regression suite (landed)
+
+Added browser-side automation so M2 regressions are caught in CI
+without operator eyeball. Backed by a persistent dev stand.
+
+- [x] **GOBS-M2.5-1** `scripts/stand-up.sh` — boots server + agent,
+  bootstraps admin, accepts fingerprint, pushes paper credential,
+  deploys `rug-detector-composite` (defaults; override via
+  `STAND_TEMPLATE`). Writes `.stand-run/stand.env` with
+  `HTTP_URL`, `ADMIN_TOKEN`, `AGENT_ID`, `DEPLOYMENT_ID`, PIDs.
+  Companion `scripts/tear-down.sh` kills PIDs.
+- [x] **GOBS-M2.5-2** `frontend/playwright.config.ts` + Chromium
+  install. `globalSetup.ts` spawns stand-up if `.stand-run/stand.env`
+  missing, else reuses it. Passes stand state via `STAND_*`
+  env vars to each spec. Trace + video retained on failure.
+- [x] **GOBS-M2.5-3** API suite
+  (`tests/e2e/api-graph-observability.spec.ts`): asserts
+  `graph_trace_recent` returns live ticks with node outputs,
+  `graph_analysis` exposes depth_map + required_sources,
+  tick counter is monotonic.
+- [x] **GOBS-M2.5-4** UI suite
+  (`tests/e2e/ui-live-mode.spec.ts`): seeds auth via
+  `localStorage.mm_auth`, navigates to `/?live=<agent>/<dep>`,
+  asserts the Live tab is active, 8 nodes render, live badges
+  populate, inspector sidebar shows hit-rate + avg-elapsed,
+  toggle back to Authoring re-enables Simulate.
+
+### Bug caught by Playwright that shipped behind build-only M2
+
+- [x] **GOBS-BUG-1** `StrategyPage` `$effect` read+wrote `nodes`
+  without `untrack()` → `effect_update_depth_exceeded` at first
+  boot, canvas empty. Fixed by wrapping the write-back in
+  `untrack(() => { nodes = ...})`; same for `decorateEdgesLive`
+  mutating `edges`. Build-only checks would never have caught
+  this — Playwright caught it on first run.
+- [x] **GOBS-BUG-2** `?live=` URL param populated `liveTarget`
+  but left `route='overview'` — StrategyPage never rendered on
+  initial load. Fixed by initialising `route` from `liveTarget`.
+- [x] **GOBS-BUG-3** Distributed mode has no graph-store, so
+  `/api/v1/strategy/graphs/:name` returns 503. `loadLiveGraph`
+  now fetches via `/api/v1/strategy/templates/:name` which is
+  wired and returns the full graph JSON.
+
+### M3 — extended validation + dead-node detection (landed)
+
+- [x] **GOBS-M3-1** `POST /api/v1/strategy/validate` response
+  extended with `required_sources`, `dead_nodes`,
+  `unconsumed_outputs`. Built from the same `Evaluator::analyze`
+  that swap-hook feeds into `graph_analysis`. Fields always
+  emitted (no `skip_serializing_if`) so client `Array.isArray`
+  checks don't flake on an empty topology.
+- [x] **GOBS-M3-2** StrategyPage validate strip gained two
+  advisory pills in the Ready state: `N dead` (red) when any
+  node has no path to a sink, `N unconsumed` (orange) for
+  output ports without consumers. New `.v-pill.warn` colour
+  hooked into the existing pill CSS.
+- [x] **GOBS-M3-3** `StrategyPalette` accepts `requiredSources`
+  prop. Source-kind chips (zero input ports, not Math/Logic/
+  Cast/Strategy/Exec/Plan/Out) render with a diagonal-stripe
+  background + 0.48 opacity when the graph doesn't reference
+  them. Hover tooltip explains "dormant — not referenced".
+  Hover boosts to 0.85 opacity so operators can still read
+  the label.
+- [x] **GOBS-M3-4** Playwright regression (`m3-validation.spec.ts`,
+  3 tests): API returns topology fields for rug-detector,
+  palette fades dormant sources after template load, validate
+  strip coexists advisory pills with the Ready pill without
+  layout breakage.
+
+### M4 — timeline + time-travel (landed — 4-4 deferred)
+
+- [x] **GOBS-M4-1** `GraphTimeline.svelte` — horizontal scrubber
+  under the canvas in Live mode. One column per TickTrace,
+  column height = `total_elapsed_ns` (relative), colour tone
+  = `sinks_fired` count (idle / low / mid / hot). Header shows
+  `tick# · HH:MM:SS.mmm · N nodes · M sinks` for the currently
+  displayed tick + a pulsing live pill / "Back to live" CTA.
+- [x] **GOBS-M4-2** Click-tick → pin. StrategyPage holds
+  `pinnedTickNum`. When non-null, `liveTickTrace` picks that
+  trace instead of `traces[0]`, `liveTickOutputs` derived map
+  feeds per-node badges so operators see that tick's values on
+  the canvas. Edge decoration also snaps (existing `$effect`
+  re-runs on pin).
+- [x] **GOBS-M4-3** URL `?tick=<tick_num>` deep link. App.svelte
+  parses alongside `?live=`, passes as `liveTick` prop,
+  StrategyPage seeds `pinnedTickNum` on mount. `navigateLiveGraph`
+  accepts an optional `tickNum` so future Incidents → "Open
+  graph at incident" deep-links are one-call wide.
+- [x] **GOBS-M4-4** Incident deep-link (re-scoped — incidents are
+  operator-opened, not engine-emitted, so "persist traces on
+  incident" doesn't apply; instead stamp the incident with the
+  current tick so the post-mortem UI can jump there).
+  - `OpenIncident` gained optional
+    `graph_agent_id` / `graph_deployment_id` / `graph_tick_num`.
+    POST handler accepts them.
+  - `DeploymentDrilldown` gained a "File incident" button —
+    snapshots latest tick via `graph_trace_recent?limit=1`,
+    POSTs with graph context, navigates to Incidents.
+  - `IncidentsPage` renders "Open graph at incident · tick #N"
+    when the graph triple is set; click routes through
+    `navigateLiveGraph(agent, dep, tick)` so the Timeline
+    scrubber opens at the exact pinned frame.
+  - Playwright `m4-4-incident-link.spec.ts` asserts the
+    round-trip (POST → row surfaces button → click sets URL
+    `?live=&tick=`). Full e2e now 14/14 green.
+- [x] **GOBS-M4-test** Playwright `m4-timeline.spec.ts` (3 tests):
+  timeline renders one column per trace with a live pill, click
+  pins + "Back to live" unpins, `?tick=` URL param pre-pins on
+  load. Whole e2e suite 13/13 green.
+
+### M5 — diff/replay v1 vs v2 (landed v1 — side-by-side canvas deferred to M5.2)
+
+Determinism was easier than the design-doc planned for: `TickTrace`
+already captures per-node inputs/outputs and source nodes expose
+their outputs by kind, so a candidate graph can be fed the same
+`(kind, port) → value` lookup and re-evaluated on the same
+evaluator loop. No new per-tick persistence needed.
+
+- [x] **GOBS-M5-1** `TickTrace::source_kind_values()` flattens
+  source-node outputs into a `(kind, port) → Value` lookup —
+  replay fodder for a candidate with different NodeIds.
+- [x] **GOBS-M5-2** `mm_strategy_graph::evaluator::replay_source_inputs(candidate, kind_values)`
+  rebuilds a per-NodeId `source_inputs` map for the candidate's
+  own source nodes.
+- [x] **GOBS-M5-3** Agent details topic `"graph_replay"` — takes
+  `args.candidate_graph` + optional `ticks`, walks its trace
+  ring, re-evaluates the candidate, diffs `sinks_fired` as a
+  string-set compare, returns `{ summary, ticks_replayed,
+  divergence_count, divergences: [...], candidate_issues }`.
+- [x] **GOBS-M5-4** Controller POST `/api/v1/agents/{a}/deployments/{d}/replay`
+  — sibling of the GET `/details/{topic}` fan-out but takes a
+  JSON body (graph JSON is too large for query args). Wraps
+  the same `FetchDeploymentDetails` command with topic
+  `graph_replay`.
+- [x] **GOBS-M5-5** `StrategyPage` toolbar: "Replay vs deployed"
+  button (Authoring mode only, requires a live target).
+  Click → modal with summary + per-tick side-by-side sink
+  JSON. Identical graph → "matches deployed behaviour"; a
+  rejected candidate surfaces its validation error; non-empty
+  divergences scroll in a bounded list.
+- [x] **GOBS-M5-6** Playwright `m5-replay.spec.ts` (3 tests):
+  API identical-graph → 0 divergences; invalid graph →
+  candidate_issues populated; UI button opens modal with
+  matching summary. Full e2e suite 17/17 green.
+- [ ] **GOBS-M5.2** (deferred) Side-by-side canvas — render
+  two miniature graphs scrubbed through the tick range with
+  diverging nodes glow-highlighted. Current v1 lists
+  divergences as JSON diff which is good enough for first
+  use; visual canvas diff is polish when operators ask.
+
+### GOBS-PRE — pre-human-testing hardening (landed)
+
+Six-point checklist to get past "happy-path proven by automation"
+toward "friendly operator can actually drive this without hitting
+land mines". Every item is a Playwright or Rust test so the
+regression stays cheap.
+
+- [x] **GOBS-PRE-1** `authz-graph-topics.spec.ts` — proves
+  `graph_trace_recent` / `graph_analysis` / `replay` are gated
+  at the controller's `internal_view` tier. No-auth = 401,
+  garbage-token = 401, fresh viewer + operator accounts
+  created through `/api/admin/users` both succeed on all three
+  endpoints. ClientReader's `tenant_scope_middleware` gate
+  inherits its existing coverage.
+- [x] **GOBS-PRE-2** `error-states.spec.ts` — unknown agent →
+  404 with readable body on both details + replay; unknown
+  deployment_id on a valid agent → 200 envelope with empty
+  traces (UI treats as "nothing to show", not a network
+  failure); `?tick=0` deep link on a running deployment → UI
+  detects the miss, auto-unpins, flashes a warning.
+- [x] **GOBS-PRE-3** `DeploymentDetailsStore::graph_trace_ring_rolls_over`
+  + `graph_trace_limit_caps_response` + `clear_graph_traces_wipes_symbol_only`
+  + `graph_analysis_replaces_on_set` — ring caps at
+  `GRAPH_TRACE_CAP=256`, newest-first read order, clear scoped
+  to one symbol, analysis set replaces.
+- [x] **GOBS-PRE-4** `multi-deploy.spec.ts` — adds a second
+  deployment on ETHUSDT alongside the stand's BTCUSDT one,
+  asserts both get independent `graph_analysis` + non-empty
+  `graph_trace_recent`, then restores the original deployment
+  list so the stand is unchanged for subsequent tests.
+- [x] **GOBS-PRE-5** `StrategyPage` guards a pin that ages out
+  of the ring. `$effect` watches `(pinnedTickNum, liveTraces)`;
+  when the pinned tick isn't found, unpins + shows a
+  "tick #N rolled off the ring — released pin" banner for 6s.
+  New CSS `.pin-warning` above the validate strip.
+- [x] **GOBS-PRE-6** `docs/guides/graph-live-mode.md` — operator
+  guide: entry points (drilldown button + URL), what every
+  visual cue means, timeline + time-travel, replay workflow,
+  filing incidents at a frame, troubleshooting table, data
+  retention + roles.
+- [x] **GOBS-PRE-bug** Incident dedup bug caught in the
+  process: the m4-4 Playwright test used a stable
+  `violation_key` so a second run merged into the first
+  incident's row and the assertion for the new tick_num
+  failed. Fixed by suffixing `Date.now()`. The dedup is
+  correct server-side; the test was the one being dishonest.
+
+### GOBS-CI — Playwright job in `.github/workflows/ci.yml` (landed)
+
+- [x] **GOBS-CI-1** New `e2e` job in `ci.yml`:
+  installs chromium via `npx playwright install --with-deps`,
+  builds Rust binaries + frontend dist, runs
+  `scripts/stand-up.sh` with `STAND_SKIP_FRONTEND=1` (we just
+  built dist), runs `npm run test:e2e`, tears down the stand
+  with `if: always()` so a failing spec still cleans up.
+- [x] **GOBS-CI-2** Failure artifacts: uploads
+  `frontend/playwright-report` + `.stand-run/logs` on job
+  failure with 14-day retention. Traces + videos inside the
+  report cover everything Playwright recorded.
+- [x] **GOBS-CI-3** 25-minute job timeout — enough for fresh
+  cargo cache + chromium install + 45s tick-warmup + ≈12s
+  test run, short enough to fail fast if the stand hangs.
+- [x] **GOBS-CI-4** Local dry-run: `./scripts/tear-down.sh` →
+  `STAND_SKIP_FRONTEND=1 ./scripts/stand-up.sh` →
+  `npm run test:e2e` → `./scripts/tear-down.sh`. All 13 tests
+  green, teardown clean. Mirrors the CI step sequence.
+
+### M6 — lazy-detector gating (landed — v1 manipulation + onchain)
+
+- [x] **GOBS-M6-1** `MarketMakerEngine` gained two bool gates —
+  `gate_manipulation` + `gate_onchain`. Default true (open) so
+  deployments without a graph keep their pre-graph behaviour.
+  Both derived from `analysis.required_sources` on every graph
+  swap (`swap_strategy_graph`) and first deploy
+  (`with_strategy_graph`) — one source of truth, no drift.
+- [x] **GOBS-M6-2** Engine hot paths gated:
+  - `self.manipulation.on_trade(trade)` — per-trade feed.
+    Closed gate = detector doesn't update on trades.
+  - `self.manipulation.on_book(...)` + snapshot publish path.
+    Closed gate = `manipulation_score` publishes `None` so
+    Prometheus + dashboard show "detector not running"
+    honestly instead of stale zeros.
+- [x] **GOBS-M6-3** Regression: `analyze_exposes_gate_keys_for_detector_templates`
+  in `crates/strategy-graph/src/lib.rs` asserts the gate
+  predicate on `rug-detector-composite` (manip open) and
+  `avellaneda-via-graph` (both closed) — catalog renames fail
+  the test before silently leaving a detector running or
+  starved in production.
+- [ ] **GOBS-M6-4** (deferred) UI palette badge — "unused —
+  will not compute" annotation on dormant detector sources
+  (beyond the M3 diagonal-stripe fade). Design-doc M3.3 covers
+  this partially. Skip for now unless operators ask.
+- [x] **GOBS-M6-5** Playwright regression sweep still 13/13 on
+  the rug-detector stand (manipulation + onchain both firing
+  — gate open path proven in browser-land too).
+
+### Open design questions
+
+- [ ] **GOBS-Q1** Trace on-demand subscribe vs always-on?
+  Leaning on-demand (agent enables trace when first request
+  arrives, disables after 30s of no requests). 1 tick of
+  latency at first subscribe is acceptable.
+- [ ] **GOBS-Q2** Diff-only trace payload (omit if equal to
+  prev)? Wire size drop ~60%. Implement in M2 if payload
+  exceeds 200 KB / poll.
+- [ ] **GOBS-Q3** Trace retention on incident — last 60 ticks
+  into audit? Couples with M4 time-travel.
+
 ## P3 — hardening / polish
 
 - [x] **HARD-1** Audit complete: all 40 `unwrap`/`expect` calls

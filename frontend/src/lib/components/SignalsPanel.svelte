@@ -15,21 +15,21 @@
 
   // UI-3 — tiered + dual-timeline OTR fetched from
   // /api/v1/otr/tiered every 4 s.
-  const api = auth ? createApiClient(auth) : null
+  const api = $derived(auth ? createApiClient(auth) : null)
   let tiered = $state({})
-  if (api) {
-    $effect(() => {
-      async function poll() {
-        try {
-          const data = await api.getJson('/api/v1/otr/tiered')
-          tiered = data?.symbols ?? {}
-        } catch { /* silent — the other signals still render */ }
-      }
-      poll()
-      const t = setInterval(poll, 4_000)
-      return () => clearInterval(t)
-    })
-  }
+  $effect(() => {
+    const client = api
+    if (!client) return
+    async function poll() {
+      try {
+        const data = await client.getJson('/api/v1/otr/tiered')
+        tiered = data?.symbols ?? {}
+      } catch { /* silent — the other signals still render */ }
+    }
+    poll()
+    const t = setInterval(poll, 4_000)
+    return () => clearInterval(t)
+  })
   const tRow = $derived(tiered[sym] || null)
   function otrColour(v) {
     if (v === null || v === undefined || Number.isNaN(v)) return 'var(--fg-muted)'

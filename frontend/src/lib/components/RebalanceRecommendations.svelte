@@ -11,7 +11,7 @@
   import { createApiClient } from '../api.svelte.js'
 
   let { auth } = $props()
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   const REFRESH_MS = 15_000
 
@@ -134,8 +134,23 @@
   {/if}
 
   {#if pending}
-    <div class="modal-backdrop" onclick={cancelExecute}>
-      <div class="modal" onclick={(e) => e.stopPropagation()}>
+    <div
+      class="modal-backdrop"
+      role="button"
+      tabindex="-1"
+      aria-label="Close modal"
+      onclick={cancelExecute}
+      onkeydown={(e) => { if (e.key === 'Escape') cancelExecute() }}
+    >
+      <div
+        class="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Confirm transfer"
+        tabindex="-1"
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={(e) => e.stopPropagation()}
+      >
         <h3>Confirm transfer</h3>
         <div class="kv">
           <span class="k">Asset</span><span class="v mono">{pending.asset}</span>

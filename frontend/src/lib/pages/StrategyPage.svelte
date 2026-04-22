@@ -23,15 +23,175 @@
   } from '@xyflow/svelte'
   import '@xyflow/svelte/dist/style.css'
   import { createApiClient } from '../api.svelte.js'
+  import { untrack } from 'svelte'
+  import {
+    createGraphLiveStore,
+    edgeValuesFromTrace,
+    nodeStatsFromTraces,
+    formatValue,
+  } from '../graphLiveStore.svelte.js'
   import Icon from '../components/Icon.svelte'
   import StrategyPalette from '../components/StrategyPalette.svelte'
   import StrategyNodeConfig from '../components/StrategyNodeConfig.svelte'
   import StrategyDeployHistory from '../components/StrategyDeployHistory.svelte'
   import StrategyNode from '../components/StrategyNode.svelte'
   import ActivePlans from '../components/ActivePlans.svelte'
+  import GraphInspector from '../components/GraphInspector.svelte'
+  import GraphTimeline from '../components/GraphTimeline.svelte'
 
-  let { auth } = $props()
-  const api = createApiClient(auth)
+  // `liveAgent` / `liveDeployment` come from App.svelte when the URL
+  // carries `?live=<agentId>/<deploymentId>` — operator opened this
+  // page from DeploymentDrilldown to observe the deployed graph.
+  let {
+    auth,
+    liveAgent = null,
+    liveDeployment = null,
+    // M4-GOBS — `?tick=<tick_num>` deep link from Incidents.
+    // When set on mount we pre-pin that tick as soon as the
+    // live store catches up with a matching trace.
+    liveTick = null,
+  } = $props()
+  const api = $derived(createApiClient(auth))
+
+  // M2-GOBS — authoring vs live mode. Authoring preserves the
+  // original behaviour (palette, drag, validate, preview, deploy).
+  // Live mode polls graph_trace_recent, overlays per-tick values on
+  // edges + nodes, shows the GraphInspector sidebar instead of the
+  // node-config panel. No deploy from Live mode — operator flips
+  // back to authoring first.
+  let mode = $state(
+    untrack(() => (liveAgent && liveDeployment ? 'live' : 'authoring')),
+  )
+  let liveStore = $state(null)
+  let liveTarget = $state(
+    untrack(() =>
+      liveAgent && liveDeployment
+        ? { agentId: liveAgent, deploymentId: liveDeployment }
+        : null,
+    ),
+  )
+  // M4-GOBS — time-travel. When `pinnedTickNum` is non-null
+  // the page renders THAT tick's values on the canvas instead
+  // of the latest live frame. Operator picks via the Timeline
+  // scrubber; deep link `?tick=N` pre-pins on mount.
+  let pinnedTickNum = $state(liveTick != null ? Number(liveTick) : null)
+  let pinWarning = $state(null) // user-facing message when a pin stales off the ring
+  const liveTraces = $derived(liveStore?.state?.traces ?? [])
+  const liveTickTrace = $derived(
+    pinnedTickNum != null
+      ? liveTraces.find((t) => t.tick_num === pinnedTickNum) ?? liveTraces[0] ?? null
+      : liveTraces[0] ?? null,
+  )
+  // M4-long-session guard — when the pinned tick rolls off the
+  // ring (operator held a pin longer than 256 ticks at ~2 Hz ≈
+  // 2 min), auto-unpin and tell them. Without this the canvas
+  // silently falls back to "newest tick" but the chrome still
+  // claimed pinned mode — worst-of-both UX. Fire only when
+  // the ring has settled (non-empty) so the bootstrap window
+  // before the first poll lands doesn't spuriously fire.
+  $effect(() => {
+    if (pinnedTickNum == null) return
+    if (liveTraces.length === 0) return
+    const found = liveTraces.some((t) => t.tick_num === pinnedTickNum)
+    if (!found) {
+      pinWarning = `tick #${pinnedTickNum} rolled off the ring — released pin`
+      pinnedTickNum = null
+      setTimeout(() => { pinWarning = null }, 6000)
+    }
+  })
+  let liveEdgeValues = $derived(edgeValuesFromTrace(liveTickTrace))
+  let liveNodeStats = $derived(nodeStatsFromTraces(liveTraces))
+  // Per-node output lookup for the currently displayed tick
+  // (pinned or latest). Used so node badges reflect the exact
+  // frame the operator selected, not the rolling window tail.
+  const liveTickOutputs = $derived.by(() => {
+    const m = new Map()
+    if (!liveTickTrace) return m
+    for (const n of liveTickTrace.nodes ?? []) {
+      const first = n.outputs?.[0]
+      if (first) m.set(n.id, first[1])
+    }
+    return m
+  })
+  let liveGraphAnalysis = $derived(liveStore?.state?.graphAnalysis ?? null)
+  let deadNodeIds = $derived(new Set(liveGraphAnalysis?.dead_nodes ?? []))
+
+  // Spin up / tear down the live-poll store as mode flips.
+  $effect(() => {
+    if (mode === 'live' && liveTarget) {
+      liveStore = createGraphLiveStore(auth, liveTarget.agentId, liveTarget.deploymentId)
+      return () => { liveStore?.stop?.(); liveStore = null }
+    }
+    liveStore = null
+    return () => {}
+  })
+
+  // In Live mode, re-decorate edges whenever a new trace lands.
+  $effect(() => {
+    if (mode !== 'live') return
+    // Subscribe to trace updates (reading state.lastFetch forces
+    // reactivity). The heavy lifting is in decorateEdgesLive below.
+    liveStore?.state?.lastFetch
+    decorateEdgesLive()
+  })
+
+  // When entering Live mode with a known deployment, pull the
+  // deployment's graph onto the canvas so the overlay has edges
+  // to decorate. Fetches the fleet snapshot, finds the matching
+  // deployment, then reads its graph name + hash.
+  $effect(() => {
+    if (mode !== 'live' || !liveTarget) return
+    loadLiveGraph().catch((e) => { deployStatus = `live graph load failed: ${e}` })
+  })
+
+  async function loadLiveGraph() {
+    const fleet = await api.getJson('/api/v1/fleet')
+    if (!Array.isArray(fleet)) return
+    const agent = fleet.find((a) => a.agent_id === liveTarget.agentId)
+    const dep = agent?.deployments?.find((d) => d.deployment_id === liveTarget.deploymentId)
+    const graphName = dep?.active_graph?.name
+    if (!graphName) {
+      deployStatus = 'live: deployment has no strategy graph attached'
+      return
+    }
+    // In distributed mode `/strategy/graphs/:name` needs a graph
+    // store which isn't wired; `/strategy/templates/:name` returns
+    // the bundled graph JSON and works for every template the
+    // controller knows about. Fall back silently on 404 so
+    // operator-saved custom graphs still hit the regular path
+    // once a graph store is available.
+    try {
+      const g = await api.getJson(
+        `/api/v1/strategy/templates/${encodeURIComponent(graphName)}`,
+      )
+      applyLoadedGraph(g)
+      deployStatus = `live: watching ${graphName}`
+    } catch (e) {
+      deployStatus = `live: failed to fetch ${graphName} (${e})`
+    }
+  }
+
+  // Extracted helper — same transform the existing `loadGraph`
+  // applies, hoisted so `loadLiveGraph` can call it without
+  // re-fetching from a different endpoint.
+  function applyLoadedGraph(g) {
+    graphName = g.name
+    scopeKind = g.scope.kind
+    scopeValue = g.scope.value ?? ''
+    nodes = g.nodes.map((n) => ({
+      id: n.id,
+      type: 'graphNode',
+      position: { x: n.pos?.[0] ?? 0, y: n.pos?.[1] ?? 0 },
+      data: nodeData(n.kind, n.config),
+    }))
+    edges = g.edges.map((e, i) => ({
+      id: `e${i}`,
+      source: e.from.node,
+      sourceHandle: e.from.port,
+      target: e.to.node,
+      targetHandle: e.to.port,
+    }))
+  }
 
   let nodes = $state.raw([])
   let edges = $state.raw([])
@@ -65,7 +225,18 @@
   // Live server-side validation snapshot. Debounced on any graph
   // mutation. `valid` drives the Deploy button; `issues` render as
   // red chips in the validation strip.
-  let validation = $state({ valid: false, issues: [], node_count: 0, edge_count: 0, sink_count: 0 })
+  let validation = $state({
+    valid: false,
+    issues: [],
+    node_count: 0,
+    edge_count: 0,
+    sink_count: 0,
+    // M3-GOBS — topology fields, empty arrays when the graph
+    // doesn't compile (issues surface the reason instead).
+    required_sources: [],
+    dead_nodes: [],
+    unconsumed_outputs: [],
+  })
 
   let fileInput = $state(null)
   let saveDialogOpen = $state(false)
@@ -642,6 +813,109 @@
     })
   }
 
+  // M2-GOBS — Live-mode edge decoration. Same svelte-flow label
+  // path as preview, but values come from the `TickTrace` the
+  // agent returned over `graph_trace_recent`. Called from the
+  // `$effect` that watches `liveStore.state.lastFetch`. Reads
+  // `edges` for the rebuild but wraps the read in `untrack` so
+  // the self-write doesn't re-enter the effect.
+  function decorateEdgesLive() {
+    const lookup = liveEdgeValues
+    const deadIds = deadNodeIds
+    const current = untrack(() => edges)
+    edges = current.map((e) => {
+      const key = `${e.source}:${e.sourceHandle}`
+      const label = lookup[key]
+      const isDead = deadIds.has(e.source) || deadIds.has(e.target)
+      const base = isDead
+        ? { stroke: 'var(--danger)', 'stroke-dasharray': '4 3' }
+        : {}
+      if (label !== undefined) {
+        return {
+          ...e,
+          label,
+          labelStyle:
+            'font-family: var(--font-mono); font-size: 10px; fill: var(--fg-primary);',
+          labelBgStyle:
+            'fill: var(--bg-raised); stroke: var(--accent); stroke-width: 1;',
+          labelBgPadding: [4, 2],
+          labelBgBorderRadius: 4,
+          style: isDead
+            ? 'stroke: var(--danger); stroke-dasharray: 4 3;'
+            : undefined,
+        }
+      }
+      return {
+        ...e,
+        label: undefined,
+        style: isDead
+          ? 'stroke: var(--danger); stroke-dasharray: 4 3;'
+          : undefined,
+      }
+    })
+  }
+
+  // M2-GOBS — push per-node Live data onto `node.data` so
+  // StrategyNode can render the badge / pulse / status chip /
+  // dead border without plumbing a separate store through
+  // svelte-flow's custom node slot.
+  //
+  // The effect reads `nodes` to write back onto it. Svelte 5
+  // would re-trigger the effect infinitely if we read `nodes`
+  // reactively here — wrap the read in `untrack` so the effect
+  // only re-runs when the live data actually changes.
+  $effect(() => {
+    // Declared dependencies: re-run when mode flips, traces tick,
+    // or graph analysis swaps.
+    const activeMode = mode
+    const stats = liveNodeStats
+    const analysis = liveGraphAnalysis
+    // M4 — re-run on pin/unpin so node badges snap to the
+    // selected tick's output (read outside untrack).
+    const tickOutputs = liveTickOutputs
+    untrack(() => {
+      if (activeMode !== 'live') {
+        let needsReset = false
+        for (const n of nodes) {
+          if (n.data?.live) { needsReset = true; break }
+        }
+        if (!needsReset) return
+        nodes = nodes.map((n) => {
+          if (!n.data?.live) return n
+          const { live: _drop, ...rest } = n.data
+          return { ...n, data: rest }
+        })
+        return
+      }
+      const dead = new Set(analysis?.dead_nodes ?? [])
+      const required = new Set(analysis?.required_sources ?? [])
+      nodes = nodes.map((n) => {
+        const row = stats.get(n.id)
+        // Prefer the pinned/selected tick's actual output; fall
+        // back to the rolling-window last-value for nodes that
+        // happened not to fire on the selected tick.
+        const pinnedOut = tickOutputs.get(n.id) ?? null
+        const fallbackOut =
+          row && row.history.length > 0
+            ? row.history[row.history.length - 1]
+            : null
+        const display = pinnedOut ?? fallbackOut
+        const live = {
+          latest: formatValue(display),
+          status: row?.lastStatus ?? null,
+          hitRate: row?.hitRate ?? 0,
+          dead: dead.has(n.id),
+          dormant:
+            (n.data?.inputs?.length ?? 0) === 0 &&
+            required.size > 0 &&
+            !required.has(n.data?.kind),
+          tickCount: row?.fired ?? 0,
+        }
+        return { ...n, data: { ...n.data, live } }
+      })
+    })
+  })
+
   async function loadGraph(name) {
     try {
       const g = await api.getJson(`/api/v1/strategy/graphs/${encodeURIComponent(name)}`)
@@ -687,6 +961,48 @@
     edges = edges.filter(e => e.source !== id && e.target !== id)
     selected = null
   }
+
+  // M5-GOBS — replay current canvas against the deployment's
+  // recent trace ring. Button shows only when we know which
+  // deployment to compare against (i.e. operator arrived here
+  // from the Live view of that deployment).
+  let replayBusy = $state(false)
+  let replayResult = $state(null)
+  async function runReplay() {
+    if (replayBusy || !liveTarget) return
+    replayBusy = true
+    replayResult = null
+    try {
+      const url =
+        `/api/v1/agents/${encodeURIComponent(liveTarget.agentId)}` +
+        `/deployments/${encodeURIComponent(liveTarget.deploymentId)}/replay`
+      // Controller fans out to the agent via the
+      // `graph_replay` details topic; response wraps the
+      // ReplayResponse under `payload`.
+      const resp = await api.postJson(url, {
+        candidate_graph: toBackendGraph(),
+        ticks: 20,
+      })
+      replayResult = resp?.payload ?? {
+        summary: 'empty replay response',
+        ticks_replayed: 0,
+        divergence_count: 0,
+        divergences: [],
+        candidate_issues: [],
+      }
+    } catch (e) {
+      replayResult = {
+        summary: `replay failed: ${e}`,
+        ticks_replayed: 0,
+        divergence_count: 0,
+        divergences: [],
+        candidate_issues: [String(e)],
+      }
+    } finally {
+      replayBusy = false
+    }
+  }
+  function closeReplay() { replayResult = null }
 
   const nodeTypes = { graphNode: StrategyNode }
 </script>
@@ -753,16 +1069,61 @@
       <button type="button" class="btn ghost" onclick={openSaveDialog} disabled={nodes.length === 0} title="Save as reusable template">
         <Icon name="save" size={14} />
       </button>
-      <button type="button" class="btn ghost" onclick={simulate} disabled={previewBusy || nodes.length === 0} title="Evaluate graph without deploying">
+      <button type="button" class="btn ghost" onclick={simulate} disabled={previewBusy || nodes.length === 0 || mode === 'live'} title="Evaluate graph without deploying">
         <Icon name="pulse" size={14} />
         <span>{previewBusy ? 'Simulating…' : 'Simulate'}</span>
       </button>
-      <button type="button" class="btn" onclick={deploy} disabled={deployBusy || nodes.length === 0 || !validation.valid}>
+      {#if liveTarget && mode === 'authoring'}
+        <button
+          type="button"
+          class="btn ghost"
+          onclick={runReplay}
+          disabled={replayBusy || nodes.length === 0}
+          title={`Replay this canvas against the last 20 ticks of ${liveTarget.agentId}/${liveTarget.deploymentId} and count where the sink actions diverge.`}
+        >
+          <Icon name="history" size={14} />
+          <span>{replayBusy ? 'Replaying…' : 'Replay vs deployed'}</span>
+        </button>
+      {/if}
+      <button type="button" class="btn" onclick={deploy} disabled={deployBusy || nodes.length === 0 || !validation.valid || mode === 'live'}>
         <Icon name="bolt" size={14} />
         <span>{deployBusy ? 'Deploying…' : 'Deploy'}</span>
       </button>
+      <div class="mode-toggle" role="tablist" aria-label="Editor mode">
+        <button
+          type="button"
+          class="mode-btn"
+          class:active={mode === 'authoring'}
+          role="tab"
+          aria-selected={mode === 'authoring'}
+          onclick={() => (mode = 'authoring')}
+        >
+          Authoring
+        </button>
+        <button
+          type="button"
+          class="mode-btn"
+          class:active={mode === 'live'}
+          role="tab"
+          aria-selected={mode === 'live'}
+          disabled={!liveTarget}
+          title={liveTarget ? 'Watch deployed graph live' : 'Open from Fleet → deployment → Open graph (live)'}
+          onclick={() => (mode = 'live')}
+        >
+          <span class={mode === 'live' ? 'live-pulse' : ''}></span>
+          Live
+        </button>
+      </div>
     </div>
   </div>
+
+  {#if pinWarning}
+    <div class="pin-warning" role="status">
+      <Icon name="alert" size={12} />
+      <span>{pinWarning}</span>
+      <button type="button" class="pin-warning-close" onclick={() => (pinWarning = null)} aria-label="Dismiss">×</button>
+    </div>
+  {/if}
 
   <!-- Validation strip: live counters + issue list, server-side
        authoritative. Green pill = Evaluator::build succeeded +
@@ -783,6 +1144,16 @@
       <span class="v-stats">
         {validation.node_count} nodes · {validation.edge_count} edges · {validation.sink_count} sinks
       </span>
+      {#if validation.dead_nodes.length > 0}
+        <span class="v-pill bad" title="nodes with no path to any sink — dead branches">
+          <span class="dot"></span> {validation.dead_nodes.length} dead
+        </span>
+      {/if}
+      {#if validation.unconsumed_outputs.length > 0}
+        <span class="v-pill warn" title="output ports never consumed — wire them or drop the node">
+          <span class="dot"></span> {validation.unconsumed_outputs.length} unconsumed
+        </span>
+      {/if}
       <span class="v-status">{deployStatus}</span>
     {:else}
       <span class="v-pill bad"><span class="dot"></span> {validation.issues.length} issue{validation.issues.length === 1 ? '' : 's'}</span>
@@ -797,9 +1168,83 @@
     {/if}
   </div>
 
+  {#if replayResult}
+    <div
+      class="modal-backdrop"
+      role="button"
+      tabindex="-1"
+      aria-label="Close replay"
+      onclick={closeReplay}
+      onkeydown={(e) => { if (e.key === 'Escape') closeReplay() }}
+    >
+      <div
+        class="modal replay-card"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Replay vs deployed"
+        tabindex="-1"
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={(e) => e.stopPropagation()}
+      >
+        <h3>Replay vs deployed</h3>
+        <div class="replay-summary" class:bad={replayResult.divergence_count > 0}>
+          <div class="replay-summary-line">{replayResult.summary}</div>
+          {#if replayResult.candidate_issues?.length}
+            <div class="replay-issues">
+              {#each replayResult.candidate_issues as iss}
+                <code class="v-issue">{iss}</code>
+              {/each}
+            </div>
+          {/if}
+        </div>
+        {#if replayResult.divergences?.length}
+          <div class="replay-diff-head">Divergent ticks ({replayResult.divergences.length})</div>
+          <div class="replay-diff-list">
+            {#each replayResult.divergences as d (d.tick_num)}
+              <div class="replay-diff-row">
+                <div class="replay-diff-meta">
+                  <code>tick #{d.tick_num}</code>
+                  <span class="muted">{new Date(d.tick_ms).toLocaleTimeString()}</span>
+                </div>
+                <div class="replay-diff-cols">
+                  <div class="col-old">
+                    <span class="col-label">deployed</span>
+                    <pre class="mono">{JSON.stringify(d.original_sinks, null, 1)}</pre>
+                  </div>
+                  <div class="col-new">
+                    <span class="col-label">candidate</span>
+                    <pre class="mono">{JSON.stringify(d.replay_sinks, null, 1)}</pre>
+                  </div>
+                </div>
+              </div>
+            {/each}
+          </div>
+        {/if}
+        <div class="modal-actions">
+          <button type="button" class="btn ghost" onclick={closeReplay}>Close</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
   {#if saveDialogOpen}
-    <div class="modal-backdrop" onclick={() => (saveDialogOpen = false)}>
-      <div class="modal" onclick={(e) => e.stopPropagation()} role="dialog" aria-label="Save as template">
+    <div
+      class="modal-backdrop"
+      role="button"
+      tabindex="-1"
+      aria-label="Close dialog"
+      onclick={() => (saveDialogOpen = false)}
+      onkeydown={(e) => { if (e.key === 'Escape') saveDialogOpen = false }}
+    >
+      <div
+        class="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Save as template"
+        tabindex="-1"
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={(e) => e.stopPropagation()}
+      >
         <h3>Save as template</h3>
         <label class="field stacked">
           <span class="field-label">Name</span>
@@ -844,14 +1289,17 @@
 
   <div class="body">
     <aside class="palette">
-      <StrategyPalette {catalog} onAdd={(k) => addNode(k, { x: 120, y: 120 })} />
+      <StrategyPalette
+        {catalog}
+        requiredSources={validation.required_sources}
+        onAdd={(k) => addNode(k, { x: 120, y: 120 })}
+      />
     </aside>
 
     <section
       class="canvas"
       ondrop={onDrop}
       ondragover={onDragOver}
-      role="region"
       aria-label="Strategy graph canvas"
     >
       {#if nodes.length === 0}
@@ -879,13 +1327,34 @@
     </section>
 
     <aside class="config">
-      <StrategyNodeConfig
-        node={selected}
-        onUpdate={updateSelectedConfig}
-        onDelete={deleteSelected}
-      />
+      {#if mode === 'live'}
+        <GraphInspector
+          node={selected}
+          stats={liveNodeStats}
+          graphAnalysis={liveGraphAnalysis}
+          traces={liveStore?.state?.traces ?? []}
+          lastFetch={liveStore?.state?.lastFetch ?? null}
+          error={liveStore?.state?.error ?? null}
+          onReturnToAuthoring={() => (mode = 'authoring')}
+        />
+      {:else}
+        <StrategyNodeConfig
+          node={selected}
+          onUpdate={updateSelectedConfig}
+          onDelete={deleteSelected}
+        />
+      {/if}
     </aside>
   </div>
+
+  {#if mode === 'live'}
+    <GraphTimeline
+      traces={liveTraces}
+      pinnedTickNum={pinnedTickNum}
+      onPin={(n) => (pinnedTickNum = n)}
+      onUnpin={() => (pinnedTickNum = null)}
+    />
+  {/if}
 
   <StrategyDeployHistory
     {auth}
@@ -1117,6 +1586,46 @@
   .left-chunk, .right-chunk {
     display: flex; gap: var(--s-2); align-items: center; flex: 0 0 auto;
   }
+
+  /* M2-GOBS — mode toggle lives flush against the right-chunk
+     actions. Small, uses a pill container so the active state
+     reads at a glance. */
+  .mode-toggle {
+    display: inline-flex;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--r-pill);
+    overflow: hidden;
+    margin-left: var(--s-2);
+  }
+  .mode-btn {
+    padding: 4px var(--s-3);
+    background: transparent;
+    border: none;
+    color: var(--fg-muted);
+    font-family: var(--font-sans);
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: color var(--dur-fast), background var(--dur-fast);
+  }
+  .mode-btn:hover:not(:disabled) { color: var(--fg-primary); background: var(--bg-raised); }
+  .mode-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .mode-btn.active { background: var(--accent-dim); color: var(--accent); }
+  .mode-btn.active .live-pulse {
+    width: 8px; height: 8px;
+    background: var(--accent);
+    border-radius: 50%;
+    box-shadow: 0 0 0 0 var(--accent);
+    animation: live-pulse 1.5s infinite;
+  }
+  @keyframes live-pulse {
+    0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent); }
+    70%  { box-shadow: 0 0 0 6px transparent; }
+    100% { box-shadow: 0 0 0 0 transparent; }
+  }
   .divider {
     width: 1px; height: 22px;
     background: var(--border-subtle); margin: 0 var(--s-2);
@@ -1277,6 +1786,20 @@
   }
   .v-pill.ok    { color: var(--pos); border-color: color-mix(in srgb, var(--pos) 60%, transparent); }
   .v-pill.bad   { color: var(--neg); border-color: color-mix(in srgb, var(--neg) 60%, transparent); }
+  .v-pill.warn  { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 60%, transparent); }
+  .pin-warning {
+    display: flex; align-items: center; gap: var(--s-2);
+    padding: 4px var(--s-3);
+    background: color-mix(in srgb, var(--warn) 14%, transparent);
+    color: var(--warn);
+    font-size: 11px;
+    border-bottom: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+  }
+  .pin-warning-close {
+    margin-left: auto;
+    background: none; border: 0; padding: 0 4px;
+    color: var(--warn); cursor: pointer; font-size: 14px;
+  }
   .v-pill.muted { color: var(--fg-muted); }
   .v-pill.rollback {
     color: var(--warn);
@@ -1331,6 +1854,51 @@
     color: var(--neg); font-family: var(--font-mono); font-size: 11px;
   }
   .modal-actions { display: flex; justify-content: flex-end; gap: var(--s-2); }
+
+  /* M5-GOBS — replay result modal. Wider than the save dialog
+     because divergent ticks render as two-column pre blocks. */
+  .replay-card { min-width: 640px; max-width: 900px; max-height: 80vh; display: flex; flex-direction: column; }
+  .replay-summary {
+    padding: var(--s-3);
+    background: color-mix(in srgb, var(--ok) 8%, transparent);
+    border-radius: var(--r-sm);
+    font-size: var(--fs-sm);
+    color: var(--fg-primary);
+  }
+  .replay-summary.bad { background: color-mix(in srgb, var(--warn) 14%, transparent); color: var(--warn); }
+  .replay-summary-line { font-weight: 500; }
+  .replay-issues { margin-top: var(--s-2); display: flex; flex-wrap: wrap; gap: 4px; }
+  .replay-diff-head {
+    margin-top: var(--s-3);
+    font-size: 10px;
+    letter-spacing: var(--tracking-label);
+    text-transform: uppercase;
+    color: var(--fg-muted);
+  }
+  .replay-diff-list {
+    flex: 1; overflow-y: auto; min-height: 0;
+    display: flex; flex-direction: column; gap: var(--s-2);
+    margin-top: var(--s-2);
+  }
+  .replay-diff-row {
+    padding: var(--s-2);
+    background: var(--bg-raised);
+    border-radius: var(--r-sm);
+    border: 1px solid var(--border-subtle);
+  }
+  .replay-diff-meta { display: flex; gap: var(--s-2); font-size: var(--fs-xs); margin-bottom: 4px; }
+  .replay-diff-cols { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-2); }
+  .replay-diff-cols .col-label {
+    font-size: 10px; letter-spacing: var(--tracking-label);
+    text-transform: uppercase; color: var(--fg-muted);
+  }
+  .replay-diff-cols pre {
+    margin: 2px 0 0; padding: var(--s-2);
+    background: var(--bg-base); border-radius: var(--r-sm);
+    font-size: 10px; line-height: 1.3; overflow: auto; max-height: 160px;
+  }
+  .replay-diff-cols .col-old pre { border-left: 2px solid var(--fg-muted); }
+  .replay-diff-cols .col-new pre { border-left: 2px solid var(--accent); }
 
   .preview-bar {
     display: flex; align-items: center; flex-wrap: wrap; gap: var(--s-2);

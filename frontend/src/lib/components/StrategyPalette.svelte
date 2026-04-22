@@ -11,9 +11,19 @@
 
   import Icon from './Icon.svelte'
 
-  let { catalog = [], onAdd } = $props()
+  let {
+    catalog = [],
+    onAdd,
+    // M3-GOBS — in-graph source kinds from `/validate`. When
+    // non-empty, palette entries with zero input ports that are
+    // NOT in this list render as "dormant" (faded, diagonal
+    // stripe, tooltip explaining the node is unused). Empty or
+    // omitted → no fading (authoring a fresh graph).
+    requiredSources = [],
+  } = $props()
 
   let query = $state('')
+  const requiredSet = $derived(new Set(requiredSources))
 
   const grouped = $derived.by(() => {
     const q = query.trim().toLowerCase()
@@ -83,16 +93,22 @@
         {#if !collapsed[bucket]}
           <div class="group-body">
             {#each entries as e (e.kind)}
+              {@const isSource = e.inputs.length === 0 && !e.kind.startsWith('Out.')
+                && !e.kind.startsWith('Math.') && !e.kind.startsWith('Logic.')
+                && !e.kind.startsWith('Cast.') && !e.kind.startsWith('Strategy.')
+                && !e.kind.startsWith('Exec.') && !e.kind.startsWith('Plan.')}
+              {@const isDormant = isSource && requiredSet.size > 0 && !requiredSet.has(e.kind)}
               <button
                 type="button"
                 class="chip"
                 class:restricted={e.restricted}
+                class:dormant={isDormant}
                 draggable="true"
                 ondragstart={(ev) => startDrag(ev, e.kind)}
                 onclick={() => onAdd?.(e.kind)}
                 title={`${e.label ?? e.kind}
 ${e.summary ?? ''}
-${e.kind} · ${e.inputs.length} in · ${e.outputs.length} out${e.restricted ? ' · restricted' : ''}`}
+${e.kind} · ${e.inputs.length} in · ${e.outputs.length} out${e.restricted ? ' · restricted' : ''}${isDormant ? '\n\ndormant — this source is not referenced by any downstream node in the current graph' : ''}`}
               >
                 <span class="chip-name">{e.label ?? e.kind.split('.').slice(1).join('.')}</span>
                 <span class="chip-shape">
@@ -217,6 +233,19 @@ ${e.kind} · ${e.inputs.length} in · ${e.outputs.length} out${e.restricted ? ' 
   .chip:hover { background: var(--bg-base); border-color: var(--accent); }
   .chip:active { cursor: grabbing; }
   .chip.restricted { border-color: var(--neg); }
+  /* M3-GOBS — dormant source (not referenced by current graph). */
+  .chip.dormant {
+    opacity: 0.48;
+    background:
+      repeating-linear-gradient(
+        135deg,
+        var(--bg-chip) 0,
+        var(--bg-chip) 5px,
+        var(--bg-raised) 5px,
+        var(--bg-raised) 10px
+      );
+  }
+  .chip.dormant:hover { opacity: 0.85; }
 
   .chip-name {
     flex: 1; min-width: 0;

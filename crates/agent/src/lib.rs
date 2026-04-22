@@ -730,6 +730,169 @@ impl<T: Transport> LeaseClient<T> {
                                     None,
                                 )
                             }
+                            "graph_trace_recent" => {
+                                // M1-GOBS — strategy-graph live trace ring.
+                                // Engine pushes a `TickTrace` on every
+                                // `refresh_quotes`; the UI polls this
+                                // topic every 2s while Live mode is open.
+                                // Optional `limit` arg caps the returned
+                                // slice (default 20).
+                                let limit = args
+                                    .get("limit")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|n| n as usize)
+                                    .unwrap_or(20);
+                                let store = mm_dashboard::details_store::global();
+                                let traces = store.graph_traces(&symbol, Some(limit));
+                                let analysis = store.graph_analysis(&symbol);
+                                (
+                                    serde_json::json!({
+                                        "traces": traces,
+                                        "graph_analysis": analysis,
+                                    }),
+                                    None,
+                                )
+                            }
+                            "graph_replay" => {
+                                // M5-GOBS — replay a candidate graph
+                                // against the last N captured TickTraces
+                                // for this deployment's symbol. The
+                                // candidate graph JSON arrives inside
+                                // `args.candidate_graph`; `ticks`
+                                // caps the replay window (default 20).
+                                //
+                                // Runs entirely on the agent so the
+                                // trace ring (process-global on the
+                                // agent) is a direct read — no fan-
+                                // out. Divergences are sink-set diffs
+                                // between the original capture and
+                                // what the candidate would fire given
+                                // the same source-node values.
+                                let candidate_json = args
+                                    .get("candidate_graph")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                let ticks = args
+                                    .get("ticks")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|n| n.min(256) as usize)
+                                    .unwrap_or(20);
+                                let candidate: Result<mm_strategy_graph::Graph, _> =
+                                    serde_json::from_value(candidate_json);
+                                let payload = match candidate {
+                                    Err(e) => serde_json::json!({
+                                        "summary": format!("candidate parse failed: {e}"),
+                                        "ticks_replayed": 0,
+                                        "divergence_count": 0,
+                                        "divergences": [],
+                                        "candidate_issues": [format!("{e}")],
+                                    }),
+                                    Ok(candidate) => {
+                                        match mm_strategy_graph::Evaluator::build(&candidate) {
+                                            Err(e) => serde_json::json!({
+                                                "summary": format!("candidate graph rejected: {e}"),
+                                                "ticks_replayed": 0,
+                                                "divergence_count": 0,
+                                                "divergences": [],
+                                                "candidate_issues": [format!("{e}")],
+                                            }),
+                                            Ok(mut replay_ev) => {
+                                                let store = mm_dashboard::details_store::global();
+                                                // Oldest→newest to
+                                                // preserve tick ordering
+                                                // in the divergence list.
+                                                let original: Vec<_> = store
+                                                    .graph_traces(&symbol, Some(ticks))
+                                                    .into_iter()
+                                                    .rev()
+                                                    .collect();
+                                                let ctx = mm_strategy_graph::EvalCtx::default();
+                                                let mut divergences: Vec<serde_json::Value> =
+                                                    Vec::new();
+                                                for t in &original {
+                                                    let kind_values = t.source_kind_values();
+                                                    let src =
+                                                        mm_strategy_graph::evaluator::replay_source_inputs(
+                                                            &replay_ev,
+                                                            &kind_values,
+                                                        );
+                                                    let replay_sinks = replay_ev
+                                                        .tick(&ctx, &src)
+                                                        .unwrap_or_default();
+                                                    let replay_set: std::collections::BTreeSet<String> =
+                                                        replay_sinks
+                                                            .iter()
+                                                            .filter_map(|a| {
+                                                                serde_json::to_string(a).ok()
+                                                            })
+                                                            .collect();
+                                                    let original_set: std::collections::BTreeSet<String> =
+                                                        t.sinks_fired
+                                                            .iter()
+                                                            .filter_map(|a| {
+                                                                serde_json::to_string(a).ok()
+                                                            })
+                                                            .collect();
+                                                    if replay_set != original_set {
+                                                        divergences.push(serde_json::json!({
+                                                            "tick_num": t.tick_num,
+                                                            "tick_ms": t.tick_ms,
+                                                            "original_sinks": t.sinks_fired,
+                                                            "replay_sinks": replay_sinks,
+                                                        }));
+                                                    }
+                                                }
+                                                let summary = if original.is_empty() {
+                                                    format!(
+                                                        "no traces for {symbol} — deployment may not have ticked yet"
+                                                    )
+                                                } else if divergences.is_empty() {
+                                                    format!(
+                                                        "{} tick(s) replayed · candidate matches deployed behaviour",
+                                                        original.len()
+                                                    )
+                                                } else {
+                                                    format!(
+                                                        "{} tick(s) replayed · candidate diverges on {} tick(s)",
+                                                        original.len(),
+                                                        divergences.len()
+                                                    )
+                                                };
+                                                serde_json::json!({
+                                                    "summary": summary,
+                                                    "ticks_replayed": original.len(),
+                                                    "divergence_count": divergences.len(),
+                                                    "divergences": divergences,
+                                                    "candidate_issues": Vec::<String>::new(),
+                                                })
+                                            }
+                                        }
+                                    }
+                                };
+                                (payload, None)
+                            }
+                            "graph_analysis" => {
+                                // M1-GOBS — static topology analysis,
+                                // populated on every `swap_strategy_graph`.
+                                // Cheap read; UI asks once when entering
+                                // Live mode and again on detected swap.
+                                let analysis = mm_dashboard::details_store::global()
+                                    .graph_analysis(&symbol);
+                                match analysis {
+                                    Some(a) => (
+                                        serde_json::to_value(&a)
+                                            .unwrap_or(serde_json::Value::Null),
+                                        None,
+                                    ),
+                                    None => (
+                                        serde_json::json!({}),
+                                        Some(
+                                            "no graph analysis yet — no graph swapped"
+                                                .to_string(),
+                                        ),
+                                    ),
+                                }
+                            }
                             "audit_chain_verify" => {
                                 // Fix #2 — real SHA-256 chain
                                 // verify on the agent's local

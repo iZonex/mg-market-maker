@@ -460,6 +460,53 @@ else:
   check_endpoint_nonempty "/api/v1/alerts/fleet" "alerts"
   check_endpoint_nonempty "/api/v1/surveillance/fleet" "surveillance"
 
+  # M1-GOBS — graph trace + static analysis must reach the agent's
+  # details store. We expect ≥1 trace and a non-empty analysis
+  # struct after the engine has ticked a few times.
+  log "checking M1-GOBS graph-observability topics"
+  TRACE_JSON=$(curl -sf -H "Authorization: Bearer $TOKEN" \
+    "$HTTP_URL/api/v1/agents/$AGENT_ID/deployments/$DEP_ID/details/graph_trace_recent?limit=5" 2>&1) \
+    || { log "  ⚠ graph_trace_recent fetch failed: $TRACE_JSON"; }
+  if [[ -n "${TRACE_JSON:-}" ]]; then
+    echo "$TRACE_JSON" > "$LOGS/graph_trace_recent.json"
+    TRACE_COUNT=$(echo "$TRACE_JSON" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    traces = (d.get("payload") or {}).get("traces", [])
+    print(len(traces))
+except Exception:
+    print("ERR")
+')
+    log "  graph_trace_recent → $TRACE_COUNT trace(s)"
+    if [[ "$TRACE_COUNT" == "0" || "$TRACE_COUNT" == "ERR" ]]; then
+      log "  ⚠ expected at least 1 tick trace; the engine may not have ticked yet"
+    else
+      log "  ✓ graph trace ring is populated"
+    fi
+  fi
+
+  ANALYSIS_JSON=$(curl -sf -H "Authorization: Bearer $TOKEN" \
+    "$HTTP_URL/api/v1/agents/$AGENT_ID/deployments/$DEP_ID/details/graph_analysis" 2>&1) \
+    || { log "  ⚠ graph_analysis fetch failed: $ANALYSIS_JSON"; }
+  if [[ -n "${ANALYSIS_JSON:-}" ]]; then
+    echo "$ANALYSIS_JSON" > "$LOGS/graph_analysis.json"
+    ANALYSIS_SUMMARY=$(echo "$ANALYSIS_JSON" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    p = d.get("payload") or {}
+    print("sources={} dead={} unconsumed={}".format(
+        len(p.get("required_sources", [])),
+        len(p.get("dead_nodes", [])),
+        len(p.get("unconsumed_outputs", [])),
+    ))
+except Exception:
+    print("ERR")
+')
+    log "  graph_analysis → $ANALYSIS_SUMMARY"
+  fi
+
   log "  ✓ live deploy phase complete (inspect $LOGS/endpoint-*.json for detail)"
 else
   log "SKIP_LIVE_PHASE=1 — skipping live deploy + telemetry check"

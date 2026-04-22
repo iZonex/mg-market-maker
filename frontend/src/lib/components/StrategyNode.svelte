@@ -51,12 +51,32 @@
   class:sink={isSink}
   class:source={isSource}
   class:restricted={data.restricted}
+  class:dead={data.live?.dead}
+  class:dormant={data.live?.dormant}
+  class:errored={data.live?.status === 'error'}
+  class:fired={data.live?.status === 'ok' || data.live?.status === 'source'}
   data-category={category}
 >
   <header>
     <span class="category">{category}</span>
     <span class="kind">{name}</span>
+    {#if data.live?.status}
+      <span class="live-status status-{data.live.status}" title={`hit rate ${Math.round((data.live.hitRate ?? 0) * 100)}%`}></span>
+    {/if}
   </header>
+
+  {#if data.live && data.live.latest !== undefined}
+    <div class="live-badge" title={`latest output · ${data.live.tickCount ?? 0} ticks fired`}>
+      <span class="live-badge-label">out</span>
+      <span class="live-badge-value mono">{data.live.latest}</span>
+    </div>
+  {/if}
+
+  {#if data.live?.dead}
+    <div class="dead-banner" title="this node has no path to any sink — dead branch">dead branch</div>
+  {:else if data.live?.dormant}
+    <div class="dead-banner dormant" title="this source is not referenced by any downstream node in this graph">dormant source</div>
+  {/if}
 
   {#if data.inputs.length > 0}
     <div class="port-group inputs">
@@ -101,6 +121,81 @@
     box-shadow: 0 0 0 2px var(--accent-dim), 0 4px 10px rgba(0, 0, 0, 0.45);
   }
   .node.restricted { border-color: var(--neg); }
+  /* M2-GOBS — live-mode decorations. Dead = red dashed border;
+     dormant = grey diagonal stripe. `fired` triggers the pulse
+     animation via a CSS variable on header. */
+  .node.dead {
+    border: 1px dashed var(--danger);
+    opacity: 0.75;
+  }
+  .node.dormant {
+    background:
+      repeating-linear-gradient(
+        135deg,
+        var(--bg-raised) 0,
+        var(--bg-raised) 6px,
+        var(--bg-chip) 6px,
+        var(--bg-chip) 12px
+      );
+    opacity: 0.78;
+  }
+  .node.errored { border-color: var(--danger); }
+  .node.fired header {
+    animation: node-fire 0.35s ease-out;
+  }
+  @keyframes node-fire {
+    0%   { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+    100% { background: var(--bg-chip); }
+  }
+
+  .live-status {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    display: inline-block;
+    margin-left: auto;
+    background: var(--fg-muted);
+  }
+  .live-status.status-ok     { background: var(--pos); }
+  .live-status.status-source { background: var(--accent); }
+  .live-status.status-error  { background: var(--danger); }
+
+  .live-badge {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s-2);
+    padding: 2px var(--s-3);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    border-bottom: 1px dashed var(--border-subtle);
+    font-size: 10px;
+  }
+  .live-badge-label {
+    color: var(--fg-muted);
+    letter-spacing: var(--tracking-label);
+    text-transform: uppercase;
+  }
+  .live-badge-value {
+    font-family: var(--font-mono);
+    color: var(--accent);
+    max-width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .dead-banner {
+    padding: 2px var(--s-3);
+    font-size: 9px;
+    text-align: center;
+    color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 14%, transparent);
+    letter-spacing: var(--tracking-label);
+    text-transform: uppercase;
+  }
+  .dead-banner.dormant {
+    color: var(--fg-muted);
+    background: var(--bg-raised);
+  }
 
   /* Category colour band (left edge). */
   .node[data-category="Source"]     { border-left-color: #7dd3fc; }
@@ -126,13 +221,17 @@
   .node[data-category="Out"]        { border-left-color: #ef4444; }
 
   header {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: var(--s-2) 6px;
     padding: var(--s-2) var(--s-3);
     background: var(--bg-chip);
     border-bottom: 1px solid var(--border-subtle);
   }
+  header .category { grid-row: 1; grid-column: 1; }
+  header .kind { grid-row: 2; grid-column: 1 / span 3; }
+  header .live-status { grid-row: 1; grid-column: 3; }
   .category {
     font-family: var(--font-mono); font-size: 9px;
     color: var(--fg-muted); text-transform: uppercase;

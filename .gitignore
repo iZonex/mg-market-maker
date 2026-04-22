@@ -35,6 +35,9 @@ docs/sprints/
 # Smoke / paper-run scratch dirs — generated credentials, leases,
 # approvals, audit files. Never ship.
 .smoke-run/
+.stand-run/
+frontend/playwright-report/
+frontend/test-results/
 auth-secret
 jwt-secret
 master-key

@@ -18,8 +18,8 @@
   import Icon from '../components/Icon.svelte'
   import { createApiClient } from '../api.svelte.js'
 
-  let { auth } = $props()
-  const api = createApiClient(auth)
+  let { auth, onOpenGraphLive = null } = $props()
+  const api = $derived(createApiClient(auth))
 
   const REFRESH_MS = 5000
 
@@ -147,7 +147,19 @@
           {#each filtered as inc (inc.id)}
             {@const isOpen = selectedId === inc.id}
             <div class="inc-card state-{inc.state}">
-              <div class="inc-head" onclick={() => (selectedId = isOpen ? null : inc.id)}>
+              <div
+                class="inc-head"
+                role="button"
+                tabindex="0"
+                aria-expanded={isOpen}
+                onclick={() => (selectedId = isOpen ? null : inc.id)}
+                onkeydown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault()
+                    selectedId = isOpen ? null : inc.id
+                  }
+                }}
+              >
                 <span class="sev sev-{inc.severity}">{inc.severity}</span>
                 <span class="cat mono">{inc.category}</span>
                 <span class="target mono">{inc.target}</span>
@@ -168,6 +180,29 @@
                       <span>· resolved {fmtTime(inc.resolved_at_ms)} by <code>{inc.resolved_by}</code></span>
                     {/if}
                   </div>
+
+                  {#if inc.graph_agent_id && inc.graph_deployment_id && onOpenGraphLive}
+                    <div class="graph-link">
+                      <button
+                        type="button"
+                        class="btn ghost small"
+                        onclick={() => onOpenGraphLive(
+                          inc.graph_agent_id,
+                          inc.graph_deployment_id,
+                          inc.graph_tick_num ?? null,
+                        )}
+                        title="Open the strategy graph at the tick this incident was filed against"
+                      >
+                        <Icon name="graph" size={12} />
+                        <span>
+                          Open graph at incident
+                          {#if inc.graph_tick_num != null}
+                            · tick #{inc.graph_tick_num}
+                          {/if}
+                        </span>
+                      </button>
+                    </div>
+                  {/if}
 
                   {#if inc.state === 'resolved'}
                     <div class="postmortem">

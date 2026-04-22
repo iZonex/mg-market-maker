@@ -17,9 +17,11 @@
 use crate::catalog;
 use crate::graph::{Graph, ValidationError};
 use crate::node::{EvalCtx, NodeKind, NodeOutputs, NodeState};
+use crate::trace::{ExecStatus, NodeExec, TickTrace};
 use crate::types::{AtomicBundleSpec, GraphQuote, NodeId, Value, VenueQuote};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
+use std::time::Instant;
 
 /// Per-tick capture of every node's produced output values, keyed by
 /// `(node_id, output_port_name)`. Populated only by
@@ -31,7 +33,8 @@ pub type EvalTrace = HashMap<(NodeId, String), Value>;
 /// Engine-side action produced by a sink node firing on a given tick.
 /// The evaluator collects these in order; the engine applies them
 /// after the `tick()` returns.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "data")]
 pub enum SinkAction {
     SpreadMult(Decimal),
     SizeMult(Decimal),
@@ -103,6 +106,38 @@ impl std::fmt::Debug for Evaluator {
     }
 }
 
+/// M5-GOBS — helper that maps a candidate graph's source-node
+/// outputs to a `source_inputs` map for re-evaluation, given a
+/// kind-keyed lookup of values from some *other* graph's tick.
+///
+/// Walks the candidate evaluator's catalog-registered nodes,
+/// filters to sources (zero declared input ports), looks up each
+/// `(kind, port)` in `kind_values`, and emits the corresponding
+/// `(NodeId, port) → Value` tuple for the candidate's own IDs.
+/// Skips kinds not present in `kind_values` so a replay against
+/// a graph that references detectors the source trace never fed
+/// falls back to the defaults each node returns from `evaluate`.
+pub fn replay_source_inputs(
+    candidate: &Evaluator,
+    kind_values: &HashMap<(String, String), Value>,
+) -> HashMap<(NodeId, String), Value> {
+    let mut out: HashMap<(NodeId, String), Value> = HashMap::new();
+    for id in &candidate.order {
+        let Some(order) = candidate.input_order.get(id) else { continue };
+        if !order.is_empty() {
+            continue;
+        }
+        let Some(kind) = candidate.kinds.get(id).cloned() else { continue };
+        let Some(node) = candidate.nodes.get(id) else { continue };
+        for p in node.output_ports() {
+            if let Some(v) = kind_values.get(&(kind.clone(), p.name.clone())) {
+                out.insert((*id, p.name.clone()), v.clone());
+            }
+        }
+    }
+    out
+}
+
 impl Evaluator {
     /// Read-only view of every node's `kind` string, in topological
     /// order. The engine's source-marshaller needs this to decide
@@ -124,6 +159,126 @@ impl Evaluator {
     /// build for this read-only view).
     pub fn node_configs(&self) -> &HashMap<NodeId, serde_json::Value> {
         &self.configs
+    }
+
+    /// Static topology analysis — depth map, required sources,
+    /// dead nodes, unconsumed outputs. Computed from the compiled
+    /// evaluator so it sees the same graph the engine will
+    /// execute. Safe to call any time; cheap (O(nodes + edges)).
+    pub fn analyze(&self, graph_hash: impl Into<String>) -> crate::trace::GraphAnalysis {
+        use std::collections::HashSet;
+
+        // Depth map via Kahn (topological depth from sources).
+        let mut depth: HashMap<NodeId, u32> = HashMap::new();
+        for id in &self.order {
+            let order = self.input_order.get(id).cloned().unwrap_or_default();
+            let d = order
+                .iter()
+                .filter_map(|port| {
+                    self.incoming
+                        .get(&(*id, port.clone()))
+                        .and_then(|(src, _)| depth.get(src).copied())
+                })
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(0);
+            depth.insert(*id, d);
+        }
+
+        // Reverse-BFS from every sink. A sink is any node whose
+        // catalog kind starts with `Out.`.
+        let mut outgoing: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for ((to_node, _), (from_node, _)) in &self.incoming {
+            outgoing.entry(*from_node).or_default().push(*to_node);
+        }
+        let sinks: Vec<NodeId> = self
+            .kinds
+            .iter()
+            .filter(|(_, k)| k.starts_with("Out."))
+            .map(|(id, _)| *id)
+            .collect();
+        let mut reachable: HashSet<NodeId> = HashSet::new();
+        let mut stack: Vec<NodeId> = sinks.clone();
+        // Walk predecessors: anything that can reach a sink stays.
+        // Predecessor lookup via incoming map.
+        while let Some(n) = stack.pop() {
+            if !reachable.insert(n) {
+                continue;
+            }
+            // Find predecessors of n (incoming edges pointing at n's
+            // input ports). The `incoming` map is keyed by (to_node,
+            // to_port) → (from_node, from_port) — scan it once.
+            for ((to_node, _), (from_node, _)) in &self.incoming {
+                if *to_node == n {
+                    stack.push(*from_node);
+                }
+            }
+        }
+
+        let dead_nodes: Vec<NodeId> = self
+            .order
+            .iter()
+            .filter(|id| !reachable.contains(id))
+            .copied()
+            .collect();
+
+        // Required sources: nodes that are source (empty input
+        // ports) AND reachable (have path to a sink) AND whose kind
+        // string is a known source prefix (Book., Trade., Volatility.,
+        // Sentiment., Surveillance., Onchain., Funding., Cost.,
+        // Liquidity., Regime., etc. — anything that's not `Math.`,
+        // `Logic.`, `Cast.`, `Strategy.`, `Exec.`, `Plan.`, `Out.`).
+        // We filter by presence of a dot in the kind and by not
+        // being in the "transform / sink / strategy" set.
+        let mut required_sources: Vec<String> = self
+            .order
+            .iter()
+            .filter(|id| {
+                let order = self.input_order.get(id).cloned().unwrap_or_default();
+                order.is_empty() && reachable.contains(id)
+            })
+            .filter_map(|id| self.kinds.get(id).cloned())
+            .filter(|kind| !is_transform_kind(kind))
+            .collect();
+        required_sources.sort();
+        required_sources.dedup();
+
+        // Unconsumed outputs: each node's output_ports that has no
+        // edge from (node, port) anywhere in `incoming.values()`.
+        let consumed: HashSet<(NodeId, String)> = self
+            .incoming
+            .values()
+            .map(|(n, p)| (*n, p.clone()))
+            .collect();
+        let mut unconsumed_outputs: Vec<(NodeId, String)> = Vec::new();
+        for id in &self.order {
+            let Some(node) = self.nodes.get(id) else { continue };
+            // Sinks don't expose useful outputs; skip them.
+            let is_sink = self
+                .kinds
+                .get(id)
+                .map(|k| k.starts_with("Out."))
+                .unwrap_or(false);
+            if is_sink {
+                continue;
+            }
+            for p in node.output_ports() {
+                if !consumed.contains(&(*id, p.name.clone())) {
+                    unconsumed_outputs.push((*id, p.name.clone()));
+                }
+            }
+        }
+
+        let mut depth_map: Vec<(NodeId, u32)> = depth.into_iter().collect();
+        depth_map.sort_by_key(|(_, d)| *d);
+
+        crate::trace::GraphAnalysis {
+            graph_hash: graph_hash.into(),
+            depth_map,
+            required_sources,
+            dead_nodes,
+            unconsumed_outputs,
+        }
     }
 
     /// UI-1 — snapshot of `Plan.*` node states. Reads
@@ -200,7 +355,7 @@ impl Evaluator {
         ctx: &EvalCtx,
         source_inputs: &HashMap<(NodeId, String), Value>,
     ) -> anyhow::Result<Vec<SinkAction>> {
-        self.tick_inner(ctx, source_inputs, false).map(|(s, _)| s)
+        self.tick_inner(ctx, source_inputs, &mut None).map(|(s, _)| s)
     }
 
     /// Preview-mode evaluation: same as `tick` but ALSO captures
@@ -216,23 +371,43 @@ impl Evaluator {
         ctx: &EvalCtx,
         source_inputs: &HashMap<(NodeId, String), Value>,
     ) -> anyhow::Result<(Vec<SinkAction>, EvalTrace)> {
-        self.tick_inner(ctx, source_inputs, true)
+        let mut full = Some(TickTrace::default());
+        let (sinks, _) = self.tick_inner(ctx, source_inputs, &mut full)?;
+        let trace = full
+            .map(|t| eval_trace_from_tick_trace(&t))
+            .unwrap_or_default();
+        Ok((sinks, trace))
+    }
+
+    /// Live-observability evaluation: fills a [`TickTrace`] with
+    /// per-node inputs / outputs / elapsed time + sinks fired, on top
+    /// of returning the sinks themselves. Used by the engine tick hook
+    /// when a subscriber has asked for graph trace streaming; the
+    /// evaluator itself stays clock-free (the timestamp / tick counter /
+    /// graph hash are filled by the caller).
+    pub fn tick_with_full_trace(
+        &mut self,
+        ctx: &EvalCtx,
+        source_inputs: &HashMap<(NodeId, String), Value>,
+    ) -> anyhow::Result<(Vec<SinkAction>, TickTrace)> {
+        let mut full = Some(TickTrace::default());
+        let (sinks, _) = self.tick_inner(ctx, source_inputs, &mut full)?;
+        Ok((sinks, full.unwrap_or_default()))
     }
 
     fn tick_inner(
         &mut self,
         ctx: &EvalCtx,
         source_inputs: &HashMap<(NodeId, String), Value>,
-        capture: bool,
-    ) -> anyhow::Result<(Vec<SinkAction>, EvalTrace)> {
+        full_trace: &mut Option<TickTrace>,
+    ) -> anyhow::Result<(Vec<SinkAction>, ())> {
         let mut outputs: HashMap<NodeId, NodeOutputs> =
             HashMap::with_capacity(self.order.len());
         let mut sinks: Vec<SinkAction> = Vec::new();
-        let mut trace: EvalTrace = if capture {
-            HashMap::with_capacity(self.order.len() * 2)
-        } else {
-            HashMap::new()
-        };
+        let tick_started = full_trace.as_ref().map(|_| Instant::now());
+        if let Some(t) = full_trace.as_mut() {
+            t.nodes.reserve(self.order.len());
+        }
 
         for id in &self.order {
             let node = self
@@ -240,6 +415,7 @@ impl Evaluator {
                 .get(id)
                 .expect("evaluator built with this id");
             let kind_name = self.kinds.get(id).cloned().unwrap_or_default();
+            let node_started = full_trace.as_ref().map(|_| Instant::now());
 
             // Source node short-circuit — zero input ports means
             // the node is a pure producer. We pull its outputs
@@ -297,13 +473,58 @@ impl Evaluator {
 
             // Stash produced values by output port name.
             let mut out_map: NodeOutputs = HashMap::new();
+            let mut output_pairs: Vec<(String, Value)> = Vec::new();
             for (port, value) in node.output_ports().iter().zip(produced.iter().cloned()) {
-                if capture {
-                    trace.insert((*id, port.name.clone()), value.clone());
+                if full_trace.is_some() {
+                    output_pairs.push((port.name.clone(), value.clone()));
                 }
                 out_map.insert(port.name.clone(), value);
             }
             outputs.insert(*id, out_map);
+
+            // Capture per-node exec record before the sink-harvest
+            // below — the sink harvest `continue`s on suppressed
+            // VenueQuotesIf, which would otherwise skip pushing a
+            // NodeExec for that node.
+            if let Some(t) = full_trace.as_mut() {
+                let inputs_named: Vec<(String, Value)> = if is_source {
+                    // Source nodes have no declared input ports.
+                    // Record which `source_inputs` keys actually
+                    // resolved into this node's outputs so the UI
+                    // can show what the engine fed in.
+                    node.output_ports()
+                        .iter()
+                        .filter_map(|p| {
+                            source_inputs
+                                .get(&(*id, p.name.clone()))
+                                .cloned()
+                                .map(|v| (p.name.clone(), v))
+                        })
+                        .collect()
+                } else {
+                    order
+                        .iter()
+                        .cloned()
+                        .zip(input_vec.iter().cloned())
+                        .collect()
+                };
+                let elapsed_ns = node_started
+                    .map(|s| s.elapsed().as_nanos().min(u32::MAX as u128) as u32)
+                    .unwrap_or(0);
+                let status = if is_source {
+                    ExecStatus::Source
+                } else {
+                    ExecStatus::Ok
+                };
+                t.nodes.push(NodeExec {
+                    id: *id,
+                    kind: kind_name.clone(),
+                    inputs: inputs_named,
+                    outputs: output_pairs,
+                    elapsed_ns,
+                    status,
+                });
+            }
 
             // Sink harvest — turn the node's input into a SinkAction
             // for the engine to apply. We look up the input on the
@@ -453,6 +674,45 @@ impl Evaluator {
             }
         }
 
-        Ok((sinks, trace))
+        if let Some(t) = full_trace.as_mut() {
+            t.sinks_fired = sinks.clone();
+            t.total_elapsed_ns = tick_started
+                .map(|s| s.elapsed().as_nanos().min(u32::MAX as u128) as u32)
+                .unwrap_or(0);
+        }
+
+        Ok((sinks, ()))
     }
+}
+
+/// Project the rich [`TickTrace`] down to the legacy [`EvalTrace`]
+/// (flat `(node_id, port) → value` map) used by the preview-tick
+/// endpoint. Keeps the preview wire contract stable while the engine
+/// tick hook reads the full trace.
+fn eval_trace_from_tick_trace(trace: &TickTrace) -> EvalTrace {
+    let mut out = HashMap::with_capacity(trace.nodes.len() * 2);
+    for n in &trace.nodes {
+        for (port, value) in &n.outputs {
+            out.insert((n.id, port.clone()), value.clone());
+        }
+    }
+    out
+}
+
+/// Kind-string classifier for the topology analyser. A "transform"
+/// is any node whose role is to reshape upstream data — Math, Logic,
+/// Cast, Strategy wrappers, Exec configs, Plan runners, and Out
+/// sinks. Anything else with zero input ports is treated as a
+/// source (Book.L1, Surveillance.RugScore, Onchain.HolderConcentration,
+/// Funding.Rate, Sentiment.Rate, etc.). The list is kept explicit
+/// so adding a new source family doesn't accidentally drop it from
+/// the `required_sources` analysis.
+fn is_transform_kind(kind: &str) -> bool {
+    kind.starts_with("Math.")
+        || kind.starts_with("Logic.")
+        || kind.starts_with("Cast.")
+        || kind.starts_with("Strategy.")
+        || kind.starts_with("Exec.")
+        || kind.starts_with("Plan.")
+        || kind.starts_with("Out.")
 }

@@ -29,7 +29,7 @@
   // 23-UX-12 — client scope selector. Operators running multiple
   // clients on one engine need to filter which client's legs
   // they're watching. Empty string = "all clients".
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
   let clients = $state([])
   let activeClient = $state('') // '' = all
   let clientMenuOpen = $state(false)

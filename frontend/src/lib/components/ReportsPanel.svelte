@@ -19,7 +19,7 @@
   import Icon from './Icon.svelte'
 
   let { auth } = $props()
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   let history = $state([])
   let error = $state('')

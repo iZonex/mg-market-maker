@@ -10,7 +10,7 @@
   import Icon from './Icon.svelte'
 
   let { auth, onReload, onRollback, onRollbackToDeployment } = $props()
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   let entries = $state([])
   let open = $state(false)
@@ -226,8 +226,23 @@
       <div class="diff-card"><div class="diff-title">loading diff…</div></div>
     </div>
   {:else if diff}
-    <div class="diff-backdrop" onclick={closeDiff}>
-      <div class="diff-card" onclick={(e) => e.stopPropagation()}>
+    <div
+      class="diff-backdrop"
+      role="button"
+      tabindex="-1"
+      aria-label="Close diff"
+      onclick={closeDiff}
+      onkeydown={(e) => { if (e.key === 'Escape') closeDiff() }}
+    >
+      <div
+        class="diff-card"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Graph diff"
+        tabindex="-1"
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={(e) => e.stopPropagation()}
+      >
         <div class="diff-head">
           <div class="diff-title">
             <code>{diff.current.name}</code>

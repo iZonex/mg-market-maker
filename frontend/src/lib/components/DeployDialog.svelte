@@ -18,7 +18,7 @@
   import { createApiClient } from '../api.svelte.js'
 
   let { auth, agent, agents = null, onClose = () => {}, onDeployed = () => {} } = $props()
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   // Wave C3 — batch mode. `agents` (optional, non-empty) replaces
   // `agent`: the same template + variables fan out to every
@@ -26,9 +26,9 @@
   // first agent; operator is expected to pick IDs that exist on
   // every target (shared infra) or to run batch only for
   // same-tenant agents with mirrored vaults.
-  const batchMode = agents != null && Array.isArray(agents) && agents.length > 1
-  const targetAgents = batchMode ? agents : [agent]
-  const primaryAgent = batchMode ? agents[0] : agent
+  const batchMode = $derived(agents != null && Array.isArray(agents) && agents.length > 1)
+  const targetAgents = $derived(batchMode ? agents : [agent])
+  const primaryAgent = $derived(batchMode ? agents[0] : agent)
   let batchResults = $state([])  // [{ agent_id, phase: 'pending'|'ok'|'err', detail }]
 
   let templates = $state([])
@@ -311,7 +311,7 @@
   })
 </script>
 
-<div class="backdrop" role="dialog" aria-modal="true" onmousedown={handleBackdrop}>
+<div class="backdrop" role="dialog" aria-modal="true" tabindex="-1" onmousedown={handleBackdrop}>
   <div class="modal">
     <header class="modal-head">
       <div class="head-text">

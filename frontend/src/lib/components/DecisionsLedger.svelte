@@ -9,11 +9,14 @@
   import { createApiClient } from '../api.svelte.js'
 
   let { auth, symbol = null } = $props()
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   const REFRESH_MS = 4_000
 
+  const MAX_ROWS = 200
+
   let decisions = $state([])
+  let totalBeforeSlice = $state(0)
   let error = $state(null)
   let lastFetch = $state(null)
   let onlyResolved = $state(false)
@@ -83,7 +86,8 @@
         }
       }
       flat.sort((a, b) => (b.fill_ts ?? b.tick_ms) - (a.fill_ts ?? a.tick_ms))
-      decisions = flat.slice(0, 200)
+      totalBeforeSlice = flat.length
+      decisions = flat.slice(0, MAX_ROWS)
       error = null
       lastFetch = new Date()
       loading = false
@@ -171,6 +175,11 @@
         </tbody>
       </table>
     </div>
+    {#if totalBeforeSlice > MAX_ROWS}
+      <div class="truncated">
+        {totalBeforeSlice - MAX_ROWS} older row(s) truncated · per-deployment drilldown shows the full ledger
+      </div>
+    {/if}
   {/if}
 </div>
 
@@ -206,4 +215,12 @@
   .r { text-align: right; }
   .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
   tr.unresolved td { opacity: 0.6; }
+  .truncated {
+    padding: var(--s-1) var(--s-2);
+    font-size: 10px;
+    color: var(--fg-muted);
+    font-style: italic;
+    text-align: center;
+    border-top: 1px dashed var(--border-subtle);
+  }
 </style>

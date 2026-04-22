@@ -5,7 +5,7 @@
   let { data, auth } = $props()
   const s = $derived(data.state)
   const sym = $derived(s.activeSymbol || s.symbols[0] || '')
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   let httpRows = $state([])
   let lastError = $state('')

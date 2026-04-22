@@ -27,7 +27,7 @@
   import Icon from './Icon.svelte'
 
   let { data, auth } = $props()
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   const s = $derived(data?.state ?? { activeSymbol: '', symbols: [], data: {} })
   const activeSymbol = $derived(s.activeSymbol || s.symbols?.[0] || '')

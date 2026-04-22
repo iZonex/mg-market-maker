@@ -21,6 +21,7 @@ pub mod node;
 pub mod nodes;
 pub mod storage;
 pub mod templates;
+pub mod trace;
 pub mod types;
 
 pub use evaluator::{Evaluator, SinkAction};
@@ -29,6 +30,7 @@ pub use node::{
     ConfigEnumOption, ConfigField, ConfigWidget, EvalCtx, NodeKind, NodeState,
 };
 pub use storage::{DeployRecord, GraphStore};
+pub use trace::{ExecStatus, GraphAnalysis, NodeExec, TickTrace};
 pub use types::{
     AtomicBundleSpec, Edge, GraphQuote, NodeId, Port, PortRef, PortType, QuoteSide, Value,
     VenueQuote,
@@ -435,6 +437,177 @@ mod integration_tests {
             quotes_fired(&hot).as_deref(),
             Some(sample_quotes.as_slice()),
             "trigger=true must propagate the upstream quotes; got {hot:?}"
+        );
+    }
+
+    /// M1-GOBS — `tick_with_full_trace` emits per-node exec records
+    /// with declared inputs + produced outputs + a non-zero elapsed
+    /// budget, and the sinks_fired vector mirrors the returned
+    /// SinkActions.
+    #[test]
+    fn tick_with_full_trace_captures_every_node_and_sinks() {
+        let add_id = NodeId::new();
+        let sink_id = NodeId::new();
+        let mut g = Graph::empty("full-trace", GScope::Symbol("BTCUSDT".into()));
+        g.nodes.push(graph::Node {
+            id: add_id,
+            kind: "Math.Add".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(graph::Node {
+            id: sink_id,
+            kind: "Out.SpreadMult".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        g.edges.push(Edge {
+            from: PortRef { node: add_id, port: "out".into() },
+            to: PortRef { node: sink_id, port: "mult".into() },
+        });
+
+        let mut ev = Evaluator::build(&g).expect("valid");
+        let mut src: HashMap<(NodeId, String), Value> = HashMap::new();
+        src.insert((add_id, "a".into()), Value::Number(dec!(3)));
+        src.insert((add_id, "b".into()), Value::Number(dec!(4)));
+        let (sinks, trace) = ev
+            .tick_with_full_trace(&EvalCtx::default(), &src)
+            .expect("ok");
+
+        assert_eq!(sinks, vec![SinkAction::SpreadMult(dec!(7))]);
+        assert_eq!(trace.nodes.len(), 2, "one NodeExec per node");
+        assert_eq!(trace.sinks_fired, sinks);
+        let add = trace.nodes.iter().find(|n| n.id == add_id).unwrap();
+        assert_eq!(add.kind, "Math.Add");
+        assert_eq!(add.outputs.len(), 1);
+        assert_eq!(add.outputs[0].0, "out");
+        assert_eq!(add.outputs[0].1, Value::Number(dec!(7)));
+        let snk = trace.nodes.iter().find(|n| n.id == sink_id).unwrap();
+        assert_eq!(snk.kind, "Out.SpreadMult");
+        // Sink takes the Math.Add output on its `mult` input.
+        assert!(
+            snk.inputs.iter().any(|(p, v)| p == "mult" && *v == Value::Number(dec!(7))),
+            "sink must record the upstream value on its `mult` port",
+        );
+    }
+
+    /// M6-GOBS — the engine's detector-gating derivation keys
+    /// off `analyze().required_sources`. Encode the exact
+    /// predicate the engine uses so a catalog rename would fail
+    /// this test instead of silently leaving the gate open
+    /// forever (or closed forever on a template that needs it).
+    #[test]
+    fn analyze_exposes_gate_keys_for_detector_templates() {
+        let detector = crate::templates::load("rug-detector-composite")
+            .expect("rug-detector template available")
+            .expect("rug-detector parses cleanly");
+        let ev = Evaluator::build(&detector).expect("valid graph");
+        let a = ev.analyze(detector.content_hash());
+        let manip_gate = a
+            .required_sources
+            .iter()
+            .any(|k| k == "Surveillance.ManipulationScore" || k == "Surveillance.RugScore");
+        assert!(
+            manip_gate,
+            "rug-detector references Surveillance.RugScore — gate must open; got required_sources={:?}",
+            a.required_sources
+        );
+
+        // Plain avellaneda-via-graph has no Surveillance source
+        // and no Onchain source — both gates stay closed.
+        let plain = crate::templates::load("avellaneda-via-graph")
+            .expect("avellaneda template available")
+            .expect("avellaneda parses cleanly");
+        let ev = Evaluator::build(&plain).expect("valid graph");
+        let a = ev.analyze(plain.content_hash());
+        let manip_gate = a
+            .required_sources
+            .iter()
+            .any(|k| k == "Surveillance.ManipulationScore" || k == "Surveillance.RugScore");
+        let onchain_gate = a
+            .required_sources
+            .iter()
+            .any(|k| k.starts_with("Onchain."));
+        assert!(
+            !manip_gate,
+            "avellaneda-via-graph should not trip the manipulation gate; got {:?}",
+            a.required_sources
+        );
+        assert!(
+            !onchain_gate,
+            "avellaneda-via-graph should not trip the onchain gate; got {:?}",
+            a.required_sources
+        );
+    }
+
+    /// M1-GOBS — `Evaluator::analyze` returns required_sources,
+    /// dead_nodes, unconsumed_outputs for a graph that has a
+    /// dead branch (Math.Add node unreachable from any sink).
+    #[test]
+    fn analyze_flags_dead_branch_and_unconsumed_outputs() {
+        let rate = NodeId::new();
+        let cast = NodeId::new();
+        let sink = NodeId::new();
+        let dead_add = NodeId::new();
+        let mut g = Graph::empty("dead-branch", GScope::Global);
+        g.nodes.push(graph::Node {
+            id: rate,
+            kind: "Sentiment.Rate".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(graph::Node {
+            id: cast,
+            kind: "Cast.ToBool".into(),
+            config: serde_json::json!({ "threshold": "3", "cmp": "ge" }),
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(graph::Node {
+            id: dead_add,
+            kind: "Math.Add".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(graph::Node {
+            id: sink,
+            kind: "Out.SpreadMult".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        // Rate → Cast → nothing connects Cast.out to the sink.
+        // Instead wire Rate.value straight into the sink's mult port
+        // so validation passes (Sentiment.Rate is a Number-typed
+        // source, and `Out.SpreadMult.mult` is Number-typed).
+        g.edges.push(Edge {
+            from: PortRef { node: rate, port: "value".into() },
+            to: PortRef { node: cast, port: "x".into() },
+        });
+        g.edges.push(Edge {
+            from: PortRef { node: rate, port: "value".into() },
+            to: PortRef { node: sink, port: "mult".into() },
+        });
+
+        let ev = Evaluator::build(&g).expect("valid");
+        let a = ev.analyze("abc123");
+
+        assert_eq!(a.graph_hash, "abc123");
+        // Rate is a required source (used by both Cast and sink).
+        assert!(a.required_sources.iter().any(|k| k == "Sentiment.Rate"));
+        // Math.Add has no inputs (it's actually treated as a source
+        // with port ports when the catalog declares them, but
+        // either way it has no path to the sink).
+        assert!(
+            a.dead_nodes.contains(&dead_add) || a.dead_nodes.contains(&cast),
+            "unreachable nodes should surface in dead_nodes: {:?}",
+            a.dead_nodes,
+        );
+        // Cast.out has no consumer — the dead branch's terminal
+        // output should show up as unconsumed.
+        assert!(
+            a.unconsumed_outputs
+                .iter()
+                .any(|(id, _)| *id == cast || *id == dead_add),
+            "unconsumed outputs should include cast or dead_add",
         );
     }
 

@@ -1342,6 +1342,19 @@ struct ValidateResponse {
     node_count: usize,
     edge_count: usize,
     sink_count: usize,
+    /// M3-GOBS — source kinds this graph actually references. The
+    /// UI fades palette entries that are *not* in this list so
+    /// operators see at a glance which detectors are dormant.
+    /// Always emitted — never dropped on empty — so downstream
+    /// `Array.isArray()` checks don't flake on a dense graph.
+    required_sources: Vec<String>,
+    /// M3-GOBS — nodes that have no path to any sink. Authoring
+    /// error — deploy still proceeds but the UI shows a red
+    /// dashed border on these and lists them as warnings.
+    dead_nodes: Vec<mm_strategy_graph::NodeId>,
+    /// M3-GOBS — output ports produced by a node but never
+    /// consumed by any edge. Orange informational warning.
+    unconsumed_outputs: Vec<(mm_strategy_graph::NodeId, String)>,
 }
 
 #[derive(Deserialize)]
@@ -1356,14 +1369,21 @@ async fn validate_strategy_graph(
 
     // Shape-level: compile via Evaluator::build. That covers unknown
     // kinds, port type mismatches, cycles, and the SpreadMult-sink
-    // requirement in one call.
-    if let Err(e) = mm_strategy_graph::Evaluator::build(&req.graph) {
-        // thiserror's Display form is the human-facing message
-        // (`"graph contains no reachable Out.SpreadMult sink"`),
-        // not the enum variant name. Keep it that way here so the
-        // validation strip in the UI shows operator-readable text.
-        issues.push(e.to_string());
-    }
+    // requirement in one call. We also hang onto the built evaluator
+    // so the topology analysis can run off the same validated DAG —
+    // the UI gets dead-node / unconsumed-output / required-source
+    // diagnostics for free when the graph compiles cleanly.
+    let evaluator = match mm_strategy_graph::Evaluator::build(&req.graph) {
+        Ok(ev) => Some(ev),
+        Err(e) => {
+            // thiserror's Display form is the human-facing message
+            // (`"graph contains no reachable Out.SpreadMult sink"`),
+            // not the enum variant name. Keep it that way here so the
+            // validation strip in the UI shows operator-readable text.
+            issues.push(e.to_string());
+            None
+        }
+    };
 
     // Dangling-edges audit. Evaluator::build tolerates missing inputs
     // (they propagate as Missing) — but an edge whose `from`/`to`
@@ -1387,12 +1407,35 @@ async fn validate_strategy_graph(
         .filter(|n| n.kind.starts_with("Out."))
         .count();
 
+    // M3-GOBS — topology analysis when the graph compiles. Returns
+    // empty on failure; the UI already shows the `issues` list in
+    // that case and doesn't try to render these.
+    let analysis = evaluator
+        .as_ref()
+        .map(|ev| ev.analyze(req.graph.content_hash()));
+
+    let required_sources = analysis
+        .as_ref()
+        .map(|a| a.required_sources.clone())
+        .unwrap_or_default();
+    let dead_nodes = analysis
+        .as_ref()
+        .map(|a| a.dead_nodes.clone())
+        .unwrap_or_default();
+    let unconsumed_outputs = analysis
+        .as_ref()
+        .map(|a| a.unconsumed_outputs.clone())
+        .unwrap_or_default();
+
     Json(ValidateResponse {
         valid: issues.is_empty(),
         issues,
         node_count: req.graph.nodes.len(),
         edge_count: req.graph.edges.len(),
         sink_count,
+        required_sources,
+        dead_nodes,
+        unconsumed_outputs,
     })
 }
 
@@ -2449,6 +2492,15 @@ struct OpenIncidentRequest {
     target: String,
     metric: String,
     detail: String,
+    // M4-4 GOBS — optional graph deep-link triple. Accepted when
+    // the incident was filed from a deployment drilldown so the
+    // Incidents page can surface "Open graph at incident".
+    #[serde(default)]
+    graph_agent_id: Option<String>,
+    #[serde(default)]
+    graph_deployment_id: Option<String>,
+    #[serde(default)]
+    graph_tick_num: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2499,6 +2551,9 @@ async fn post_incident_handler(
         root_cause: None,
         action_taken: None,
         preventive: None,
+        graph_agent_id: body.graph_agent_id,
+        graph_deployment_id: body.graph_deployment_id,
+        graph_tick_num: body.graph_tick_num,
     };
     Json(state.open_incident(inc))
 }

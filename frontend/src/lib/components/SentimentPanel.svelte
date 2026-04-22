@@ -27,7 +27,7 @@
   import Icon from './Icon.svelte'
 
   let { auth } = $props()
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   let rows = $state([])
   let histories = $state({}) // asset → Array<{ ts, mentions_rate }>

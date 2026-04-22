@@ -18,6 +18,7 @@
 //! 20 entries). Older entries silently drop off the front so
 //! memory stays bounded no matter how long the engine runs.
 
+use mm_strategy_graph::trace::{GraphAnalysis, TickTrace};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -52,6 +53,12 @@ const DECISIONS_CAP: usize = 200;
 /// window for the operator to scroll through.
 const SOR_DECISIONS_CAP: usize = 100;
 
+/// Graph live-trace ring capacity. 256 ticks at ~2 Hz ≈ 2 min of
+/// history on-canvas — enough for the operator to scroll back
+/// through the last-reaction window on a kill escalation without
+/// blowing memory on a quiet deployment.
+const GRAPH_TRACE_CAP: usize = 256;
+
 #[derive(Default)]
 struct Inner {
     funding_arb: HashMap<String, VecDeque<FundingArbEventEntry>>,
@@ -68,6 +75,15 @@ struct Inner {
     /// `SOR_DECISIONS_CAP` so a hot route-heavy deployment
     /// doesn't blow memory.
     sor_decisions: HashMap<String, VecDeque<serde_json::Value>>,
+    /// Per-symbol ring of the last `GRAPH_TRACE_CAP` strategy-graph
+    /// `TickTrace`s. Engine pushes after every `refresh_quotes`
+    /// when a subscriber is active; agent serves on the
+    /// `graph_trace_recent` topic. Newest-first on read.
+    graph_traces: HashMap<String, VecDeque<TickTrace>>,
+    /// Static topology analysis, computed once per graph swap.
+    /// Engine writes on `swap_strategy_graph`; agent serves on
+    /// the `graph_analysis` topic. Replaced wholesale on swap.
+    graph_analysis: HashMap<String, GraphAnalysis>,
 }
 
 #[derive(Default)]
@@ -144,6 +160,58 @@ impl DeploymentDetailsStore {
             .map(|ring| ring.iter().rev().cloned().collect())
             .unwrap_or_default()
     }
+
+    /// Append one strategy-graph `TickTrace` for `symbol`,
+    /// evicting the oldest entry when the ring is full.
+    ///
+    /// Only writes when an agent has announced a subscriber
+    /// (otherwise the engine skips the full-trace capture path
+    /// entirely — controlled by `trace_subscribers_*`).
+    pub fn push_graph_trace(&self, symbol: &str, trace: TickTrace) {
+        let Ok(mut g) = self.inner.lock() else { return };
+        let ring = g.graph_traces.entry(symbol.to_string()).or_default();
+        if ring.len() >= GRAPH_TRACE_CAP {
+            ring.pop_front();
+        }
+        ring.push_back(trace);
+    }
+
+    /// Snapshot the graph-trace ring for `symbol`, newest-first.
+    /// Returns up to `limit` entries; pass `None` for the whole
+    /// buffer.
+    pub fn graph_traces(&self, symbol: &str, limit: Option<usize>) -> Vec<TickTrace> {
+        let Ok(g) = self.inner.lock() else { return Vec::new() };
+        let Some(ring) = g.graph_traces.get(symbol) else {
+            return Vec::new();
+        };
+        let iter = ring.iter().rev().cloned();
+        match limit {
+            Some(n) => iter.take(n).collect(),
+            None => iter.collect(),
+        }
+    }
+
+    /// Clear the graph-trace ring for `symbol`. Called on graph
+    /// swap so stale traces from the prior graph version don't
+    /// pollute a fresh subscriber's first frame.
+    pub fn clear_graph_traces(&self, symbol: &str) {
+        let Ok(mut g) = self.inner.lock() else { return };
+        g.graph_traces.remove(symbol);
+    }
+
+    /// Store the static graph analysis for `symbol`. Engine calls
+    /// once per swap; replaces any previous entry.
+    pub fn set_graph_analysis(&self, symbol: &str, analysis: GraphAnalysis) {
+        let Ok(mut g) = self.inner.lock() else { return };
+        g.graph_analysis.insert(symbol.to_string(), analysis);
+    }
+
+    /// Read the current graph analysis for `symbol`. Returns
+    /// `None` before the first swap has landed.
+    pub fn graph_analysis(&self, symbol: &str) -> Option<GraphAnalysis> {
+        let Ok(g) = self.inner.lock() else { return None };
+        g.graph_analysis.get(symbol).cloned()
+    }
 }
 
 static GLOBAL: OnceLock<Arc<DeploymentDetailsStore>> = OnceLock::new();
@@ -185,6 +253,85 @@ mod tests {
     fn unknown_symbol_returns_empty() {
         let s = DeploymentDetailsStore::default();
         assert!(s.funding_arb_events("ETHUSDT").is_empty());
+    }
+
+    /// M4-long-session GOBS — push past GRAPH_TRACE_CAP and confirm
+    /// oldest traces are evicted, newest are retained, ring length
+    /// is capped, and `graph_traces(limit=None)` returns every
+    /// surviving entry newest-first.
+    #[test]
+    fn graph_trace_ring_rolls_over() {
+        use mm_strategy_graph::trace::TickTrace;
+        let s = DeploymentDetailsStore::default();
+        let total: u64 = (GRAPH_TRACE_CAP as u64) + 50;
+        for i in 0..total {
+            let mut t = TickTrace::default();
+            t.tick_num = i;
+            t.tick_ms = i as u64;
+            s.push_graph_trace("BTCUSDT", t);
+        }
+        let all = s.graph_traces("BTCUSDT", None);
+        assert_eq!(
+            all.len(),
+            GRAPH_TRACE_CAP,
+            "ring must cap at GRAPH_TRACE_CAP",
+        );
+        // Newest-first: first entry is the final tick we pushed.
+        assert_eq!(all[0].tick_num, total - 1);
+        // Oldest surviving: total - GRAPH_TRACE_CAP.
+        assert_eq!(all[all.len() - 1].tick_num, total - GRAPH_TRACE_CAP as u64);
+    }
+
+    #[test]
+    fn graph_trace_limit_caps_response() {
+        use mm_strategy_graph::trace::TickTrace;
+        let s = DeploymentDetailsStore::default();
+        for i in 0..20u64 {
+            let mut t = TickTrace::default();
+            t.tick_num = i;
+            s.push_graph_trace("BTCUSDT", t);
+        }
+        let snap = s.graph_traces("BTCUSDT", Some(5));
+        assert_eq!(snap.len(), 5);
+        assert_eq!(snap[0].tick_num, 19); // newest
+        assert_eq!(snap[4].tick_num, 15); // 5 newest
+    }
+
+    #[test]
+    fn graph_analysis_replaces_on_set() {
+        use mm_strategy_graph::trace::GraphAnalysis;
+        let s = DeploymentDetailsStore::default();
+        s.set_graph_analysis(
+            "BTCUSDT",
+            GraphAnalysis {
+                graph_hash: "v1".into(),
+                ..Default::default()
+            },
+        );
+        s.set_graph_analysis(
+            "BTCUSDT",
+            GraphAnalysis {
+                graph_hash: "v2".into(),
+                ..Default::default()
+            },
+        );
+        let a = s.graph_analysis("BTCUSDT").expect("present");
+        assert_eq!(a.graph_hash, "v2", "set must replace, not append");
+    }
+
+    #[test]
+    fn clear_graph_traces_wipes_symbol_only() {
+        use mm_strategy_graph::trace::TickTrace;
+        let s = DeploymentDetailsStore::default();
+        for i in 0..3u64 {
+            let mut t = TickTrace::default();
+            t.tick_num = i;
+            s.push_graph_trace("BTCUSDT", t.clone());
+            s.push_graph_trace("ETHUSDT", t);
+        }
+        s.clear_graph_traces("BTCUSDT");
+        assert!(s.graph_traces("BTCUSDT", None).is_empty());
+        assert_eq!(s.graph_traces("ETHUSDT", None).len(), 3);
     }
 
     #[test]

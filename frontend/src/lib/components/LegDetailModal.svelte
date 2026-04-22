@@ -26,7 +26,7 @@
     onClose = () => {},
   } = $props()
 
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   let funding = $state(null)
   let pnlRow = $state(null)

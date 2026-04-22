@@ -18,7 +18,7 @@
   import Icon from './Icon.svelte'
 
   let { auth } = $props()
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   const REFRESH_MS = 5000
 

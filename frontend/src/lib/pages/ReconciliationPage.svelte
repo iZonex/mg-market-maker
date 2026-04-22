@@ -17,7 +17,7 @@
   import { createApiClient } from '../api.svelte.js'
 
   let { auth } = $props()
-  const api = createApiClient(auth)
+  const api = $derived(createApiClient(auth))
 
   const REFRESH_MS = 5000
 
@@ -25,7 +25,7 @@
   let error = $state(null)
   let loading = $state(true)
   let lastFetch = $state(null)
-  let showClean = $state(false)
+  let showClean = $state(null)
 
   async function refresh() {
     try {
@@ -48,6 +48,11 @@
 
   const driftRows = $derived(rows.filter(r => r.has_drift))
   const cleanRows = $derived(rows.filter(r => !r.has_drift))
+  // Auto-expand clean rows when the fleet is small enough to
+  // skim in one glance. Operator can still collapse manually.
+  const cleanExpanded = $derived(
+    showClean !== null ? showClean : cleanRows.length > 0 && cleanRows.length <= 20
+  )
 
   const totals = $derived.by(() => {
     let ghosts = 0, phantoms = 0, balMm = 0, fetchFails = 0
@@ -196,7 +201,7 @@
       {#snippet children()}
         {#if cleanRows.length === 0}
           <div class="muted">no clean rows</div>
-        {:else if !showClean}
+        {:else if !cleanExpanded}
           <button type="button" class="btn ghost" onclick={() => (showClean = true)}>
             Show {cleanRows.length} clean row(s)
           </button>

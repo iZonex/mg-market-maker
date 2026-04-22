@@ -778,6 +778,18 @@ pub struct MarketMakerEngine {
     /// at swap time so the tick-path doesn't need to re-borrow
     /// the graph to count nodes.
     strategy_graph_node_count: Option<usize>,
+    /// M1-GOBS — monotonic tick counter stamped onto each
+    /// captured `TickTrace` so the UI can detect missing frames
+    /// in the ring buffer (skipping a sequence implies a slow
+    /// poll, not a skipped tick).
+    strategy_graph_tick_counter: u64,
+    /// M6-GOBS — detector gating. When the active strategy graph
+    /// doesn't reference a given source kind, the engine skips
+    /// its detector's hot-path updates. Values default to `true`
+    /// (open) so deployments WITHOUT a graph behave exactly like
+    /// before the graph layer landed. Recomputed on every swap.
+    gate_manipulation: bool,
+    gate_onchain: bool,
     /// Epic G — reservation-price skew contribution from the
     /// most recent social evaluation. Bumped by
     /// `SocialRiskState.inv_skew_bps` on every tick and
@@ -1296,6 +1308,9 @@ impl MarketMakerEngine {
             strategy_graph_scope: None,
             strategy_graph_deployed_at_ms: None,
             strategy_graph_node_count: None,
+            strategy_graph_tick_counter: 0,
+            gate_manipulation: true,
+            gate_onchain: true,
             margin_guard: config.margin.as_ref().map(|m| {
                 // PERP-3 — pin the guard to this engine's
                 // symbol + configured margin mode so isolated
@@ -2930,6 +2945,22 @@ impl MarketMakerEngine {
                 return Err(e);
             }
         };
+        // M1-GOBS — emit static topology analysis on first deploy.
+        let analysis = ev.analyze(graph.content_hash());
+        // M6-GOBS — same gate derivation as `swap_strategy_graph`;
+        // keeps `with_strategy_graph` symmetric so the first
+        // deploy doesn't leave gates in the constructor-default
+        // "open" state when the graph actually has no detectors.
+        self.gate_manipulation = analysis
+            .required_sources
+            .iter()
+            .any(|k| k == "Surveillance.ManipulationScore" || k == "Surveillance.RugScore");
+        self.gate_onchain = analysis
+            .required_sources
+            .iter()
+            .any(|k| k.starts_with("Onchain."));
+        mm_dashboard::details_store::global().set_graph_analysis(&self.symbol, analysis);
+
         self.strategy_graph = Some(ev);
         self.strategy_graph_name = Some(graph.name.clone());
         self.strategy_graph_hash = Some(graph.content_hash());
@@ -2977,6 +3008,28 @@ impl MarketMakerEngine {
                 return Err(e);
             }
         };
+        // M1-GOBS — static topology analysis on swap. The UI reads
+        // this via the `graph_analysis` details topic to render dead
+        // nodes, unconsumed outputs, and dormant sources. Clear the
+        // previous graph's trace ring so a fresh subscriber's first
+        // frame isn't polluted with traces from the old DAG.
+        let analysis = ev.analyze(graph.content_hash());
+        // M6-GOBS — refresh detector gates from the analysis.
+        // Detectors whose source kind isn't referenced by the new
+        // graph go silent on the next tick. Every gate defaults
+        // to `true` (open) so downstream publishers see live data
+        // immediately when a source gets wired in.
+        self.gate_manipulation = analysis
+            .required_sources
+            .iter()
+            .any(|k| k == "Surveillance.ManipulationScore" || k == "Surveillance.RugScore");
+        self.gate_onchain = analysis
+            .required_sources
+            .iter()
+            .any(|k| k.starts_with("Onchain."));
+        mm_dashboard::details_store::global().set_graph_analysis(&self.symbol, analysis);
+        mm_dashboard::details_store::global().clear_graph_traces(&self.symbol);
+
         self.strategy_graph = Some(ev);
         self.strategy_graph_name = Some(graph.name.clone());
         self.strategy_graph_hash = Some(graph.content_hash());
@@ -5011,8 +5064,15 @@ impl MarketMakerEngine {
             }
         }
 
-        let actions = match graph.tick(&ctx, &src) {
-            Ok(a) => a,
+        // M1-GOBS — capture full tick trace for live observability.
+        // Always on for now (Open Question 1 in
+        // docs/research/graph-observability.md); the on-demand
+        // subscribe gate is planned for M2 once the UI cadence is
+        // visible. Cost: ~5 KB allocation + 30 clones per tick on
+        // a typical 30-node graph; per-deployment ring caps at 256
+        // traces.
+        let (actions, mut trace) = match graph.tick_with_full_trace(&ctx, &src) {
+            Ok(pair) => pair,
             Err(e) => {
                 warn!(
                     symbol = %self.symbol,
@@ -5022,6 +5082,18 @@ impl MarketMakerEngine {
                 return;
             }
         };
+        // The evaluator is clock-free — fill timestamp, tick counter,
+        // and graph hash here where the engine owns that context.
+        trace.tick_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        self.strategy_graph_tick_counter = self
+            .strategy_graph_tick_counter
+            .wrapping_add(1);
+        trace.tick_num = self.strategy_graph_tick_counter;
+        if let Some(h) = self.strategy_graph_hash.as_deref() {
+            trace.graph_hash = h.to_string();
+        }
+        mm_dashboard::details_store::global()
+            .push_graph_trace(&self.symbol, trace);
         for a in actions {
             match a {
                 SinkAction::SpreadMult(m) => {
@@ -7414,8 +7486,15 @@ impl MarketMakerEngine {
                 // detector bundle (pump-dump velocity + wash
                 // prints + thin-book volume tail). Cheap per-trade
                 // bookkeeping; snapshot is published each tick
-                // later in `refresh_quotes`.
-                self.manipulation.on_trade(trade);
+                // later in `refresh_quotes`. M6-GOBS: skip when
+                // the active graph doesn't reference any
+                // Surveillance.* score that depends on this
+                // aggregator — keeps idle detectors out of the
+                // trade hot path on strategies that don't need
+                // manipulation signals.
+                if self.gate_manipulation {
+                    self.manipulation.on_trade(trade);
+                }
                 // R2.12 — feed the market-cap proxy guard too.
                 // Guard is `None` when the operator hasn't set a
                 // circulating supply for this symbol.
@@ -10622,20 +10701,25 @@ impl MarketMakerEngine {
             // R2.6 — CEX-side manipulation snapshot. Refreshed
             // on-book before the publish via `on_book`, so each
             // tick carries the latest (pump, wash, thin-book,
-            // combined) tuple.
-            manipulation_score: Some({
+            // combined) tuple. M6-GOBS: when gate is closed
+            // (graph has no manipulation/rug source), skip the
+            // on_book scan and publish `None` so Prometheus +
+            // dashboard honestly show "detector not running".
+            manipulation_score: if self.gate_manipulation {
                 self.manipulation.on_book(
                     &self.book_keeper.book,
                     chrono::Utc::now(),
                 );
                 let snap = self.manipulation.snapshot();
-                mm_dashboard::state::ManipulationScoreSnapshot {
+                Some(mm_dashboard::state::ManipulationScoreSnapshot {
                     pump_dump: snap.pump_dump,
                     wash: snap.wash,
                     thin_book: snap.thin_book,
                     combined: snap.combined,
-                }
-            }),
+                })
+            } else {
+                None
+            },
             // R2.13 — composite rug score. Weighted sum of the
             // manipulation + on-chain + listing-age + mcap
             // proxy signals; the dashboard panel + graph source
