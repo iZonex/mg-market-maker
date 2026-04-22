@@ -103,6 +103,12 @@ struct Running {
     /// serde_json::Map the wire protocol uses to keep zero
     /// conversion cost on the telemetry hot path.
     variables: serde_json::Map<String, serde_json::Value>,
+    /// UI-DEPLOY-1 — credentials allow-list this deployment
+    /// was spawned with. Echoed into `DeploymentStateRow.credentials`
+    /// so the DeployDialog can rebuild the full DesiredStrategy
+    /// slice when adding a new deployment (SetDesiredStrategies
+    /// is replace-by-set).
+    credentials: Vec<String>,
     /// Hot-reload channel — paired with the receiver held by
     /// the running engine. `patch_variables` translates each
     /// `variables[key]=value` pair into a `ConfigOverride`
@@ -527,6 +533,7 @@ impl StrategyRegistry {
                     symbol: desc.symbol.clone(),
                     template: desc.template.clone(),
                     variables: desc.variables.clone(),
+                    credentials: desc.credentials.clone(),
                     config_override_tx: spawned.config_override_tx,
                 },
             );
@@ -658,6 +665,7 @@ impl StrategyRegistry {
                 adaptive_reason: String::new(),
                 features: feature_flags_from_variables(&r.variables),
                 variables: r.variables.clone(),
+                credentials: r.credentials.clone(),
                 live_orders: orders_by_symbol
                     .get(&r.symbol)
                     .map(|v| *v as u32)

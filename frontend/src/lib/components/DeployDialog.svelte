@@ -149,22 +149,57 @@
       variables = { strategy_graph: raw }
     }
     submitting = true
-    const body = {
-      strategies: [{
-        deployment_id: form.deployment_id.trim(),
-        // In graph mode the template is a thin runner (any
-        // `-via-graph` row works); we pick the first one as
-        // a carrier so the backend has a valid catalog name.
-        template: mode === 'template' ? form.template : (form.template || 'avellaneda-via-graph'),
-        symbol: form.symbol.trim().toUpperCase(),
-        credentials: Array.from(form.selected_credentials),
-        variables,
-      }],
+    const newStrategy = {
+      deployment_id: form.deployment_id.trim(),
+      // In graph mode the template is a thin runner (any
+      // `-via-graph` row works); we pick the first one as
+      // a carrier so the backend has a valid catalog name.
+      template: mode === 'template' ? form.template : (form.template || 'avellaneda-via-graph'),
+      symbol: form.symbol.trim().toUpperCase(),
+      credentials: Array.from(form.selected_credentials),
+      variables,
+    }
+    // UI-DEPLOY-1 (2026-04-22) — `SetDesiredStrategies` is
+    // replace-by-set on the agent. Sending just the new
+    // strategy would stop every sibling deployment silently.
+    // Fetch the current desired set, replace the matching
+    // deployment_id (operator might be editing), append when
+    // it's a fresh add, then POST the union. DeploymentStateRow
+    // echoes `credentials` back specifically so this merge
+    // path works. In batch mode each agent's existing set is
+    // fetched + merged independently.
+    async function mergedBodyFor(agentId) {
+      let existing = []
+      try {
+        existing = await api.getJson(
+          `/api/v1/agents/${encodeURIComponent(agentId)}/deployments`,
+        )
+        if (!Array.isArray(existing)) existing = []
+      } catch (_) {
+        // Fall back to "replace all" if GET fails; this is
+        // the legacy behaviour, a regression vs pre-fix is
+        // better than a confusing deploy refusal.
+        existing = []
+      }
+      const merged = []
+      for (const d of existing) {
+        if (d.deployment_id === newStrategy.deployment_id) continue
+        merged.push({
+          deployment_id: d.deployment_id,
+          template: d.template || '',
+          symbol: d.symbol,
+          credentials: Array.isArray(d.credentials) ? d.credentials : [],
+          variables: d.variables || {},
+        })
+      }
+      merged.push(newStrategy)
+      return { strategies: merged }
     }
     if (batchMode) {
       batchResults = targetAgents.map(a => ({ agent_id: a.agent_id, phase: 'pending', detail: '' }))
       const settled = await Promise.all(targetAgents.map(async (a) => {
         try {
+          const body = await mergedBodyFor(a.agent_id)
           const r = await api.authedFetch(`/api/v1/agents/${encodeURIComponent(a.agent_id)}/deployments`, {
             method: 'POST',
             body: JSON.stringify(body),
@@ -187,6 +222,7 @@
       return
     }
     try {
+      const body = await mergedBodyFor(primaryAgent.agent_id)
       const r = await api.authedFetch(`/api/v1/agents/${encodeURIComponent(primaryAgent.agent_id)}/deployments`, {
         method: 'POST',
         body: JSON.stringify(body),

@@ -312,6 +312,16 @@ pub struct DeploymentStateRow {
     /// operator PATCH them live.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub variables: serde_json::Map<String, serde_json::Value>,
+    /// UI-DEPLOY-1 (2026-04-22) — the credential allow-list the
+    /// operator deployed with. Echoed back so DeployDialog can
+    /// reconstruct the full `DesiredStrategy` list when adding a
+    /// new deployment: `SetDesiredStrategies` is REPLACE-by-set,
+    /// so the UI must union the existing slice with the new
+    /// strategy before POST, or sibling deployments stop
+    /// silently. Empty in the subscribe-only runner path
+    /// (credentials don't exist there).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credentials: Vec<String>,
     /// Count of currently-resting orders this deployment has on
     /// the book.
     #[serde(default, skip_serializing_if = "is_zero_u32")]

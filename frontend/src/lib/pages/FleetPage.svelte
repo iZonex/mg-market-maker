@@ -217,6 +217,54 @@
   }
 
   function accept(fp) { doAction(fp, 'accept') }
+
+  // UI-STOP-1 (2026-04-22) — retire a single deployment. Before
+  // this there was no UI action to take a single strategy off an
+  // agent: DeployDialog only added; DeploymentDrilldown's kill
+  // ladder at L5 (Disconnect) halts the engine but leaves the
+  // row in the desired set, so reconcile re-spawns it. Genuine
+  // removal needs SetDesiredStrategies without that deployment_id.
+  // Same union-fetch pattern as the deploy dialog.
+  async function retireDeployment(agentId, deploymentId, symbol) {
+    if (
+      !confirm(
+        `Retire deployment "${deploymentId}" (${symbol}) from agent "${agentId}"?\n\n` +
+          'Engine stops, orders cancelled, deployment removed from the desired set. ' +
+          'Other deployments on this agent stay running.',
+      )
+    ) {
+      return
+    }
+    try {
+      let existing = await api.getJson(
+        `/api/v1/agents/${encodeURIComponent(agentId)}/deployments`,
+      )
+      if (!Array.isArray(existing)) existing = []
+      const merged = existing
+        .filter(d => d.deployment_id !== deploymentId)
+        .map(d => ({
+          deployment_id: d.deployment_id,
+          template: d.template || '',
+          symbol: d.symbol,
+          credentials: Array.isArray(d.credentials) ? d.credentials : [],
+          variables: d.variables || {},
+        }))
+      const resp = await api.authedFetch(
+        `/api/v1/agents/${encodeURIComponent(agentId)}/deployments`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ strategies: merged }),
+        },
+      )
+      if (!resp.ok) {
+        const t = await resp.text().catch(() => '')
+        throw new Error(t || resp.statusText)
+      }
+      await refresh()
+    } catch (e) {
+      error = `retire failed: ${e.message || e}`
+    }
+  }
   function reject(fp) {
     const reason = prompt('Reject reason? (optional)') || 'operator reject'
     doAction(fp, 'reject', reason)
@@ -751,6 +799,7 @@
                         <th class="num">inventory</th>
                         <th class="num">unrealised PnL</th>
                         <th></th>
+                        <th></th>
                       </tr>
                     </thead>
                     <tbody>
@@ -777,6 +826,19 @@
                           </td>
                           <td class="num mono">{fmtDecimal(d.inventory, 6)}</td>
                           <td class="num mono">{fmtDecimal(d.unrealized_pnl_quote, 4)}</td>
+                          <td class="dep-actions">
+                            <button
+                              type="button"
+                              class="btn ghost xsmall"
+                              title="Retire deployment (remove from desired set)"
+                              onclick={(e) => {
+                                e.stopPropagation()
+                                retireDeployment(live.agent_id, d.deployment_id, d.symbol)
+                              }}
+                            >
+                              Retire
+                            </button>
+                          </td>
                           <td class="chev">›</td>
                         </tr>
                       {/each}
@@ -1232,6 +1294,8 @@
   .dep-row:hover { background: var(--bg-raised); }
   .chev { color: var(--fg-muted); text-align: right; font-size: var(--fs-md); width: 16px; }
   .dep-row:hover .chev { color: var(--accent); }
+  .dep-actions { text-align: right; width: 1%; white-space: nowrap; }
+  .btn.xsmall { padding: 2px 8px; font-size: 10px; }
   .denial {
     font-size: var(--fs-xs); color: var(--fg-muted);
     border-top: 1px solid var(--border-subtle); padding-top: var(--s-2);
