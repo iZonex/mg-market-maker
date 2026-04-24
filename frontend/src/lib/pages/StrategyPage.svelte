@@ -38,6 +38,7 @@
   import ActivePlans from '../components/ActivePlans.svelte'
   import GraphInspector from '../components/GraphInspector.svelte'
   import GraphTimeline from '../components/GraphTimeline.svelte'
+  import ReplayModal from '../components/ReplayModal.svelte'
   import { computeGraphDiff } from '../graphDiff.js'
 
   // `liveAgent` / `liveDeployment` come from App.svelte when the URL
@@ -1098,27 +1099,20 @@
   // M5-GOBS — replay current canvas against the deployment's
   // recent trace ring. Button shows only when we know which
   // deployment to compare against (i.e. operator arrived here
-  // from the Live view of that deployment).
+  // from the Live view of that deployment). The modal chrome
+  // + side-by-side canvas + divergence scrubber live in
+  // `ReplayModal.svelte`; we only own the fetch + the two
+  // graph snapshots that feed it.
   let replayBusy = $state(false)
   let replayResult = $state(null)
-  // M5.2-GOBS — side-by-side canvas state. `deployedGraphSnapshot`
-  // is populated by `loadLiveGraph` on Live-mode entry; the replay
-  // modal refreshes it on open as a safety net so an operator who
-  // landed in authoring mode without visiting Live still gets a
-  // deployed-side pane. `candidateGraphForReplay` freezes the
-  // candidate's node+edge layout at replay-run time so later
-  // canvas edits don't retroactively change the modal. Divergence
-  // cursor drives which tick the two mini-canvases glow-highlight.
   let deployedGraphSnapshot = $state(null)
   let deployedGraphName = $state(null)
   let candidateGraphForReplay = $state(null)
-  let replayDivergenceIdx = $state(0)
   async function runReplay() {
     if (replayBusy || !liveTarget) return
     replayBusy = true
     replayResult = null
     candidateGraphForReplay = toBackendGraph()
-    replayDivergenceIdx = 0
     // Safety-net re-fetch — if the operator never flipped into
     // Live mode, `loadLiveGraph` never ran so the cache is empty.
     // Best-effort: failure here leaves `deployedGraphSnapshot`
@@ -1176,72 +1170,7 @@
   function closeReplay() {
     replayResult = null
     candidateGraphForReplay = null
-    replayDivergenceIdx = 0
   }
-
-  // M5.2-GOBS — derive the currently-scrubbed divergence. When the
-  // divergences list is empty (identical-match case), returns null
-  // and the modal skips the scrubber + glow entirely.
-  const activeDivergence = $derived.by(() => {
-    const list = replayResult?.divergences ?? []
-    if (list.length === 0) return null
-    const idx = Math.max(0, Math.min(replayDivergenceIdx, list.length - 1))
-    return list[idx]
-  })
-  const activeDivergingKinds = $derived(
-    new Set(activeDivergence?.diverging_kinds ?? []),
-  )
-
-  // M5.2-GOBS — project a backend graph (from the controller) into
-  // a viewbox-fitted list of mini-canvas rects + straight edges.
-  // Handles both backend-shape (nodes[].pos, edges[].from/to) and
-  // empty graphs (returns null so the caller can short-circuit).
-  function projectGraphForMiniCanvas(graph) {
-    if (!graph?.nodes?.length) return null
-    const NODE_W = 92
-    const NODE_H = 28
-    const xs = graph.nodes.map((n) => (Array.isArray(n.pos) ? n.pos[0] : 0))
-    const ys = graph.nodes.map((n) => (Array.isArray(n.pos) ? n.pos[1] : 0))
-    const minX = Math.min(...xs)
-    const minY = Math.min(...ys)
-    const maxX = Math.max(...xs) + NODE_W
-    const maxY = Math.max(...ys) + NODE_H
-    const padding = 12
-    const vbX = minX - padding
-    const vbY = minY - padding
-    const vbW = maxX - minX + padding * 2
-    const vbH = maxY - minY + padding * 2
-    const posById = new Map()
-    const projectedNodes = graph.nodes.map((n) => {
-      const x = (Array.isArray(n.pos) ? n.pos[0] : 0)
-      const y = (Array.isArray(n.pos) ? n.pos[1] : 0)
-      posById.set(n.id, { cx: x + NODE_W / 2, cy: y + NODE_H / 2 })
-      return {
-        id: n.id,
-        kind: n.kind,
-        x,
-        y,
-        w: NODE_W,
-        h: NODE_H,
-      }
-    })
-    const projectedEdges = (graph.edges ?? [])
-      .map((e, i) => {
-        const from = posById.get(e.from?.node)
-        const to = posById.get(e.to?.node)
-        if (!from || !to) return null
-        return { id: `e-${i}`, x1: from.cx, y1: from.cy, x2: to.cx, y2: to.cy }
-      })
-      .filter(Boolean)
-    return {
-      viewBox: `${vbX} ${vbY} ${vbW} ${vbH}`,
-      nodes: projectedNodes,
-      edges: projectedEdges,
-    }
-  }
-
-  const miniDeployed = $derived(projectGraphForMiniCanvas(deployedGraphSnapshot))
-  const miniCandidate = $derived(projectGraphForMiniCanvas(candidateGraphForReplay))
 
   const nodeTypes = { graphNode: StrategyNode }
 </script>
@@ -1465,156 +1394,13 @@
     </div>
   {/if}
 
-  {#if replayResult}
-    <div
-      class="modal-backdrop"
-      role="button"
-      tabindex="-1"
-      aria-label="Close replay"
-      onclick={closeReplay}
-      onkeydown={(e) => { if (e.key === 'Escape') closeReplay() }}
-    >
-      <div
-        class="modal replay-card"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Replay vs deployed"
-        tabindex="-1"
-        onclick={(e) => e.stopPropagation()}
-        onkeydown={(e) => e.stopPropagation()}
-      >
-        <h3>Replay vs deployed</h3>
-        <div class="replay-summary" class:bad={replayResult.divergence_count > 0}>
-          <div class="replay-summary-line">{replayResult.summary}</div>
-          {#if replayResult.candidate_issues?.length}
-            <div class="replay-issues">
-              {#each replayResult.candidate_issues as iss}
-                <code class="v-issue">{iss}</code>
-              {/each}
-            </div>
-          {/if}
-        </div>
-
-        {#if activeDivergence}
-          {@const divList = replayResult.divergences}
-          <div class="replay-scrubber">
-            <button
-              type="button"
-              class="btn ghost sm"
-              disabled={replayDivergenceIdx <= 0}
-              onclick={() => (replayDivergenceIdx = Math.max(0, replayDivergenceIdx - 1))}
-              aria-label="Previous divergent tick"
-            >‹</button>
-            <span class="replay-scrubber-meta">
-              <code>tick #{activeDivergence.tick_num}</code>
-              <span class="muted">
-                ({replayDivergenceIdx + 1}/{divList.length}) ·
-                {new Date(activeDivergence.tick_ms).toLocaleTimeString()}
-              </span>
-              {#if activeDivergence.diverging_kinds?.length}
-                <span class="replay-kinds">
-                  kinds:
-                  {#each activeDivergence.diverging_kinds as k}
-                    <code class="replay-kind-chip">{k}</code>
-                  {/each}
-                </span>
-              {/if}
-            </span>
-            <input
-              type="range"
-              min="0"
-              max={Math.max(0, divList.length - 1)}
-              bind:value={replayDivergenceIdx}
-              aria-label="Divergence cursor"
-            />
-            <button
-              type="button"
-              class="btn ghost sm"
-              disabled={replayDivergenceIdx >= divList.length - 1}
-              onclick={() => (replayDivergenceIdx = Math.min(divList.length - 1, replayDivergenceIdx + 1))}
-              aria-label="Next divergent tick"
-            >›</button>
-          </div>
-
-          <div class="replay-canvas-pair">
-            <div class="replay-mini-col">
-              <span class="col-label">
-                deployed{deployedGraphName ? ` · ${deployedGraphName}` : ''}
-              </span>
-              {#if miniDeployed}
-                <svg
-                  class="mini-canvas"
-                  viewBox={miniDeployed.viewBox}
-                  preserveAspectRatio="xMidYMid meet"
-                >
-                  {#each miniDeployed.edges as e (e.id)}
-                    <line class="mini-edge"
-                          x1={e.x1} y1={e.y1} x2={e.x2} y2={e.y2} />
-                  {/each}
-                  {#each miniDeployed.nodes as n (n.id)}
-                    {@const diverging = activeDivergingKinds.has(n.kind)}
-                    <g class="mini-node" class:diverging>
-                      <rect x={n.x} y={n.y} width={n.w} height={n.h} rx="4" />
-                      <text x={n.x + n.w / 2} y={n.y + n.h / 2 + 3}>
-                        {n.kind}
-                      </text>
-                    </g>
-                  {/each}
-                </svg>
-              {:else}
-                <div class="mini-empty muted">deployed graph unavailable</div>
-              {/if}
-            </div>
-            <div class="replay-mini-col">
-              <span class="col-label">candidate</span>
-              {#if miniCandidate}
-                <svg
-                  class="mini-canvas"
-                  viewBox={miniCandidate.viewBox}
-                  preserveAspectRatio="xMidYMid meet"
-                >
-                  {#each miniCandidate.edges as e (e.id)}
-                    <line class="mini-edge"
-                          x1={e.x1} y1={e.y1} x2={e.x2} y2={e.y2} />
-                  {/each}
-                  {#each miniCandidate.nodes as n (n.id)}
-                    {@const diverging = activeDivergingKinds.has(n.kind)}
-                    <g class="mini-node" class:diverging>
-                      <rect x={n.x} y={n.y} width={n.w} height={n.h} rx="4" />
-                      <text x={n.x + n.w / 2} y={n.y + n.h / 2 + 3}>
-                        {n.kind}
-                      </text>
-                    </g>
-                  {/each}
-                </svg>
-              {:else}
-                <div class="mini-empty muted">candidate graph unavailable</div>
-              {/if}
-            </div>
-          </div>
-
-          <details class="replay-sink-diff">
-            <summary>Sink JSON for tick #{activeDivergence.tick_num}</summary>
-            <div class="replay-diff-cols">
-              <div class="col-old">
-                <span class="col-label">deployed</span>
-                <pre class="mono">{JSON.stringify(activeDivergence.original_sinks, null, 1)}</pre>
-              </div>
-              <div class="col-new">
-                <span class="col-label">candidate</span>
-                <pre class="mono">{JSON.stringify(activeDivergence.replay_sinks, null, 1)}</pre>
-              </div>
-            </div>
-          </details>
-        {/if}
-
-        <div class="modal-actions">
-          <button type="button" class="btn ghost" onclick={closeReplay}>Close</button>
-        </div>
-      </div>
-    </div>
-  {/if}
-
+  <ReplayModal
+    result={replayResult}
+    deployedGraph={deployedGraphSnapshot}
+    {deployedGraphName}
+    candidateGraph={candidateGraphForReplay}
+    onClose={closeReplay}
+  />
   {#if saveDialogOpen}
     <div
       class="modal-backdrop"
@@ -2322,146 +2108,8 @@
   }
   .modal-actions { display: flex; justify-content: flex-end; gap: var(--s-2); }
 
-  /* M5-GOBS — replay result modal. Wider than the save dialog
-     because divergent ticks render as two-column pre blocks. */
-  .replay-card { min-width: 640px; max-width: 900px; max-height: 80vh; display: flex; flex-direction: column; }
-  .replay-summary {
-    padding: var(--s-3);
-    background: color-mix(in srgb, var(--ok) 8%, transparent);
-    border-radius: var(--r-sm);
-    font-size: var(--fs-sm);
-    color: var(--fg-primary);
-  }
-  .replay-summary.bad { background: color-mix(in srgb, var(--warn) 14%, transparent); color: var(--warn); }
-  .replay-summary-line { font-weight: 500; }
-  .replay-issues { margin-top: var(--s-2); display: flex; flex-wrap: wrap; gap: 4px; }
-  .replay-diff-head {
-    margin-top: var(--s-3);
-    font-size: 10px;
-    letter-spacing: var(--tracking-label);
-    text-transform: uppercase;
-    color: var(--fg-muted);
-  }
-  .replay-diff-list {
-    flex: 1; overflow-y: auto; min-height: 0;
-    display: flex; flex-direction: column; gap: var(--s-2);
-    margin-top: var(--s-2);
-  }
-  .replay-diff-row {
-    padding: var(--s-2);
-    background: var(--bg-raised);
-    border-radius: var(--r-sm);
-    border: 1px solid var(--border-subtle);
-  }
-  .replay-diff-meta { display: flex; gap: var(--s-2); font-size: var(--fs-xs); margin-bottom: 4px; }
-  .replay-diff-cols { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-2); }
-  .replay-diff-cols .col-label {
-    font-size: 10px; letter-spacing: var(--tracking-label);
-    text-transform: uppercase; color: var(--fg-muted);
-  }
-  .replay-diff-cols pre {
-    margin: 2px 0 0; padding: var(--s-2);
-    background: var(--bg-base); border-radius: var(--r-sm);
-    font-size: 10px; line-height: 1.3; overflow: auto; max-height: 160px;
-  }
-  .replay-diff-cols .col-old pre { border-left: 2px solid var(--fg-muted); }
-  .replay-diff-cols .col-new pre { border-left: 2px solid var(--accent); }
-
-  /* M5.2-GOBS — side-by-side mini-canvas + divergence scrubber.
-     Mini-canvases sit between the summary and the JSON detail
-     expander. The scrubber controls which divergent tick is
-     glowing — nodes whose kind appears in diverging_kinds for
-     the active tick get a coloured ring on both panes. */
-  .replay-scrubber {
-    margin-top: var(--s-3);
-    padding: var(--s-2);
-    display: grid;
-    grid-template-columns: auto 1fr auto auto;
-    gap: var(--s-2);
-    align-items: center;
-    background: var(--bg-raised);
-    border-radius: var(--r-sm);
-    border: 1px solid var(--border-subtle);
-    font-size: var(--fs-xs);
-  }
-  .replay-scrubber .sm { padding: 2px 8px; min-width: 24px; }
-  .replay-scrubber-meta { display: flex; flex-wrap: wrap; gap: var(--s-2); align-items: center; }
-  .replay-scrubber input[type="range"] { grid-column: 1 / -1; width: 100%; accent-color: var(--warn); }
-  .replay-kinds { display: inline-flex; gap: 4px; flex-wrap: wrap; }
-  .replay-kind-chip {
-    background: color-mix(in srgb, var(--warn) 18%, transparent);
-    color: var(--warn);
-    padding: 1px 6px;
-    border-radius: var(--r-pill);
-    font-size: 10px;
-    font-family: var(--font-mono);
-  }
-
-  .replay-canvas-pair {
-    margin-top: var(--s-3);
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: var(--s-2);
-  }
-  .replay-mini-col { display: flex; flex-direction: column; gap: 4px; }
-  .replay-mini-col .col-label {
-    font-size: 10px; letter-spacing: var(--tracking-label);
-    text-transform: uppercase; color: var(--fg-muted);
-  }
-  .mini-canvas {
-    width: 100%;
-    height: 220px;
-    background: var(--bg-base);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--r-sm);
-  }
-  .mini-empty {
-    height: 220px;
-    display: flex; align-items: center; justify-content: center;
-    background: var(--bg-base);
-    border: 1px dashed var(--border-subtle);
-    border-radius: var(--r-sm);
-    font-size: var(--fs-xs);
-  }
-  .mini-edge { stroke: var(--fg-muted); stroke-width: 1.2; opacity: 0.5; }
-  .mini-node rect {
-    fill: var(--bg-raised);
-    stroke: var(--border-subtle);
-    stroke-width: 1;
-  }
-  .mini-node text {
-    fill: var(--fg-secondary);
-    font-family: var(--font-mono);
-    font-size: 10px;
-    text-anchor: middle;
-    pointer-events: none;
-  }
-  .mini-node.diverging rect {
-    stroke: var(--warn);
-    stroke-width: 2;
-    fill: color-mix(in srgb, var(--warn) 15%, var(--bg-raised));
-    filter: drop-shadow(0 0 6px color-mix(in srgb, var(--warn) 70%, transparent));
-  }
-  .mini-node.diverging text {
-    fill: var(--warn);
-    font-weight: 700;
-  }
-
-  .replay-sink-diff {
-    margin-top: var(--s-3);
-    padding: var(--s-2);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--r-sm);
-    background: var(--bg-raised);
-  }
-  .replay-sink-diff summary {
-    cursor: pointer;
-    font-size: 10px;
-    letter-spacing: var(--tracking-label);
-    text-transform: uppercase;
-    color: var(--fg-muted);
-  }
-  .replay-sink-diff[open] summary { margin-bottom: var(--s-2); }
+  /* Replay modal CSS moved to ReplayModal.svelte as part of the
+     Wave 6 modal-decomposition refactor. */
 
   /* M-SAVE GOBS — save-diff preview inside the save modal.
      Sits between the input fields and the action buttons. */
