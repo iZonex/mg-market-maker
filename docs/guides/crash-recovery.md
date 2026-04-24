@@ -31,10 +31,12 @@ The audit log references this directory for regulators.
 
 ## 2. Inspect local state
 
-- `data/checkpoint.json` — last persisted engine state. The HMAC
-  in the envelope must verify against `MM_CHECKPOINT_SECRET`. A
-  mismatch means the file was tampered with or signed under a
-  different secret (rotate keys? check host compromise).
+- `data/checkpoint-*.json` — last persisted engine state per label.
+  The HMAC in the envelope verifies against `MM_CHECKPOINT_SECRET`
+  if set, else falls back to `MM_AUTH_SECRET` (same semantics, just
+  a convenience for small deployments). A mismatch means the file
+  was tampered with or signed under a different secret (rotate
+  keys? check host compromise).
 - `data/audit.jsonl` — last events before the crash. Look for
   `KillSwitchEscalated`, `CircuitBreakerTripped`, `PairBreak`
   within the 60 s leading up to the stop.

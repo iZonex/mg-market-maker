@@ -19,15 +19,14 @@ reconciliation loop writes audit rows + fires incidents on drift
    mock-deployment — any venue whose REST + WS is real but the
    balance is sandbox.
 
-   Export as:
+   **Do not export as env vars** — venue credentials live in the
+   encrypted vault. Add an entry via Admin → Vault with
+   `kind=exchange`, `values={api_key, api_secret}`, and metadata
+   `{exchange: "binance", product: "linear_perp"}`. Controller will
+   push them to the agent on register.
 
-   ```bash
-   export MM_API_KEY="..."
-   export MM_API_SECRET="..."
-   ```
-
-2. **Config**. Point `MM_CONFIG` at a single-symbol config using
-   the testnet base URL. Minimal:
+2. **Config**. Start a single-symbol config pointing at the testnet
+   REST/WS URLs. Minimal:
 
    ```toml
    [market_maker]

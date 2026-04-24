@@ -81,11 +81,11 @@ panel. Pass = all green.
 |---|-------|---------------|
 | 1 | Both engines quoting | Overview → per-symbol cards show non-zero `bid/ask` |
 | 2 | Cross-venue portfolio aggregates | Overview → Cross-Venue Portfolio panel shows one asset row per base, both legs populated, `net_delta` updates over ticks |
-| 3 | DecisionLedger resolves | `GET /api/v1/decisions/recent?limit=10` returns rows whose `decision_id` is bound to order ids and whose `outcome` flips from `Pending` → `Filled/Cancelled` |
-| 4 | Tiered OTR publishes | `GET /api/v1/otr/tiered` returns per-symbol rows; each symbol has `tob` and `top20` buckets with monotone-increasing counts |
+| 3 | DecisionLedger resolves | Fetch per-deployment via `POST /api/v1/agents/{a}/deployments/{d}/details` with body `{"topic":"decisions_recent"}` — rows should flip `outcome` from `Pending` → `Filled/Cancelled`. (The old global `/api/v1/decisions/recent` endpoint was removed.) |
+| 4 | Tiered OTR publishes | Prometheus `mm_otr_tiered` gauge with labels `symbol, tier, window` — every symbol row present |
 | 5 | FillProbability source emits | Deploy a graph with `Book.FillProbability(side=buy)` wired into `Out.SpreadMult`. Check dashboard → Strategy → Node outputs: the source shows a number in [0, 1], not `Missing` (after ~30 sec of synthetic trade flow) |
-| 6 | Queue tracker attaches | `cargo run --release --bin mm-server -- --dump-queue-tracker` *(optional stretch — not wired yet, manually inspect via log)*: search stdout for `QueueTracker` initialisation lines, one per fresh maker order |
-| 7 | Venues health | `GET /api/v1/venues/health` returns both venues with `status=healthy` |
+| 6 | Queue tracker attaches | Search the server's `RUST_LOG=debug` stdout for `QueueTracker` initialisation lines, one per fresh maker order |
+| 7 | Venues health | `GET /api/v1/venues/status` returns both venues with non-stale last-message timestamps |
 | 8 | Audit chain writes | `tail -n 20 data/audit.jsonl` — every row's `prev_hash` matches the previous row's SHA-256 |
 
 Stop-the-bus signals:

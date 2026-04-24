@@ -44,8 +44,11 @@ Then trigger an error path — fastest is to POST a deliberately
 malformed graph:
 
 ```bash
+# Use an admin JWT — obtain one by logging in through the dashboard
+# or via POST /login; there is no dedicated env-var token.
+ADMIN_JWT="$(cat admin.jwt)"
 curl -X POST http://127.0.0.1:8080/api/admin/strategy/graph \
-     -H "Authorization: Bearer $MM_ADMIN_TOKEN" \
+     -H "Authorization: Bearer $ADMIN_JWT" \
      -H "Content-Type: application/json" \
      -d '{"not":"a graph"}'
 ```

@@ -23,26 +23,44 @@ This starts in paper mode by default with localhost exchange.
    # Edit config/production.toml with your exchange URLs
    ```
 
-2. **Set secrets:**
+2. **Set process secrets (not venue credentials):**
    ```bash
    cat > .env << 'EOF'
-   MM_API_KEY=your-exchange-api-key
-   MM_API_SECRET=your-exchange-api-secret
+   # Dashboard JWT signing + HMAC-level secrets
+   MM_AUTH_SECRET=<32+ random bytes>
+   MM_MASTER_KEY=<64 hex chars = 32 bytes, for vault encryption>
    MM_MODE=live
+   # Optional — Telegram alerts + 2-way control
    MM_TELEGRAM_TOKEN=your-telegram-bot-token
    MM_TELEGRAM_CHAT=your-telegram-chat-id
+   # Optional — TLS
+   MM_TLS_CERT=/path/to/cert.pem
+   MM_TLS_KEY=/path/to/key.pem
    EOF
    ```
+
+   **Venue credentials are NOT set via env vars.** They go into the
+   encrypted vault — either via Vault UI (`/vault` on the dashboard) or
+   by POST to `/api/admin/vault/{name}` on the controller. Each entry
+   carries `kind=exchange`, `values={api_key, api_secret}` (encrypted
+   on disk), and metadata tagging the venue + product. The controller
+   pushes them to each agent via signed `PushedCredential` messages on
+   register + rotate.
 
 3. **Start:**
    ```bash
    docker compose up -d
    ```
 
-4. **Monitor:**
+4. **Seed vault + operators** (first-run only):
+   - Open `http://localhost:9090/` → First-install wizard creates the
+     admin user and generates `MM_AUTH_SECRET` / `MM_MASTER_KEY` if
+     missing.
+   - Add venue entries via Admin → Vault.
+
+5. **Monitor:**
    - Dashboard: http://localhost:9090/api/status
-   - Prometheus: http://localhost:9091
-   - Grafana: http://localhost:3000 (admin/admin)
+   - Prometheus: http://localhost:9090/metrics (scrape via federated Prom)
    - Audit trail: `docker compose exec market-maker cat data/audit/btcusdt.jsonl`
 
 ### Endpoints
@@ -68,22 +86,43 @@ cargo build --release
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `MM_CONFIG` | No | Config file path (default: `config/default.toml`) |
-| `MM_API_KEY` | For live | Exchange API key |
-| `MM_API_SECRET` | For live | Exchange API secret |
-| `MM_MODE` | No | `live` or `paper` (default: `live`) |
-| `MM_TELEGRAM_TOKEN` | No | Telegram bot token |
-| `MM_TELEGRAM_CHAT` | No | Telegram chat ID |
+| `MM_AUTH_SECRET` | Yes | JWT HMAC signing (32+ bytes). Server refuses to boot without it |
+| `MM_MASTER_KEY` / `MM_MASTER_KEY_FILE` | Recommended | 32-byte AES-256-GCM key for the vault. If absent, generated on first boot and persisted to disk |
+| `MM_CHECKPOINT_SECRET` | Recommended | Signs engine checkpoints (falls back to `MM_AUTH_SECRET` when unset) |
+| `MM_MODE` | No | `live` or `paper` (default from config) |
+| `MM_HTTP_ADDR` | No | Dashboard bind address (default `0.0.0.0:9090`) |
+| `MM_AGENT_WS_ADDR` | No | Control-plane WS bind address |
+| `MM_TLS_CERT` / `MM_TLS_KEY` | Prod | TLS cert + key paths (enable HTTPS + wss) |
+| `MM_VAULT` | No | Vault JSON path (default `vault.json`) |
+| `MM_USERS` | No | Users JSON path (default `users.json`) |
+| `MM_APPROVALS` | No | Approval store path (default `approvals.json`) |
+| `MM_TUNABLES` | No | Runtime tunables JSON path |
+| `MM_AUDIT_PATH` | No | Audit log directory path |
+| `MM_AUDIT_ARCHIVE_CMD` | No | External command to archive rotated audit files |
+| `MM_TELEGRAM_TOKEN` | No | Telegram bot token (for alerts + 2-way commands) |
+| `MM_TELEGRAM_CHAT` | No | Authorized Telegram chat id for commands |
+| `MM_REQUIRE_TOTP_FOR_ADMIN` | No | Set `1` to force 2FA on admin login |
+| `MM_REQUIRE_TOTP_ADMIN_BYPASS` | No | Escape hatch for first-boot bootstrap admin |
+| `MM_TOTP_ISSUER` | No | Issuer label shown by authenticator apps |
+| `MM_ALLOW_RESTRICTED` | No | `yes-pentest-mode` unlocks pentest strategies |
+| `MM_FRONTEND_DIR` | No | Override bundled frontend `dist/` path |
+| `MM_DASHBOARD_CORS_ORIGINS` | No | Comma-separated CORS origin allowlist |
 | `RUST_LOG` | No | Log level (default: `info`) |
+
+**Venue API keys live in the vault, not in env vars.** See the vault flow in §"Set process secrets" above.
 
 ## Security Checklist
 
-- [ ] API keys have **no withdrawal permission**
-- [ ] IP whitelisting enabled on exchange
-- [ ] Dashboard port restricted (firewall/VPN)
-- [ ] `.env` file has `chmod 600`
-- [ ] Audit trail directory is backed up
-- [ ] Telegram bot token is kept secret
+- [ ] Venue API keys have **no withdrawal permission**
+- [ ] Venue keys are in the vault (admin UI) — **not** in any env var or config file
+- [ ] IP whitelisting enabled on the exchange side
+- [ ] Dashboard port restricted (firewall / VPN) OR TLS + strong auth
+- [ ] `MM_AUTH_SECRET` is 32+ random bytes, stored with `chmod 600`
+- [ ] `MM_MASTER_KEY` is 32 random bytes (64 hex), stored with `chmod 600`
+- [ ] Audit trail directory is backed up (encrypted)
+- [ ] Admin accounts have 2FA enrolled (`MM_REQUIRE_TOTP_FOR_ADMIN=1`)
+- [ ] TLS cert + key provisioned for prod (`MM_TLS_CERT` / `MM_TLS_KEY`)
+- [ ] Telegram bot token is restricted (one authorized chat)
 - [ ] Running as non-root user (Docker does this)
 
 ## Fast protocol paths
