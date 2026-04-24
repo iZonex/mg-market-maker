@@ -1,15 +1,13 @@
 # Alerts & Webhooks
 
-How to route operational events (kill-switch escalation, SLA breach, deployment incident, calibration ready, manipulation score spike) to Telegram, webhooks, and email.
+How to route operational events (kill-switch escalation, SLA breach, manipulation score spike) to Telegram and webhook subscribers.
 
-Three delivery channels, two triggering layers:
+Two triggering layers, two real-time delivery channels (Telegram + webhooks), plus an SMTP path used primarily for compliance report delivery:
 
 | Layer | Source | Purpose |
 |-------|--------|---------|
 | **Alert rules** | `AlertRule` in DashboardState | Threshold-based alerts — PnL drop, spread widen, inventory breach, uptime drop, fill-rate drop |
-| **Control-plane events** | Engine audit + risk events | Narrative events — kill-switch level change, incident opened, graph deployed, vault rotated |
-
-Each event fans out to zero or more subscribers based on severity + per-channel filters.
+| **Audit + risk events** | Engine-side audit trail (`AuditEventType`) | Narrative events — kill-switch, surveillance, graph-deploy, SLA violation, etc. |
 
 ---
 

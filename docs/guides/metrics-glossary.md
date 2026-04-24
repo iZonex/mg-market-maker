@@ -2,7 +2,7 @@
 
 Every `mm_*` Prometheus metric exported by the engine, with semantics, typical range, and alertable threshold suggestions. Scrape endpoint: `http://<dashboard>:9091/metrics` (Prometheus-federation-friendly).
 
-All metrics carry a `symbol` label unless noted. Multi-dimensional metrics add extra labels per row.
+Most metrics carry a `symbol` label; some (portfolio, archive, scheduler, sentiment, borrow, SOR-routing) are labelled by `asset`, `stream`, `cadence`, `venue`, or other dimensions instead — explicit per-row below. Check `crates/dashboard/src/metrics.rs` as the authoritative source if your PromQL needs an exact label set.
 
 ---
 
@@ -42,7 +42,7 @@ All metrics carry a `symbol` label unless noted. Multi-dimensional metrics add e
 | `mm_adverse_selection_bps` | gauge | Post-fill mid drift against our fill side (bps) | > 5 bps = adverse selection pressure |
 | `mm_market_resilience` | gauge | Recovery score after a shock, [0, 1] | < 0.3 for 3s → kill switch L1 |
 | `mm_order_to_trade_ratio` | gauge | MiCA OTR — orders / trades ratio (rolling) | < 500 typical; MiCA Art. 17 threshold varies |
-| `mm_otr_tiered` | gauge | Tiered OTR per `tier` label (top20 / total) | MiCA compliance detail |
+| `mm_otr_tiered` | gauge | Tiered OTR, labels `symbol, tier, window` | MiCA compliance detail |
 | `mm_hma_value` | gauge | Hull Moving Average of mid | Trend indicator, symbol-specific |
 | `mm_momentum_ofi_ewma` | gauge | EWMA of Cont-Kukanov-Stoikov OFI | Sign = directional pressure |
 | `mm_momentum_learned_mp_drift` | gauge | Stoikov 2018 learned-microprice drift (frac of mid) | \|·\| > 5e-5 = strong signal |
@@ -56,11 +56,11 @@ All metrics carry a `symbol` label unless noted. Multi-dimensional metrics add e
 
 | Metric | Type | Meaning |
 |--------|------|---------|
-| `mm_sor_dispatch_success_total` | counter | Successful multi-leg dispatches, labels `target_qty_source` |
-| `mm_sor_dispatch_errors_total` | counter | Failed dispatches, labels `reason` |
+| `mm_sor_dispatch_success_total` | counter | Successful multi-leg dispatches |
+| `mm_sor_dispatch_errors_total` | counter | Failed dispatches, labels `symbol, venue` |
 | `mm_sor_dispatch_filled_qty` | gauge | Last dispatch's total dispatched qty |
-| `mm_sor_route_cost_bps` | gauge | Per-leg expected cost in bps, labels `symbol, venue` |
-| `mm_sor_fill_attribution` | gauge | Per-venue fill share, labels `symbol, venue` |
+| `mm_sor_route_cost_bps` | gauge | Per-venue effective cost in bps, label `venue` |
+| `mm_sor_fill_attribution` | gauge | Per-venue recommended fill quantity, label `venue` |
 
 ---
 
@@ -81,7 +81,7 @@ All metrics carry a `symbol` label unless noted. Multi-dimensional metrics add e
 |--------|------|---------|
 | `mm_maker_fee_bps` | gauge | Active maker fee tier in bps |
 | `mm_taker_fee_bps` | gauge | Active taker fee tier in bps |
-| `mm_borrow_rate_bps_hourly` | gauge | Per-hour borrow rate (spot margin) |
+| `mm_borrow_rate_bps_hourly` | gauge | Per-hour borrow rate (spot margin), label `asset` |
 | `mm_borrow_carry_bps` | gauge | Accumulated borrow carry cost (bps) |
 | `mm_fill_slippage_avg_bps` | gauge | Average slippage of filled orders vs NBBO at placement |
 
@@ -91,7 +91,7 @@ All metrics carry a `symbol` label unless noted. Multi-dimensional metrics add e
 
 | Metric | Type | Meaning |
 |--------|------|---------|
-| `mm_cross_venue_basis_bps` | gauge | Basis between two venue mids (signed bps), labels `base_asset, venue_a, venue_b` | > max_divergence → basis config guard |
+| `mm_cross_venue_basis_bps` | gauge | `perp_mid − spot_mid` in bps of spot mid | > max_divergence → basis config guard |
 
 ---
 
@@ -102,10 +102,10 @@ All metrics carry a `symbol` label unless noted. Multi-dimensional metrics add e
 | `mm_portfolio_total_equity` | gauge | Aggregated equity across all symbols, quote asset |
 | `mm_portfolio_realised_pnl` | gauge | Realised PnL, portfolio-wide |
 | `mm_portfolio_unrealised_pnl` | gauge | Unrealised PnL (MTM), portfolio-wide |
-| `mm_portfolio_asset_qty` | gauge | Per-asset quantity, label `asset` |
+| `mm_portfolio_asset_qty` | gauge | Per-asset position quantity (signed), labelled by symbol |
 | `mm_portfolio_asset_unrealised_reporting` | gauge | Per-asset unrealised MTM for client reports |
-| `mm_portfolio_factor_delta` | gauge | Factor-model delta, label `factor` |
-| `mm_portfolio_strategy_pnl` | gauge | Per-strategy PnL, label `strategy_class` |
+| `mm_portfolio_factor_delta` | gauge | Signed factor-model exposure, label `asset` |
+| `mm_portfolio_strategy_pnl` | gauge | Per-strategy PnL, label `strategy` |
 
 ---
 
@@ -113,8 +113,8 @@ All metrics carry a `symbol` label unless noted. Multi-dimensional metrics add e
 
 | Metric | Type | Meaning |
 |--------|------|---------|
-| `mm_strategy_graph_deploys_total` | counter | Deploy attempts, label `outcome=accepted|rejected` |
-| `mm_strategy_graph_nodes` | gauge | Node count of currently deployed graph, label `name` |
+| `mm_strategy_graph_deploys_total` | counter | Deploy attempts, label `outcome` (accepted / rejected) |
+| `mm_strategy_graph_nodes` | gauge | Node count of currently deployed graph, label `graph` |
 
 ---
 
@@ -133,7 +133,7 @@ All metrics carry a `symbol` label unless noted. Multi-dimensional metrics add e
 | Metric | Type | Meaning |
 |--------|------|---------|
 | `mm_funding_arb_active` | gauge | 1 when funding-arb has an open pair, else 0 |
-| `mm_funding_arb_transitions_total` | counter | State transitions, label `outcome=entered|exited|hold|pair_break|...` |
+| `mm_funding_arb_transitions_total` | counter | State transitions, labels `symbol, outcome` (entered / exited / hold / pair_break / ...) |
 
 ---
 
@@ -151,9 +151,9 @@ All metrics carry a `symbol` label unless noted. Multi-dimensional metrics add e
 
 | Metric | Type | Meaning |
 |--------|------|---------|
-| `mm_sentiment_ticks_total` | counter | Sentiment ticks ingested, label `source` |
-| `mm_sentiment_articles_total` | counter | Articles processed, label `source` |
-| `mm_sentiment_mentions_rate` | gauge | Current mentions/min rate, label `symbol` |
+| `mm_sentiment_ticks_total` | counter | Sentiment ticks ingested, label `asset` |
+| `mm_sentiment_articles_total` | counter | Articles processed, label `scorer` |
+| `mm_sentiment_mentions_rate` | gauge | Current mentions/min rate, label `asset` |
 | `mm_social_spread_mult` | gauge | Spread multiplier driven by sentiment engine |
 | `mm_social_size_mult` | gauge | Size multiplier driven by sentiment engine |
 | `mm_social_kill_triggers_total` | counter | Times sentiment escalated kill switch |
@@ -164,8 +164,8 @@ All metrics carry a `symbol` label unless noted. Multi-dimensional metrics add e
 
 | Metric | Type | Meaning |
 |--------|------|---------|
-| `mm_surveillance_score` | gauge | Per-pattern score, label `pattern` (spoof / layer / wash / etc.), [0, 1] |
-| `mm_surveillance_alerts_total` | counter | Surveillance-score breaches that fired alert |
+| `mm_surveillance_score` | gauge | Per-pattern score [0, 1], labels `pattern, symbol` |
+| `mm_surveillance_alerts_total` | counter | Surveillance-score breaches that fired alert, labels `pattern, symbol` |
 | `mm_manipulation_combined` | gauge | Aggregate manipulation score |
 | `mm_manipulation_pump_dump` | gauge | Pump-and-dump orchestrator-style score |
 | `mm_manipulation_thin_book` | gauge | Thin-book / layering composite |
@@ -178,7 +178,7 @@ All metrics carry a `symbol` label unless noted. Multi-dimensional metrics add e
 | Metric | Type | Meaning |
 |--------|------|---------|
 | `mm_decision_realized_cost_bps` | gauge | Rolling realised cost per decision (bps) |
-| `mm_decision_vs_expected_bps` | gauge | Realised − Expected spread (bps), label `decision_kind` |
+| `mm_decision_vs_expected_bps` | gauge | Realised − Expected spread (bps), labels `symbol, side` |
 
 ---
 
@@ -186,7 +186,7 @@ All metrics carry a `symbol` label unless noted. Multi-dimensional metrics add e
 
 | Metric | Type | Meaning |
 |--------|------|---------|
-| `mm_book_update_latency_ms` | gauge | WS book-update latency p50 (internal processing) |
+| `mm_book_update_latency_ms` | gauge | WS book-update processing latency, labels `symbol, venue, kind` |
 
 ---
 
@@ -194,13 +194,13 @@ All metrics carry a `symbol` label unless noted. Multi-dimensional metrics add e
 
 | Metric | Type | Meaning |
 |--------|------|---------|
-| `mm_archive_uploads_total` | counter | Audit archive uploads attempted |
-| `mm_archive_upload_errors_total` | counter | Failed archive uploads |
-| `mm_archive_upload_bytes_total` | counter | Bytes uploaded to archive |
-| `mm_archive_last_success_ts` | gauge | Unix ts of last successful archive upload |
-| `mm_scheduler_runs_total` | counter | Scheduled job runs, label `job` |
-| `mm_scheduler_failures_total` | counter | Scheduled job failures, label `job` |
-| `mm_scheduler_last_success_ts` | gauge | Last successful scheduled run, label `job` |
+| `mm_archive_uploads_total` | counter | Audit archive uploads attempted, label `stream` |
+| `mm_archive_upload_errors_total` | counter | Failed archive uploads, label `stream` |
+| `mm_archive_upload_bytes_total` | counter | Bytes uploaded to archive, label `stream` |
+| `mm_archive_last_success_ts` | gauge | Unix ts of last successful archive upload, label `stream` |
+| `mm_scheduler_runs_total` | counter | Scheduled job runs, label `cadence` |
+| `mm_scheduler_failures_total` | counter | Scheduled job failures, label `cadence` |
+| `mm_scheduler_last_success_ts` | gauge | Last successful scheduled run, label `cadence` |
 
 ---
 
