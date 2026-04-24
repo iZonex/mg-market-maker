@@ -58,10 +58,8 @@ struct EwmaState {
     prev: Option<Decimal>,
 }
 
-static EWMA_INPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("x", PortType::Number)]);
-static EWMA_OUTPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("out", PortType::Number)]);
+static EWMA_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("x", PortType::Number)]);
+static EWMA_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("out", PortType::Number)]);
 
 impl NodeKind for Ewma {
     fn kind(&self) -> &'static str {
@@ -80,7 +78,11 @@ impl NodeKind for Ewma {
             label: "α (smoothing)",
             hint: Some("0 < α ≤ 1. Higher = more responsive, less smoothing"),
             default: serde_json::json!("0.1"),
-            widget: ConfigWidget::Number { min: Some(0.0001), max: Some(1.0), step: Some(0.01) },
+            widget: ConfigWidget::Number {
+                min: Some(0.0001),
+                max: Some(1.0),
+                step: Some(0.01),
+            },
         }]
     }
     fn evaluate(
@@ -93,10 +95,7 @@ impl NodeKind for Ewma {
         let Some(x) = inputs.first().and_then(Value::as_number) else {
             // Missing input — pass through the cached previous value
             // so downstream consumers still see a number.
-            return Ok(vec![st
-                .prev
-                .map(Value::Number)
-                .unwrap_or(Value::Missing)]);
+            return Ok(vec![st.prev.map(Value::Number).unwrap_or(Value::Missing)]);
         };
         let out = match st.prev {
             None => x,
@@ -116,11 +115,7 @@ mod tests {
         let node = Ewma::from_config(&Json::Null).unwrap();
         let mut st = NodeState::default();
         let out = node
-            .evaluate(
-                &EvalCtx::default(),
-                &[Value::Number(dec!(10))],
-                &mut st,
-            )
+            .evaluate(&EvalCtx::default(), &[Value::Number(dec!(10))], &mut st)
             .unwrap();
         assert_eq!(out, vec![Value::Number(dec!(10))]);
     }
@@ -130,26 +125,14 @@ mod tests {
         let node = Ewma::from_config(&serde_json::json!({ "alpha": "0.5" })).unwrap();
         let mut st = NodeState::default();
         // seed = 0, then 10 → 0.5*10 + 0.5*0 = 5, then 10 → 7.5
-        node.evaluate(
-            &EvalCtx::default(),
-            &[Value::Number(dec!(0))],
-            &mut st,
-        )
-        .unwrap();
+        node.evaluate(&EvalCtx::default(), &[Value::Number(dec!(0))], &mut st)
+            .unwrap();
         let s1 = node
-            .evaluate(
-                &EvalCtx::default(),
-                &[Value::Number(dec!(10))],
-                &mut st,
-            )
+            .evaluate(&EvalCtx::default(), &[Value::Number(dec!(10))], &mut st)
             .unwrap();
         assert_eq!(s1, vec![Value::Number(dec!(5))]);
         let s2 = node
-            .evaluate(
-                &EvalCtx::default(),
-                &[Value::Number(dec!(10))],
-                &mut st,
-            )
+            .evaluate(&EvalCtx::default(), &[Value::Number(dec!(10))], &mut st)
             .unwrap();
         assert_eq!(s2, vec![Value::Number(dec!(7.5))]);
     }
@@ -166,11 +149,7 @@ mod tests {
         let node = Ewma::from_config(&Json::Null).unwrap();
         let mut st = NodeState::default();
         let first = node
-            .evaluate(
-                &EvalCtx::default(),
-                &[Value::Number(dec!(42))],
-                &mut st,
-            )
+            .evaluate(&EvalCtx::default(), &[Value::Number(dec!(42))], &mut st)
             .unwrap();
         assert_eq!(first, vec![Value::Number(dec!(42))]);
         let miss = node

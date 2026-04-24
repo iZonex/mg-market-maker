@@ -114,10 +114,8 @@ pub fn extract_tickers(text: &str, whitelist: &[String]) -> Vec<String> {
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '/' && c != '&')
         .filter(|t| !t.is_empty())
         .collect();
-    let whitelist_set: std::collections::HashSet<String> = whitelist
-        .iter()
-        .map(|w| normalize_ticker(w))
-        .collect();
+    let whitelist_set: std::collections::HashSet<String> =
+        whitelist.iter().map(|w| normalize_ticker(w)).collect();
 
     let mut out: Vec<String> = Vec::new();
     for tok in &tokens {
@@ -184,7 +182,12 @@ mod tests {
 
     #[test]
     fn dedup_preserves_order() {
-        let input = ["bitcoin".into(), "BTC".into(), "eth".into(), "BITCOIN".into()];
+        let input = [
+            "bitcoin".into(),
+            "BTC".into(),
+            "eth".into(),
+            "BITCOIN".into(),
+        ];
         let out = normalize_asset_list(&input);
         assert_eq!(out, vec!["BTC", "ETH"]);
     }

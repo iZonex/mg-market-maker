@@ -183,12 +183,10 @@ impl Orchestrator {
                     tracing::warn!(error = %e, "article writer append failed");
                 }
             }
-            let ts = article
-                .published_at
-                .unwrap_or(analysis.analyzed_at);
+            let ts = article.published_at.unwrap_or(analysis.analyzed_at);
             // Bot filter — suppress retweet / syndication
             // cascades by normalised text hash. Articles
-                // that don't pass still flow through the
+            // that don't pass still flow through the
             // counter for their *first* occurrence
             // (burst_cap = 1 by default) so a real signal
             // isn't lost, subsequent repeats just get

@@ -68,10 +68,7 @@ pub struct SuspectWalletTracker {
 }
 
 impl SuspectWalletTracker {
-    pub fn new(
-        provider: Arc<dyn OnchainProvider>,
-        config: SuspectWalletConfig,
-    ) -> Self {
+    pub fn new(provider: Arc<dyn OnchainProvider>, config: SuspectWalletConfig) -> Self {
         Self {
             provider,
             config,
@@ -83,11 +80,7 @@ impl SuspectWalletTracker {
     /// `suspects_per_symbol[symbol]`, fetches recent transfers
     /// via the provider, filters on destination ∈ CEX
     /// allowlist, sums the notional, stores the result.
-    pub async fn refresh(
-        &self,
-        symbol: &str,
-        chain: &str,
-    ) -> OnchainResult<InflowSnapshot> {
+    pub async fn refresh(&self, symbol: &str, chain: &str) -> OnchainResult<InflowSnapshot> {
         let wallets = self
             .config
             .suspects_per_symbol
@@ -98,11 +91,7 @@ impl SuspectWalletTracker {
         let mut total = Decimal::ZERO;
         let mut count = 0u32;
         for w in wallets {
-            let transfers = match self
-                .provider
-                .get_address_transfers(chain, &w, since)
-                .await
-            {
+            let transfers = match self.provider.get_address_transfers(chain, &w, since).await {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!(
@@ -157,20 +146,26 @@ mod tests {
     }
     #[async_trait]
     impl OnchainProvider for StubProvider {
-        fn name(&self) -> &str { "stub" }
+        fn name(&self) -> &str {
+            "stub"
+        }
         async fn get_top_holders(
-            &self, _c: &str, _t: &str, _l: u32,
+            &self,
+            _c: &str,
+            _t: &str,
+            _l: u32,
         ) -> OnchainResult<Vec<HolderEntry>> {
             Ok(Vec::new())
         }
         async fn get_address_transfers(
-            &self, _c: &str, _w: &str, _s: DateTime<Utc>,
+            &self,
+            _c: &str,
+            _w: &str,
+            _s: DateTime<Utc>,
         ) -> OnchainResult<Vec<TransferEntry>> {
             Ok(self.transfers.clone())
         }
-        async fn get_token_metadata(
-            &self, _c: &str, _t: &str,
-        ) -> OnchainResult<TokenMetadata> {
+        async fn get_token_metadata(&self, _c: &str, _t: &str) -> OnchainResult<TokenMetadata> {
             Err(OnchainError::UnsupportedChain("stub".into()))
         }
     }
@@ -183,27 +178,39 @@ mod tests {
         let transfers = vec![
             // Suspect → CEX: counted.
             TransferEntry {
-                from: suspect.into(), to: cex.clone(),
-                token: "0xrave".into(), value: dec!(1000),
-                tx_hash: "0xh1".into(), timestamp: Utc::now(),
+                from: suspect.into(),
+                to: cex.clone(),
+                token: "0xrave".into(),
+                value: dec!(1000),
+                tx_hash: "0xh1".into(),
+                timestamp: Utc::now(),
             },
             // Suspect → random: skipped.
             TransferEntry {
-                from: suspect.into(), to: "0xrandom".into(),
-                token: "0xrave".into(), value: dec!(5000),
-                tx_hash: "0xh2".into(), timestamp: Utc::now(),
+                from: suspect.into(),
+                to: "0xrandom".into(),
+                token: "0xrave".into(),
+                value: dec!(5000),
+                tx_hash: "0xh2".into(),
+                timestamp: Utc::now(),
             },
             // Bystander → CEX: different `from`, not counted.
             TransferEntry {
-                from: bystander.into(), to: cex.clone(),
-                token: "0xrave".into(), value: dec!(9000),
-                tx_hash: "0xh3".into(), timestamp: Utc::now(),
+                from: bystander.into(),
+                to: cex.clone(),
+                token: "0xrave".into(),
+                value: dec!(9000),
+                tx_hash: "0xh3".into(),
+                timestamp: Utc::now(),
             },
             // Suspect → CEX again: counted.
             TransferEntry {
-                from: suspect.into(), to: cex.clone(),
-                token: "0xrave".into(), value: dec!(2000),
-                tx_hash: "0xh4".into(), timestamp: Utc::now(),
+                from: suspect.into(),
+                to: cex.clone(),
+                token: "0xrave".into(),
+                value: dec!(2000),
+                tx_hash: "0xh4".into(),
+                timestamp: Utc::now(),
             },
         ];
         let p = Arc::new(StubProvider { transfers });

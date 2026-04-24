@@ -417,12 +417,7 @@ mod tests {
         // Exchange shows we bought 1.5 total, sold 0.5. We should
         // be long 1.0, but WS dropped a 0.2 buy so tracker thinks
         // long 0.8.
-        let r = reconcile_position_delta(
-            dec!(1.5),
-            dec!(0.5),
-            dec!(0.8),
-            dec!(0.0001),
-        );
+        let r = reconcile_position_delta(dec!(1.5), dec!(0.5), dec!(0.8), dec!(0.0001));
         assert_eq!(r.expected_inventory, dec!(1.0));
         assert_eq!(r.delta, dec!(-0.2));
         assert!(r.drifted);
@@ -444,12 +439,7 @@ mod tests {
     /// Drift equal to tolerance is NOT flagged (strict >).
     #[test]
     fn position_delta_equal_to_tolerance_is_clean() {
-        let r = reconcile_position_delta(
-            dec!(1),
-            dec!(0),
-            dec!(1.001),
-            dec!(0.001),
-        );
+        let r = reconcile_position_delta(dec!(1), dec!(0), dec!(1.001), dec!(0.001));
         assert!(!r.drifted);
     }
 }

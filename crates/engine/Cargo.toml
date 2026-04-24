@@ -31,3 +31,6 @@ mm-exchange-binance = { workspace = true }
 mm-exchange-bybit = { workspace = true }
 mm-exchange-hyperliquid = { workspace = true }
 proptest = "1"
+
+[lints]
+workspace = true

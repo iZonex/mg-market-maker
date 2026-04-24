@@ -722,7 +722,9 @@ mod tests {
             sor_inventory_threshold: rust_decimal::Decimal::ZERO,
             sor_trade_rate_window_secs: 60,
             sor_queue_refresh_secs: 2,
-            sor_extra_l1_poll_secs: 5, venue_regime_classify_secs: 2, };
+            sor_extra_l1_poll_secs: 5,
+            venue_regime_classify_secs: 2,
+        };
         let product = ProductSpec {
             symbol: "BTCUSDT".into(),
             base_asset: "BTC".into(),
@@ -832,7 +834,9 @@ mod tests {
             sor_inventory_threshold: rust_decimal::Decimal::ZERO,
             sor_trade_rate_window_secs: 60,
             sor_queue_refresh_secs: 2,
-            sor_extra_l1_poll_secs: 5, venue_regime_classify_secs: 2, }
+            sor_extra_l1_poll_secs: 5,
+            venue_regime_classify_secs: 2,
+        }
     }
 
     fn queue_test_product() -> ProductSpec {

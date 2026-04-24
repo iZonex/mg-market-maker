@@ -120,8 +120,7 @@ impl LiquidationHeatmap {
     }
 
     fn evict(&mut self) {
-        let cutoff = Utc::now()
-            - chrono::Duration::seconds(self.config.window_secs);
+        let cutoff = Utc::now() - chrono::Duration::seconds(self.config.window_secs);
         self.events.retain(|e| e.timestamp >= cutoff);
     }
 
@@ -146,7 +145,9 @@ impl LiquidationHeatmap {
                 continue;
             }
             let ratio = diff / self.last_mid * dec!(10_000);
-            let Some(bps_f) = ratio.to_f64() else { continue };
+            let Some(bps_f) = ratio.to_f64() else {
+                continue;
+            };
             let bps = bps_f as i32;
             if bps.abs() > max_bps {
                 continue;
@@ -255,12 +256,7 @@ mod tests {
 
         // Looking above mid with a threshold that excludes the
         // small +20 cluster → None.
-        let none = h.nearest_cluster_above_threshold(
-            Side::Buy,
-            dec!(10_000),
-            10,
-            200,
-        );
+        let none = h.nearest_cluster_above_threshold(Side::Buy, dec!(10_000), 10, 200);
         assert!(none.is_none());
     }
 

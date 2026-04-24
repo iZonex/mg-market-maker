@@ -20,9 +20,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mm_agent::{default_registry_builder, run_with_reconnect, CredentialCatalog, ReconnectConfig};
-use mm_controller::{http_router, spawn_accept_loop, AgentRegistry, FleetState, LeasePolicy};
 use mm_common::settings::SettingsFile;
 use mm_control::messages::AgentId;
+use mm_controller::{http_router, spawn_accept_loop, AgentRegistry, FleetState, LeasePolicy};
 use tokio::sync::watch;
 
 #[tokio::test]
@@ -36,7 +36,12 @@ async fn reconnect_loop_establishes_first_session() {
     let fleet = FleetState::new();
     let registry = AgentRegistry::new();
     let policy = Arc::new(LeasePolicy::default());
-    let accept_task = spawn_accept_loop(ws_addr, fleet.clone(), registry.clone(), Arc::clone(&policy));
+    let accept_task = spawn_accept_loop(
+        ws_addr,
+        fleet.clone(),
+        registry.clone(),
+        Arc::clone(&policy),
+    );
     let http_task = tokio::spawn(async move {
         axum::serve(http_listener, http_router(fleet.clone(), registry.clone()))
             .await
@@ -65,22 +70,19 @@ async fn reconnect_loop_establishes_first_session() {
     );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let agent_task = tokio::spawn(async move {
-        run_with_reconnect(cfg, shutdown_rx).await
-    });
+    let agent_task = tokio::spawn(async move { run_with_reconnect(cfg, shutdown_rx).await });
 
     // The agent should show up in the fleet view — that proves
     // the reconnect loop dialed the controller and the lease
     // handshake succeeded.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     loop {
-        let body: serde_json::Value =
-            reqwest::get(format!("http://{}/api/v1/fleet", http_addr))
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+        let body: serde_json::Value = reqwest::get(format!("http://{}/api/v1/fleet", http_addr))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         let n = body.as_array().map(|a| a.len()).unwrap_or(0);
         if n == 1 {
             break;
@@ -132,9 +134,7 @@ async fn reconnect_loop_exits_quickly_when_controller_absent_and_shutdown_fires(
     );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let agent_task = tokio::spawn(async move {
-        run_with_reconnect(cfg, shutdown_rx).await
-    });
+    let agent_task = tokio::spawn(async move { run_with_reconnect(cfg, shutdown_rx).await });
 
     // Let the loop spin through a few failed attempts.
     tokio::time::sleep(Duration::from_millis(500)).await;

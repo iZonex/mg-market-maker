@@ -26,9 +26,7 @@ use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 
 pub mod cross_venue;
-pub use cross_venue::{
-    infer_base_asset, AssetAggregate, CrossVenuePortfolio, VenueInventory,
-};
+pub use cross_venue::{infer_base_asset, AssetAggregate, CrossVenuePortfolio, VenueInventory};
 
 /// A single asset position with weighted-average cost basis.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -180,10 +178,7 @@ pub struct AttributionSnap {
 
 impl AttributionSnap {
     pub fn total(&self) -> Decimal {
-        self.spread_pnl
-            + self.inventory_pnl
-            + self.rebate_income
-            + self.funding_pnl_realised
+        self.spread_pnl + self.inventory_pnl + self.rebate_income + self.funding_pnl_realised
             - self.fees_paid
             - self.loan_cost_amortized
     }
@@ -208,8 +203,7 @@ impl Portfolio {
     /// send the absolute current state, not a delta, so repeat
     /// calls don't accumulate).
     pub fn record_attribution(&mut self, symbol: &str, snap: AttributionSnap) {
-        self.attribution_by_symbol
-            .insert(symbol.to_string(), snap);
+        self.attribution_by_symbol.insert(symbol.to_string(), snap);
     }
 
     /// S3.5 — per-symbol attribution read-back. Keys match

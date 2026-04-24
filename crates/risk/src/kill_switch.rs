@@ -229,9 +229,7 @@ impl KillSwitch {
                 crate::MarginGuardDecision::Reduce => {
                     "margin ratio high — engine reducing proactively (>= reduce_ratio)"
                 }
-                crate::MarginGuardDecision::StopNewOrders => {
-                    "margin ratio high (>= stop_ratio)"
-                }
+                crate::MarginGuardDecision::StopNewOrders => "margin ratio high (>= stop_ratio)",
                 crate::MarginGuardDecision::CancelAll => {
                     "margin ratio critical (>= cancel_ratio) — pre-liquidation"
                 }

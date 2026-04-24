@@ -281,12 +281,8 @@ impl FundingArbExecutor {
                 // 100 / 200 / 400 ms covers the common transient
                 // classes without turning a real outage into a
                 // second-long hang on the engine's select loop.
-                let compensated = place_with_retry(
-                    self.hedge.as_ref(),
-                    &compensation,
-                    &[100, 200, 400],
-                )
-                .await;
+                let compensated =
+                    place_with_retry(self.hedge.as_ref(), &compensation, &[100, 200, 400]).await;
 
                 Err(PairLegError::PairBreak {
                     reason: maker_err.to_string(),
@@ -404,10 +400,10 @@ mod tests {
                     max_order_rate: 100,
                     supports_funding_rate: product.has_funding(),
                     supports_margin_info: false,
-                supports_margin_mode: false,
-            supports_liquidation_feed: false,
-            supports_set_leverage: false,
-                            },
+                    supports_margin_mode: false,
+                    supports_liquidation_feed: false,
+                    supports_set_leverage: false,
+                },
                 behaviours: Mutex::new(vec![]),
                 placed: Mutex::new(vec![]),
             }

@@ -59,8 +59,8 @@ impl FileCursorStore {
     /// rollback would require deleting a possibly-partial file
     /// the operator needs for debugging.
     pub fn save(&self, cursor: &Cursor) -> Result<(), CursorStoreError> {
-        let body = serde_json::to_string(cursor)
-            .map_err(|e| CursorStoreError::Parse(e.to_string()))?;
+        let body =
+            serde_json::to_string(cursor).map_err(|e| CursorStoreError::Parse(e.to_string()))?;
         let tmp = self.path.with_extension("tmp");
         std::fs::write(&tmp, body)?;
         std::fs::rename(&tmp, &self.path)?;

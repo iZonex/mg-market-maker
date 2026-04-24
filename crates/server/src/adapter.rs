@@ -56,10 +56,7 @@ pub fn spawn_fleet_to_dashboard_adapter(
 fn project_fleet_into_dashboard(fleet: &FleetState, dashboard: &DashboardState) {
     for agent in fleet.snapshot() {
         for dep in &agent.deployments {
-            let inventory = dep
-                .inventory
-                .parse::<Decimal>()
-                .unwrap_or(Decimal::ZERO);
+            let inventory = dep.inventory.parse::<Decimal>().unwrap_or(Decimal::ZERO);
             let unrealized = dep
                 .unrealized_pnl_quote
                 .parse::<Decimal>()
@@ -283,7 +280,10 @@ fn parse_decimal(s: &str) -> Decimal {
 }
 
 fn variable_str(dep: &mm_control::DeploymentStateRow, key: &str) -> Option<String> {
-    dep.variables.get(key).and_then(|v| v.as_str()).map(str::to_string)
+    dep.variables
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 fn variable_decimal(dep: &mm_control::DeploymentStateRow, key: &str) -> Option<Decimal> {

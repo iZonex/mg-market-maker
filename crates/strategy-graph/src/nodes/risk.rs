@@ -230,7 +230,12 @@ impl NodeKind for InventoryUrgency {
             // successive multiplications when exponent is a
             // small positive integer, else use the linear
             // ratio (documented as fallback in the docstring).
-            let exp_int = self.exponent.trunc().to_string().parse::<u32>().unwrap_or(2);
+            let exp_int = self
+                .exponent
+                .trunc()
+                .to_string()
+                .parse::<u32>()
+                .unwrap_or(2);
             let mut out = Decimal::ONE;
             for _ in 0..exp_int {
                 out *= ratio;
@@ -290,8 +295,7 @@ impl CircuitBreaker {
 
 static CIRCUIT_INPUTS: Lazy<Vec<Port>> =
     Lazy::new(|| vec![Port::new("spread_bps", PortType::Number)]);
-static CIRCUIT_OUTPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("tripped", PortType::Bool)]);
+static CIRCUIT_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("tripped", PortType::Bool)]);
 
 impl NodeKind for CircuitBreaker {
     fn kind(&self) -> &'static str {
@@ -340,11 +344,7 @@ mod tests {
         let n = ToxicityWiden::from_config(&Json::Null).unwrap();
         let mut st = NodeState::default();
         let out = n
-            .evaluate(
-                &EvalCtx::default(),
-                &[Value::Number(dec!(0))],
-                &mut st,
-            )
+            .evaluate(&EvalCtx::default(), &[Value::Number(dec!(0))], &mut st)
             .unwrap();
         assert_eq!(out, vec![Value::Number(dec!(1))]);
     }
@@ -354,11 +354,7 @@ mod tests {
         let n = ToxicityWiden::from_config(&serde_json::json!({ "scale": "2" })).unwrap();
         let mut st = NodeState::default();
         let out = n
-            .evaluate(
-                &EvalCtx::default(),
-                &[Value::Number(dec!(1))],
-                &mut st,
-            )
+            .evaluate(&EvalCtx::default(), &[Value::Number(dec!(1))], &mut st)
             .unwrap();
         assert_eq!(out, vec![Value::Number(dec!(3))]);
     }
@@ -368,19 +364,11 @@ mod tests {
         let n = ToxicityWiden::from_config(&Json::Null).unwrap();
         let mut st = NodeState::default();
         let over = n
-            .evaluate(
-                &EvalCtx::default(),
-                &[Value::Number(dec!(5))],
-                &mut st,
-            )
+            .evaluate(&EvalCtx::default(), &[Value::Number(dec!(5))], &mut st)
             .unwrap();
         assert_eq!(over, vec![Value::Number(dec!(3))]);
         let under = n
-            .evaluate(
-                &EvalCtx::default(),
-                &[Value::Number(dec!(-0.5))],
-                &mut st,
-            )
+            .evaluate(&EvalCtx::default(), &[Value::Number(dec!(-0.5))], &mut st)
             .unwrap();
         assert_eq!(under, vec![Value::Number(dec!(1))]);
     }
@@ -389,7 +377,9 @@ mod tests {
     fn toxicity_widen_missing_vpin_returns_1() {
         let n = ToxicityWiden::from_config(&Json::Null).unwrap();
         let mut st = NodeState::default();
-        let out = n.evaluate(&EvalCtx::default(), &[Value::Missing], &mut st).unwrap();
+        let out = n
+            .evaluate(&EvalCtx::default(), &[Value::Missing], &mut st)
+            .unwrap();
         assert_eq!(out, vec![Value::Number(dec!(1))]);
     }
 
@@ -399,11 +389,7 @@ mod tests {
         let n = InventoryUrgency::from_config(&serde_json::json!({ "cap": "10" })).unwrap();
         let mut st = NodeState::default();
         let out = n
-            .evaluate(
-                &EvalCtx::default(),
-                &[Value::Number(dec!(5))],
-                &mut st,
-            )
+            .evaluate(&EvalCtx::default(), &[Value::Number(dec!(5))], &mut st)
             .unwrap();
         assert_eq!(out, vec![Value::Number(dec!(0.25))]);
     }
@@ -414,11 +400,7 @@ mod tests {
         let n = InventoryUrgency::from_config(&serde_json::json!({ "cap": "10" })).unwrap();
         let mut st = NodeState::default();
         let out = n
-            .evaluate(
-                &EvalCtx::default(),
-                &[Value::Number(dec!(-5))],
-                &mut st,
-            )
+            .evaluate(&EvalCtx::default(), &[Value::Number(dec!(-5))], &mut st)
             .unwrap();
         assert_eq!(out, vec![Value::Number(dec!(0.25))]);
     }
@@ -428,34 +410,21 @@ mod tests {
         let n = InventoryUrgency::from_config(&serde_json::json!({ "cap": "10" })).unwrap();
         let mut st = NodeState::default();
         let out = n
-            .evaluate(
-                &EvalCtx::default(),
-                &[Value::Number(dec!(30))],
-                &mut st,
-            )
+            .evaluate(&EvalCtx::default(), &[Value::Number(dec!(30))], &mut st)
             .unwrap();
         assert_eq!(out, vec![Value::Number(dec!(1))]);
     }
 
     #[test]
     fn circuit_breaker_trips_on_wide_spread() {
-        let n =
-            CircuitBreaker::from_config(&serde_json::json!({ "wide_bps": "100" })).unwrap();
+        let n = CircuitBreaker::from_config(&serde_json::json!({ "wide_bps": "100" })).unwrap();
         let mut st = NodeState::default();
         let over = n
-            .evaluate(
-                &EvalCtx::default(),
-                &[Value::Number(dec!(150))],
-                &mut st,
-            )
+            .evaluate(&EvalCtx::default(), &[Value::Number(dec!(150))], &mut st)
             .unwrap();
         assert_eq!(over, vec![Value::Bool(true)]);
         let ok = n
-            .evaluate(
-                &EvalCtx::default(),
-                &[Value::Number(dec!(50))],
-                &mut st,
-            )
+            .evaluate(&EvalCtx::default(), &[Value::Number(dec!(50))], &mut st)
             .unwrap();
         assert_eq!(ok, vec![Value::Bool(false)]);
     }

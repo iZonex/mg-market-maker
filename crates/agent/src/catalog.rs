@@ -230,7 +230,10 @@ mod tests {
         let cat = CredentialCatalog::from_settings(sample_settings());
         let mut bad = sample_pushed();
         bad.exchange = "nonesuch".into();
-        assert!(matches!(cat.insert(bad), Err(CredentialError::BadExchange(_))));
+        assert!(matches!(
+            cat.insert(bad),
+            Err(CredentialError::BadExchange(_))
+        ));
     }
 
     #[test]

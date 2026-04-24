@@ -120,10 +120,9 @@ pub fn connector_for(
     venue: VenueId,
     product: Option<mm_exchange_core::connector::VenueProduct>,
 ) -> Option<&Arc<dyn ExchangeConnector>> {
-    bundle.all_connectors().find(|c| {
-        c.venue_id() == venue
-            && product.map(|p| c.product() == p).unwrap_or(true)
-    })
+    bundle
+        .all_connectors()
+        .find(|c| c.venue_id() == venue && product.map(|p| c.product() == p).unwrap_or(true))
 }
 
 /// Core dispatch helper. Walks the decision's legs, picks the

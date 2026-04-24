@@ -160,7 +160,12 @@ impl OrderLifecycleTracker {
     pub fn feed(&mut self, ev: &SurveillanceEvent) {
         match ev {
             SurveillanceEvent::OrderPlaced {
-                order_id, symbol, side, price, qty, ts,
+                order_id,
+                symbol,
+                side,
+                price,
+                qty,
+                ts,
             } => {
                 self.open.insert(
                     order_id.clone(),
@@ -173,17 +178,27 @@ impl OrderLifecycleTracker {
                     },
                 );
             }
-            SurveillanceEvent::OrderCancelled { order_id, symbol, ts } => {
+            SurveillanceEvent::OrderCancelled {
+                order_id,
+                symbol,
+                ts,
+            } => {
                 if let Some(rec) = self.open.remove(order_id) {
                     let lifetime_ms = (*ts - rec.placed_at).num_milliseconds();
-                    self.cancels
-                        .entry(symbol.clone())
-                        .or_default()
-                        .push_back((*ts, lifetime_ms, rec.side));
+                    self.cancels.entry(symbol.clone()).or_default().push_back((
+                        *ts,
+                        lifetime_ms,
+                        rec.side,
+                    ));
                 }
             }
             SurveillanceEvent::OrderFilled {
-                symbol, side, filled_qty, price, ts, ..
+                symbol,
+                side,
+                filled_qty,
+                price,
+                ts,
+                ..
             } => {
                 // Partial fills still hold the order open — only a
                 // full fill removes it. Detectors don't need that
@@ -209,7 +224,12 @@ impl OrderLifecycleTracker {
                 // Cap at the rolling window — same WINDOW_SECS cap
                 // as the other queues. Evicted below in `evict`.
             }
-            SurveillanceEvent::OrderAmended { order_id, new_price, ts, .. } => {
+            SurveillanceEvent::OrderAmended {
+                order_id,
+                new_price,
+                ts,
+                ..
+            } => {
                 if let Some(rec) = self.open.get_mut(order_id) {
                     rec.price = *new_price;
                     rec.placed_at = *ts;
@@ -348,11 +368,7 @@ impl SpoofingDetector {
     /// symbol. Score is a simple mean of three clamped-to-[0,1]
     /// sub-signals — a reviewer can trace exactly why the detector
     /// flagged this minute.
-    pub fn score(
-        &self,
-        symbol: &str,
-        tracker: &OrderLifecycleTracker,
-    ) -> DetectorOutput {
+    pub fn score(&self, symbol: &str, tracker: &OrderLifecycleTracker) -> DetectorOutput {
         let stats = tracker.snapshot(symbol);
 
         // (1) cancel-to-fill ratio signal.
@@ -448,11 +464,7 @@ impl LayeringDetector {
         Self::default()
     }
 
-    pub fn score(
-        &self,
-        symbol: &str,
-        tracker: &OrderLifecycleTracker,
-    ) -> DetectorOutput {
+    pub fn score(&self, symbol: &str, tracker: &OrderLifecycleTracker) -> DetectorOutput {
         // Collect open orders per side; find the biggest cluster on
         // either side (consecutive orders within price_cluster_frac
         // of the median).
@@ -481,34 +493,28 @@ impl LayeringDetector {
                 let mut j = i;
                 while j < prices.len() {
                     let delta = (prices[j] - anchor).abs();
-                    if anchor == Decimal::ZERO
-                        || delta / anchor <= self.config.price_cluster_frac
-                    {
+                    if anchor == Decimal::ZERO || delta / anchor <= self.config.price_cluster_frac {
                         j += 1;
                     } else {
                         break;
                     }
                 }
-                biggest_cluster_per_side =
-                    biggest_cluster_per_side.max(j - i);
+                biggest_cluster_per_side = biggest_cluster_per_side.max(j - i);
                 i = j.max(i + 1);
             }
         }
         let cluster_sig = if self.config.n_orders_hot == 0 {
             Decimal::ZERO
         } else {
-            (Decimal::from(biggest_cluster_per_side)
-                / Decimal::from(self.config.n_orders_hot))
-            .min(Decimal::ONE)
+            (Decimal::from(biggest_cluster_per_side) / Decimal::from(self.config.n_orders_hot))
+                .min(Decimal::ONE)
         };
 
         // Synchronous-cancel signal: cancels within the window on the
         // same side → one big co-ordinated pull.
         let mut sync_sig = Decimal::ZERO;
         if let Some(cancels) = tracker.cancels.get(symbol) {
-            let window = chrono::Duration::milliseconds(
-                self.config.synchronous_cancel_window_ms,
-            );
+            let window = chrono::Duration::milliseconds(self.config.synchronous_cancel_window_ms);
             let mut buckets: Vec<(DateTime<Utc>, Side, usize)> = Vec::new();
             for (ts, _lifetime, side) in cancels.iter() {
                 if let Some(last) = buckets.last_mut() {
@@ -521,9 +527,8 @@ impl LayeringDetector {
             }
             let biggest = buckets.iter().map(|(_, _, n)| *n).max().unwrap_or(0);
             if self.config.n_orders_hot > 0 {
-                sync_sig = (Decimal::from(biggest)
-                    / Decimal::from(self.config.n_orders_hot))
-                .min(Decimal::ONE);
+                sync_sig = (Decimal::from(biggest) / Decimal::from(self.config.n_orders_hot))
+                    .min(Decimal::ONE);
             }
         }
 
@@ -578,11 +583,7 @@ impl QuoteStuffingDetector {
         Self::default()
     }
 
-    pub fn score(
-        &self,
-        symbol: &str,
-        tracker: &OrderLifecycleTracker,
-    ) -> DetectorOutput {
+    pub fn score(&self, symbol: &str, tracker: &OrderLifecycleTracker) -> DetectorOutput {
         let stats = tracker.snapshot(symbol);
         let total = stats.cancel_count + stats.fill_count;
         // Orders/sec across the 60s rolling window, coarse but
@@ -592,12 +593,10 @@ impl QuoteStuffingDetector {
             Decimal::ZERO
         } else {
             let hot = self.config.orders_per_sec_hot as f64;
-            Decimal::from_f64_retain((orders_per_sec / hot).min(1.0))
-                .unwrap_or(Decimal::ZERO)
+            Decimal::from_f64_retain((orders_per_sec / hot).min(1.0)).unwrap_or(Decimal::ZERO)
         };
         let cancel_sig = if self.config.cancel_ratio_hot > Decimal::ZERO {
-            (stats.cancel_to_fill_ratio / self.config.cancel_ratio_hot)
-                .min(Decimal::ONE)
+            (stats.cancel_to_fill_ratio / self.config.cancel_ratio_hot).min(Decimal::ONE)
         } else {
             Decimal::ZERO
         };
@@ -611,8 +610,7 @@ impl QuoteStuffingDetector {
             if fill_rate >= self.config.fill_rate_cold {
                 Decimal::ZERO
             } else {
-                Decimal::ONE
-                    - (fill_rate / self.config.fill_rate_cold).min(Decimal::ONE)
+                Decimal::ONE - (fill_rate / self.config.fill_rate_cold).min(Decimal::ONE)
             }
         } else {
             Decimal::ZERO
@@ -697,8 +695,7 @@ impl WashDetector {
         let sig = if self.config.pair_count_hot == 0 {
             Decimal::ZERO
         } else {
-            (Decimal::from(pairs) / Decimal::from(self.config.pair_count_hot))
-                .min(Decimal::ONE)
+            (Decimal::from(pairs) / Decimal::from(self.config.pair_count_hot)).min(Decimal::ONE)
         };
         DetectorOutput {
             score: sig,
@@ -763,11 +760,7 @@ impl CrossMarketDetector {
         Self::default()
     }
 
-    pub fn score(
-        &self,
-        illiquid_ratio: Decimal,
-        liquid_move_bps: Decimal,
-    ) -> DetectorOutput {
+    pub fn score(&self, illiquid_ratio: Decimal, liquid_move_bps: Decimal) -> DetectorOutput {
         let ratio_sig = if self.config.illiquid_ratio_hot > Decimal::ZERO {
             (illiquid_ratio / self.config.illiquid_ratio_hot).min(Decimal::ONE)
         } else {
@@ -781,8 +774,7 @@ impl CrossMarketDetector {
             Decimal::ZERO
         };
         DetectorOutput {
-            score: ((ratio_sig + move_sig) / dec!(2))
-                .clamp(Decimal::ZERO, Decimal::ONE),
+            score: ((ratio_sig + move_sig) / dec!(2)).clamp(Decimal::ZERO, Decimal::ONE),
             cancel_to_fill_ratio: Decimal::ZERO,
             median_order_lifetime_ms: None,
             size_vs_avg_trade: None,
@@ -836,10 +828,12 @@ impl LatencyExploitDetector {
         let sig = if self.config.hot_count == 0 {
             Decimal::ZERO
         } else {
-            (Decimal::from(hits) / Decimal::from(self.config.hot_count))
-                .min(Decimal::ONE)
+            (Decimal::from(hits) / Decimal::from(self.config.hot_count)).min(Decimal::ONE)
         };
-        DetectorOutput { score: sig, ..Default::default() }
+        DetectorOutput {
+            score: sig,
+            ..Default::default()
+        }
     }
 }
 
@@ -886,7 +880,10 @@ impl RebateAbuseDetector {
         } else {
             Decimal::ZERO
         };
-        DetectorOutput { score: sig, ..Default::default() }
+        DetectorOutput {
+            score: sig,
+            ..Default::default()
+        }
     }
 }
 
@@ -949,8 +946,15 @@ impl ImbalanceManipulationDetector {
                 }
             }
         }
-        let sig = if flips == 0 { Decimal::ZERO } else { Decimal::ONE };
-        DetectorOutput { score: sig, ..Default::default() }
+        let sig = if flips == 0 {
+            Decimal::ZERO
+        } else {
+            Decimal::ONE
+        };
+        DetectorOutput {
+            score: sig,
+            ..Default::default()
+        }
     }
 }
 
@@ -1002,10 +1006,12 @@ impl CancelOnReactionDetector {
         let sig = if self.config.hot_count == 0 {
             Decimal::ZERO
         } else {
-            (Decimal::from(hits) / Decimal::from(self.config.hot_count))
-                .min(Decimal::ONE)
+            (Decimal::from(hits) / Decimal::from(self.config.hot_count)).min(Decimal::ONE)
         };
-        DetectorOutput { score: sig, ..Default::default() }
+        DetectorOutput {
+            score: sig,
+            ..Default::default()
+        }
     }
 }
 
@@ -1025,7 +1031,9 @@ pub struct OneSidedQuotingConfig {
 
 impl Default for OneSidedQuotingConfig {
     fn default() -> Self {
-        Self { one_sided_ratio_hot: dec!(0.9) }
+        Self {
+            one_sided_ratio_hot: dec!(0.9),
+        }
     }
 }
 
@@ -1049,7 +1057,10 @@ impl OneSidedQuotingDetector {
         } else {
             Decimal::ZERO
         };
-        DetectorOutput { score: sig, ..Default::default() }
+        DetectorOutput {
+            score: sig,
+            ..Default::default()
+        }
     }
 }
 
@@ -1070,7 +1081,9 @@ pub struct InventoryPushingConfig {
 
 impl Default for InventoryPushingConfig {
     fn default() -> Self {
-        Self { correlation_hot: dec!(0.6) }
+        Self {
+            correlation_hot: dec!(0.6),
+        }
     }
 }
 
@@ -1093,7 +1106,10 @@ impl InventoryPushingDetector {
         } else {
             Decimal::ZERO
         };
-        DetectorOutput { score: sig, ..Default::default() }
+        DetectorOutput {
+            score: sig,
+            ..Default::default()
+        }
     }
 }
 
@@ -1136,11 +1152,7 @@ impl StrategicNonFillingDetector {
         Self::default()
     }
 
-    pub fn score(
-        &self,
-        near_touch_placements: usize,
-        near_touch_fills: usize,
-    ) -> DetectorOutput {
+    pub fn score(&self, near_touch_placements: usize, near_touch_fills: usize) -> DetectorOutput {
         if near_touch_placements < self.config.min_placements {
             return DetectorOutput::default();
         }
@@ -1149,13 +1161,15 @@ impl StrategicNonFillingDetector {
             if fill_rate >= self.config.fill_rate_cold {
                 Decimal::ZERO
             } else {
-                Decimal::ONE
-                    - (fill_rate / self.config.fill_rate_cold).min(Decimal::ONE)
+                Decimal::ONE - (fill_rate / self.config.fill_rate_cold).min(Decimal::ONE)
             }
         } else {
             Decimal::ZERO
         };
-        DetectorOutput { score: sig, ..Default::default() }
+        DetectorOutput {
+            score: sig,
+            ..Default::default()
+        }
     }
 }
 
@@ -1296,18 +1310,19 @@ impl FakeLiquidityDetector {
     pub fn score(&self, then: &L2Snapshot, now: &L2Snapshot) -> DetectorOutput {
         let mid_now = match (now.bids.first(), now.asks.first()) {
             (Some(b), Some(a)) => (b.price + a.price) / dec!(2),
-            _ => return DetectorOutput {
-                score: Decimal::ZERO,
-                cancel_to_fill_ratio: Decimal::ZERO,
-                median_order_lifetime_ms: None,
-                size_vs_avg_trade: None,
-            },
+            _ => {
+                return DetectorOutput {
+                    score: Decimal::ZERO,
+                    cancel_to_fill_ratio: Decimal::ZERO,
+                    median_order_lifetime_ms: None,
+                    size_vs_avg_trade: None,
+                }
+            }
         };
         let bp = dec!(10_000);
         let max_frac = self.config.max_distance_bps / bp;
         let in_band = |p: Decimal| -> bool {
-            mid_now > Decimal::ZERO
-                && (p - mid_now).abs() / mid_now <= max_frac
+            mid_now > Decimal::ZERO && (p - mid_now).abs() / mid_now <= max_frac
         };
 
         let mut pulled = 0usize;
@@ -1325,9 +1340,7 @@ impl FakeLiquidityDetector {
                     .unwrap_or(Decimal::ZERO);
                 if l_then.qty > Decimal::ZERO {
                     let shrinkage = (l_then.qty - now_qty) / l_then.qty;
-                    if shrinkage >= Decimal::ZERO
-                        && shrinkage >= self.config.vanish_threshold
-                    {
+                    if shrinkage >= Decimal::ZERO && shrinkage >= self.config.vanish_threshold {
                         out += 1;
                     }
                 }
@@ -1340,9 +1353,7 @@ impl FakeLiquidityDetector {
         let sig = if self.config.pulled_levels_hot == 0 {
             Decimal::ZERO
         } else {
-            (Decimal::from(pulled)
-                / Decimal::from(self.config.pulled_levels_hot))
-            .min(Decimal::ONE)
+            (Decimal::from(pulled) / Decimal::from(self.config.pulled_levels_hot)).min(Decimal::ONE)
         };
         DetectorOutput {
             score: sig,
@@ -1415,13 +1426,9 @@ impl MomentumIgnitionDetector {
             };
         }
         // Window the trades to the config burst_window_ms.
-        let now = trades
-            .last()
-            .map(|t| t.ts)
-            .unwrap_or_else(Utc::now);
+        let now = trades.last().map(|t| t.ts).unwrap_or_else(Utc::now);
         let cutoff = now - chrono::Duration::milliseconds(self.config.burst_window_ms);
-        let windowed: Vec<&PublicTradeSample> =
-            trades.iter().filter(|t| t.ts >= cutoff).collect();
+        let windowed: Vec<&PublicTradeSample> = trades.iter().filter(|t| t.ts >= cutoff).collect();
         if windowed.is_empty() {
             return DetectorOutput {
                 score: Decimal::ZERO,
@@ -1435,9 +1442,8 @@ impl MomentumIgnitionDetector {
         let rate_sig = if self.config.trade_count_hot == 0 {
             Decimal::ZERO
         } else {
-            (Decimal::from(windowed.len())
-                / Decimal::from(self.config.trade_count_hot))
-            .min(Decimal::ONE)
+            (Decimal::from(windowed.len()) / Decimal::from(self.config.trade_count_hot))
+                .min(Decimal::ONE)
         };
 
         // (2) aggressor dominance.
@@ -1479,8 +1485,7 @@ impl MomentumIgnitionDetector {
         {
             Decimal::ONE
         } else if self.config.min_move_bps > Decimal::ZERO {
-            (move_bps / (self.config.min_move_bps * dec!(3)))
-                .min(Decimal::ONE)
+            (move_bps / (self.config.min_move_bps * dec!(3))).min(Decimal::ONE)
         } else {
             Decimal::ZERO
         };

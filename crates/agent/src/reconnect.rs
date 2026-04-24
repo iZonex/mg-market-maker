@@ -38,8 +38,8 @@ use mm_control::messages::AgentId;
 use mm_control::ws_transport::WsTransport;
 
 use crate::{
-    AgentConfig, AgentError, AuthorityHandle, CredentialCatalog, LeaseClient,
-    RealEngineFactory, StrategyRegistry,
+    AgentConfig, AgentError, AuthorityHandle, CredentialCatalog, LeaseClient, RealEngineFactory,
+    StrategyRegistry,
 };
 
 /// Build-registry callback — lets the reconnect loop rebuild a
@@ -98,10 +98,7 @@ impl ReconnectConfig {
         self
     }
 
-    pub fn with_dashboard(
-        mut self,
-        dashboard: mm_dashboard::state::DashboardState,
-    ) -> Self {
+    pub fn with_dashboard(mut self, dashboard: mm_dashboard::state::DashboardState) -> Self {
         self.dashboard = Some(dashboard);
         self
     }
@@ -111,7 +108,10 @@ impl ReconnectConfig {
 /// Returns when authority is lost (controller revoke, or fail-ladder
 /// completed and the agent caller decides to give up) or when
 /// the caller's shutdown signal fires.
-pub async fn run_with_reconnect(cfg: ReconnectConfig, shutdown: watch::Receiver<bool>) -> Result<()> {
+pub async fn run_with_reconnect(
+    cfg: ReconnectConfig,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
     let mut backoff = cfg.initial_backoff;
     let mut consecutive_failures = 0u32;
 
@@ -127,10 +127,7 @@ pub async fn run_with_reconnect(cfg: ReconnectConfig, shutdown: watch::Receiver<
                 return Ok(());
             }
             SessionOutcome::CleanClose => {
-                tracing::info!(
-                    consecutive_failures,
-                    "control-plane session ended cleanly"
-                );
+                tracing::info!(consecutive_failures, "control-plane session ended cleanly");
                 // Clean end (controller closed) — reset backoff and
                 // try again immediately. A clean close at this
                 // level is almost always controller restart.
@@ -227,10 +224,12 @@ async fn connect_and_run(
 fn jittered(base: Duration) -> Duration {
     use std::hash::{BuildHasher, Hasher, RandomState};
     let mut h = RandomState::new().build_hasher();
-    h.write_u64(std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0));
+    h.write_u64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0),
+    );
     let rand_u64 = h.finish();
     // Map to [-0.25, +0.25).
     let frac = ((rand_u64 as f64) / (u64::MAX as f64)) * 0.5 - 0.25;
@@ -254,8 +253,7 @@ pub fn default_registry_builder(
             .with_authority(authority)
             .with_trading_enabled(true)
             .with_dashboard(dashboard.clone());
-        StrategyRegistry::new(Arc::new(factory))
-            .with_dashboard(dashboard.clone())
+        StrategyRegistry::new(Arc::new(factory)).with_dashboard(dashboard.clone())
     })
 }
 
@@ -269,7 +267,10 @@ mod tests {
             let j = jittered(Duration::from_secs(4));
             let ms = j.as_millis();
             // 4s × [0.75, 1.25] = [3000, 5000], clamp at 100.
-            assert!((2_900..=5_100).contains(&(ms as i64)), "jitter out of band: {ms}ms");
+            assert!(
+                (2_900..=5_100).contains(&(ms as i64)),
+                "jitter out of band: {ms}ms"
+            );
         }
     }
 

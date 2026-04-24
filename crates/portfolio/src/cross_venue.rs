@@ -158,8 +158,7 @@ impl CrossVenuePortfolio {
             .map(|(base, mut legs)| {
                 legs.sort_by(|a, b| a.venue.cmp(&b.venue).then(a.symbol.cmp(&b.symbol)));
                 let net_delta = legs.iter().map(|l| l.inventory).sum();
-                let net_notional_quote =
-                    legs.iter().filter_map(|l| l.notional_quote).sum();
+                let net_notional_quote = legs.iter().filter_map(|l| l.notional_quote).sum();
                 AssetAggregate {
                     base,
                     net_delta,

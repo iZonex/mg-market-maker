@@ -20,8 +20,7 @@ use rust_decimal::Decimal;
 use std::time::Duration;
 
 use crate::{
-    HolderEntry, OnchainError, OnchainProvider, OnchainResult, TokenMetadata,
-    TransferEntry,
+    HolderEntry, OnchainError, OnchainProvider, OnchainResult, TokenMetadata, TransferEntry,
 };
 
 #[derive(Debug, Clone)]
@@ -185,8 +184,16 @@ impl OnchainProvider for AlchemyProvider {
             if ts < since_ts {
                 break;
             }
-            let from = t.get("from").and_then(|a| a.as_str()).unwrap_or_default().to_string();
-            let to = t.get("to").and_then(|a| a.as_str()).unwrap_or_default().to_string();
+            let from = t
+                .get("from")
+                .and_then(|a| a.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let to = t
+                .get("to")
+                .and_then(|a| a.as_str())
+                .unwrap_or_default()
+                .to_string();
             let token = t
                 .get("rawContract")
                 .and_then(|rc| rc.get("address"))
@@ -204,28 +211,32 @@ impl OnchainProvider for AlchemyProvider {
                 .and_then(|h| h.as_str())
                 .unwrap_or_default()
                 .to_string();
-            out.push(TransferEntry { from, to, token, value, tx_hash, timestamp: ts });
+            out.push(TransferEntry {
+                from,
+                to,
+                token,
+                value,
+                tx_hash,
+                timestamp: ts,
+            });
         }
         Ok(out)
     }
 
-    async fn get_token_metadata(
-        &self,
-        chain: &str,
-        token: &str,
-    ) -> OnchainResult<TokenMetadata> {
+    async fn get_token_metadata(&self, chain: &str, token: &str) -> OnchainResult<TokenMetadata> {
         let meta = self
-            .rpc(chain, "alchemy_getTokenMetadata", serde_json::json!([token]))
+            .rpc(
+                chain,
+                "alchemy_getTokenMetadata",
+                serde_json::json!([token]),
+            )
             .await?;
         let symbol = meta
             .get("symbol")
             .and_then(|s| s.as_str())
             .unwrap_or_default()
             .to_string();
-        let decimals = meta
-            .get("decimals")
-            .and_then(|d| d.as_u64())
-            .unwrap_or(18) as u8;
+        let decimals = meta.get("decimals").and_then(|d| d.as_u64()).unwrap_or(18) as u8;
         // Alchemy metadata doesn't include total_supply on the
         // free tier. Fall back to a single eth_call if needed
         // or leave zero so consumers that need supply pick a

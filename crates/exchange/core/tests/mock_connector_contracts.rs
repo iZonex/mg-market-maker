@@ -10,12 +10,10 @@
 //! the override path a unit-tested Binance / Bybit follows.
 
 use async_trait::async_trait;
-use mm_common::types::{
-    Balance, LiveOrder, OrderId, PriceLevel, ProductSpec,
-};
+use mm_common::types::{Balance, LiveOrder, OrderId, PriceLevel, ProductSpec};
 use mm_exchange_core::connector::{
-    AmendOrder, ExchangeConnector, LongShortRatio, MarginError, NewOrder,
-    OpenInterestInfo, VenueCapabilities, VenueId, VenueProduct,
+    AmendOrder, ExchangeConnector, LongShortRatio, MarginError, NewOrder, OpenInterestInfo,
+    VenueCapabilities, VenueId, VenueProduct,
 };
 use mm_exchange_core::events::MarketEvent;
 use rust_decimal_macros::dec;
@@ -106,17 +104,10 @@ impl ExchangeConnector for MockConnector {
     async fn place_order(&self, _order: &NewOrder) -> anyhow::Result<OrderId> {
         Ok(uuid::Uuid::new_v4())
     }
-    async fn place_orders_batch(
-        &self,
-        orders: &[NewOrder],
-    ) -> anyhow::Result<Vec<OrderId>> {
+    async fn place_orders_batch(&self, orders: &[NewOrder]) -> anyhow::Result<Vec<OrderId>> {
         Ok(orders.iter().map(|_| uuid::Uuid::new_v4()).collect())
     }
-    async fn cancel_order(
-        &self,
-        _symbol: &str,
-        _order_id: OrderId,
-    ) -> anyhow::Result<()> {
+    async fn cancel_order(&self, _symbol: &str, _order_id: OrderId) -> anyhow::Result<()> {
         Ok(())
     }
     async fn cancel_orders_batch(
@@ -132,19 +123,13 @@ impl ExchangeConnector for MockConnector {
     async fn amend_order(&self, _amend: &AmendOrder) -> anyhow::Result<()> {
         Ok(())
     }
-    async fn get_open_orders(
-        &self,
-        _symbol: &str,
-    ) -> anyhow::Result<Vec<LiveOrder>> {
+    async fn get_open_orders(&self, _symbol: &str) -> anyhow::Result<Vec<LiveOrder>> {
         Ok(vec![])
     }
     async fn get_balances(&self) -> anyhow::Result<Vec<Balance>> {
         Ok(vec![])
     }
-    async fn get_product_spec(
-        &self,
-        symbol: &str,
-    ) -> anyhow::Result<ProductSpec> {
+    async fn get_product_spec(&self, symbol: &str) -> anyhow::Result<ProductSpec> {
         Ok(ProductSpec {
             symbol: symbol.to_string(),
             base_asset: "BASE".into(),
@@ -163,25 +148,15 @@ impl ExchangeConnector for MockConnector {
 
     // ── Overridden REST polls — the whole point of this mock ──
 
-    async fn get_open_interest(
-        &self,
-        _symbol: &str,
-    ) -> anyhow::Result<Option<OpenInterestInfo>> {
+    async fn get_open_interest(&self, _symbol: &str) -> anyhow::Result<Option<OpenInterestInfo>> {
         Ok(self.oi_override.lock().unwrap().clone())
     }
 
-    async fn get_long_short_ratio(
-        &self,
-        _symbol: &str,
-    ) -> anyhow::Result<Option<LongShortRatio>> {
+    async fn get_long_short_ratio(&self, _symbol: &str) -> anyhow::Result<Option<LongShortRatio>> {
         Ok(self.ls_override.lock().unwrap().clone())
     }
 
-    async fn set_leverage(
-        &self,
-        symbol: &str,
-        leverage: u32,
-    ) -> Result<(), MarginError> {
+    async fn set_leverage(&self, symbol: &str, leverage: u32) -> Result<(), MarginError> {
         self.leverage_calls
             .lock()
             .unwrap()

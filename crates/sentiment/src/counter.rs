@@ -125,12 +125,11 @@ impl MentionCounter {
         // weight mean is fine at low event counts; EWMA
         // becomes interesting at higher volumes but the
         // simple mean is robust and traceable for audit).
-        let (count_5min, sum_5min) =
-            state
-                .events
-                .iter()
-                .filter(|(ts, _)| *ts >= five_min_ago)
-                .fold((0u64, dec!(0)), |(c, s), (_, v)| (c + 1, s + v));
+        let (count_5min, sum_5min) = state
+            .events
+            .iter()
+            .filter(|(ts, _)| *ts >= five_min_ago)
+            .fold((0u64, dec!(0)), |(c, s), (_, v)| (c + 1, s + v));
         let sentiment_5min = if count_5min > 0 {
             sum_5min / Decimal::from(count_5min)
         } else {
@@ -247,7 +246,11 @@ mod tests {
         let mut c = MentionCounter::new();
         // 5 events from 2 hours ago — should be pruned.
         for i in 0..5 {
-            c.record(t0() - Duration::hours(2) - Duration::seconds(i), "BTC", dec!(0));
+            c.record(
+                t0() - Duration::hours(2) - Duration::seconds(i),
+                "BTC",
+                dec!(0),
+            );
         }
         // One fresh event keeps the asset alive.
         c.record(t0(), "BTC", dec!(0));

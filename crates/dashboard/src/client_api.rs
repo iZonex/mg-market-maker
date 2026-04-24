@@ -120,7 +120,10 @@ pub fn client_routes() -> Router<DashboardState> {
         .route("/api/v1/system/diagnostics", get(get_diagnostics))
         .route("/api/v1/pnl/timeseries", get(get_pnl_timeseries))
         .route("/api/v1/spread/timeseries", get(get_spread_timeseries))
-        .route("/api/v1/inventory/timeseries", get(get_inventory_timeseries))
+        .route(
+            "/api/v1/inventory/timeseries",
+            get(get_inventory_timeseries),
+        )
         .route("/api/v1/risk/summary", get(get_risk_summary))
         .route("/api/v1/trade-flow", get(get_trade_flow))
         .route("/api/v1/portfolio", get(get_portfolio))
@@ -138,7 +141,10 @@ pub fn client_routes() -> Router<DashboardState> {
         // bundle: the raw events + an HMAC manifest (same
         // signing secret as the monthly bundles). Consumers
         // verify by recomputing the HMAC of the event body.
-        .route("/api/v1/audit/export", axum::routing::post(post_audit_export))
+        .route(
+            "/api/v1/audit/export",
+            axum::routing::post(post_audit_export),
+        )
         .route("/api/v1/export/bundle", get(get_export_bundle))
         .route("/api/v1/archive/health", get(get_archive_health))
         .route("/api/v1/sentiment/snapshot", get(get_sentiment_snapshot))
@@ -149,7 +155,10 @@ pub fn client_routes() -> Router<DashboardState> {
         .route("/api/v1/strategy/deploys", get(list_strategy_deploys))
         .route("/api/v1/strategy/active", get(list_strategy_active))
         .route("/api/v1/strategy/templates", get(list_strategy_templates))
-        .route("/api/v1/strategy/templates/{name}", get(get_strategy_template))
+        .route(
+            "/api/v1/strategy/templates/{name}",
+            get(get_strategy_template),
+        )
         .route(
             "/api/v1/strategy/graphs/{name}/history/{hash}",
             get(get_strategy_graph_version),
@@ -164,13 +173,11 @@ pub fn client_routes() -> Router<DashboardState> {
         )
         .route(
             "/api/v1/strategy/custom_templates",
-            get(list_custom_templates)
-                .post(save_custom_template),
+            get(list_custom_templates).post(save_custom_template),
         )
         .route(
             "/api/v1/strategy/custom_templates/{name}",
-            get(get_custom_template)
-                .delete(delete_custom_template),
+            get(get_custom_template).delete(delete_custom_template),
         )
         .route(
             "/api/v1/strategy/custom_templates/{name}/versions/{hash}",
@@ -732,8 +739,8 @@ async fn get_sla_certificate(State(state): State<DashboardState>) -> Json<SlaCer
 fn hmac_sha256_hex(key: &str, message: &str) -> String {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
-    let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes())
-        .expect("HMAC-SHA256 accepts any key length");
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("HMAC-SHA256 accepts any key length");
     mac.update(message.as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }
@@ -790,22 +797,21 @@ async fn post_audit_export(
     // Fleet-aware path: reuse the existing audit-range fetcher
     // installed at server boot. Falls back to the local file
     // reader when the controller has no fleet wired (tests).
-    let events: Vec<serde_json::Value> =
-        if let Some(fetcher) = state.audit_range_fetcher() {
-            fetcher(req.from_ms, req.until_ms, limit).await
-        } else if let Some(path) = state.audit_log_path() {
-            let from_dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(req.from_ms)
-                .ok_or((StatusCode::BAD_REQUEST, "from_ms out of range".into()))?;
-            let until_dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(req.until_ms)
-                .ok_or((StatusCode::BAD_REQUEST, "until_ms out of range".into()))?;
-            mm_risk::audit_reader::read_audit_range(&path, from_dt, until_dt)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-                .into_iter()
-                .filter_map(|ev| serde_json::to_value(ev).ok())
-                .collect()
-        } else {
-            Vec::new()
-        };
+    let events: Vec<serde_json::Value> = if let Some(fetcher) = state.audit_range_fetcher() {
+        fetcher(req.from_ms, req.until_ms, limit).await
+    } else if let Some(path) = state.audit_log_path() {
+        let from_dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(req.from_ms)
+            .ok_or((StatusCode::BAD_REQUEST, "from_ms out of range".into()))?;
+        let until_dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(req.until_ms)
+            .ok_or((StatusCode::BAD_REQUEST, "until_ms out of range".into()))?;
+        mm_risk::audit_reader::read_audit_range(&path, from_dt, until_dt)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .into_iter()
+            .filter_map(|ev| serde_json::to_value(ev).ok())
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // Filter by client_id when requested. Audit events carry
     // `client_id` as an optional field — empty when the event
@@ -998,15 +1004,12 @@ async fn get_diagnostics(State(state): State<DashboardState>) -> Json<Diagnostic
 /// server booted with. The response is the config struct
 /// serialised verbatim; secrets never land in the struct (they
 /// come from env), so this is safe to expose to the operator UI.
-async fn get_config_snapshot(
-    State(state): State<DashboardState>,
-) -> axum::response::Response {
+async fn get_config_snapshot(State(state): State<DashboardState>) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     match state.app_config() {
         Some(cfg) => {
-            let val = serde_json::to_value(&*cfg)
-                .unwrap_or(serde_json::Value::Null);
+            let val = serde_json::to_value(&*cfg).unwrap_or(serde_json::Value::Null);
             (StatusCode::OK, Json(val)).into_response()
         }
         None => (
@@ -1039,13 +1042,11 @@ struct MonthlyQuery {
     client_id: Option<String>,
 }
 
-fn parse_period(
-    q: &MonthlyQuery,
-) -> Result<(chrono::NaiveDate, chrono::NaiveDate), String> {
+fn parse_period(q: &MonthlyQuery) -> Result<(chrono::NaiveDate, chrono::NaiveDate), String> {
     let from = chrono::NaiveDate::parse_from_str(&q.from, "%Y-%m-%d")
         .map_err(|e| format!("bad from: {e}"))?;
-    let to = chrono::NaiveDate::parse_from_str(&q.to, "%Y-%m-%d")
-        .map_err(|e| format!("bad to: {e}"))?;
+    let to =
+        chrono::NaiveDate::parse_from_str(&q.to, "%Y-%m-%d").map_err(|e| format!("bad to: {e}"))?;
     Ok((from, to))
 }
 
@@ -1089,12 +1090,20 @@ async fn get_monthly_csv(
     match build_report(&state, &q) {
         Ok(data) => {
             let body = crate::report_export::render_csv(&data);
-            let filename =
-                format!("monthly-{}-{}-to-{}.csv", data.client_id, data.period_from, data.period_to);
-            ([
-                (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
-                (header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{filename}\"")),
-            ], body)
+            let filename = format!(
+                "monthly-{}-{}-to-{}.csv",
+                data.client_id, data.period_from, data.period_to
+            );
+            (
+                [
+                    (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        &format!("attachment; filename=\"{filename}\""),
+                    ),
+                ],
+                body,
+            )
                 .into_response()
         }
         Err((code, msg)) => (code, msg).into_response(),
@@ -1105,14 +1114,12 @@ async fn get_monthly_xlsx(
     State(state): State<DashboardState>,
     Query(q): Query<MonthlyQuery>,
 ) -> axum::response::Response {
-    use axum::http::{StatusCode, header};
+    use axum::http::{header, StatusCode};
     use axum::response::IntoResponse;
     match build_report(&state, &q) {
         Ok(data) => {
             let secret = state.report_secret();
-            let manifest = match crate::report_export::build_manifest(
-                &data, &["xlsx"], &secret,
-            ) {
+            let manifest = match crate::report_export::build_manifest(&data, &["xlsx"], &secret) {
                 Ok(m) => m,
                 Err(e) => {
                     return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
@@ -1128,13 +1135,19 @@ async fn get_monthly_xlsx(
                 "monthly-{}-{}-to-{}.xlsx",
                 data.client_id, data.period_from, data.period_to
             );
-            ([
-                (
-                    header::CONTENT_TYPE,
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                ),
-                (header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{filename}\"")),
-            ], bytes)
+            (
+                [
+                    (
+                        header::CONTENT_TYPE,
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    ),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        &format!("attachment; filename=\"{filename}\""),
+                    ),
+                ],
+                bytes,
+            )
                 .into_response()
         }
         Err((code, msg)) => (code, msg).into_response(),
@@ -1145,14 +1158,12 @@ async fn get_monthly_pdf(
     State(state): State<DashboardState>,
     Query(q): Query<MonthlyQuery>,
 ) -> axum::response::Response {
-    use axum::http::{StatusCode, header};
+    use axum::http::{header, StatusCode};
     use axum::response::IntoResponse;
     match build_report(&state, &q) {
         Ok(data) => {
             let secret = state.report_secret();
-            let manifest = match crate::report_export::build_manifest(
-                &data, &["pdf"], &secret,
-            ) {
+            let manifest = match crate::report_export::build_manifest(&data, &["pdf"], &secret) {
                 Ok(m) => m,
                 Err(e) => {
                     return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
@@ -1168,10 +1179,16 @@ async fn get_monthly_pdf(
                 "monthly-{}-{}-to-{}.pdf",
                 data.client_id, data.period_from, data.period_to
             );
-            ([
-                (header::CONTENT_TYPE, "application/pdf"),
-                (header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{filename}\"")),
-            ], bytes)
+            (
+                [
+                    (header::CONTENT_TYPE, "application/pdf"),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        &format!("attachment; filename=\"{filename}\""),
+                    ),
+                ],
+                bytes,
+            )
                 .into_response()
         }
         Err((code, msg)) => (code, msg).into_response(),
@@ -1244,9 +1261,7 @@ async fn get_strategy_catalog() -> Json<Vec<CatalogEntry>> {
     Json(entries)
 }
 
-async fn list_strategy_graphs(
-    State(state): State<DashboardState>,
-) -> axum::response::Response {
+async fn list_strategy_graphs(State(state): State<DashboardState>) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     let Some(store) = state.strategy_graph_store() else {
@@ -1269,7 +1284,10 @@ async fn get_strategy_graph(
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     let Some(store) = state.strategy_graph_store() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "strategy graphs not configured")
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "strategy graphs not configured",
+        )
             .into_response();
     };
     match store.load(&name) {
@@ -1295,9 +1313,7 @@ async fn list_strategy_templates() -> Json<Vec<TemplateMeta>> {
     Json(list)
 }
 
-async fn get_strategy_template(
-    Path(name): Path<String>,
-) -> axum::response::Response {
+async fn get_strategy_template(Path(name): Path<String>) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     match mm_strategy_graph::templates::load(&name) {
@@ -1393,8 +1409,7 @@ async fn validate_strategy_graph(
     // (they propagate as Missing) — but an edge whose `from`/`to`
     // references a node that was deleted is a graph-state bug worth
     // surfacing before deploy, so a partial delete doesn't persist.
-    let node_ids: std::collections::HashSet<_> =
-        req.graph.nodes.iter().map(|n| n.id).collect();
+    let node_ids: std::collections::HashSet<_> = req.graph.nodes.iter().map(|n| n.id).collect();
     for e in &req.graph.edges {
         if !node_ids.contains(&e.from.node) {
             issues.push(format!("edge references missing node {}", e.from.node));
@@ -1445,9 +1460,7 @@ async fn validate_strategy_graph(
 
 // ─── User-authored templates (Phase 4 follow-up) ────────────
 
-fn user_templates_dir(
-    state: &DashboardState,
-) -> Option<std::path::PathBuf> {
+fn user_templates_dir(state: &DashboardState) -> Option<std::path::PathBuf> {
     let store = state.strategy_graph_store()?;
     Some(store.root().join("user_templates"))
 }
@@ -1482,7 +1495,9 @@ struct CustomTemplateSummary {
     version_count: usize,
 }
 
-fn is_zero_usize(v: &usize) -> bool { *v == 0 }
+fn is_zero_usize(v: &usize) -> bool {
+    *v == 0
+}
 
 /// M-SAVE GOBS — one line per version in `user_templates/<name>/history.jsonl`.
 /// The canonical graph JSON for each version lives in
@@ -1613,10 +1628,17 @@ async fn save_custom_template(
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     let Some(root) = user_templates_dir(&state) else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "strategy graphs not configured")
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "strategy graphs not configured",
+        )
             .into_response();
     };
-    if !req.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !req
+        .name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return (StatusCode::BAD_REQUEST, "name must be [A-Za-z0-9_-]+").into_response();
     }
     if req.name.is_empty() {
@@ -1654,8 +1676,7 @@ async fn save_custom_template(
             // Write the legacy graph under its hash + append the
             // history line, then drop the flat file to avoid a
             // double-read on next list.
-            let legacy_graph_body =
-                serde_json::to_string_pretty(&legacy.graph).unwrap_or_default();
+            let legacy_graph_body = serde_json::to_string_pretty(&legacy.graph).unwrap_or_default();
             let _ = std::fs::write(
                 template_dir.join(format!("{legacy_hash}.json")),
                 legacy_graph_body,
@@ -1682,7 +1703,11 @@ async fn save_custom_template(
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
         if let Err(e) = std::fs::write(&graph_path, body) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("write graph: {e}")).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("write graph: {e}"),
+            )
+                .into_response();
         }
     }
     let entry = CustomTemplateVersion {
@@ -1724,11 +1749,17 @@ async fn get_custom_template(
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return (StatusCode::BAD_REQUEST, "bad name").into_response();
     }
     let Some(root) = user_templates_dir(&state) else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "strategy graphs not configured")
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "strategy graphs not configured",
+        )
             .into_response();
     };
     let template_dir = root.join(&name);
@@ -1812,14 +1843,20 @@ async fn get_custom_template_version(
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return (StatusCode::BAD_REQUEST, "bad name").into_response();
     }
     if !hash.chars().all(|c| c.is_ascii_alphanumeric()) {
         return (StatusCode::BAD_REQUEST, "bad hash").into_response();
     }
     let Some(root) = user_templates_dir(&state) else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "strategy graphs not configured")
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "strategy graphs not configured",
+        )
             .into_response();
     };
     let path = root.join(&name).join(format!("{hash}.json"));
@@ -1841,11 +1878,17 @@ async fn delete_custom_template(
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return (StatusCode::BAD_REQUEST, "bad name").into_response();
     }
     let Some(root) = user_templates_dir(&state) else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "strategy graphs not configured")
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "strategy graphs not configured",
+        )
             .into_response();
     };
     let template_dir = root.join(&name);
@@ -1855,8 +1898,7 @@ async fn delete_custom_template(
     let mut removed = false;
     if template_dir.is_dir() {
         if let Err(e) = std::fs::remove_dir_all(&template_dir) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("rmdir: {e}"))
-                .into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("rmdir: {e}")).into_response();
         }
         removed = true;
     }
@@ -1977,7 +2019,10 @@ async fn get_strategy_graph_version(
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     let Some(store) = state.strategy_graph_store() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "strategy graphs not configured")
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "strategy graphs not configured",
+        )
             .into_response();
     };
     match store.load_by_hash(&name, &hash) {
@@ -1986,13 +2031,14 @@ async fn get_strategy_graph_version(
     }
 }
 
-async fn list_strategy_deploys(
-    State(state): State<DashboardState>,
-) -> axum::response::Response {
+async fn list_strategy_deploys(State(state): State<DashboardState>) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     let Some(store) = state.strategy_graph_store() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "strategy graphs not configured")
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "strategy graphs not configured",
+        )
             .into_response();
     };
     match store.deploys() {
@@ -2007,23 +2053,22 @@ async fn list_strategy_deploys(
 /// Settings UI care about "what's live *right now*" — full history
 /// is already at `/deploys`. Folding happens server-side so the UI
 /// never misrepresents the ground truth.
-async fn list_strategy_active(
-    State(state): State<DashboardState>,
-) -> axum::response::Response {
+async fn list_strategy_active(State(state): State<DashboardState>) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     let Some(store) = state.strategy_graph_store() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "strategy graphs not configured")
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "strategy graphs not configured",
+        )
             .into_response();
     };
     let records = match store.deploys() {
         Ok(r) => r,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    let mut active: std::collections::HashMap<
-        (String, String),
-        mm_strategy_graph::DeployRecord,
-    > = std::collections::HashMap::new();
+    let mut active: std::collections::HashMap<(String, String), mm_strategy_graph::DeployRecord> =
+        std::collections::HashMap::new();
     for rec in records {
         let key = (rec.name.clone(), rec.scope.clone());
         active
@@ -2069,9 +2114,7 @@ async fn get_sentiment_history(
 
 // ── Block D — archive health probe ─────────────────────────
 
-async fn get_archive_health(
-    State(state): State<DashboardState>,
-) -> axum::response::Response {
+async fn get_archive_health(State(state): State<DashboardState>) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     match state.archive_client() {
@@ -2125,7 +2168,7 @@ async fn get_export_bundle(
     State(state): State<DashboardState>,
     Query(q): Query<BundleQuery>,
 ) -> axum::response::Response {
-    use axum::http::{StatusCode, header};
+    use axum::http::{header, StatusCode};
     use axum::response::IntoResponse;
     let from = match chrono::NaiveDate::parse_from_str(&q.from, "%Y-%m-%d") {
         Ok(d) => d,
@@ -2145,15 +2188,17 @@ async fn get_export_bundle(
     };
     match crate::archive::bundle::build_zip(req) {
         Ok(out) => {
-            let filename =
-                format!("bundle-{client_name}-{from}-to-{to}.zip");
-            ([
-                (header::CONTENT_TYPE, "application/zip"),
-                (
-                    header::CONTENT_DISPOSITION,
-                    &format!("attachment; filename=\"{filename}\""),
-                ),
-            ], out.bytes)
+            let filename = format!("bundle-{client_name}-{from}-to-{to}.zip");
+            (
+                [
+                    (header::CONTENT_TYPE, "application/zip"),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        &format!("attachment; filename=\"{filename}\""),
+                    ),
+                ],
+                out.bytes,
+            )
                 .into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -2169,11 +2214,7 @@ async fn get_monthly_manifest(
     match build_report(&state, &q) {
         Ok(data) => {
             let secret = state.report_secret();
-            match crate::report_export::build_manifest(
-                &data,
-                &["csv", "xlsx", "pdf"],
-                &secret,
-            ) {
+            match crate::report_export::build_manifest(&data, &["csv", "xlsx", "pdf"], &secret) {
                 Ok(m) => (StatusCode::OK, Json(m)).into_response(),
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
             }
@@ -2415,10 +2456,7 @@ async fn get_client_fills(
     Json(fills)
 }
 
-async fn collect_fleet_client_fills(
-    state: &DashboardState,
-    client_id: &str,
-) -> Vec<FillRecord> {
+async fn collect_fleet_client_fills(state: &DashboardState, client_id: &str) -> Vec<FillRecord> {
     let metrics = fleet_client_metrics(state, Some(client_id)).await;
     let mut out = Vec::new();
     for row in metrics {
@@ -2578,7 +2616,8 @@ fn self_client_id(
     ))?;
     claims.client_id.clone().ok_or((
         axum::http::StatusCode::BAD_REQUEST,
-        "this endpoint is for tenant-scoped tokens; use /api/v1/client/{id}/* with an explicit id".into(),
+        "this endpoint is for tenant-scoped tokens; use /api/v1/client/{id}/* with an explicit id"
+            .into(),
     ))
 }
 
@@ -2685,8 +2724,8 @@ async fn add_self_webhook(
     Json(body): Json<SelfWebhookBody>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
     let id = self_client_id(Some(&claims))?;
-    let url = validate_webhook_url(&body.url)
-        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?;
+    let url =
+        validate_webhook_url(&body.url).map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?;
     let dispatcher = match state.get_client_webhook_dispatcher(&id) {
         Some(d) => d,
         None => {
@@ -2845,7 +2884,13 @@ async fn resolve_incident_handler(
 ) -> Result<Json<crate::state::OpenIncident>, (axum::http::StatusCode, String)> {
     let actor = body.by.unwrap_or_else(|| claims.user_id.clone());
     state
-        .resolve_incident(&id, &actor, body.root_cause, body.action_taken, body.preventive)
+        .resolve_incident(
+            &id,
+            &actor,
+            body.root_cause,
+            body.action_taken,
+            body.preventive,
+        )
         .map(Json)
         .ok_or((
             axum::http::StatusCode::NOT_FOUND,

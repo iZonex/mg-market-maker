@@ -14,7 +14,7 @@
 //! concurrently would crash-load otherwise).
 
 use crate::graph::{Graph, CURRENT_SCHEMA_VERSION};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -152,16 +152,16 @@ impl GraphStore {
             .join("history")
             .join(name)
             .join(format!("{hash}.json"));
-        let body = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let body =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         Graph::from_json(&body)
     }
 
     /// Load a graph by name.
     pub fn load(&self, name: &str) -> Result<Graph> {
         let path = self.path_for(name)?;
-        let body = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let body =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         Graph::from_json(&body)
     }
 
@@ -287,8 +287,8 @@ mod tests {
 
     #[test]
     fn store_save_load_roundtrip() {
-        let dir = std::env::temp_dir()
-            .join(format!("mm_strategy_graph_test_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("mm_strategy_graph_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = GraphStore::new(&dir).unwrap();
         let g = sample_graph();
@@ -310,21 +310,22 @@ mod tests {
 
     #[test]
     fn historical_save_enables_load_by_hash() {
-        let dir = std::env::temp_dir()
-            .join(format!("mm_strategy_graph_hist_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("mm_strategy_graph_hist_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = GraphStore::new(&dir).unwrap();
         let g = sample_graph();
         let hash = store.save(&g, Some("alice")).unwrap();
-        let back = store.load_by_hash("sample", &hash).expect("historical load");
+        let back = store
+            .load_by_hash("sample", &hash)
+            .expect("historical load");
         assert_eq!(back.content_hash(), hash);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn load_by_hash_rejects_path_traversal() {
-        let dir = std::env::temp_dir()
-            .join(format!("mm_sg_hash_trav_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mm_sg_hash_trav_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = GraphStore::new(&dir).unwrap();
         assert!(store.load_by_hash("sample", "../../passwd").is_err());
@@ -334,8 +335,7 @@ mod tests {
 
     #[test]
     fn rejects_path_traversal_in_name() {
-        let dir = std::env::temp_dir()
-            .join(format!("mm_strategy_trav_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mm_strategy_trav_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = GraphStore::new(&dir).unwrap();
         let mut g = sample_graph();

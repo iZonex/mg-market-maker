@@ -74,16 +74,15 @@ fn build_router_inner(
     ws_broadcast: Arc<WsBroadcast>,
     auth_state: AuthState,
 ) -> Router {
-
     // Rate limiters — admin gets a stricter budget; login is
     // throttled by source IP to slow credential-stuffing.
     let admin_rl = RateLimiter::new(300); // 300 req/min per user
     let login_rl = RateLimiter::new(20); // 20/min per source IP
-    // Sprint 5c — strategy-graph deploy is far more expensive than
-    // most admin reads (parse + validate + persist + broadcast to
-    // every engine) and a deploy burst is a plausible misuse / DoS
-    // path, so it gets its own much tighter budget. Reads (graphs
-    // list, templates, history) stay on the generic admin limiter.
+                                         // Sprint 5c — strategy-graph deploy is far more expensive than
+                                         // most admin reads (parse + validate + persist + broadcast to
+                                         // every engine) and a deploy burst is a plausible misuse / DoS
+                                         // path, so it gets its own much tighter budget. Reads (graphs
+                                         // list, templates, history) stay on the generic admin limiter.
     let graph_deploy_rl = RateLimiter::new(10);
 
     // Public routes — no auth. Login is IP-rate-limited.
@@ -238,7 +237,10 @@ fn build_router_inner(
         // DeploymentDrilldown panel to target a specific
         // deployment; there's no operator path that still needs
         // symbol-based routing.
-        .route("/api/v1/ops/client-reset/{client_id}", post(ops_client_reset))
+        .route(
+            "/api/v1/ops/client-reset/{client_id}",
+            post(ops_client_reset),
+        )
         // 23-UX-6 — venue-scoped kill switch control. Operators
         // quench one venue without disturbing sibling venues
         // on the same engine. Read endpoint is admin-only too
@@ -357,9 +359,11 @@ fn build_router_inner(
         ));
 
     // WebSocket — auth via query param, verified inside handler.
-    let ws_routes = Router::new()
-        .route("/ws", get(ws_handler))
-        .with_state((state.clone(), ws_broadcast, auth_state));
+    let ws_routes = Router::new().route("/ws", get(ws_handler)).with_state((
+        state.clone(),
+        ws_broadcast,
+        auth_state,
+    ));
 
     let cors = build_cors_layer();
 
@@ -640,9 +644,10 @@ async fn venues_latency_p95() -> Json<VenueLatencyResponse> {
             for b in h.get_bucket() {
                 let ub = b.get_upper_bound();
                 let count = b.get_cumulative_count();
-                if let Some(existing) = buckets.iter_mut().find(|(boundary, _)| {
-                    (boundary - ub).abs() < f64::EPSILON
-                }) {
+                if let Some(existing) = buckets
+                    .iter_mut()
+                    .find(|(boundary, _)| (boundary - ub).abs() < f64::EPSILON)
+                {
                     existing.1 += count;
                 } else {
                     buckets.push((ub, count));
@@ -793,9 +798,7 @@ async fn rebalance_execute(
         };
         let from = req.from_wallet.as_deref().unwrap_or("SPOT");
         let to = req.to_wallet.as_deref().unwrap_or("SPOT");
-        let outcome = conn
-            .internal_transfer(&req.asset, req.qty, from, to)
-            .await;
+        let outcome = conn.internal_transfer(&req.asset, req.qty, from, to).await;
         let (status_enum, tx_id, err_text, http) = match &outcome {
             Ok(tx) => (
                 TransferStatus::Executed,
@@ -872,8 +875,7 @@ async fn rebalance_execute(
             status: "accepted".into(),
             venue_tx_id: None,
             error: Some(
-                "cross-venue transfers require manual venue-side action; decision logged"
-                    .into(),
+                "cross-venue transfers require manual venue-side action; decision logged".into(),
             ),
         }),
     )
@@ -885,9 +887,7 @@ struct RebalanceLogResponse {
     records: Vec<mm_persistence::transfer_log::TransferRecord>,
 }
 
-async fn rebalance_log(
-    State(state): State<DashboardState>,
-) -> Json<RebalanceLogResponse> {
+async fn rebalance_log(State(state): State<DashboardState>) -> Json<RebalanceLogResponse> {
     let records = state
         .transfer_log()
         .and_then(|log| mm_persistence::transfer_log::read_all(log.path()).ok())
@@ -927,9 +927,8 @@ async fn calibration_status(
         for row in metrics {
             if let Some(cal) = row.get("calibration") {
                 if !cal.is_null() {
-                    if let Ok(snap) = serde_json::from_value::<
-                        crate::state::CalibrationSnapshot,
-                    >(cal.clone())
+                    if let Ok(snap) =
+                        serde_json::from_value::<crate::state::CalibrationSnapshot>(cal.clone())
                     {
                         rows.push(snap);
                     }
@@ -960,9 +959,7 @@ async fn otr_tiered() -> Json<TieredOtrResponse> {
         std::collections::BTreeMap::new();
     let families = prometheus::gather();
     for fam in &families {
-        if fam.get_name() != "mm_otr_tiered"
-            || fam.get_field_type() != MetricType::GAUGE
-        {
+        if fam.get_name() != "mm_otr_tiered" || fam.get_field_type() != MetricType::GAUGE {
             continue;
         }
         for m in fam.get_metric() {
@@ -977,8 +974,7 @@ async fn otr_tiered() -> Json<TieredOtrResponse> {
                     _ => {}
                 }
             }
-            let (Some(symbol), Some(tier), Some(window)) = (symbol, tier, window)
-            else {
+            let (Some(symbol), Some(tier), Some(window)) = (symbol, tier, window) else {
                 continue;
             };
             let v = m.get_gauge().get_value();
@@ -1034,9 +1030,7 @@ async fn admin_auth_audit_handler(
 ) -> Result<Json<Vec<serde_json::Value>>, (axum::http::StatusCode, String)> {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let until_ms = q.until_ms.unwrap_or(now_ms);
-    let from_ms = q
-        .from_ms
-        .unwrap_or_else(|| until_ms - 24 * 60 * 60 * 1000);
+    let from_ms = q.from_ms.unwrap_or_else(|| until_ms - 24 * 60 * 60 * 1000);
     if from_ms > until_ms {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
@@ -1066,14 +1060,9 @@ async fn admin_auth_audit_handler(
         T::PasswordResetIssued,
         T::PasswordResetCompleted,
     ];
-    let events = mm_risk::audit_reader::read_audit_filtered(
-        &path,
-        from_dt,
-        until_dt,
-        Some(&types),
-        None,
-    )
-    .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let events =
+        mm_risk::audit_reader::read_audit_filtered(&path, from_dt, until_dt, Some(&types), None)
+            .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Filter against both the event_type tag and the detail
     // string so operators can narrow by "password_reset" /
@@ -1090,11 +1079,7 @@ async fn admin_auth_audit_handler(
                     .ok()
                     .and_then(|v| v.as_str().map(|s| s.to_string()))
                     .unwrap_or_default();
-                tag.contains(needle)
-                    || ev
-                        .detail
-                        .as_deref()
-                        .is_some_and(|d| d.contains(needle))
+                tag.contains(needle) || ev.detail.as_deref().is_some_and(|d| d.contains(needle))
             })
         })
         .take(limit)
@@ -1497,7 +1482,9 @@ async fn admin_optimize_apply(
         if state.send_config_override(&body.symbol, ovr) {
             applied += 1;
         } else {
-            skipped.push(format!("{key} (no local engine — distributed apply not yet wired)"));
+            skipped.push(format!(
+                "{key} (no local engine — distributed apply not yet wired)"
+            ));
         }
     }
     state.clear_calibration(&body.symbol);
@@ -1519,7 +1506,6 @@ async fn admin_optimize_discard(
         "symbol": body.symbol,
     }))
 }
-
 
 // ── Epic H — strategy graph save ───────────────────────────
 //
@@ -1694,7 +1680,10 @@ async fn admin_save_strategy_graph(
             if let Some(audit) = state.audit_log() {
                 audit.strategy_graph_deploy_rejected(
                     &graph.name,
-                    &format!("restricted deploy awaiting operator ack: {}", offenders.join(",")),
+                    &format!(
+                        "restricted deploy awaiting operator ack: {}",
+                        offenders.join(",")
+                    ),
                     &operator,
                 );
             }
@@ -1754,20 +1743,9 @@ async fn admin_save_strategy_graph(
         if let Some(from_hash) = q.rollback_from.as_deref() {
             audit.strategy_graph_rolled_back(&graph.name, from_hash, &hash, &operator);
         }
-        audit.strategy_graph_deployed(
-            &graph.name,
-            &hash,
-            &scope_key,
-            &operator,
-            0,
-        );
+        audit.strategy_graph_deployed(&graph.name, &hash, &scope_key, &operator, 0);
         if !offenders.is_empty() {
-            audit.strategy_graph_restricted_deploy_acked(
-                &graph.name,
-                &hash,
-                &operator,
-                &offenders,
-            );
+            audit.strategy_graph_restricted_deploy_acked(&graph.name, &hash, &operator, &offenders);
         }
     }
 
@@ -1965,7 +1943,6 @@ async fn admin_patch_strategy_node_config(
         .into_response()
 }
 
-
 /// 23-UX-6 — set the kill-switch level for a single venue. Body
 /// carries `{level: u8}` on the 0..=5 scale (same as the
 /// per-symbol kill). `level = 0` clears the entry. The engine
@@ -2006,7 +1983,11 @@ async fn ops_set_venue_kill_level(
             &format!(
                 "venue_kill venue={venue} level={} reason={}",
                 req.level,
-                if req.reason.is_empty() { "n/a" } else { &req.reason }
+                if req.reason.is_empty() {
+                    "n/a"
+                } else {
+                    &req.reason
+                }
             ),
         );
     }
@@ -2017,9 +1998,7 @@ async fn ops_set_venue_kill_level(
     })
 }
 
-async fn list_venue_kill_levels(
-    State(state): State<DashboardState>,
-) -> Json<serde_json::Value> {
+async fn list_venue_kill_levels(State(state): State<DashboardState>) -> Json<serde_json::Value> {
     let levels = state.all_venue_kill_levels();
     // Sort by venue name so the response is deterministic.
     let mut rows: Vec<(String, u8)> = levels.into_iter().collect();
@@ -2195,15 +2174,10 @@ struct VenueBookStateRow {
     regime_age_ms: Option<i64>,
 }
 
-async fn venues_book_state(
-    State(state): State<DashboardState>,
-) -> Json<Vec<VenueBookStateRow>> {
+async fn venues_book_state(State(state): State<DashboardState>) -> Json<Vec<VenueBookStateRow>> {
     let now = chrono::Utc::now();
-    let regime_map: std::collections::HashMap<_, _> = state
-        .data_bus()
-        .regime_entries()
-        .into_iter()
-        .collect();
+    let regime_map: std::collections::HashMap<_, _> =
+        state.data_bus().regime_entries().into_iter().collect();
     let mut rows: Vec<VenueBookStateRow> = state
         .data_bus()
         .l1_entries()
@@ -2323,9 +2297,7 @@ fn product_ordinal(p: mm_common::config::ProductType) -> u8 {
     }
 }
 
-async fn venues_funding_state(
-    State(state): State<DashboardState>,
-) -> Json<Vec<FundingStateRow>> {
+async fn venues_funding_state(State(state): State<DashboardState>) -> Json<Vec<FundingStateRow>> {
     let entries = state.data_bus().funding_entries();
     let rows: Vec<FundingStateRow> = entries
         .into_iter()

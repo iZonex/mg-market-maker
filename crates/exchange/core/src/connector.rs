@@ -506,11 +506,7 @@ pub trait ExchangeConnector: Send + Sync {
     /// Idempotent: a venue returning "already in this mode"
     /// (Binance `-4046`, Bybit `110026`) is treated as `Ok(())`
     /// by the wrapper; only new errors propagate.
-    async fn set_margin_mode(
-        &self,
-        _symbol: &str,
-        _mode: MarginMode,
-    ) -> Result<(), MarginError> {
+    async fn set_margin_mode(&self, _symbol: &str, _mode: MarginMode) -> Result<(), MarginError> {
         Err(MarginError::NotSupported)
     }
 
@@ -518,11 +514,7 @@ pub trait ExchangeConnector: Send + Sync {
     /// on top of the venue's own bracket limits — venues clamp
     /// to their tier-maximum silently. Spot connectors return
     /// `NotSupported`.
-    async fn set_leverage(
-        &self,
-        _symbol: &str,
-        _leverage: u32,
-    ) -> Result<(), MarginError> {
+    async fn set_leverage(&self, _symbol: &str, _leverage: u32) -> Result<(), MarginError> {
         Err(MarginError::NotSupported)
     }
 
@@ -634,11 +626,7 @@ pub trait ExchangeConnector: Send + Sync {
     /// override against their `get_my_trades` / `query_user_trades`
     /// endpoint, filtering by `symbol` + `since_ms`.
     #[allow(unused_variables)]
-    async fn get_my_trades_since(
-        &self,
-        symbol: &str,
-        since_ms: i64,
-    ) -> anyhow::Result<Vec<Fill>> {
+    async fn get_my_trades_since(&self, symbol: &str, since_ms: i64) -> anyhow::Result<Vec<Fill>> {
         Ok(Vec::new())
     }
 
@@ -681,10 +669,7 @@ pub trait ExchangeConnector: Send + Sync {
     /// OI endpoint but the response was empty; `Err` when the
     /// call failed. Spot connectors override to return `None`
     /// directly — OI is a perp concept.
-    async fn get_open_interest(
-        &self,
-        _symbol: &str,
-    ) -> anyhow::Result<Option<OpenInterestInfo>> {
+    async fn get_open_interest(&self, _symbol: &str) -> anyhow::Result<Option<OpenInterestInfo>> {
         Ok(None)
     }
 
@@ -693,10 +678,7 @@ pub trait ExchangeConnector: Send + Sync {
     /// response was empty. Spot / custom override to return
     /// `None` directly — L/S ratio is a perp positioning
     /// concept.
-    async fn get_long_short_ratio(
-        &self,
-        _symbol: &str,
-    ) -> anyhow::Result<Option<LongShortRatio>> {
+    async fn get_long_short_ratio(&self, _symbol: &str) -> anyhow::Result<Option<LongShortRatio>> {
         Ok(None)
     }
 
@@ -860,4 +842,3 @@ mod withdraw_whitelist_tests {
         assert!(validate_withdraw_address(Some(&list), "0xaabb").is_err());
     }
 }
-

@@ -83,10 +83,7 @@ impl Default for BasisArbConfig {
 /// when the guard conditions fail (zero mids, basis below
 /// threshold, delta over limit) — the caller treats an empty
 /// bundle as "cancel all basis-arb quotes".
-pub fn compute_basis_arb_legs(
-    snap: &BasisSnapshot,
-    cfg: &BasisArbConfig,
-) -> Vec<ArbLeg> {
+pub fn compute_basis_arb_legs(snap: &BasisSnapshot, cfg: &BasisArbConfig) -> Vec<ArbLeg> {
     if snap.spot_mid <= Decimal::ZERO || snap.perp_mid <= Decimal::ZERO {
         return Vec::new();
     }
@@ -210,8 +207,6 @@ mod tests {
     #[test]
     fn zero_mids_short_circuits() {
         let s = snap(dec!(0), dec!(100), Decimal::ZERO);
-        assert!(
-            compute_basis_arb_legs(&s, &BasisArbConfig::default()).is_empty()
-        );
+        assert!(compute_basis_arb_legs(&s, &BasisArbConfig::default()).is_empty());
     }
 }

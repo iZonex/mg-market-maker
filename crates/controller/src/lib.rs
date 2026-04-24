@@ -24,18 +24,18 @@ pub mod vault;
 pub mod ws_accept;
 
 pub use approvals::{ApprovalRecord, ApprovalState, ApprovalStore, ApprovalStoreError};
-pub use vault::{
-    CredentialCheck, CredentialDescriptor, VaultEntry, VaultError, VaultStore, VaultSummary,
-};
-pub use master_key::{MasterKey, MasterKeyError};
-pub use tunables::{Tunables, TunablesError, TunablesStore};
 pub use fleet::{AgentView, FleetState};
 pub use http::{
     router as http_router, router_full as http_router_full,
     router_full_authed as http_router_full_authed, run_http_server, run_http_server_full,
 };
+pub use master_key::{MasterKey, MasterKeyError};
 pub use registry::{AgentCommandTx, AgentRegistry, RegistryError, SessionLifecycleEvent};
 pub use replay::ReplayStore;
+pub use tunables::{Tunables, TunablesError, TunablesStore};
+pub use vault::{
+    CredentialCheck, CredentialDescriptor, VaultEntry, VaultError, VaultStore, VaultSummary,
+};
 pub use ws_accept::{
     run_accept_loop, spawn_accept_loop, spawn_accept_loop_tls, spawn_accept_loop_tls_full,
     spawn_accept_loop_tls_with_credentials, spawn_accept_loop_with_credentials,
@@ -174,6 +174,12 @@ pub struct AgentSession<T: Transport> {
 /// Disambiguation for the run loop's three-way select. Kept
 /// private to the crate because it's purely an implementation
 /// detail of [`AgentSession::run_until_disconnect`].
+// The `Incoming` branch intentionally carries the envelope by
+// value — boxing would force an allocation for every frame on
+// the hot receive path, where the transport already pools its
+// buffer. The ~480 byte variant size is the SignedEnvelope
+// cost, not a miss.
+#[allow(clippy::large_enum_variant)]
 enum TransportSelect {
     Incoming(Result<Option<SignedEnvelope>, TransportError>),
     OutboundCommand(Option<CommandPayload>),
@@ -203,7 +209,9 @@ fn check_agent_version(policy: &LeasePolicy, raw: &str) -> Result<(), String> {
     }
     if let Some(max) = &policy.max_agent_version {
         if parsed >= *max {
-            return Err(format!("agent version {parsed} is at/above exclusive max {max}"));
+            return Err(format!(
+                "agent version {parsed} is at/above exclusive max {max}"
+            ));
         }
     }
     Ok(())
@@ -343,7 +351,9 @@ impl<T: Transport> AgentSession<T> {
                     if let (Some(fleet), Some(id)) = (self.fleet.as_ref(), self.agent_id.as_ref()) {
                         fleet.on_disconnect(id);
                     }
-                    if let (Some(reg), Some(id)) = (self.agent_registry.as_ref(), self.agent_id.as_ref()) {
+                    if let (Some(reg), Some(id)) =
+                        (self.agent_registry.as_ref(), self.agent_id.as_ref())
+                    {
                         reg.deregister(id);
                     }
                     return Ok(());
@@ -402,16 +412,15 @@ impl<T: Transport> AgentSession<T> {
                     "agent approval revoked at runtime — sending LeaseRevoke"
                 );
                 self.current_lease = None;
-                self.push_command(CommandPayload::LeaseRevoke { reason }).await
+                self.push_command(CommandPayload::LeaseRevoke { reason })
+                    .await
             }
         }
     }
 
     async fn on_envelope(&mut self, signed: SignedEnvelope) -> Result<(), SessionError> {
         let Envelope {
-            telemetry,
-            command,
-            ..
+            telemetry, command, ..
         } = signed.envelope;
         if command.is_some() {
             // Agents never send commands back at the controller.
@@ -427,9 +436,16 @@ impl<T: Transport> AgentSession<T> {
                 protocol_version,
                 pubkey,
                 agent_version,
-            } => self
-                .on_register(agent_id, protocol_version, last_applied, agent_version, pubkey)
-                .await,
+            } => {
+                self.on_register(
+                    agent_id,
+                    protocol_version,
+                    last_applied,
+                    agent_version,
+                    pubkey,
+                )
+                .await
+            }
             TelemetryPayload::LeaseRefreshRequest { current_lease_id } => {
                 self.on_refresh_request(current_lease_id).await
             }
@@ -583,7 +599,8 @@ impl<T: Transport> AgentSession<T> {
         if let (Some(fleet), Some(id)) = (self.fleet.as_ref(), self.agent_id.as_ref()) {
             fleet.update_lease(id, lease.clone());
         }
-        self.push_command(CommandPayload::LeaseGrant { lease }).await?;
+        self.push_command(CommandPayload::LeaseGrant { lease })
+            .await?;
 
         let batch: Vec<_> = match (self.credentials.as_ref(), self.agent_id.as_ref()) {
             (Some(store), Some(id)) => store.pushable_exchange_for_agent(id.as_str()),
@@ -670,8 +687,7 @@ impl<T: Transport> AgentSession<T> {
     fn issue_fresh_lease(&self) -> LeaderLease {
         let issued = chrono::Utc::now();
         let expires = issued
-            + chrono::Duration::from_std(self.policy.lease_ttl)
-                .expect("ttl fits chrono::Duration");
+            + chrono::Duration::from_std(self.policy.lease_ttl).expect("ttl fits chrono::Duration");
         LeaderLease {
             lease_id: uuid::Uuid::new_v4(),
             agent_id: self
@@ -688,8 +704,7 @@ impl<T: Transport> AgentSession<T> {
     fn issue_extended_lease(&self, reuse_lease_id: uuid::Uuid) -> LeaderLease {
         let issued = chrono::Utc::now();
         let expires = issued
-            + chrono::Duration::from_std(self.policy.lease_ttl)
-                .expect("ttl fits chrono::Duration");
+            + chrono::Duration::from_std(self.policy.lease_ttl).expect("ttl fits chrono::Duration");
         LeaderLease {
             lease_id: reuse_lease_id,
             agent_id: self
@@ -711,4 +726,3 @@ impl<T: Transport> AgentSession<T> {
         Ok(())
     }
 }
-

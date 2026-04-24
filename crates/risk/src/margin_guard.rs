@@ -315,11 +315,7 @@ impl MarginGuard {
     /// compares it to `stop_ratio` itself (so the same code
     /// handles both observed + projected escalation through
     /// one path).
-    pub fn projected_ratio(
-        &self,
-        notional_delta: Decimal,
-        leverage: u32,
-    ) -> Option<Decimal> {
+    pub fn projected_ratio(&self, notional_delta: Decimal, leverage: u32) -> Option<Decimal> {
         let info = self.last.as_ref()?;
         let lev = Decimal::from(leverage.max(1));
         let im_needed = notional_delta / lev;
@@ -672,8 +668,8 @@ mod tests {
 
     #[test]
     fn isolated_mode_uses_per_position_ratio_not_wallet() {
-        let mut g = MarginGuard::new(thresholds())
-            .with_symbol_mode("BTCUSDT", MarginModeCfg::Isolated);
+        let mut g =
+            MarginGuard::new(thresholds()).with_symbol_mode("BTCUSDT", MarginModeCfg::Isolated);
         let now = 1_700_000_000_000;
         // Position: 1 BTC × 50_000 = 50_000 notional. Isolated
         // margin = 200. MMR default = 0.005 (no other position
@@ -690,14 +686,17 @@ mod tests {
             now,
         ));
         let ratio = g.observed_ratio().unwrap();
-        assert!(ratio >= dec!(1.0), "isolated ratio should reflect position bucket, got {ratio}");
+        assert!(
+            ratio >= dec!(1.0),
+            "isolated ratio should reflect position bucket, got {ratio}"
+        );
         assert_eq!(g.decide(now), MarginGuardDecision::CancelAll);
     }
 
     #[test]
     fn cross_mode_ignores_symbol_and_uses_wallet_ratio() {
-        let mut g = MarginGuard::new(thresholds())
-            .with_symbol_mode("BTCUSDT", MarginModeCfg::Cross);
+        let mut g =
+            MarginGuard::new(thresholds()).with_symbol_mode("BTCUSDT", MarginModeCfg::Cross);
         let now = 1_700_000_000_000;
         // Same snapshot as isolated test — but in Cross mode
         // the guard uses `margin_ratio` = 0.1 → Normal, even
@@ -717,8 +716,8 @@ mod tests {
 
     #[test]
     fn isolated_projected_ratio_uses_bucket_not_wallet() {
-        let mut g = MarginGuard::new(thresholds())
-            .with_symbol_mode("BTCUSDT", MarginModeCfg::Isolated);
+        let mut g =
+            MarginGuard::new(thresholds()).with_symbol_mode("BTCUSDT", MarginModeCfg::Isolated);
         let now = 1_700_000_000_000;
         // Healthy bucket: 50_000 notional, 5_000 isolated
         // margin. Using the fixture snapshot's total_mm of
@@ -815,8 +814,8 @@ mod tests {
 
     #[test]
     fn isolated_falls_back_to_cross_when_no_position_for_symbol() {
-        let mut g = MarginGuard::new(thresholds())
-            .with_symbol_mode("BTCUSDT", MarginModeCfg::Isolated);
+        let mut g =
+            MarginGuard::new(thresholds()).with_symbol_mode("BTCUSDT", MarginModeCfg::Isolated);
         let now = 1_700_000_000_000;
         // Position is for ETHUSDT, not our engine's symbol.
         g.update(isolated_snapshot(

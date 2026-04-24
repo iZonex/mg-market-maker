@@ -57,7 +57,9 @@ pub struct MasterKey {
 
 impl std::fmt::Debug for MasterKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MasterKey").field("bytes", &"<redacted>").finish()
+        f.debug_struct("MasterKey")
+            .field("bytes", &"<redacted>")
+            .finish()
     }
 }
 
@@ -149,7 +151,9 @@ impl MasterKey {
         let ct = b64.decode(blob.ciphertext_b64.as_bytes())?;
         let nonce_bytes = b64.decode(blob.nonce_b64.as_bytes())?;
         if nonce_bytes.len() != 12 {
-            return Err(MasterKeyError::BadLength { got: nonce_bytes.len() });
+            return Err(MasterKeyError::BadLength {
+                got: nonce_bytes.len(),
+            });
         }
         let nonce = Nonce::from_slice(&nonce_bytes);
         let pt = self

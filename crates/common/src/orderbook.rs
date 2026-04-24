@@ -233,11 +233,7 @@ impl LocalOrderBook {
     /// Returns `None` when the book side is empty or mid price
     /// is zero / missing. Partial fill (book shallower than
     /// `target_qty`) returns `Some` with `fully_filled = false`.
-    pub fn sweep_vwap(
-        &self,
-        side: Side,
-        target_qty: Qty,
-    ) -> Option<SweepResult> {
+    pub fn sweep_vwap(&self, side: Side, target_qty: Qty) -> Option<SweepResult> {
         if target_qty <= Decimal::ZERO {
             return None;
         }
@@ -289,11 +285,7 @@ impl LocalOrderBook {
     /// Convenience — just the `(vwap, impact_bps)` pair. For
     /// callers that only need the cost estimate, not the full
     /// fill breakdown.
-    pub fn impact_bps(
-        &self,
-        side: Side,
-        size: Qty,
-    ) -> Option<(Price, Decimal)> {
+    pub fn impact_bps(&self, side: Side, size: Qty) -> Option<(Price, Decimal)> {
         let r = self.sweep_vwap(side, size)?;
         Some((r.vwap, r.impact_bps))
     }

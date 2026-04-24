@@ -141,11 +141,7 @@ pub fn build_manifest(
 /// Verify a manifest against the same `secret` used at signing.
 /// Returns `true` only if the re-computed signature matches in
 /// constant time.
-pub fn verify_manifest(
-    manifest: &ReportManifest,
-    data: &MonthlyReportData,
-    secret: &[u8],
-) -> bool {
+pub fn verify_manifest(manifest: &ReportManifest, data: &MonthlyReportData, secret: &[u8]) -> bool {
     // Re-use build_manifest to produce the canonical signature, then
     // compare via constant-time eq.
     let formats: Vec<&str> = manifest.formats.iter().map(|s| s.as_str()).collect();
@@ -174,7 +170,10 @@ pub fn render_csv(data: &MonthlyReportData) -> String {
     // Header block
     out.push_str("# Monthly Compliance Report\n");
     out.push_str(&format!("# client_id,{}\n", csv_escape(&data.client_id)));
-    out.push_str(&format!("# client_name,{}\n", csv_escape(&data.client_name)));
+    out.push_str(&format!(
+        "# client_name,{}\n",
+        csv_escape(&data.client_name)
+    ));
     out.push_str(&format!("# period_from,{}\n", data.period_from));
     out.push_str(&format!("# period_to,{}\n", data.period_to));
     out.push_str(&format!(
@@ -260,10 +259,7 @@ fn csv_escape(s: &str) -> String {
 ///
 /// Returns the workbook as a `Vec<u8>` ready to stream as
 /// `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`.
-pub fn render_xlsx(
-    data: &MonthlyReportData,
-    manifest: &ReportManifest,
-) -> anyhow::Result<Vec<u8>> {
+pub fn render_xlsx(data: &MonthlyReportData, manifest: &ReportManifest) -> anyhow::Result<Vec<u8>> {
     use rust_xlsxwriter::{Format, FormatAlign, FormatBorder, Workbook};
 
     let mut wb = Workbook::new();
@@ -296,11 +292,7 @@ pub fn render_xlsx(
         sheet.write_string_with_format(3, 0, "Client name", &label_fmt)?;
         sheet.write_string(3, 1, &data.client_name)?;
         sheet.write_string_with_format(4, 0, "Period", &label_fmt)?;
-        sheet.write_string(
-            4,
-            1,
-            format!("{} – {}", data.period_from, data.period_to),
-        )?;
+        sheet.write_string(4, 1, format!("{} – {}", data.period_from, data.period_to))?;
         sheet.write_string_with_format(5, 0, "Generated", &label_fmt)?;
         sheet.write_string(5, 1, data.generated_at.to_rfc3339())?;
 
@@ -506,7 +498,11 @@ mod tests {
         let m = build_manifest(&data, &["csv", "xlsx"], secret).unwrap();
         assert!(verify_manifest(&m, &data, secret));
         // Wrong secret fails
-        assert!(!verify_manifest(&m, &data, b"wrong-secret-value-padding-padding"));
+        assert!(!verify_manifest(
+            &m,
+            &data,
+            b"wrong-secret-value-padding-padding"
+        ));
     }
 
     #[test]

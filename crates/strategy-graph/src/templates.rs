@@ -35,8 +35,10 @@ static BASIS_CARRY_SPOT_PERP: &str = include_str!("../templates/basis-carry-spot
 static PENTEST_SPOOF_CLASSIC: &str = include_str!("../templates/pentest/spoof-classic.json");
 static PENTEST_PUMP_AND_DUMP: &str = include_str!("../templates/pentest/pump-and-dump.json");
 static PENTEST_RAVE_CYCLE: &str = include_str!("../templates/pentest/rave-cycle.json");
-static PENTEST_RAVE_FULL_CAMPAIGN: &str = include_str!("../templates/pentest/rave-full-campaign.json");
-static PENTEST_LIQUIDATION_CASCADE: &str = include_str!("../templates/pentest/liquidation-cascade.json");
+static PENTEST_RAVE_FULL_CAMPAIGN: &str =
+    include_str!("../templates/pentest/rave-full-campaign.json");
+static PENTEST_LIQUIDATION_CASCADE: &str =
+    include_str!("../templates/pentest/liquidation-cascade.json");
 static PENTEST_BASKET_PUSH: &str = include_str!("../templates/pentest/basket-push.json");
 static RUG_DETECTOR_COMPOSITE: &str = include_str!("../templates/rug-detector-composite.json");
 static FUNDING_AWARE_QUOTER: &str = include_str!("../templates/funding-aware-quoter.json");
@@ -216,9 +218,8 @@ mod tests {
                 continue;
             }
             let g = Graph::from_json(t.body).unwrap();
-            let err = Evaluator::build(&g).expect_err(
-                "pentest template should refuse to compile without the restricted env",
-            );
+            let err = Evaluator::build(&g)
+                .expect_err("pentest template should refuse to compile without the restricted env");
             assert!(
                 matches!(err, ValidationError::RestrictedNotAllowed(_)),
                 "expected RestrictedNotAllowed, got {err:?}"

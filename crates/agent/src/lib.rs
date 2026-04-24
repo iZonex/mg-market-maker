@@ -40,8 +40,8 @@ pub use registry::{EngineFactory, MockEngineFactory, SpawnedEngine, StrategyRegi
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
 use tokio::sync::watch;
+use tokio::sync::Mutex;
 
 use mm_control::envelope::{Envelope, SignedEnvelope};
 use mm_control::identity::IdentityKey;
@@ -193,10 +193,7 @@ impl<T: Transport> LeaseClient<T> {
     /// Must be the same instance the attached `RealEngineFactory`
     /// carries via `with_dashboard`, so engines write and the
     /// details handler reads through a single map.
-    pub fn with_dashboard(
-        mut self,
-        dashboard: mm_dashboard::state::DashboardState,
-    ) -> Self {
+    pub fn with_dashboard(mut self, dashboard: mm_dashboard::state::DashboardState) -> Self {
         self.dashboard = Some(dashboard);
         self
     }
@@ -286,12 +283,15 @@ impl<T: Transport> LeaseClient<T> {
                 let guard = self.current_lease.lock().await;
                 match guard.as_ref() {
                     Some(lease) => {
-                        let total_ms =
-                            (lease.expires_at - lease.issued_at).num_milliseconds().max(1);
+                        let total_ms = (lease.expires_at - lease.issued_at)
+                            .num_milliseconds()
+                            .max(1);
                         let refresh_offset_ms =
                             (total_ms as f32 * self.config.refresh_at_fraction) as i64;
                         (
-                            Some(lease.issued_at + chrono::Duration::milliseconds(refresh_offset_ms)),
+                            Some(
+                                lease.issued_at + chrono::Duration::milliseconds(refresh_offset_ms),
+                            ),
                             Some(lease.expires_at),
                         )
                     }
@@ -353,9 +353,7 @@ impl<T: Transport> LeaseClient<T> {
                         next_snapshot = tokio::time::Instant::now() + SNAPSHOT_EVERY;
                     }
                     if let (Some(rd), Some(seq)) = (refresh_dl, current_issued_seq) {
-                        if chrono::Utc::now() >= rd
-                            && refresh_requested_for != Some(seq)
-                        {
+                        if chrono::Utc::now() >= rd && refresh_requested_for != Some(seq) {
                             self.request_refresh().await?;
                             refresh_requested_for = Some(seq);
                         }
@@ -402,10 +400,7 @@ impl<T: Transport> LeaseClient<T> {
     async fn request_refresh(&mut self) -> Result<(), AgentError> {
         let (lease_id, expires_at) = {
             let guard = self.current_lease.lock().await;
-            guard
-                .as_ref()
-                .map(|l| (l.lease_id, l.expires_at))
-                .unzip()
+            guard.as_ref().map(|l| (l.lease_id, l.expires_at)).unzip()
         };
         if let Some(lease_id) = lease_id {
             // Debug-visible so operators can correlate "no
@@ -449,7 +444,9 @@ impl<T: Transport> LeaseClient<T> {
             }
             CommandPayload::LeaseRevoke { reason } => {
                 self.revoke_lease(reason).await;
-                return Err(AgentError::AuthorityLost("lease revoked by controller".into()));
+                return Err(AgentError::AuthorityLost(
+                    "lease revoked by controller".into(),
+                ));
             }
             CommandPayload::PushCredential { credential } => {
                 if let Some(cat) = self.catalog.as_ref() {
@@ -481,9 +478,7 @@ impl<T: Transport> LeaseClient<T> {
                     // retries.
                     let rows = reg.snapshot_rows();
                     let _ = self
-                        .send_telemetry(TelemetryPayload::DeploymentState {
-                            deployments: rows,
-                        })
+                        .send_telemetry(TelemetryPayload::DeploymentState { deployments: rows })
                         .await;
                 } else {
                     tracing::debug!(
@@ -508,9 +503,7 @@ impl<T: Transport> LeaseClient<T> {
                         // UI sees the new `variables` immediately.
                         let rows = reg.snapshot_rows();
                         let _ = self
-                            .send_telemetry(TelemetryPayload::DeploymentState {
-                                deployments: rows,
-                            })
+                            .send_telemetry(TelemetryPayload::DeploymentState { deployments: rows })
                             .await;
                     } else {
                         tracing::warn!(
@@ -543,10 +536,7 @@ impl<T: Transport> LeaseClient<T> {
                             "funding_arb_recent_events" => {
                                 let events = mm_dashboard::details_store::global()
                                     .funding_arb_events(&symbol);
-                                (
-                                    serde_json::json!({ "events": events }),
-                                    None,
-                                )
+                                (serde_json::json!({ "events": events }), None)
                             }
                             "audit_tail" => {
                                 // Engine writes to data/audit/{symbol}.jsonl
@@ -570,27 +560,25 @@ impl<T: Transport> LeaseClient<T> {
                                     .map(|n| n as usize)
                                     .unwrap_or(200)
                                     .min(5000);
-                                let path = format!(
-                                    "data/audit/{}.jsonl",
-                                    symbol.to_lowercase()
-                                );
+                                let path = format!("data/audit/{}.jsonl", symbol.to_lowercase());
                                 let events = match std::fs::read_to_string(&path) {
                                     Ok(content) => content
                                         .lines()
                                         .rev()
                                         .filter_map(|line| {
-                                            serde_json::from_str::<serde_json::Value>(
-                                                line,
-                                            )
-                                            .ok()
+                                            serde_json::from_str::<serde_json::Value>(line).ok()
                                         })
                                         .filter(|v| {
                                             let ts = audit_entry_ts(v);
                                             if let (Some(ts), Some(from)) = (ts, from_ms) {
-                                                if ts < from { return false; }
+                                                if ts < from {
+                                                    return false;
+                                                }
                                             }
                                             if let (Some(ts), Some(until)) = (ts, until_ms) {
-                                                if ts > until { return false; }
+                                                if ts > until {
+                                                    return false;
+                                                }
                                             }
                                             true
                                         })
@@ -598,10 +586,7 @@ impl<T: Transport> LeaseClient<T> {
                                         .collect::<Vec<_>>(),
                                     Err(_) => Vec::new(),
                                 };
-                                (
-                                    serde_json::json!({ "events": events }),
-                                    None,
-                                )
+                                (serde_json::json!({ "events": events }), None)
                             }
                             "sor_decisions_recent" => {
                                 // Prefer the shared DashboardState
@@ -616,13 +601,9 @@ impl<T: Transport> LeaseClient<T> {
                                         .filter_map(|r| serde_json::to_value(&r).ok())
                                         .collect()
                                 } else {
-                                    mm_dashboard::details_store::global()
-                                        .sor_decisions(&symbol)
+                                    mm_dashboard::details_store::global().sor_decisions(&symbol)
                                 };
-                                (
-                                    serde_json::json!({ "decisions": decisions }),
-                                    None,
-                                )
+                                (serde_json::json!({ "decisions": decisions }), None)
                             }
                             "atomic_bundles_inflight" => {
                                 let bundles = self
@@ -634,10 +615,7 @@ impl<T: Transport> LeaseClient<T> {
                                     .into_iter()
                                     .filter_map(|b| serde_json::to_value(&b).ok())
                                     .collect();
-                                (
-                                    serde_json::json!({ "bundles": values }),
-                                    None,
-                                )
+                                (serde_json::json!({ "bundles": values }), None)
                             }
                             "funding_arb_pairs" => {
                                 let pairs = self
@@ -649,10 +627,7 @@ impl<T: Transport> LeaseClient<T> {
                                     .into_iter()
                                     .filter_map(|p| serde_json::to_value(&p).ok())
                                     .collect();
-                                (
-                                    serde_json::json!({ "pairs": values }),
-                                    None,
-                                )
+                                (serde_json::json!({ "pairs": values }), None)
                             }
                             "rebalance_recommendations" => {
                                 let recs = self
@@ -664,10 +639,7 @@ impl<T: Transport> LeaseClient<T> {
                                     .into_iter()
                                     .filter_map(|r| serde_json::to_value(&r).ok())
                                     .collect();
-                                (
-                                    serde_json::json!({ "recommendations": values }),
-                                    None,
-                                )
+                                (serde_json::json!({ "recommendations": values }), None)
                             }
                             "onchain_scores" => {
                                 let snaps = self
@@ -679,26 +651,22 @@ impl<T: Transport> LeaseClient<T> {
                                     .into_iter()
                                     .filter_map(|s| serde_json::to_value(&s).ok())
                                     .collect();
-                                (
-                                    serde_json::json!({ "snapshots": values }),
-                                    None,
-                                )
+                                (serde_json::json!({ "snapshots": values }), None)
                             }
                             "adverse_selection" => {
                                 let row = self
                                     .dashboard
                                     .as_ref()
                                     .and_then(|dash| dash.get_symbol(&symbol))
-                                    .map(|s| serde_json::json!({
-                                        "symbol": s.symbol,
-                                        "adverse_bps": s.adverse_bps,
-                                        "as_prob_bid": s.as_prob_bid,
-                                        "as_prob_ask": s.as_prob_ask,
-                                    }));
-                                (
-                                    serde_json::json!({ "row": row }),
-                                    None,
-                                )
+                                    .map(|s| {
+                                        serde_json::json!({
+                                            "symbol": s.symbol,
+                                            "adverse_bps": s.adverse_bps,
+                                            "as_prob_bid": s.as_prob_bid,
+                                            "as_prob_ask": s.as_prob_ask,
+                                        })
+                                    });
+                                (serde_json::json!({ "row": row }), None)
                             }
                             "venue_inventory" => {
                                 // Symbol-scoped — only this deployment's
@@ -713,10 +681,7 @@ impl<T: Transport> LeaseClient<T> {
                                     .into_iter()
                                     .filter_map(|v| serde_json::to_value(&v).ok())
                                     .collect();
-                                (
-                                    serde_json::json!({ "legs": values }),
-                                    None,
-                                )
+                                (serde_json::json!({ "legs": values }), None)
                             }
                             "decisions_recent" => {
                                 // DecisionLedger mirror — engine pushes
@@ -726,10 +691,7 @@ impl<T: Transport> LeaseClient<T> {
                                 // engine's own state.
                                 let decisions = mm_dashboard::details_store::global()
                                     .decisions_snapshot(&symbol);
-                                (
-                                    serde_json::json!({ "decisions": decisions }),
-                                    None,
-                                )
+                                (serde_json::json!({ "decisions": decisions }), None)
                             }
                             "graph_trace_recent" => {
                                 // M1-GOBS — strategy-graph live trace ring.
@@ -823,19 +785,17 @@ impl<T: Transport> LeaseClient<T> {
                                 // populated on every `swap_strategy_graph`.
                                 // Cheap read; UI asks once when entering
                                 // Live mode and again on detected swap.
-                                let analysis = mm_dashboard::details_store::global()
-                                    .graph_analysis(&symbol);
+                                let analysis =
+                                    mm_dashboard::details_store::global().graph_analysis(&symbol);
                                 match analysis {
                                     Some(a) => (
-                                        serde_json::to_value(&a)
-                                            .unwrap_or(serde_json::Value::Null),
+                                        serde_json::to_value(&a).unwrap_or(serde_json::Value::Null),
                                         None,
                                     ),
                                     None => (
                                         serde_json::json!({}),
                                         Some(
-                                            "no graph analysis yet — no graph swapped"
-                                                .to_string(),
+                                            "no graph analysis yet — no graph swapped".to_string(),
                                         ),
                                     ),
                                 }
@@ -854,10 +814,7 @@ impl<T: Transport> LeaseClient<T> {
                                 // change the bytes so the
                                 // controller can't verify by
                                 // itself — it has to fan out.
-                                let path = format!(
-                                    "data/audit/{}.jsonl",
-                                    symbol.to_lowercase()
-                                );
+                                let path = format!("data/audit/{}.jsonl", symbol.to_lowercase());
                                 let p = std::path::Path::new(&path);
                                 let payload = if !p.exists() {
                                     serde_json::json!({
@@ -875,9 +832,9 @@ impl<T: Transport> LeaseClient<T> {
                                         }),
                                         Err(err) => {
                                             let (row, expected, got, kind) = match err {
-                                                mm_risk::audit::ChainVerifyError::MalformedRow(r) => {
-                                                    (r, None, None, "malformed_row")
-                                                }
+                                                mm_risk::audit::ChainVerifyError::MalformedRow(
+                                                    r,
+                                                ) => (r, None, None, "malformed_row"),
                                                 mm_risk::audit::ChainVerifyError::ChainBroken {
                                                     row,
                                                     expected,
@@ -931,10 +888,8 @@ impl<T: Transport> LeaseClient<T> {
                                 // the position and return the
                                 // widest pct_from_mid reached.
                                 // Empty book → unknown estimate.
-                                let row = self
-                                    .dashboard
-                                    .as_ref()
-                                    .and_then(|d| d.get_symbol(&symbol));
+                                let row =
+                                    self.dashboard.as_ref().and_then(|d| d.get_symbol(&symbol));
                                 let payload = match row {
                                     Some(s) => {
                                         let qty = s.inventory.abs();
@@ -996,8 +951,9 @@ impl<T: Transport> LeaseClient<T> {
                                     .as_ref()
                                     .and_then(|d| d.get_reconciliation(&symbol));
                                 let payload = match snap {
-                                    Some(s) => serde_json::to_value(&s)
-                                        .unwrap_or(serde_json::Value::Null),
+                                    Some(s) => {
+                                        serde_json::to_value(&s).unwrap_or(serde_json::Value::Null)
+                                    }
                                     None => serde_json::Value::Null,
                                 };
                                 (payload, None)
@@ -1009,10 +965,8 @@ impl<T: Transport> LeaseClient<T> {
                                 // without parsing the whole SymbolState
                                 // blob. All decimals as strings so
                                 // rust_decimal round-trips precisely.
-                                let row = self
-                                    .dashboard
-                                    .as_ref()
-                                    .and_then(|d| d.get_symbol(&symbol));
+                                let row =
+                                    self.dashboard.as_ref().and_then(|d| d.get_symbol(&symbol));
                                 let payload = match row {
                                     Some(s) => {
                                         let bid_depth: rust_decimal::Decimal = s
@@ -1041,9 +995,7 @@ impl<T: Transport> LeaseClient<T> {
                                         let recent = self
                                             .dashboard
                                             .as_ref()
-                                            .map(|d| {
-                                                d.get_recent_fills(Some(&s.symbol), 50)
-                                            })
+                                            .map(|d| d.get_recent_fills(Some(&s.symbol), 50))
                                             .unwrap_or_default();
                                         serde_json::json!({
                                             "symbol": s.symbol,

@@ -100,8 +100,8 @@ fn is_meme_name(base: &str) -> bool {
     // happens to match (unlikely — these are historically reserved
     // for memes).
     const HINTS: &[&str] = &[
-        "doge", "shib", "pepe", "floki", "wojak", "moon", "elon", "bonk", "wif", "turbo",
-        "meme", "popcat", "brett", "mog", "trump",
+        "doge", "shib", "pepe", "floki", "wojak", "moon", "elon", "bonk", "wif", "turbo", "meme",
+        "popcat", "brett", "mog", "trump",
     ];
     HINTS.iter().any(|h| lc.contains(h)) || lc.ends_with("inu")
 }

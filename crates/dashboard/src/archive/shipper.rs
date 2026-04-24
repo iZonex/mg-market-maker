@@ -67,10 +67,7 @@ impl OffsetState {
 
 /// Spawn the shipper loop. Returns the `JoinHandle` so the
 /// server can await graceful shutdown at SIGTERM.
-pub fn spawn(
-    client: ArchiveClient,
-    cfg: ShipperConfig,
-) -> tokio::task::JoinHandle<()> {
+pub fn spawn(client: ArchiveClient, cfg: ShipperConfig) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut state = OffsetState::load(&cfg.offset_file);
         let mut ticker = tokio::time::interval(cfg.interval);

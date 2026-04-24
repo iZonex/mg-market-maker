@@ -78,8 +78,8 @@ impl BinanceConnector {
                 supports_funding_rate: false, // spot has no funding
                 supports_margin_info: false,  // spot — margin is N/A
                 supports_margin_mode: false,
-            supports_liquidation_feed: false,
-            supports_set_leverage: false,
+                supports_liquidation_feed: false,
+                supports_set_leverage: false,
             },
             ws_trader: None,
             withdraw_whitelist: None,
@@ -632,10 +632,7 @@ impl ExchangeConnector for BinanceConnector {
         address: &str,
         network: &str,
     ) -> anyhow::Result<String> {
-        mm_exchange_core::validate_withdraw_address(
-            self.withdraw_whitelist.as_deref(),
-            address,
-        )?;
+        mm_exchange_core::validate_withdraw_address(self.withdraw_whitelist.as_deref(), address)?;
         let params = format!("coin={asset}&amount={qty}&address={address}&network={network}");
         let resp = self
             .signed_post("/sapi/v1/capital/withdraw/apply", &params)
@@ -774,9 +771,10 @@ pub(crate) fn parse_binance_event(stream: &str, data: &Value) -> Option<MarketEv
         };
         let qty: Decimal = o.get("q").and_then(|q| q.as_str())?.parse().ok()?;
         let price: Decimal = o.get("p").and_then(|p| p.as_str())?.parse().ok()?;
-        let ts_ms = o.get("T").and_then(|t| t.as_i64()).unwrap_or_else(|| {
-            chrono::Utc::now().timestamp_millis()
-        });
+        let ts_ms = o
+            .get("T")
+            .and_then(|t| t.as_i64())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
         Some(MarketEvent::Liquidation {
             venue: VenueId::Binance,
             symbol,

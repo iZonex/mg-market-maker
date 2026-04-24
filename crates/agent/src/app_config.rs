@@ -219,7 +219,8 @@ pub fn build_agent_config(
     // deployment's primary symbol unless the credential's
     // `default_symbol` overrides (common when an extra venue
     // uses a different ticker convention for the same asset).
-    let default_extra_qty = variable_decimal(desired, "sor_extra_max_inventory").unwrap_or(dec!(0.005));
+    let default_extra_qty =
+        variable_decimal(desired, "sor_extra_max_inventory").unwrap_or(dec!(0.005));
     for extra in extra_credentials {
         let symbol = extra
             .default_symbol
@@ -277,9 +278,7 @@ fn template_to_strategy_type(template: &str) -> StrategyType {
         }
         "glft-via-graph" | "glft" => StrategyType::Glft,
         "grid-via-graph" | "grid" => StrategyType::Grid,
-        "cross-exchange-basic" | "cross-exchange" | "xemm-reactive" => {
-            StrategyType::CrossExchange
-        }
+        "cross-exchange-basic" | "cross-exchange" | "xemm-reactive" => StrategyType::CrossExchange,
         "basis-carry-spot-perp" | "basis" => StrategyType::Basis,
         "funding-aware-quoter" | "funding_arb" => StrategyType::FundingArb,
         "stat_arb" => StrategyType::StatArb,
@@ -423,8 +422,14 @@ mod tests {
 
     #[test]
     fn credential_populates_exchange_and_keys() {
-        let cfg = build_agent_config(&sample_desired(), &sample_credential(), None, &[], &sample_settings(true))
-            .unwrap();
+        let cfg = build_agent_config(
+            &sample_desired(),
+            &sample_credential(),
+            None,
+            &[],
+            &sample_settings(true),
+        )
+        .unwrap();
         assert_eq!(cfg.exchange.exchange_type, ExchangeType::Binance);
         assert_eq!(cfg.exchange.product, ProductType::Spot);
         assert_eq!(cfg.exchange.api_key.as_deref(), Some("test-key"));
@@ -433,16 +438,28 @@ mod tests {
 
     #[test]
     fn symbol_list_carries_desired_symbol() {
-        let cfg = build_agent_config(&sample_desired(), &sample_credential(), None, &[], &sample_settings(true))
-            .unwrap();
+        let cfg = build_agent_config(
+            &sample_desired(),
+            &sample_credential(),
+            None,
+            &[],
+            &sample_settings(true),
+        )
+        .unwrap();
         assert_eq!(cfg.symbols, vec!["BTCUSDT"]);
     }
 
     #[test]
     fn mode_reads_from_variables_with_paper_fallback() {
         // No `variables.mode` + agent has paper_fill_simulation → paper.
-        let paper_ff = build_agent_config(&sample_desired(), &sample_credential(), None, &[], &sample_settings(true))
-            .unwrap();
+        let paper_ff = build_agent_config(
+            &sample_desired(),
+            &sample_credential(),
+            None,
+            &[],
+            &sample_settings(true),
+        )
+        .unwrap();
         assert_eq!(paper_ff.mode, "paper");
         // No `variables.mode` + agent has NO paper_fill_simulation →
         // NEW SAFER DEFAULT: paper. Previous behaviour silently went
@@ -450,21 +467,41 @@ mod tests {
         // immediately tried signed endpoints with every credential —
         // operators who intended paper ended up live. Operators opt
         // into live explicitly now via `variables.mode = "live"`.
-        let default_no_ff = build_agent_config(&sample_desired(), &sample_credential(), None, &[], &sample_settings(false))
-            .unwrap();
+        let default_no_ff = build_agent_config(
+            &sample_desired(),
+            &sample_credential(),
+            None,
+            &[],
+            &sample_settings(false),
+        )
+        .unwrap();
         assert_eq!(default_no_ff.mode, "paper");
         // Explicit `variables.mode = "live"` overrides.
         let mut live_desc = sample_desired();
-        live_desc.variables.insert("mode".into(), serde_json::Value::String("live".into()));
-        let live = build_agent_config(&live_desc, &sample_credential(), None, &[], &sample_settings(false))
-            .unwrap();
+        live_desc
+            .variables
+            .insert("mode".into(), serde_json::Value::String("live".into()));
+        let live = build_agent_config(
+            &live_desc,
+            &sample_credential(),
+            None,
+            &[],
+            &sample_settings(false),
+        )
+        .unwrap();
         assert_eq!(live.mode, "live");
     }
 
     #[test]
     fn rails_override_kill_switch_defaults() {
-        let cfg = build_agent_config(&sample_desired(), &sample_credential(), None, &[], &sample_settings(true))
-            .unwrap();
+        let cfg = build_agent_config(
+            &sample_desired(),
+            &sample_credential(),
+            None,
+            &[],
+            &sample_settings(true),
+        )
+        .unwrap();
         assert_eq!(cfg.kill_switch.daily_loss_limit, "25".parse().unwrap());
         assert_eq!(cfg.kill_switch.max_message_rate, 30);
         assert_eq!(cfg.risk.stale_book_timeout_secs, 15);
@@ -473,10 +510,23 @@ mod tests {
     #[test]
     fn variable_override_applies_to_market_maker() {
         let mut desired = sample_desired();
-        desired.variables.insert("gamma".into(), serde_json::json!("0.25"));
-        desired.variables.insert("num_levels".into(), serde_json::json!(5));
-        desired.variables.insert("min_spread_bps".into(), serde_json::json!("7"));
-        let cfg = build_agent_config(&desired, &sample_credential(), None, &[], &sample_settings(true)).unwrap();
+        desired
+            .variables
+            .insert("gamma".into(), serde_json::json!("0.25"));
+        desired
+            .variables
+            .insert("num_levels".into(), serde_json::json!(5));
+        desired
+            .variables
+            .insert("min_spread_bps".into(), serde_json::json!("7"));
+        let cfg = build_agent_config(
+            &desired,
+            &sample_credential(),
+            None,
+            &[],
+            &sample_settings(true),
+        )
+        .unwrap();
         assert_eq!(cfg.market_maker.gamma, "0.25".parse().unwrap());
         assert_eq!(cfg.market_maker.num_levels, 5);
         assert_eq!(cfg.market_maker.min_spread_bps, "7".parse().unwrap());
@@ -486,11 +536,25 @@ mod tests {
     fn template_name_maps_to_strategy_type() {
         let mut desired = sample_desired();
         desired.template = "glft-via-graph".into();
-        let cfg = build_agent_config(&desired, &sample_credential(), None, &[], &sample_settings(true)).unwrap();
+        let cfg = build_agent_config(
+            &desired,
+            &sample_credential(),
+            None,
+            &[],
+            &sample_settings(true),
+        )
+        .unwrap();
         assert_eq!(cfg.market_maker.strategy, StrategyType::Glft);
 
         desired.template = "cross-exchange-basic".into();
-        let cfg = build_agent_config(&desired, &sample_credential(), None, &[], &sample_settings(true)).unwrap();
+        let cfg = build_agent_config(
+            &desired,
+            &sample_credential(),
+            None,
+            &[],
+            &sample_settings(true),
+        )
+        .unwrap();
         assert_eq!(cfg.market_maker.strategy, StrategyType::CrossExchange);
     }
 
@@ -498,7 +562,14 @@ mod tests {
     fn unknown_template_falls_back_to_avellaneda() {
         let mut desired = sample_desired();
         desired.template = "not-a-real-template".into();
-        let cfg = build_agent_config(&desired, &sample_credential(), None, &[], &sample_settings(true)).unwrap();
+        let cfg = build_agent_config(
+            &desired,
+            &sample_credential(),
+            None,
+            &[],
+            &sample_settings(true),
+        )
+        .unwrap();
         assert_eq!(cfg.market_maker.strategy, StrategyType::AvellanedaStoikov);
     }
 
@@ -639,7 +710,10 @@ mod tests {
             &sample_settings(true),
         )
         .unwrap();
-        assert_eq!(cfg.sor_extra_venues[0].max_inventory, "0.02".parse().unwrap());
+        assert_eq!(
+            cfg.sor_extra_venues[0].max_inventory,
+            "0.02".parse().unwrap()
+        );
     }
 
     #[test]
@@ -673,8 +747,16 @@ mod tests {
     #[test]
     fn unknown_variable_is_logged_not_fatal() {
         let mut desired = sample_desired();
-        desired.variables.insert("total_bogus_knob".into(), serde_json::json!("x"));
-        let cfg = build_agent_config(&desired, &sample_credential(), None, &[], &sample_settings(true));
+        desired
+            .variables
+            .insert("total_bogus_knob".into(), serde_json::json!("x"));
+        let cfg = build_agent_config(
+            &desired,
+            &sample_credential(),
+            None,
+            &[],
+            &sample_settings(true),
+        );
         assert!(cfg.is_ok(), "unknown variables survive without crashing");
     }
 }

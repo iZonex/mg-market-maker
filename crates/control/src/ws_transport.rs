@@ -51,9 +51,7 @@ pub struct WsTransport {
 #[async_trait]
 impl Transport for WsTransport {
     async fn send(&self, envelope: SignedEnvelope) -> Result<(), TransportError> {
-        self.tx
-            .send(envelope)
-            .map_err(|_| TransportError::Closed)
+        self.tx.send(envelope).map_err(|_| TransportError::Closed)
     }
 
     async fn recv(&mut self) -> Result<Option<SignedEnvelope>, TransportError> {
@@ -115,9 +113,7 @@ impl WsTransport {
 fn spawn_pumps<S, R>(mut sink: S, mut source: R) -> WsTransport
 where
     S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin + Send + 'static,
-    R: StreamExt<
-            Item = Result<Message, tokio_tungstenite::tungstenite::Error>,
-        >
+    R: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
         + Unpin
         + Send
         + 'static,
@@ -135,7 +131,7 @@ where
                     continue;
                 }
             };
-            if let Err(e) = sink.send(Message::Text(json.into())).await {
+            if let Err(e) = sink.send(Message::Text(json)).await {
                 tracing::info!(error = %e, "ws outbound: send failed — closing transport");
                 break;
             }
@@ -246,9 +242,9 @@ impl WsListener {
                     .accept(stream)
                     .await
                     .map_err(|e| TransportError::Io(format!("tls handshake from {peer}: {e}")))?;
-                let ws = accept_async(tls_stream).await.map_err(|e| {
-                    TransportError::Io(format!("wss handshake from {peer}: {e}"))
-                })?;
+                let ws = accept_async(tls_stream)
+                    .await
+                    .map_err(|e| TransportError::Io(format!("wss handshake from {peer}: {e}")))?;
                 Ok((WsTransport::from_server_tls_stream(ws), peer))
             }
         }
@@ -281,10 +277,7 @@ mod tests {
         let server = accept.await.unwrap();
 
         // Controller → agent command.
-        let cmd = SignedEnvelope::unsigned(Envelope::command(
-            Seq(1),
-            CommandPayload::Heartbeat,
-        ));
+        let cmd = SignedEnvelope::unsigned(Envelope::command(Seq(1), CommandPayload::Heartbeat));
         server.send(cmd).await.unwrap();
         // Give the inbound pump a moment to forward.
         let got = tokio::time::timeout(Duration::from_secs(1), {

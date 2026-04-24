@@ -83,39 +83,55 @@ impl EmulatorOrderSpec {
     /// deadline_in_secs`.
     pub fn to_emulator_order(self) -> EmulatorOrder {
         match self {
-            Self::StopMarket { side, trigger_price, qty } => {
-                EmulatorOrder::StopMarket { side, trigger_price, qty }
-            }
-            Self::StopLimit { side, trigger_price, limit_price, qty } => {
-                EmulatorOrder::StopLimit {
-                    side,
-                    trigger_price,
-                    limit_price,
-                    qty,
-                }
-            }
-            Self::TrailingStop { side, trail_amount, qty, watermark } => {
-                EmulatorOrder::TrailingStop {
-                    side,
-                    trail_amount,
-                    qty,
-                    watermark,
-                }
-            }
-            Self::OcoLeg { side, trigger_price, qty, sibling } => {
-                EmulatorOrder::OcoLeg {
-                    side,
-                    trigger_price,
-                    qty,
-                    sibling,
-                }
-            }
-            Self::GtdCancel { venue_order_id, deadline_in_secs } => {
-                EmulatorOrder::GtdCancel {
-                    venue_order_id,
-                    deadline: Instant::now() + Duration::from_secs(deadline_in_secs),
-                }
-            }
+            Self::StopMarket {
+                side,
+                trigger_price,
+                qty,
+            } => EmulatorOrder::StopMarket {
+                side,
+                trigger_price,
+                qty,
+            },
+            Self::StopLimit {
+                side,
+                trigger_price,
+                limit_price,
+                qty,
+            } => EmulatorOrder::StopLimit {
+                side,
+                trigger_price,
+                limit_price,
+                qty,
+            },
+            Self::TrailingStop {
+                side,
+                trail_amount,
+                qty,
+                watermark,
+            } => EmulatorOrder::TrailingStop {
+                side,
+                trail_amount,
+                qty,
+                watermark,
+            },
+            Self::OcoLeg {
+                side,
+                trigger_price,
+                qty,
+                sibling,
+            } => EmulatorOrder::OcoLeg {
+                side,
+                trigger_price,
+                qty,
+                sibling,
+            },
+            Self::GtdCancel {
+                venue_order_id,
+                deadline_in_secs,
+            } => EmulatorOrder::GtdCancel {
+                venue_order_id,
+                deadline: Instant::now() + Duration::from_secs(deadline_in_secs),
+            },
         }
     }
 }
@@ -575,7 +591,10 @@ mod tests {
         let order = spec.to_emulator_order();
         let after = Instant::now();
         match order {
-            EmulatorOrder::GtdCancel { venue_order_id, deadline } => {
+            EmulatorOrder::GtdCancel {
+                venue_order_id,
+                deadline,
+            } => {
                 assert_eq!(venue_order_id, "ord-123");
                 // Deadline is now + 60s, bounded by wall-clock
                 // jitter between before / after snaps.

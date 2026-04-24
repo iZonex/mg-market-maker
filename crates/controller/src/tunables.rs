@@ -333,7 +333,9 @@ impl TunablesStore {
         std::fs::create_dir_all(dir)?;
         let tmp = dir.join(format!(
             ".{}.tmp-{}",
-            path.file_name().and_then(|s| s.to_str()).unwrap_or("tunables"),
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("tunables"),
             std::process::id()
         ));
         {
@@ -368,7 +370,8 @@ fn validate(t: &Tunables) -> Result<(), TunablesError> {
     }
     if t.lease_min_refresh_interval_secs * 3 > t.lease_ttl_secs {
         return Err(TunablesError::Invalid(
-            "refresh interval × 3 must be ≤ lease TTL (otherwise agents can't keep a lease alive)".into(),
+            "refresh interval × 3 must be ≤ lease TTL (otherwise agents can't keep a lease alive)"
+                .into(),
         ));
     }
     if !t.min_agent_version.is_empty() {

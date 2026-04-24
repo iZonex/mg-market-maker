@@ -25,8 +25,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use mm_strategy_graph::{EvalCtx, Evaluator};
 use mm_strategy_graph::trace::{ExecStatus, TickTrace};
+use mm_strategy_graph::{EvalCtx, Evaluator};
 use serde_json::Value;
 
 /// Replay every entry in `original_traces` through `replay_ev`
@@ -50,10 +50,7 @@ pub fn compute_replay_payload(
 
     for t in original_traces {
         let kind_values = t.source_kind_values();
-        let src = mm_strategy_graph::evaluator::replay_source_inputs(
-            replay_ev,
-            &kind_values,
-        );
+        let src = mm_strategy_graph::evaluator::replay_source_inputs(replay_ev, &kind_values);
 
         // `tick_with_full_trace` returns the candidate's sinks +
         // a fresh `TickTrace` we can diff against the captured
@@ -123,10 +120,7 @@ pub fn compute_replay_payload(
 /// injected identically from the original trace via
 /// `replay_source_inputs` — any "divergence" there is a
 /// numerical artifact of serialisation, not strategy behaviour.
-fn compute_diverging_kinds(
-    deployed: &TickTrace,
-    candidate: &TickTrace,
-) -> Vec<String> {
+fn compute_diverging_kinds(deployed: &TickTrace, candidate: &TickTrace) -> Vec<String> {
     type KindPortToValues = BTreeMap<(String, String), Vec<String>>;
 
     fn collect(trace: &TickTrace) -> KindPortToValues {

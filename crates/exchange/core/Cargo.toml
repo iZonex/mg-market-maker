@@ -18,3 +18,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 prometheus = { workspace = true }
 once_cell = "1"
+
+[lints]
+workspace = true

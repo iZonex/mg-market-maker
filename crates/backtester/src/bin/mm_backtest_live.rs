@@ -61,7 +61,13 @@ fn parse_args() -> Args {
             _ => i += 1,
         }
     }
-    Args { events, gamma, kappa, sigma, order_size }
+    Args {
+        events,
+        gamma,
+        kappa,
+        sigma,
+        order_size,
+    }
 }
 
 fn main() -> Result<()> {
@@ -111,7 +117,7 @@ fn main() -> Result<()> {
         inventory_drift_auto_correct: false,
         amend_enabled: true,
         amend_max_ticks: 2,
-            margin_reduce_slice_pct: rust_decimal_macros::dec!(0.1),
+        margin_reduce_slice_pct: rust_decimal_macros::dec!(0.1),
         fee_tier_refresh_enabled: false,
         fee_tier_refresh_secs: 600,
         borrow_enabled: false,
@@ -129,7 +135,7 @@ fn main() -> Result<()> {
         var_guard_cvar_limit_99: None,
         cross_venue_basis_max_staleness_ms: 1500,
         strategy_capital_budget: std::collections::HashMap::new(),
-            symbol_circulating_supply: std::collections::HashMap::new(),
+        symbol_circulating_supply: std::collections::HashMap::new(),
         cross_exchange_min_profit_bps: dec!(5),
         max_cross_venue_divergence_pct: None,
         sor_inline_enabled: false,
@@ -139,7 +145,9 @@ fn main() -> Result<()> {
         sor_inventory_threshold: rust_decimal::Decimal::ZERO,
         sor_trade_rate_window_secs: 60,
         sor_queue_refresh_secs: 2,
-        sor_extra_l1_poll_secs: 5, venue_regime_classify_secs: 2, };
+        sor_extra_l1_poll_secs: 5,
+        venue_regime_classify_secs: 2,
+    };
 
     let sim = Simulator::new(config, product, FillModel::queue_aware_log());
     let report = sim.run(&AvellanedaStoikov, &events);

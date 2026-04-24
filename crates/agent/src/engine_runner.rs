@@ -107,10 +107,7 @@ impl RealEngineFactory {
     /// Engines spawned by this factory will publish per-symbol
     /// operator-facing state into it; the agent's details
     /// endpoint reads back from the same instance.
-    pub fn with_dashboard(
-        mut self,
-        dashboard: mm_dashboard::state::DashboardState,
-    ) -> Self {
+    pub fn with_dashboard(mut self, dashboard: mm_dashboard::state::DashboardState) -> Self {
         self.dashboard = Some(dashboard);
         self
     }
@@ -259,7 +256,11 @@ impl EngineFactory for RealEngineFactory {
                 .variables
                 .get("extras_credentials")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             let mut extras_resolved: Vec<mm_common::settings::ResolvedCredential> = Vec::new();
             for extra_id in &extras_ids {
@@ -482,7 +483,7 @@ impl SubscribeOnlyRunner {
             // events and the log ticker.
             let next_rung_dl = walker
                 .as_ref()
-                .and_then(|w| next_rung_sleep(w))
+                .and_then(next_rung_sleep)
                 .unwrap_or(self.log_interval);
             let rung_ticker = tokio::time::sleep(next_rung_dl);
             tokio::pin!(rung_ticker);
@@ -588,9 +589,10 @@ fn classify_transition(state: &LeaseState, ladder: &FailLadder) -> Option<FailLa
     match state {
         LeaseState::Held(_) => None,
         LeaseState::Unclaimed => None,
-        LeaseState::Expired(_) | LeaseState::Revoked { .. } => Some(
-            FailLadderWalker::start(ladder.clone(), std::time::Instant::now()),
-        ),
+        LeaseState::Expired(_) | LeaseState::Revoked { .. } => Some(FailLadderWalker::start(
+            ladder.clone(),
+            std::time::Instant::now(),
+        )),
     }
 }
 
@@ -633,10 +635,7 @@ mod tests {
 
     fn desired(primary: &str, symbol: &str) -> DesiredStrategy {
         let mut vars = serde_json::Map::new();
-        vars.insert(
-            "primary_credential".into(),
-            serde_json::json!(primary),
-        );
+        vars.insert("primary_credential".into(), serde_json::json!(primary));
         DesiredStrategy {
             deployment_id: "dep-1".into(),
             template: "subscribe-only".into(),
@@ -723,15 +722,17 @@ mod tests {
         let catalog = Arc::new(CredentialCatalog::from_settings(settings_with(vec![cred])));
         // Inject "other-cred" directly into the catalog as if it
         // had been pushed for a different deployment.
-        catalog.insert(mm_control::messages::PushedCredential {
-            id: "other-cred".into(),
-            exchange: "binance".into(),
-            product: "spot".into(),
-            api_key: "leaked-key".into(),
-            api_secret: "leaked-secret".into(),
-            max_notional_quote: None,
-            default_symbol: None,
-        }).unwrap();
+        catalog
+            .insert(mm_control::messages::PushedCredential {
+                id: "other-cred".into(),
+                exchange: "binance".into(),
+                product: "spot".into(),
+                api_key: "leaked-key".into(),
+                api_secret: "leaked-secret".into(),
+                max_notional_quote: None,
+                default_symbol: None,
+            })
+            .unwrap();
         let factory = RealEngineFactory::new(catalog);
         // Desired only allows "allowed-cred", but variables points
         // at "other-cred" — the allow-list gate must refuse.

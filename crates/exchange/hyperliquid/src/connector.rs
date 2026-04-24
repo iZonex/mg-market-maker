@@ -1008,10 +1008,9 @@ impl ExchangeConnector for HyperLiquidConnector {
             }))
             .await
             .map_err(MarginError::Other)?;
-        parse_hl_clearinghouse_margin(&resp)
-            .ok_or_else(|| MarginError::Other(anyhow::anyhow!(
-                "malformed HL clearinghouseState response"
-            )))
+        parse_hl_clearinghouse_margin(&resp).ok_or_else(|| {
+            MarginError::Other(anyhow::anyhow!("malformed HL clearinghouseState response"))
+        })
     }
 
     /// Set per-symbol margin mode + leverage via
@@ -1021,18 +1020,11 @@ impl ExchangeConnector for HyperLiquidConnector {
     /// higher-level code can reason about them independently;
     /// the implementation reads back the current leverage from
     /// the asset map and passes it through.
-    async fn set_margin_mode(
-        &self,
-        symbol: &str,
-        mode: MarginMode,
-    ) -> Result<(), MarginError> {
+    async fn set_margin_mode(&self, symbol: &str, mode: MarginMode) -> Result<(), MarginError> {
         if self.is_spot {
             return Err(MarginError::NotSupported);
         }
-        let asset = self
-            .asset_for(symbol)
-            .await
-            .map_err(MarginError::Other)?;
+        let asset = self.asset_for(symbol).await.map_err(MarginError::Other)?;
         // HL requires a leverage value on every updateLeverage
         // call. Pick a conservative default (1x) when we don't
         // know the current setting; the subsequent
@@ -1049,18 +1041,11 @@ impl ExchangeConnector for HyperLiquidConnector {
             .map_err(MarginError::Other)
     }
 
-    async fn set_leverage(
-        &self,
-        symbol: &str,
-        leverage: u32,
-    ) -> Result<(), MarginError> {
+    async fn set_leverage(&self, symbol: &str, leverage: u32) -> Result<(), MarginError> {
         if self.is_spot {
             return Err(MarginError::NotSupported);
         }
-        let asset = self
-            .asset_for(symbol)
-            .await
-            .map_err(MarginError::Other)?;
+        let asset = self.asset_for(symbol).await.map_err(MarginError::Other)?;
         // HL's updateLeverage accepts `isCross`; we preserve
         // the account's current mode by defaulting to `false`
         // (isolated). Operators setting cross mode should
@@ -1401,9 +1386,10 @@ pub(crate) fn parse_hl_event(v: &Value, is_spot: bool) -> Vec<MarketEvent> {
                         "B" => Side::Buy,
                         _ => return None,
                     };
-                    let time_ms = t.get("time").and_then(|v| v.as_i64()).unwrap_or_else(|| {
-                        chrono::Utc::now().timestamp_millis()
-                    });
+                    let time_ms = t
+                        .get("time")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
                     Some(MarketEvent::Liquidation {
                         venue,
                         symbol,

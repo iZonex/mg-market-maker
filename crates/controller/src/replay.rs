@@ -150,7 +150,10 @@ mod tests {
         }
         assert_eq!(s.len_for("a1"), DEFAULT_BUFFER_CAP);
         let (_, gap) = s.replay_after("a1", Seq(5));
-        assert!(gap, "oldest entries dropped — cursor inside dropped window is a gap");
+        assert!(
+            gap,
+            "oldest entries dropped — cursor inside dropped window is a gap"
+        );
     }
 
     #[test]

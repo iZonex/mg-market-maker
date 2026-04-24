@@ -29,11 +29,7 @@ use mm_controller::{
     spawn_accept_loop_with_credentials_and_approvals, AgentRegistry, ApprovalStore, FleetState,
     LeasePolicy, MasterKey, TunablesStore, VaultStore,
 };
-use mm_dashboard::{
-    auth::AuthState,
-    state::DashboardState,
-    websocket::WsBroadcast,
-};
+use mm_dashboard::{auth::AuthState, state::DashboardState, websocket::WsBroadcast};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -44,21 +40,23 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     // UI + dashboard + controller API — one port, operator-facing.
     // Default 9090 matches the legacy `dashboard_port` config so
     // operators bookmark the same URL.
-    let http_addr_str = std::env::var("MM_HTTP_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:9090".to_string());
+    let http_addr_str =
+        std::env::var("MM_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:9090".to_string());
     let http_addr = SocketAddr::from_str(&http_addr_str)
         .map_err(|e| anyhow::anyhow!("invalid MM_HTTP_ADDR={http_addr_str}: {e}"))?;
 
     // Agent WS — agents dial this to join the fleet. Port 9091 is
     // the HTTP's neighbour so both cluster on one mental block.
-    let ws_addr_str = std::env::var("MM_AGENT_WS_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:9091".to_string());
+    let ws_addr_str =
+        std::env::var("MM_AGENT_WS_ADDR").unwrap_or_else(|_| "127.0.0.1:9091".to_string());
     let ws_addr = SocketAddr::from_str(&ws_addr_str)
         .map_err(|e| anyhow::anyhow!("invalid MM_AGENT_WS_ADDR={ws_addr_str}: {e}"))?;
 
@@ -107,7 +105,8 @@ async fn main() -> Result<()> {
     // `MM_TUNABLES=./tunables.json`. Missing fields in the file
     // get the code default so adding a new tunable is
     // backwards-compatible with existing deployments.
-    let tunables_path = std::env::var("MM_TUNABLES").unwrap_or_else(|_| "tunables.json".to_string());
+    let tunables_path =
+        std::env::var("MM_TUNABLES").unwrap_or_else(|_| "tunables.json".to_string());
     let tunables = match TunablesStore::load_from_path(&tunables_path) {
         Ok(t) => {
             info!(path = %tunables_path, "tunables loaded");
@@ -204,8 +203,8 @@ async fn main() -> Result<()> {
     // for MiCA monthly exports. The H4 `/api/admin/auth/audit`
     // readback reads only this local file because auth events
     // are controller-scoped.
-    let audit_path_str = std::env::var("MM_AUDIT_PATH")
-        .unwrap_or_else(|_| "data/audit.jsonl".to_string());
+    let audit_path_str =
+        std::env::var("MM_AUDIT_PATH").unwrap_or_else(|_| "data/audit.jsonl".to_string());
     let audit_path = PathBuf::from(&audit_path_str);
     if let Some(parent) = audit_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -309,15 +308,14 @@ async fn main() -> Result<()> {
     {
         let fleet_c = fleet.clone();
         let registry_c = registry.clone();
-        let fetcher: mm_dashboard::state::AuditRangeFetcher = std::sync::Arc::new(
-            move |from_ms: i64, until_ms: i64, limit: usize| {
+        let fetcher: mm_dashboard::state::AuditRangeFetcher =
+            std::sync::Arc::new(move |from_ms: i64, until_ms: i64, limit: usize| {
                 let fleet = fleet_c.clone();
                 let registry = registry_c.clone();
                 Box::pin(async move {
                     fetch_fleet_audit_range(&fleet, &registry, from_ms, until_ms, limit).await
                 })
-            },
-        );
+            });
         dashboard_state.set_audit_range_fetcher(fetcher);
     }
 
@@ -331,8 +329,8 @@ async fn main() -> Result<()> {
         let fleet_c = fleet.clone();
         let registry_c = registry.clone();
         let approvals_c = approvals.clone();
-        let fetcher: mm_dashboard::state::FleetClientMetricsFetcher = std::sync::Arc::new(
-            move |client_filter: Option<String>| {
+        let fetcher: mm_dashboard::state::FleetClientMetricsFetcher =
+            std::sync::Arc::new(move |client_filter: Option<String>| {
                 let fleet = fleet_c.clone();
                 let registry = registry_c.clone();
                 let approvals = approvals_c.clone();
@@ -345,8 +343,7 @@ async fn main() -> Result<()> {
                     )
                     .await
                 })
-            },
-        );
+            });
         dashboard_state.set_fleet_client_metrics_fetcher(fetcher);
     }
 
@@ -356,15 +353,14 @@ async fn main() -> Result<()> {
     {
         let fleet_c = fleet.clone();
         let registry_c = registry.clone();
-        let broadcaster: mm_dashboard::state::FleetAddClientBroadcaster = std::sync::Arc::new(
-            move |client_id: String, symbols: Vec<String>| {
+        let broadcaster: mm_dashboard::state::FleetAddClientBroadcaster =
+            std::sync::Arc::new(move |client_id: String, symbols: Vec<String>| {
                 let fleet = fleet_c.clone();
                 let registry = registry_c.clone();
-                Box::pin(async move {
-                    broadcast_add_client(&fleet, &registry, &client_id, &symbols)
-                })
-            },
-        );
+                Box::pin(
+                    async move { broadcast_add_client(&fleet, &registry, &client_id, &symbols) },
+                )
+            });
         dashboard_state.set_fleet_add_client_broadcaster(broadcaster);
     }
 
@@ -576,11 +572,7 @@ async fn fetch_fleet_audit_range(
     for (request_id, future) in handles {
         match future.await {
             Ok(Ok(reply)) => {
-                if let Some(events) = reply
-                    .payload
-                    .get("events")
-                    .and_then(|v| v.as_array())
-                {
+                if let Some(events) = reply.payload.get("events").and_then(|v| v.as_array()) {
                     merged.extend(events.iter().cloned());
                 }
             }
@@ -604,7 +596,7 @@ async fn fetch_fleet_audit_range(
         }
         0
     }
-    merged.sort_by(|a, b| ts_of(b).cmp(&ts_of(a)));
+    merged.sort_by_key(|r| std::cmp::Reverse(ts_of(r)));
     merged.truncate(limit);
     merged
 }
@@ -693,10 +685,7 @@ async fn fetch_fleet_client_metrics(
                     if let Some(obj) = reply.payload.as_object() {
                         let mut row = obj.clone();
                         row.insert("agent_id".into(), serde_json::json!(agent_id));
-                        row.insert(
-                            "deployment_id".into(),
-                            serde_json::json!(deployment_id),
-                        );
+                        row.insert("deployment_id".into(), serde_json::json!(deployment_id));
                         if let Some(t) = tenant {
                             row.insert("client_id".into(), serde_json::json!(t));
                         }
@@ -728,8 +717,7 @@ async fn webhook_fanout_loop(state: mm_dashboard::state::DashboardState) {
         tokio::time::sleep(TICK).await;
         let clients = state.client_ids_with_webhooks();
         for client_id in clients {
-            let Some(dispatcher) = state.get_client_webhook_dispatcher(&client_id)
-            else {
+            let Some(dispatcher) = state.get_client_webhook_dispatcher(&client_id) else {
                 continue;
             };
             // `get_client_fills` uses the same fleet-aware path
@@ -841,10 +829,7 @@ async fn violation_auto_action_loop(
                     continue;
                 }
                 let sla_uptime = dep.sla_uptime_pct.parse::<f64>().unwrap_or(100.0);
-                let manip_score = dep
-                    .manipulation_combined
-                    .parse::<f64>()
-                    .unwrap_or(0.0);
+                let manip_score = dep.manipulation_combined.parse::<f64>().unwrap_or(0.0);
                 // Wave G3 — per-category gating. Each flag
                 // controls one trigger; order here is priority
                 // (SLA first, then manipulation) so if both
@@ -954,11 +939,8 @@ async fn telegram_bridge_loop(
                 registry.pending_details_forget(request_id);
                 continue;
             }
-            if let Ok(Ok(reply)) =
-                tokio::time::timeout(Duration::from_secs(3), rx).await
-            {
-                if let Some(arr) = reply.payload.get("alerts").and_then(|v| v.as_array())
-                {
+            if let Ok(Ok(reply)) = tokio::time::timeout(Duration::from_secs(3), rx).await {
+                if let Some(arr) = reply.payload.get("alerts").and_then(|v| v.as_array()) {
                     collected.extend(arr.iter().cloned());
                 }
             }

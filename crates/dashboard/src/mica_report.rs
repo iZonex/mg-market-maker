@@ -113,8 +113,8 @@ impl MicaAlgoReport {
             sla_obligations: sla,
             generated_at,
         };
-        let body = serde_json::to_string(&unsigned)
-            .expect("MicaAlgoReport fields are all serde-safe");
+        let body =
+            serde_json::to_string(&unsigned).expect("MicaAlgoReport fields are all serde-safe");
         let signature = hmac_sign(secret, &body);
 
         Self {
@@ -243,8 +243,7 @@ mod tests {
         let config = mm_common::config::AppConfig::default();
         let from = Utc::now();
         let to = Utc::now();
-        let mut r =
-            MicaAlgoReport::build(from, to, "test", &config, dec!(0), dec!(0), 0, "key");
+        let mut r = MicaAlgoReport::build(from, to, "test", &config, dec!(0), dec!(0), 0, "key");
         r.otr_statistics.avg_otr = dec!(9999); // tamper outside the 4-token legacy scope
         assert!(
             r.verify("key").is_err(),

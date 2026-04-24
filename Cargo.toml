@@ -32,6 +32,17 @@ members = [
 edition = "2021"
 version = "0.4.0"
 
+# Clippy lints we silence workspace-wide. Both are style-only
+# Rust 1.94 additions whose churn isn't worth the diff: doc
+# continuation indentation is a formatting preference we can
+# enforce later with rustfmt itself, and field-reassign-with-
+# Default fires on any `let mut = default(); x.foo = …` builder
+# pattern regardless of readability gain.
+[workspace.lints.clippy]
+doc_lazy_continuation = "allow"
+field_reassign_with_default = "allow"
+empty_line_after_doc_comments = "allow"
+
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }

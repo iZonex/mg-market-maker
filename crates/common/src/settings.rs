@@ -193,15 +193,9 @@ pub enum ResolveError {
     #[error("credential id {0} not found in settings")]
     UnknownId(String),
     #[error("credential {credential_id}: env var {var} is not set")]
-    MissingEnv {
-        credential_id: String,
-        var: String,
-    },
+    MissingEnv { credential_id: String, var: String },
     #[error("credential {credential_id}: env var {var} is empty")]
-    EmptyEnv {
-        credential_id: String,
-        var: String,
-    },
+    EmptyEnv { credential_id: String, var: String },
 }
 
 impl CredentialSpec {
@@ -278,6 +272,7 @@ impl SettingsFile {
     /// Parse from an in-memory string — handy for tests and for
     /// the forthcoming settings-as-DB backend where the raw
     /// document is a row payload rather than a file.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(raw: &str) -> Result<Self, SettingsError> {
         let parsed: SettingsFile = toml::from_str(raw)?;
         parsed.validate()?;

@@ -38,8 +38,7 @@ pub fn classify_message(msg: &str) -> VenueError {
 
     // Insufficient collateral / margin. HL's margin engine says
     // "insufficient margin" or "insufficient ... balance".
-    if lower.contains("insufficient") && (lower.contains("margin") || lower.contains("balance"))
-    {
+    if lower.contains("insufficient") && (lower.contains("margin") || lower.contains("balance")) {
         return VenueError::insufficient_balance(msg.to_string());
     }
 
@@ -119,7 +118,10 @@ mod tests {
     #[test]
     fn bad_signature() {
         assert_eq!(
-            classify(&err("HL /exchange error: {\"status\":\"err\",\"response\":\"Invalid signature\"}")).kind,
+            classify(&err(
+                "HL /exchange error: {\"status\":\"err\",\"response\":\"Invalid signature\"}"
+            ))
+            .kind,
             VenueErrorKind::AuthRejected
         );
     }
@@ -127,7 +129,10 @@ mod tests {
     #[test]
     fn insufficient_margin() {
         assert_eq!(
-            classify(&err("HL /exchange error: {\"response\":\"Insufficient margin to place order\"}")).kind,
+            classify(&err(
+                "HL /exchange error: {\"response\":\"Insufficient margin to place order\"}"
+            ))
+            .kind,
             VenueErrorKind::InsufficientBalance
         );
     }
@@ -151,7 +156,10 @@ mod tests {
     #[test]
     fn order_never_placed_is_out_of_sync() {
         assert_eq!(
-            classify(&err("HL /exchange error: Order was never placed, already cancelled, or filled")).kind,
+            classify(&err(
+                "HL /exchange error: Order was never placed, already cancelled, or filled"
+            ))
+            .kind,
             VenueErrorKind::OutOfSync
         );
     }

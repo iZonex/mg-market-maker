@@ -114,11 +114,7 @@ impl CircuitBreaker {
     /// exposure/drawdown math stays with its owner
     /// (`ExposureManager`) and the breaker just records the
     /// observation.
-    pub fn check_condition(
-        &mut self,
-        reason: TripReason,
-        currently_breached: bool,
-    ) {
+    pub fn check_condition(&mut self, reason: TripReason, currently_breached: bool) {
         if currently_breached {
             self.trip(reason);
         } else if self.reason.as_ref() == Some(&reason) {
@@ -292,7 +288,10 @@ mod tests {
         cb.check_spread(Some(dec!(200)), &risk);
         assert_eq!(cb.reason(), Some(&TripReason::WideSpread));
         cb.check_spread(Some(dec!(50)), &risk);
-        assert!(!cb.is_tripped(), "WideSpread must auto-reset on fresh narrow spread");
+        assert!(
+            !cb.is_tripped(),
+            "WideSpread must auto-reset on fresh narrow spread"
+        );
     }
 
     /// Non-stale trips (MaxDrawdown, MaxExposure, WideSpread,

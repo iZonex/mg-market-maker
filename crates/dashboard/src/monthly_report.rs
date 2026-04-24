@@ -24,8 +24,8 @@
 //! `render_csv` / `render_xlsx` / `render_pdf` generators.
 
 use crate::report_export::{
-    AuditRow, FillRow, ManifestCounts, MonthlyReportData, ReportManifest,
-    SymbolSummaryRow, build_manifest,
+    build_manifest, AuditRow, FillRow, ManifestCounts, MonthlyReportData, ReportManifest,
+    SymbolSummaryRow,
 };
 use crate::state::{DashboardState, FillRecord};
 use chrono::{NaiveDate, Utc};
@@ -136,8 +136,7 @@ pub fn build_monthly_report(
         match audit_log_path {
             Some(p) if p.exists() => {
                 let events =
-                    mm_risk::audit_reader::read_audit_range(p, from_ts, to_ts)
-                        .unwrap_or_default();
+                    mm_risk::audit_reader::read_audit_range(p, from_ts, to_ts).unwrap_or_default();
                 events.into_iter().map(audit_event_to_row).collect()
             }
             _ => Vec::new(),
@@ -210,8 +209,7 @@ mod tests {
         let state = DashboardState::new();
         let from = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
         let to = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
-        let r = build_monthly_report(&state, None, "Unassigned", from, to, None)
-            .expect("build ok");
+        let r = build_monthly_report(&state, None, "Unassigned", from, to, None).expect("build ok");
         assert_eq!(r.client_id, "all");
         assert!(r.summaries.is_empty());
         assert!(r.fills.is_empty());

@@ -60,10 +60,7 @@ pub struct HolderConcentrationCache {
 }
 
 impl HolderConcentrationCache {
-    pub fn new(
-        provider: Arc<dyn OnchainProvider>,
-        config: HolderConcentrationConfig,
-    ) -> Self {
+    pub fn new(provider: Arc<dyn OnchainProvider>, config: HolderConcentrationConfig) -> Self {
         Self {
             provider,
             config,
@@ -79,11 +76,7 @@ impl HolderConcentrationCache {
     /// Returns the cached snapshot if under TTL; otherwise
     /// refreshes via the provider. On provider error, returns
     /// the last cached snapshot if one exists, else propagates.
-    pub async fn get(
-        &self,
-        chain: &str,
-        token: &str,
-    ) -> OnchainResult<ConcentrationSnapshot> {
+    pub async fn get(&self, chain: &str, token: &str) -> OnchainResult<ConcentrationSnapshot> {
         let key = Self::key(chain, token);
         let now = Utc::now();
         {
@@ -117,11 +110,7 @@ impl HolderConcentrationCache {
         }
     }
 
-    async fn fetch(
-        &self,
-        chain: &str,
-        token: &str,
-    ) -> OnchainResult<ConcentrationSnapshot> {
+    async fn fetch(&self, chain: &str, token: &str) -> OnchainResult<ConcentrationSnapshot> {
         let holders = self
             .provider
             .get_top_holders(chain, token, self.config.top_n)
@@ -177,24 +166,38 @@ mod tests {
     }
     #[async_trait]
     impl OnchainProvider for MockProvider {
-        fn name(&self) -> &str { "mock" }
+        fn name(&self) -> &str {
+            "mock"
+        }
         async fn get_top_holders(
-            &self, _c: &str, _t: &str, _l: u32,
+            &self,
+            _c: &str,
+            _t: &str,
+            _l: u32,
         ) -> OnchainResult<Vec<HolderEntry>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(vec![
-                HolderEntry { address: "0xa".into(), balance: dec!(500), label: None },
-                HolderEntry { address: "0xb".into(), balance: dec!(400), label: None },
+                HolderEntry {
+                    address: "0xa".into(),
+                    balance: dec!(500),
+                    label: None,
+                },
+                HolderEntry {
+                    address: "0xb".into(),
+                    balance: dec!(400),
+                    label: None,
+                },
             ])
         }
         async fn get_address_transfers(
-            &self, _c: &str, _w: &str, _s: DateTime<Utc>,
+            &self,
+            _c: &str,
+            _w: &str,
+            _s: DateTime<Utc>,
         ) -> OnchainResult<Vec<TransferEntry>> {
             Ok(Vec::new())
         }
-        async fn get_token_metadata(
-            &self, c: &str, t: &str,
-        ) -> OnchainResult<TokenMetadata> {
+        async fn get_token_metadata(&self, c: &str, t: &str) -> OnchainResult<TokenMetadata> {
             Ok(TokenMetadata {
                 chain: c.into(),
                 token: t.into(),
@@ -210,11 +213,10 @@ mod tests {
     /// provider.
     #[tokio::test]
     async fn caches_within_ttl() {
-        let p = Arc::new(MockProvider { calls: AtomicU32::new(0) });
-        let cache = HolderConcentrationCache::new(
-            p.clone(),
-            HolderConcentrationConfig::default(),
-        );
+        let p = Arc::new(MockProvider {
+            calls: AtomicU32::new(0),
+        });
+        let cache = HolderConcentrationCache::new(p.clone(), HolderConcentrationConfig::default());
         let s1 = cache.get("eth-mainnet", "0xrave").await.unwrap();
         assert_eq!(s1.concentration_pct, dec!(0.9)); // 900/1000
         let s2 = cache.get("eth-mainnet", "0xrave").await.unwrap();
@@ -231,29 +233,40 @@ mod tests {
         }
         #[async_trait]
         impl OnchainProvider for FlakyProvider {
-            fn name(&self) -> &str { "flaky" }
+            fn name(&self) -> &str {
+                "flaky"
+            }
             async fn get_top_holders(
-                &self, _c: &str, _t: &str, _l: u32,
+                &self,
+                _c: &str,
+                _t: &str,
+                _l: u32,
             ) -> OnchainResult<Vec<HolderEntry>> {
                 if !self.served_ok.swap(true, Ordering::SeqCst) {
                     Ok(vec![HolderEntry {
-                        address: "0xa".into(), balance: dec!(100), label: None
+                        address: "0xa".into(),
+                        balance: dec!(100),
+                        label: None,
                     }])
                 } else {
                     Err(OnchainError::RateLimited("flaky".into()))
                 }
             }
             async fn get_address_transfers(
-                &self, _c: &str, _w: &str, _s: DateTime<Utc>,
+                &self,
+                _c: &str,
+                _w: &str,
+                _s: DateTime<Utc>,
             ) -> OnchainResult<Vec<TransferEntry>> {
                 Ok(Vec::new())
             }
-            async fn get_token_metadata(
-                &self, c: &str, t: &str,
-            ) -> OnchainResult<TokenMetadata> {
+            async fn get_token_metadata(&self, c: &str, t: &str) -> OnchainResult<TokenMetadata> {
                 Ok(TokenMetadata {
-                    chain: c.into(), token: t.into(), symbol: "X".into(),
-                    decimals: 18, total_supply: dec!(200),
+                    chain: c.into(),
+                    token: t.into(),
+                    symbol: "X".into(),
+                    decimals: 18,
+                    total_supply: dec!(200),
                 })
             }
         }

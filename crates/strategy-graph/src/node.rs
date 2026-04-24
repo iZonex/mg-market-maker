@@ -160,9 +160,7 @@ pub enum ConfigWidget {
     /// Dropdown with a finite set of string options. Every option
     /// also carries a human label so we can show "≥" instead of
     /// `"ge"` while the graph JSON still stores the compact form.
-    Enum {
-        options: Vec<ConfigEnumOption>,
-    },
+    Enum { options: Vec<ConfigEnumOption> },
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

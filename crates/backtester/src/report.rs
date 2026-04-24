@@ -60,14 +60,13 @@ impl BacktestReport {
                 self.completed_candles.first(),
                 self.completed_candles.last(),
             ) {
-                println!("    Span:          {} → {}", first.open_ts_ms, last.close_ts_ms);
+                println!(
+                    "    Span:          {} → {}",
+                    first.open_ts_ms, last.close_ts_ms
+                );
                 println!("    Open:          {}", first.open);
                 println!("    Close:         {}", last.close);
-                let total_vol: Decimal = self
-                    .completed_candles
-                    .iter()
-                    .map(|c| c.volume())
-                    .sum();
+                let total_vol: Decimal = self.completed_candles.iter().map(|c| c.volume()).sum();
                 println!("    Total volume:  {}", total_vol);
             }
         }

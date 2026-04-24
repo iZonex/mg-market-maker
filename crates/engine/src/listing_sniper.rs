@@ -203,10 +203,8 @@ pub struct ListingSniperRunner {
     /// quarantine window to expire. Keyed by `(venue,
     /// symbol)`. Populated on every `Discovered` event;
     /// drained on every scan tick by `try_execute_pending`.
-    pending_entries: std::collections::HashMap<
-        (mm_exchange_core::connector::VenueId, String),
-        PendingEntry,
-    >,
+    pending_entries:
+        std::collections::HashMap<(mm_exchange_core::connector::VenueId, String), PendingEntry>,
     /// Epic F stage-3 — active entries counter. Incremented
     /// when `try_execute_pending` places a real IOC; never
     /// decremented automatically (sniper does not track
@@ -248,10 +246,7 @@ impl ListingSniperRunner {
     /// entry policy. Without this call the runner stays in
     /// observer-only mode (byte-identical to pre-stage-3
     /// behaviour).
-    pub fn with_entry_policy(
-        mut self,
-        cfg: mm_common::config::ListingSniperEntryConfig,
-    ) -> Self {
+    pub fn with_entry_policy(mut self, cfg: mm_common::config::ListingSniperEntryConfig) -> Self {
         self.entry_cfg = Some(cfg);
         self
     }
@@ -411,11 +406,8 @@ impl ListingSniperRunner {
             let reject = |reason: &str| {
                 let detail = format!("venue={venue:?} symbol={symbol} reason={reason}");
                 warn!(%detail, "listing sniper entry rejected");
-                self.audit.risk_event(
-                    &audit_symbol,
-                    AuditEventType::ListingEntryRejected,
-                    &detail,
-                );
+                self.audit
+                    .risk_event(&audit_symbol, AuditEventType::ListingEntryRejected, &detail);
             };
 
             // Guard 1: master switch.
@@ -493,11 +485,8 @@ impl ListingSniperRunner {
                         "venue={venue:?} symbol={symbol} qty={qty} price={limit} notional={notional}"
                     );
                     info!(%detail, "listing sniper entry placed");
-                    self.audit.risk_event(
-                        &audit_symbol,
-                        AuditEventType::ListingEntered,
-                        &detail,
-                    );
+                    self.audit
+                        .risk_event(&audit_symbol, AuditEventType::ListingEntered, &detail);
                 }
                 Err(e) => {
                     reject(&format!("place_err({e})"));

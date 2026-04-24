@@ -47,3 +47,6 @@ path = "src/bin/mm_calibrate.rs"
 [[bin]]
 name = "mm-backtest-live"
 path = "src/bin/mm_backtest_live.rs"
+
+[lints]
+workspace = true

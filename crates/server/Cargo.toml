@@ -88,3 +88,6 @@ otel = [
 # can gate their changes under `#[cfg(feature = "io-uring")]`
 # without coordinating across crates.
 io-uring = []
+
+[lints]
+workspace = true

@@ -108,8 +108,7 @@ mod tests {
             // private key — use a known-valid hex string so the
             // test doesn't hit a parse error during factory dispatch.
             // 32 bytes of 0x11 is a valid-length hex scalar.
-            api_secret: "0x1111111111111111111111111111111111111111111111111111111111111111"
-                .into(),
+            api_secret: "0x1111111111111111111111111111111111111111111111111111111111111111".into(),
             max_notional_quote: None,
             default_symbol: None,
         }
@@ -151,21 +150,23 @@ mod tests {
 
     #[test]
     fn bybit_testnet_produces_connector() {
-        let c = build_connector(&cred(ExchangeType::BybitTestnet, ProductType::LinearPerp))
-            .unwrap();
+        let c =
+            build_connector(&cred(ExchangeType::BybitTestnet, ProductType::LinearPerp)).unwrap();
         assert_eq!(c.venue_id(), VenueId::Bybit);
     }
 
     #[test]
     fn hyperliquid_produces_connector() {
-        let c = build_connector(&cred(ExchangeType::HyperLiquid, ProductType::LinearPerp))
-            .unwrap();
+        let c = build_connector(&cred(ExchangeType::HyperLiquid, ProductType::LinearPerp)).unwrap();
         assert_eq!(c.venue_id(), VenueId::HyperLiquid);
     }
 
     #[test]
     fn custom_exchange_type_rejected() {
         let err = build_connector(&cred(ExchangeType::Custom, ProductType::Spot));
-        assert!(err.is_err(), "custom requires explicit URLs, not supported via credential");
+        assert!(
+            err.is_err(),
+            "custom requires explicit URLs, not supported via credential"
+        );
     }
 }

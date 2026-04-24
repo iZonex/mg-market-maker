@@ -12,7 +12,9 @@ async fn bind_server(with_store: bool) -> (SocketAddr, tokio::task::JoinHandle<(
     let fleet = FleetState::new();
     let registry = AgentRegistry::new();
     let store = if with_store {
-        Some(VaultStore::in_memory_with_key(MasterKey::from_bytes([7u8; 32])))
+        Some(VaultStore::in_memory_with_key(MasterKey::from_bytes(
+            [7u8; 32],
+        )))
     } else {
         None
     };
@@ -42,13 +44,12 @@ async fn post_exchange_entry_appears_in_list() {
         .unwrap();
     assert_eq!(res.status(), 200);
 
-    let list: serde_json::Value =
-        reqwest::get(format!("http://{}/api/v1/vault", addr))
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+    let list: serde_json::Value = reqwest::get(format!("http://{}/api/v1/vault", addr))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let rows = list.as_array().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["name"], "binance_spot_main");

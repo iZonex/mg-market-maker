@@ -284,9 +284,7 @@ impl DecisionLedger {
         } * side_mult;
         let ten_k = Decimal::from(10_000);
         let realized_cost_bps = delta / rec.mid_at_decision * ten_k;
-        let vs_expected_bps = rec
-            .expected_cost_bps
-            .map(|e| realized_cost_bps - e);
+        let vs_expected_bps = rec.expected_cost_bps.map(|e| realized_cost_bps - e);
         let resolved = ResolvedCost {
             tick_ms,
             fill_price,
@@ -363,36 +361,16 @@ mod tests {
     #[test]
     fn fill_without_bind_returns_none() {
         let l = DecisionLedger::default();
-        let _ = l.record_decision(
-            0,
-            "BTCUSDT",
-            Side::Buy,
-            dec!(0.01),
-            dec!(100),
-            None,
-        );
+        let _ = l.record_decision(0, "BTCUSDT", Side::Buy, dec!(0.01), dec!(100), None);
         let spurious_order = OrderId::new_v4();
-        let out = l.on_fill(
-            spurious_order,
-            100,
-            Side::Buy,
-            dec!(100),
-            dec!(0.01),
-        );
+        let out = l.on_fill(spurious_order, 100, Side::Buy, dec!(100), dec!(0.01));
         assert!(out.is_none());
     }
 
     #[test]
     fn sell_side_adverse_is_positive_cost() {
         let l = DecisionLedger::default();
-        let id = l.record_decision(
-            0,
-            "ETHUSDT",
-            Side::Sell,
-            dec!(0.1),
-            dec!(1_000),
-            None,
-        );
+        let id = l.record_decision(0, "ETHUSDT", Side::Sell, dec!(0.1), dec!(1_000), None);
         let order = OrderId::new_v4();
         l.bind_order(id, order);
         // Selling at 999 is 10 bps adverse (got 10 bps less
@@ -408,14 +386,7 @@ mod tests {
         let l = DecisionLedger::new(4);
         let mut ids = Vec::new();
         for i in 0..10 {
-            ids.push(l.record_decision(
-                i,
-                "X",
-                Side::Buy,
-                dec!(1),
-                dec!(100),
-                None,
-            ));
+            ids.push(l.record_decision(i, "X", Side::Buy, dec!(1), dec!(100), None));
         }
         assert_eq!(l.len(), 4);
         // Oldest 6 evicted — get() returns None for them.

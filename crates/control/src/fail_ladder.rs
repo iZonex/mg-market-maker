@@ -178,23 +178,44 @@ mod tests {
     fn level_at_picks_highest_crossed_rung() {
         let l = FailLadder::default_maker();
         assert_eq!(l.level_at(Duration::from_secs(5)), None);
-        assert_eq!(l.level_at(Duration::from_secs(15)), Some(KillLevel::WidenSpreads));
-        assert_eq!(l.level_at(Duration::from_secs(59)), Some(KillLevel::WidenSpreads));
-        assert_eq!(l.level_at(Duration::from_secs(60)), Some(KillLevel::StopNew));
-        assert_eq!(l.level_at(Duration::from_secs(301)), Some(KillLevel::Flatten));
+        assert_eq!(
+            l.level_at(Duration::from_secs(15)),
+            Some(KillLevel::WidenSpreads)
+        );
+        assert_eq!(
+            l.level_at(Duration::from_secs(59)),
+            Some(KillLevel::WidenSpreads)
+        );
+        assert_eq!(
+            l.level_at(Duration::from_secs(60)),
+            Some(KillLevel::StopNew)
+        );
+        assert_eq!(
+            l.level_at(Duration::from_secs(301)),
+            Some(KillLevel::Flatten)
+        );
     }
 
     #[test]
     fn non_monotonic_rejected() {
         let err = FailLadder::from_rungs(vec![
-            FailRung { after: Duration::from_secs(60), level: KillLevel::StopNew },
-            FailRung { after: Duration::from_secs(30), level: KillLevel::WidenSpreads },
+            FailRung {
+                after: Duration::from_secs(60),
+                level: KillLevel::StopNew,
+            },
+            FailRung {
+                after: Duration::from_secs(30),
+                level: KillLevel::WidenSpreads,
+            },
         ]);
         assert!(matches!(err, Err(LadderError::NotMonotonic)));
     }
 
     #[test]
     fn empty_rejected() {
-        assert!(matches!(FailLadder::from_rungs(vec![]), Err(LadderError::Empty)));
+        assert!(matches!(
+            FailLadder::from_rungs(vec![]),
+            Err(LadderError::Empty)
+        ));
     }
 }

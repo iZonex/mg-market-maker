@@ -424,16 +424,36 @@ impl Default for SocialRiskCfg {
     }
 }
 
-fn default_social_rate_warn() -> String { "2".into() }
-fn default_social_rate_alarm() -> String { "5".into() }
-fn default_social_max_vol_mult() -> String { "3".into() }
-fn default_social_min_size_mult() -> String { "0.5".into() }
-fn default_social_kill_rate() -> String { "10".into() }
-fn default_social_kill_vol() -> String { "0.8".into() }
-fn default_social_skew_threshold() -> String { "0.3".into() }
-fn default_social_max_skew_bps() -> String { "15".into() }
-fn default_social_ofi_confirm() -> String { "1.5".into() }
-fn default_social_staleness_mins() -> i64 { 10 }
+fn default_social_rate_warn() -> String {
+    "2".into()
+}
+fn default_social_rate_alarm() -> String {
+    "5".into()
+}
+fn default_social_max_vol_mult() -> String {
+    "3".into()
+}
+fn default_social_min_size_mult() -> String {
+    "0.5".into()
+}
+fn default_social_kill_rate() -> String {
+    "10".into()
+}
+fn default_social_kill_vol() -> String {
+    "0.8".into()
+}
+fn default_social_skew_threshold() -> String {
+    "0.3".into()
+}
+fn default_social_max_skew_bps() -> String {
+    "15".into()
+}
+fn default_social_ofi_confirm() -> String {
+    "1.5".into()
+}
+fn default_social_staleness_mins() -> i64 {
+    10
+}
 
 /// Serialisable mirror of
 /// `mm_risk::news_retreat::NewsRetreatConfig`. Same field set,
@@ -2706,7 +2726,7 @@ impl Default for AppConfig {
                 sor_extra_l1_poll_secs: default_sor_extra_l1_poll_secs(),
                 venue_regime_classify_secs: default_venue_regime_classify_secs(),
                 strategy_capital_budget: std::collections::HashMap::new(),
-            symbol_circulating_supply: std::collections::HashMap::new(),
+                symbol_circulating_supply: std::collections::HashMap::new(),
                 cross_exchange_min_profit_bps: dec!(5),
                 max_cross_venue_divergence_pct: None,
             },

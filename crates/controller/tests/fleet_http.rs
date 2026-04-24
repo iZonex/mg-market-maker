@@ -16,10 +16,10 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use mm_agent::{AgentConfig, LeaseClient};
-use mm_controller::{http_router, AgentRegistry, AgentSession, FleetState, LeasePolicy};
 use mm_control::in_memory_pair;
 use mm_control::lease::LeaseState;
 use mm_control::messages::AgentId;
+use mm_controller::{http_router, AgentRegistry, AgentSession, FleetState, LeasePolicy};
 
 #[tokio::test]
 async fn fleet_http_returns_connected_agent() {
@@ -36,7 +36,8 @@ async fn fleet_http_returns_connected_agent() {
 
     // Controller-side: one session sharing the fleet map.
     let (controller_side, agent_side) = in_memory_pair();
-    let session = AgentSession::new(controller_side, LeasePolicy::default()).with_fleet(fleet.clone());
+    let session =
+        AgentSession::new(controller_side, LeasePolicy::default()).with_fleet(fleet.clone());
     let controller_task = tokio::spawn(async move { session.run_until_disconnect().await });
 
     // Agent-side: drive the handshake through the in-memory pair.

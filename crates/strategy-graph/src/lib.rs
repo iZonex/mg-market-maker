@@ -26,9 +26,7 @@ pub mod types;
 
 pub use evaluator::{Evaluator, SinkAction};
 pub use graph::{Graph, Node as GraphNode, Scope, ValidationError, CURRENT_SCHEMA_VERSION};
-pub use node::{
-    ConfigEnumOption, ConfigField, ConfigWidget, EvalCtx, NodeKind, NodeState,
-};
+pub use node::{ConfigEnumOption, ConfigField, ConfigWidget, EvalCtx, NodeKind, NodeState};
 pub use storage::{DeployRecord, GraphStore};
 pub use trace::{ExecStatus, GraphAnalysis, NodeExec, TickTrace};
 pub use types::{
@@ -166,8 +164,7 @@ mod integration_tests {
         let b = NodeId::new();
         let sink = NodeId::new();
         let mut g = Graph::empty("t5", GScope::Global);
-        for (id, kind) in [(a, "Math.Add"), (b, "Math.Add"), (sink, "Out.SpreadMult")]
-        {
+        for (id, kind) in [(a, "Math.Add"), (b, "Math.Add"), (sink, "Out.SpreadMult")] {
             g.nodes.push(graph::Node {
                 id,
                 kind: kind.into(),
@@ -381,20 +378,44 @@ mod integration_tests {
             pos: (0.0, 0.0),
         });
         g.edges.push(Edge {
-            from: PortRef { node: baseline_mult, port: "value".into() },
-            to: PortRef { node: baseline_sink, port: "mult".into() },
+            from: PortRef {
+                node: baseline_mult,
+                port: "value".into(),
+            },
+            to: PortRef {
+                node: baseline_sink,
+                port: "mult".into(),
+            },
         });
         g.edges.push(Edge {
-            from: PortRef { node: trigger_src, port: "value".into() },
-            to: PortRef { node: cast, port: "x".into() },
+            from: PortRef {
+                node: trigger_src,
+                port: "value".into(),
+            },
+            to: PortRef {
+                node: cast,
+                port: "x".into(),
+            },
         });
         g.edges.push(Edge {
-            from: PortRef { node: cast, port: "out".into() },
-            to: PortRef { node: sink, port: "trigger".into() },
+            from: PortRef {
+                node: cast,
+                port: "out".into(),
+            },
+            to: PortRef {
+                node: sink,
+                port: "trigger".into(),
+            },
         });
         g.edges.push(Edge {
-            from: PortRef { node: quotes_src, port: "quotes".into() },
-            to: PortRef { node: sink, port: "quotes".into() },
+            from: PortRef {
+                node: quotes_src,
+                port: "quotes".into(),
+            },
+            to: PortRef {
+                node: sink,
+                port: "quotes".into(),
+            },
         });
 
         let mut ev = Evaluator::build(&g).expect("valid");
@@ -462,8 +483,14 @@ mod integration_tests {
             pos: (0.0, 0.0),
         });
         g.edges.push(Edge {
-            from: PortRef { node: add_id, port: "out".into() },
-            to: PortRef { node: sink_id, port: "mult".into() },
+            from: PortRef {
+                node: add_id,
+                port: "out".into(),
+            },
+            to: PortRef {
+                node: sink_id,
+                port: "mult".into(),
+            },
         });
 
         let mut ev = Evaluator::build(&g).expect("valid");
@@ -486,7 +513,9 @@ mod integration_tests {
         assert_eq!(snk.kind, "Out.SpreadMult");
         // Sink takes the Math.Add output on its `mult` input.
         assert!(
-            snk.inputs.iter().any(|(p, v)| p == "mult" && *v == Value::Number(dec!(7))),
+            snk.inputs
+                .iter()
+                .any(|(p, v)| p == "mult" && *v == Value::Number(dec!(7))),
             "sink must record the upstream value on its `mult` port",
         );
     }
@@ -524,10 +553,7 @@ mod integration_tests {
             .required_sources
             .iter()
             .any(|k| k == "Surveillance.ManipulationScore" || k == "Surveillance.RugScore");
-        let onchain_gate = a
-            .required_sources
-            .iter()
-            .any(|k| k.starts_with("Onchain."));
+        let onchain_gate = a.required_sources.iter().any(|k| k.starts_with("Onchain."));
         assert!(
             !manip_gate,
             "avellaneda-via-graph should not trip the manipulation gate; got {:?}",
@@ -579,12 +605,24 @@ mod integration_tests {
         // so validation passes (Sentiment.Rate is a Number-typed
         // source, and `Out.SpreadMult.mult` is Number-typed).
         g.edges.push(Edge {
-            from: PortRef { node: rate, port: "value".into() },
-            to: PortRef { node: cast, port: "x".into() },
+            from: PortRef {
+                node: rate,
+                port: "value".into(),
+            },
+            to: PortRef {
+                node: cast,
+                port: "x".into(),
+            },
         });
         g.edges.push(Edge {
-            from: PortRef { node: rate, port: "value".into() },
-            to: PortRef { node: sink, port: "mult".into() },
+            from: PortRef {
+                node: rate,
+                port: "value".into(),
+            },
+            to: PortRef {
+                node: sink,
+                port: "mult".into(),
+            },
         });
 
         let ev = Evaluator::build(&g).expect("valid");
@@ -644,7 +682,10 @@ mod integration_tests {
             pos: (0.0, 0.0),
         });
         let err = Evaluator::build(&g).expect_err("should reject");
-        assert!(matches!(err, ValidationError::UnknownConfigField { .. }), "got {err:?}");
+        assert!(
+            matches!(err, ValidationError::UnknownConfigField { .. }),
+            "got {err:?}"
+        );
     }
 
     /// Sprint 5 — wrong-type config field (bool where number expected).
@@ -666,7 +707,10 @@ mod integration_tests {
             pos: (0.0, 0.0),
         });
         let err = Evaluator::build(&g).expect_err("should reject");
-        assert!(matches!(err, ValidationError::InvalidConfigFieldType { .. }), "got {err:?}");
+        assert!(
+            matches!(err, ValidationError::InvalidConfigFieldType { .. }),
+            "got {err:?}"
+        );
     }
 
     /// Sprint 5 — enum value outside allowed options.
@@ -688,7 +732,10 @@ mod integration_tests {
             pos: (0.0, 0.0),
         });
         let err = Evaluator::build(&g).expect_err("should reject");
-        assert!(matches!(err, ValidationError::InvalidConfigEnumValue { .. }), "got {err:?}");
+        assert!(
+            matches!(err, ValidationError::InvalidConfigEnumValue { .. }),
+            "got {err:?}"
+        );
     }
 
     /// Sprint 5b — unknown venue in Book.L1 config rejects.
@@ -704,7 +751,10 @@ mod integration_tests {
         let err = g
             .validate_venues(["binance", "bybit"])
             .expect_err("rejects");
-        assert!(matches!(err, ValidationError::UnknownVenue { .. }), "got {err:?}");
+        assert!(
+            matches!(err, ValidationError::UnknownVenue { .. }),
+            "got {err:?}"
+        );
     }
 
     /// Sprint 5b — BasisArb's spot_venue + perp_venue both checked.
@@ -743,7 +793,8 @@ mod integration_tests {
             config: serde_json::json!({ "venue": "Binance" }),
             pos: (0.0, 0.0),
         });
-        g.validate_venues(["binance"]).expect("case-insensitive match");
+        g.validate_venues(["binance"])
+            .expect("case-insensitive match");
     }
 
     /// Sprint 5b — empty / missing venue string skipped.
@@ -756,7 +807,8 @@ mod integration_tests {
             config: serde_json::json!({ "venue": "" }),
             pos: (0.0, 0.0),
         });
-        g.validate_venues::<[&str; 0], &str>([]).expect("empty venue ignored");
+        g.validate_venues::<[&str; 0], &str>([])
+            .expect("empty venue ignored");
     }
 
     /// Sprint 5 — clean config that matches schema passes.
@@ -814,8 +866,14 @@ mod integration_tests {
             pos: (0.0, 0.0),
         });
         g.edges.push(Edge {
-            from: PortRef { node: trigger_src, port: "value".into() },
-            to: PortRef { node: to_bool, port: "x".into() },
+            from: PortRef {
+                node: trigger_src,
+                port: "value".into(),
+            },
+            to: PortRef {
+                node: to_bool,
+                port: "x".into(),
+            },
         });
         g.nodes.push(graph::Node {
             id: kill_id,
@@ -830,8 +888,14 @@ mod integration_tests {
             pos: (0.0, 0.0),
         });
         g.edges.push(Edge {
-            from: PortRef { node: to_bool, port: "out".into() },
-            to: PortRef { node: kill_id, port: "trigger".into() },
+            from: PortRef {
+                node: to_bool,
+                port: "out".into(),
+            },
+            to: PortRef {
+                node: kill_id,
+                port: "trigger".into(),
+            },
         });
         // SpreadMult sink is required for validation — feed a
         // Math.Const(1) so nothing widens.
@@ -843,8 +907,14 @@ mod integration_tests {
             pos: (0.0, 0.0),
         });
         g.edges.push(Edge {
-            from: PortRef { node: passthrough, port: "value".into() },
-            to: PortRef { node: mult_sink, port: "mult".into() },
+            from: PortRef {
+                node: passthrough,
+                port: "value".into(),
+            },
+            to: PortRef {
+                node: mult_sink,
+                port: "mult".into(),
+            },
         });
 
         let mut ev = Evaluator::build(&g).expect("valid graph");
@@ -891,8 +961,14 @@ mod integration_tests {
             pos: (0.0, 0.0),
         });
         g.edges.push(Edge {
-            from: PortRef { node: trigger_src, port: "value".into() },
-            to: PortRef { node: to_bool, port: "x".into() },
+            from: PortRef {
+                node: trigger_src,
+                port: "value".into(),
+            },
+            to: PortRef {
+                node: to_bool,
+                port: "x".into(),
+            },
         });
         g.nodes.push(graph::Node {
             id: kill_id,
@@ -901,8 +977,14 @@ mod integration_tests {
             pos: (0.0, 0.0),
         });
         g.edges.push(Edge {
-            from: PortRef { node: to_bool, port: "out".into() },
-            to: PortRef { node: kill_id, port: "trigger".into() },
+            from: PortRef {
+                node: to_bool,
+                port: "out".into(),
+            },
+            to: PortRef {
+                node: kill_id,
+                port: "trigger".into(),
+            },
         });
         let passthrough = NodeId::new();
         g.nodes.push(graph::Node {
@@ -918,8 +1000,14 @@ mod integration_tests {
             pos: (0.0, 0.0),
         });
         g.edges.push(Edge {
-            from: PortRef { node: passthrough, port: "value".into() },
-            to: PortRef { node: mult_sink, port: "mult".into() },
+            from: PortRef {
+                node: passthrough,
+                port: "value".into(),
+            },
+            to: PortRef {
+                node: mult_sink,
+                port: "mult".into(),
+            },
         });
 
         let mut ev = Evaluator::build(&g).expect("valid graph");

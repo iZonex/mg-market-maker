@@ -100,7 +100,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (cert, key) = write_self_signed(tmp.path());
         let acceptor = build_acceptor(&cert, &key);
-        assert!(acceptor.is_ok(), "build_acceptor failed: {:?}", acceptor.err());
+        assert!(
+            acceptor.is_ok(),
+            "build_acceptor failed: {:?}",
+            acceptor.err()
+        );
     }
 
     #[test]

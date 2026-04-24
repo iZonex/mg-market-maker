@@ -526,7 +526,7 @@ impl MomentumSignals {
             "ofi_ewma": self.ofi_ewma.as_ref().map(|d| d.to_string()),
             "ofi_ewma_sq": self.ofi_ewma_sq.as_ref().map(|d| d.to_string()),
             "learned_mp": self.learned_mp.as_ref()
-                .map(|m| serde_json::to_value(m).ok()).flatten(),
+                .and_then(|m| serde_json::to_value(m).ok()),
             "online_mp_ring": online_ring,
         }))
     }
@@ -583,9 +583,8 @@ impl MomentumSignals {
         }
         if let Some(model_json) = state.get("learned_mp").filter(|v| !v.is_null()) {
             if self.learned_mp.is_some() {
-                let model: LearnedMicroprice =
-                    serde_json::from_value(model_json.clone())
-                        .map_err(|e| format!("momentum: bad learned_mp: {e}"))?;
+                let model: LearnedMicroprice = serde_json::from_value(model_json.clone())
+                    .map_err(|e| format!("momentum: bad learned_mp: {e}"))?;
                 self.learned_mp = Some(model);
             }
         }

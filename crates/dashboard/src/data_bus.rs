@@ -27,7 +27,11 @@ use std::sync::{Arc, RwLock};
 
 /// Per-stream key. Three-tuple because a venue can quote both spot
 /// and perp on the same symbol with different books.
-pub type StreamKey = (String /* venue */, String /* symbol */, ProductType);
+pub type StreamKey = (
+    String, /* venue */
+    String, /* symbol */
+    ProductType,
+);
 
 /// Best bid / ask + spread at a moment in time. Cheap to clone so
 /// readers can snapshot under the lock and release quickly.

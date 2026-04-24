@@ -23,11 +23,7 @@ pub type AuditRangeFetcher = Arc<
             i64,
             usize,
         ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = Vec<serde_json::Value>>
-                    + Send
-                    + 'static,
-            >,
+            Box<dyn std::future::Future<Output = Vec<serde_json::Value>> + Send + 'static>,
         > + Send
         + Sync,
 >;
@@ -50,11 +46,7 @@ pub type FleetClientMetricsFetcher = Arc<
     dyn Fn(
             Option<String>,
         ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = Vec<serde_json::Value>>
-                    + Send
-                    + 'static,
-            >,
+            Box<dyn std::future::Future<Output = Vec<serde_json::Value>> + Send + 'static>,
         > + Send
         + Sync,
 >;
@@ -71,9 +63,8 @@ pub type FleetAddClientBroadcaster = Arc<
     dyn Fn(
             String,
             Vec<String>,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = usize> + Send + 'static>,
-        > + Send
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = usize> + Send + 'static>>
+        + Send
         + Sync,
 >;
 
@@ -326,10 +317,7 @@ struct StateInner {
     /// publishes its own `Arc<DecisionLedger>` at startup so
     /// the `/api/v1/decisions/recent` handler can read without
     /// threading an engine handle through the request state.
-    decision_ledgers: HashMap<
-        String,
-        std::sync::Arc<mm_risk::decision_ledger::DecisionLedger>,
-    >,
+    decision_ledgers: HashMap<String, std::sync::Arc<mm_risk::decision_ledger::DecisionLedger>>,
     /// UI-1 — snapshot of active execution plans per symbol.
     /// Written every tick by engines that hold a plan-bearing
     /// graph; read by the `/api/v1/plans/active` endpoint.
@@ -411,8 +399,7 @@ struct StateInner {
     /// `register_hyperopt_trigger_channel` at startup; the admin
     /// endpoint pushes `HyperoptTrigger` payloads through it.
     /// `None` before registration — endpoint returns HTTP 503.
-    hyperopt_trigger_tx:
-        Option<tokio::sync::mpsc::UnboundedSender<HyperoptTrigger>>,
+    hyperopt_trigger_tx: Option<tokio::sync::mpsc::UnboundedSender<HyperoptTrigger>>,
     /// Optional WebSocket broadcaster. When set, state mutators
     /// that operators watch live (venue balance snapshots, etc.)
     /// emit a typed push message so the frontend panel doesn't
@@ -469,10 +456,8 @@ struct StateInner {
     /// venue up here and dispatches `internal_transfer` /
     /// `withdraw` directly. `None` entries mean the dashboard
     /// is headless (tests, paper) — execute POSTs refuse.
-    venue_connectors: HashMap<
-        String,
-        std::sync::Arc<dyn mm_exchange_core::connector::ExchangeConnector>,
-    >,
+    venue_connectors:
+        HashMap<String, std::sync::Arc<dyn mm_exchange_core::connector::ExchangeConnector>>,
     /// S6.4 — append-only transfer log. `None` until server
     /// boot; endpoint returns 503 when unset so tests never
     /// accidentally write to a shared path.
@@ -486,9 +471,8 @@ struct StateInner {
     /// strategy_checkpoint_state + engine_checkpoint_state). The
     /// write path flushes every 10 updates per the manager's
     /// flush_every config so we don't hit disk every tick.
-    checkpoint_manager: Option<
-        std::sync::Arc<std::sync::Mutex<mm_persistence::checkpoint::CheckpointManager>>,
-    >,
+    checkpoint_manager:
+        Option<std::sync::Arc<std::sync::Mutex<mm_persistence::checkpoint::CheckpointManager>>>,
     /// S5.4 — per-symbol calibration snapshot (currently only
     /// `GlftStrategy` publishes into this map). The engine calls
     /// the active strategy's `recalibrate_if_due` on a
@@ -517,7 +501,10 @@ impl std::fmt::Debug for StateInner {
             .field("venue_connectors_registered", &self.venue_connectors.len())
             .field(
                 "transfer_log",
-                &self.transfer_log.as_ref().map(|w| w.path().display().to_string()),
+                &self
+                    .transfer_log
+                    .as_ref()
+                    .map(|w| w.path().display().to_string()),
             )
             .finish()
     }
@@ -1358,10 +1345,7 @@ impl DashboardState {
     /// Wave B1 — wire the fleet-aware client-metrics fetcher.
     /// Called once from server boot after both FleetState and
     /// AgentRegistry are available.
-    pub fn set_fleet_client_metrics_fetcher(
-        &self,
-        fetcher: FleetClientMetricsFetcher,
-    ) {
+    pub fn set_fleet_client_metrics_fetcher(&self, fetcher: FleetClientMetricsFetcher) {
         self.inner.write().unwrap().fleet_client_metrics_fetcher = Some(fetcher);
     }
 
@@ -1377,10 +1361,7 @@ impl DashboardState {
     /// once from server boot. Admin's `create_client` invokes
     /// it so a newly-registered tenant immediately propagates
     /// to every accepted agent.
-    pub fn set_fleet_add_client_broadcaster(
-        &self,
-        broadcaster: FleetAddClientBroadcaster,
-    ) {
+    pub fn set_fleet_add_client_broadcaster(&self, broadcaster: FleetAddClientBroadcaster) {
         self.inner.write().unwrap().fleet_add_client_broadcaster = Some(broadcaster);
     }
 
@@ -1468,11 +1449,13 @@ impl DashboardState {
     /// Epic G / H — latest sentiment tick for a canonical asset,
     /// or `None` if no tick has arrived for it yet. Keyed by the
     /// asset's normalised ticker (`"BTC"`, `"ETH"`, …).
-    pub fn sentiment_tick_for(
-        &self,
-        asset: &str,
-    ) -> Option<mm_sentiment::SentimentTick> {
-        self.inner.read().unwrap().sentiment_ticks.get(asset).cloned()
+    pub fn sentiment_tick_for(&self, asset: &str) -> Option<mm_sentiment::SentimentTick> {
+        self.inner
+            .read()
+            .unwrap()
+            .sentiment_ticks
+            .get(asset)
+            .cloned()
     }
 
     /// Epic G — snapshot of the most-recent tick per asset.
@@ -1508,9 +1491,7 @@ impl DashboardState {
     }
 
     /// Epic H — clone of the graph store handle, if registered.
-    pub fn strategy_graph_store(
-        &self,
-    ) -> Option<std::sync::Arc<mm_strategy_graph::GraphStore>> {
+    pub fn strategy_graph_store(&self) -> Option<std::sync::Arc<mm_strategy_graph::GraphStore>> {
         self.inner.read().unwrap().strategy_graph_store.clone()
     }
 
@@ -1548,10 +1529,7 @@ impl DashboardState {
     pub fn decisions_all_symbols(
         &self,
         per_symbol_max: usize,
-    ) -> std::collections::BTreeMap<
-        String,
-        Vec<mm_risk::decision_ledger::DecisionSnapshot>,
-    > {
+    ) -> std::collections::BTreeMap<String, Vec<mm_risk::decision_ledger::DecisionSnapshot>> {
         let g = self.inner.read().unwrap();
         let mut out = std::collections::BTreeMap::new();
         for (sym, ledger) in g.decision_ledgers.iter() {
@@ -1759,8 +1737,7 @@ impl DashboardState {
     /// spurious "acks" for retired bundles.
     pub fn clear_atomic_bundle(&self, bundle_id: &str) {
         let mut g = self.inner.write().unwrap();
-        g.atomic_bundle_legs
-            .retain(|k, _| k.bundle_id != bundle_id);
+        g.atomic_bundle_legs.retain(|k, _| k.bundle_id != bundle_id);
     }
 
     /// S2.2 — full snapshot of every inflight atomic bundle
@@ -1774,13 +1751,14 @@ impl DashboardState {
         let g = self.inner.read().unwrap();
         let mut by_id: BTreeMap<String, AtomicBundleSnapshot> = BTreeMap::new();
         for (key, leg) in &g.atomic_bundle_legs {
-            let entry = by_id
-                .entry(key.bundle_id.clone())
-                .or_insert_with(|| AtomicBundleSnapshot {
-                    bundle_id: key.bundle_id.clone(),
-                    maker: None,
-                    hedge: None,
-                });
+            let entry =
+                by_id
+                    .entry(key.bundle_id.clone())
+                    .or_insert_with(|| AtomicBundleSnapshot {
+                        bundle_id: key.bundle_id.clone(),
+                        maker: None,
+                        hedge: None,
+                    });
             let rendered = AtomicBundleLegSnapshot {
                 venue: leg.venue.clone(),
                 symbol: leg.symbol.clone(),
@@ -1916,9 +1894,7 @@ impl DashboardState {
             if other_sym == symbol {
                 continue;
             }
-            if *other_dd > self_dd
-                || (*other_dd == self_dd && other_sym.as_str() < symbol)
-            {
+            if *other_dd > self_dd || (*other_dd == self_dd && other_sym.as_str() < symbol) {
                 rank += 1;
             }
         }
@@ -2188,7 +2164,11 @@ impl DashboardState {
     /// if the symbol has not reported any yet.
     pub fn venue_balances(&self, symbol: &str) -> Vec<VenueBalanceSnapshot> {
         let inner = self.inner.read().unwrap();
-        inner.venue_balances.get(symbol).cloned().unwrap_or_default()
+        inner
+            .venue_balances
+            .get(symbol)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Fetch per-venue balance snapshots for every symbol the
@@ -2213,9 +2193,7 @@ impl DashboardState {
     /// A WS push is emitted so panels update without polling.
     pub fn set_venue_kill_level(&self, venue: &str, level: u8) {
         let mut inner = self.inner.write().unwrap();
-        inner
-            .venue_kill_levels
-            .insert(venue.to_string(), level);
+        inner.venue_kill_levels.insert(venue.to_string(), level);
         if let Some(bc) = &inner.ws_broadcast {
             if let Ok(payload) = serde_json::to_string(&serde_json::json!({
                 "type": "venue_kill_level",
@@ -2232,11 +2210,7 @@ impl DashboardState {
     /// entry is treated the same as an explicit Normal write.
     pub fn venue_kill_level(&self, venue: &str) -> u8 {
         let inner = self.inner.read().unwrap();
-        inner
-            .venue_kill_levels
-            .get(venue)
-            .copied()
-            .unwrap_or(0)
+        inner.venue_kill_levels.get(venue).copied().unwrap_or(0)
     }
 
     /// Fetch the full venue → kill level map. Used by the
@@ -2348,10 +2322,7 @@ impl DashboardState {
     /// + engine_checkpoint_state + inflight_atomic_bundles).
     /// Silently no-ops when no manager is configured (tests, smoke
     /// runs without disk). Failures log at warn.
-    pub fn publish_symbol_checkpoint(
-        &self,
-        sc: mm_persistence::checkpoint::SymbolCheckpoint,
-    ) {
+    pub fn publish_symbol_checkpoint(&self, sc: mm_persistence::checkpoint::SymbolCheckpoint) {
         let mgr_arc = {
             let inner = self.inner.read().unwrap();
             inner.checkpoint_manager.clone()
@@ -2397,7 +2368,12 @@ impl DashboardState {
     }
 
     pub fn onchain_snapshot(&self, symbol: &str) -> Option<OnchainSnapshot> {
-        self.inner.read().unwrap().onchain_snapshots.get(symbol).cloned()
+        self.inner
+            .read()
+            .unwrap()
+            .onchain_snapshots
+            .get(symbol)
+            .cloned()
     }
 
     /// S5.4 — engine-side hook: publish a calibration snapshot
@@ -2470,12 +2446,7 @@ impl DashboardState {
     pub fn alerts_recent(&self, limit: usize) -> Vec<AlertRecord> {
         let g = self.inner.read().unwrap();
         let cap = limit.min(ALERTS_CAP);
-        g.alerts_buffer
-            .iter()
-            .rev()
-            .take(cap)
-            .cloned()
-            .collect()
+        g.alerts_buffer.iter().rev().take(cap).cloned().collect()
     }
 
     /// Wave G2 — open a new incident OR refresh an existing
@@ -2563,10 +2534,7 @@ impl DashboardState {
     /// S5.1 — register the rebalancer config at server boot.
     /// With `None`, `rebalance_recommendations` short-circuits to
     /// an empty list.
-    pub fn set_rebalancer_config(
-        &self,
-        cfg: mm_risk::rebalancer::RebalancerConfig,
-    ) {
+    pub fn set_rebalancer_config(&self, cfg: mm_risk::rebalancer::RebalancerConfig) {
         self.inner.write().unwrap().rebalancer_config = Some(cfg);
     }
 
@@ -2576,15 +2544,12 @@ impl DashboardState {
     /// `(venue, asset)` first (a single (venue, asset) can be
     /// reported by multiple symbol-scoped engines), sums
     /// `available`, then defers to `Rebalancer::recommend`.
-    pub fn rebalance_recommendations(
-        &self,
-    ) -> Vec<mm_risk::rebalancer::RebalanceRecommendation> {
+    pub fn rebalance_recommendations(&self) -> Vec<mm_risk::rebalancer::RebalanceRecommendation> {
         let inner = self.inner.read().unwrap();
         let Some(cfg) = inner.rebalancer_config.clone() else {
             return Vec::new();
         };
-        let mut by_key: HashMap<(String, String), (Decimal, Decimal)> =
-            HashMap::new();
+        let mut by_key: HashMap<(String, String), (Decimal, Decimal)> = HashMap::new();
         for snaps in inner.venue_balances.values() {
             for snap in snaps {
                 let key = (snap.venue.clone(), snap.asset.clone());
@@ -2596,14 +2561,14 @@ impl DashboardState {
         drop(inner);
         let balances: Vec<_> = by_key
             .into_iter()
-            .map(|((venue, asset), (available, locked))| {
-                mm_risk::rebalancer::VenueBalance {
+            .map(
+                |((venue, asset), (available, locked))| mm_risk::rebalancer::VenueBalance {
                     venue,
                     asset,
                     available,
                     locked,
-                }
-            })
+                },
+            )
             .collect();
         mm_risk::rebalancer::Rebalancer::new(cfg).recommend(&balances)
     }
@@ -2763,10 +2728,7 @@ impl DashboardState {
 
     /// I3 — read the last fill timestamp we've already fanned
     /// out for a given tenant.
-    pub fn webhook_fill_cursor(
-        &self,
-        client_id: &str,
-    ) -> Option<chrono::DateTime<Utc>> {
+    pub fn webhook_fill_cursor(&self, client_id: &str) -> Option<chrono::DateTime<Utc>> {
         let inner = self.inner.read().unwrap();
         inner
             .clients
@@ -2775,11 +2737,7 @@ impl DashboardState {
     }
 
     /// I3 — advance the cursor after a successful fan-out batch.
-    pub fn set_webhook_fill_cursor(
-        &self,
-        client_id: &str,
-        ts: chrono::DateTime<Utc>,
-    ) {
+    pub fn set_webhook_fill_cursor(&self, client_id: &str, ts: chrono::DateTime<Utc>) {
         let mut inner = self.inner.write().unwrap();
         if let Some(c) = inner.clients.get_mut(client_id) {
             c.webhook_fill_cursor = Some(ts);

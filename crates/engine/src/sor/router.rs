@@ -737,18 +737,10 @@ mod tests {
             snap(VenueId::Binance, dec!(10), dec!(1), dec!(5), Decimal::ZERO),
             snap(VenueId::Bybit, dec!(10), dec!(2), dec!(6), Decimal::ZERO),
         ];
-        let greedy = GreedyRouter::new(zero_cost_model()).route(
-            Side::Buy,
-            dec!(7),
-            dec!(1),
-            &snaps,
-        );
-        let convex = ConvexRouter::new(zero_cost_model()).route(
-            Side::Buy,
-            dec!(7),
-            dec!(1),
-            &snaps,
-        );
+        let greedy =
+            GreedyRouter::new(zero_cost_model()).route(Side::Buy, dec!(7), dec!(1), &snaps);
+        let convex =
+            ConvexRouter::new(zero_cost_model()).route(Side::Buy, dec!(7), dec!(1), &snaps);
         assert_eq!(greedy.legs.len(), convex.legs.len());
         for (g, c) in greedy.legs.iter().zip(convex.legs.iter()) {
             assert_eq!(g.venue, c.venue);
@@ -787,22 +779,32 @@ mod tests {
                 dec!(1.0),
             ),
         ];
-        let convex = ConvexRouter::new(zero_cost_model()).route(
-            Side::Buy,
-            dec!(10),
-            dec!(1),
-            &snaps,
+        let convex =
+            ConvexRouter::new(zero_cost_model()).route(Side::Buy, dec!(10), dec!(1), &snaps);
+        assert_eq!(
+            convex.legs.len(),
+            2,
+            "convex should spread across both venues when slippage differs"
         );
-        assert_eq!(convex.legs.len(), 2,
-            "convex should spread across both venues when slippage differs");
-        let bin_leg = convex.legs.iter().find(|l| l.venue == VenueId::Binance).unwrap();
-        let byb_leg = convex.legs.iter().find(|l| l.venue == VenueId::Bybit).unwrap();
+        let bin_leg = convex
+            .legs
+            .iter()
+            .find(|l| l.venue == VenueId::Binance)
+            .unwrap();
+        let byb_leg = convex
+            .legs
+            .iter()
+            .find(|l| l.venue == VenueId::Bybit)
+            .unwrap();
         // At equilibrium: fee_bin + slip_bin·q_bin = fee_byb + slip_byb·q_byb
         //   5 + 0.1·q_bin = 5 + 1.0·q_byb  →  q_bin = 10·q_byb
         // q_bin + q_byb = 10  →  q_byb ≈ 0.909, q_bin ≈ 9.09.
-        assert!(bin_leg.qty > byb_leg.qty,
+        assert!(
+            bin_leg.qty > byb_leg.qty,
             "thicker book should take the bigger slice: bin={}, byb={}",
-            bin_leg.qty, byb_leg.qty);
+            bin_leg.qty,
+            byb_leg.qty
+        );
         // Sanity: total fills target.
         assert_eq!(convex.filled_qty, dec!(10));
         assert!(convex.is_complete);
@@ -839,18 +841,10 @@ mod tests {
                 dec!(0.01),
             ),
         ];
-        let greedy = GreedyRouter::new(zero_cost_model()).route(
-            Side::Buy,
-            dec!(8),
-            dec!(1),
-            &snaps,
-        );
-        let convex = ConvexRouter::new(zero_cost_model()).route(
-            Side::Buy,
-            dec!(8),
-            dec!(1),
-            &snaps,
-        );
+        let greedy =
+            GreedyRouter::new(zero_cost_model()).route(Side::Buy, dec!(8), dec!(1), &snaps);
+        let convex =
+            ConvexRouter::new(zero_cost_model()).route(Side::Buy, dec!(8), dec!(1), &snaps);
         // Integrated cost function: for qty q on venue with
         // fee f and slip s → f·q + 0.5·s·q².
         let cost_under_convex = |legs: &[RouteLeg]| -> Decimal {
@@ -858,7 +852,11 @@ mod tests {
                 .map(|leg| {
                     let s = snaps.iter().find(|s| s.venue == leg.venue).unwrap();
                     let fee = s.maker_fee_bps; // urgency=1 → taker; but both fees equal here.
-                    let fee = if s.taker_fee_bps != fee { s.taker_fee_bps } else { fee };
+                    let fee = if s.taker_fee_bps != fee {
+                        s.taker_fee_bps
+                    } else {
+                        fee
+                    };
                     fee * leg.qty
                         + s.slippage_bps_per_unit * leg.qty * leg.qty / Decimal::from(2u32)
                 })
@@ -875,12 +873,8 @@ mod tests {
     /// Zero target returns an empty, complete decision.
     #[test]
     fn convex_router_zero_target_is_empty_complete() {
-        let convex = ConvexRouter::new(zero_cost_model()).route(
-            Side::Buy,
-            Decimal::ZERO,
-            dec!(1),
-            &[],
-        );
+        let convex =
+            ConvexRouter::new(zero_cost_model()).route(Side::Buy, Decimal::ZERO, dec!(1), &[]);
         assert!(convex.legs.is_empty());
         assert_eq!(convex.target_qty, Decimal::ZERO);
     }
@@ -897,12 +891,7 @@ mod tests {
             dec!(0.1),
         );
         s.available_qty = Decimal::ZERO;
-        let convex = ConvexRouter::new(zero_cost_model()).route(
-            Side::Buy,
-            dec!(5),
-            dec!(1),
-            &[s],
-        );
+        let convex = ConvexRouter::new(zero_cost_model()).route(Side::Buy, dec!(5), dec!(1), &[s]);
         assert!(convex.legs.is_empty());
         assert!(!convex.is_complete);
     }

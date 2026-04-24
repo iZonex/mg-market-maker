@@ -130,19 +130,14 @@ impl ForeignTwapDetector {
     /// `DetectorOutput.median_order_lifetime_ms` so downstream
     /// audit rows carry both pieces without a new schema.
     pub fn score(&self) -> DetectorOutput {
-        if self.total_trades < MIN_TRADES_FOR_DETECTION
-            || self.buckets.len() < 16
-        {
+        if self.total_trades < MIN_TRADES_FOR_DETECTION || self.buckets.len() < 16 {
             return DetectorOutput::default();
         }
         // Centre the series.
         let n = self.buckets.len();
-        let mean: f64 =
-            self.buckets.iter().map(|c| *c as f64).sum::<f64>() / n as f64;
-        let centered: Vec<f64> =
-            self.buckets.iter().map(|c| *c as f64 - mean).collect();
-        let variance: f64 =
-            centered.iter().map(|x| x * x).sum::<f64>() / n as f64;
+        let mean: f64 = self.buckets.iter().map(|c| *c as f64).sum::<f64>() / n as f64;
+        let centered: Vec<f64> = self.buckets.iter().map(|c| *c as f64 - mean).collect();
+        let variance: f64 = centered.iter().map(|x| x * x).sum::<f64>() / n as f64;
         if variance < f64::EPSILON {
             return DetectorOutput::default();
         }
@@ -166,10 +161,7 @@ impl ForeignTwapDetector {
         // harmonic multiple (e.g. lag 60 on a lag-10 base signal
         // has nearly the same correlation), which would mis-
         // estimate the TWAP cadence by a factor of 2–6.
-        let global_max = r[2..=max_lag]
-            .iter()
-            .copied()
-            .fold(0.0f64, f64::max);
+        let global_max = r[2..=max_lag].iter().copied().fold(0.0f64, f64::max);
         let mut best_k = 0usize;
         let mut best_r = 0.0f64;
         if global_max > 0.0 {
@@ -202,11 +194,7 @@ impl ForeignTwapDetector {
         let period_ms = (best_k as i64) * self.bucket_width_ms;
         DetectorOutput {
             score: Decimal::from_f64(score).unwrap_or(Decimal::ZERO),
-            median_order_lifetime_ms: if period_ms > 0 {
-                Some(period_ms)
-            } else {
-                None
-            },
+            median_order_lifetime_ms: if period_ms > 0 { Some(period_ms) } else { None },
             ..Default::default()
         }
     }
@@ -255,9 +243,7 @@ mod tests {
         );
         // Period estimate should land near 5000 ms (lag 10 of
         // 500 ms buckets).
-        let ms = out
-            .median_order_lifetime_ms
-            .expect("period emitted");
+        let ms = out.median_order_lifetime_ms.expect("period emitted");
         assert!(
             (4_000..=6_000).contains(&ms),
             "expected period ~5000 ms, got {ms}"
@@ -273,7 +259,8 @@ mod tests {
         let mut t = 0i64;
         let mut state: u64 = 0x1234_5678;
         for _ in 0..80 {
-            state = state.wrapping_mul(6_364_136_223_846_793_005)
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
             let jitter = ((state >> 33) as i64) % 800 + 100; // 100..900 ms
             t += jitter;

@@ -15,8 +15,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use crate::{
-    HolderEntry, OnchainError, OnchainProvider, OnchainResult, TokenMetadata,
-    TransferEntry,
+    HolderEntry, OnchainError, OnchainProvider, OnchainResult, TokenMetadata, TransferEntry,
 };
 
 const DEFAULT_BASE_URL: &str = "https://deep-index.moralis.io";
@@ -77,7 +76,9 @@ impl MoralisProvider {
         for (k, v) in query {
             req = req.query(&[(*k, v.as_str())]);
         }
-        req = req.header("X-API-Key", &self.config.api_key).header("Accept", "application/json");
+        req = req
+            .header("X-API-Key", &self.config.api_key)
+            .header("Accept", "application/json");
         let resp = req
             .send()
             .await
@@ -133,16 +134,17 @@ impl OnchainProvider for MoralisProvider {
                 .and_then(|a| a.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let balance_s = row
-                .get("balance")
-                .and_then(|b| b.as_str())
-                .unwrap_or("0");
+            let balance_s = row.get("balance").and_then(|b| b.as_str()).unwrap_or("0");
             let balance = Decimal::from_str(balance_s).unwrap_or(Decimal::ZERO);
             let label = row
                 .get("owner_address_label")
                 .and_then(|l| l.as_str())
                 .map(str::to_string);
-            out.push(HolderEntry { address, balance, label });
+            out.push(HolderEntry {
+                address,
+                balance,
+                label,
+            });
         }
         Ok(out)
     }
@@ -171,7 +173,10 @@ impl OnchainProvider for MoralisProvider {
             .unwrap_or_default();
         let mut out = Vec::new();
         for tx in items {
-            let ts_s = tx.get("block_timestamp").and_then(|s| s.as_str()).unwrap_or("");
+            let ts_s = tx
+                .get("block_timestamp")
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
             let ts = DateTime::parse_from_rfc3339(ts_s)
                 .map(|d| d.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -187,9 +192,21 @@ impl OnchainProvider for MoralisProvider {
                 continue;
             };
             for t in transfers {
-                let from = t.get("from_address").and_then(|a| a.as_str()).unwrap_or_default().to_string();
-                let to = t.get("to_address").and_then(|a| a.as_str()).unwrap_or_default().to_string();
-                let token = t.get("address").and_then(|a| a.as_str()).unwrap_or_default().to_string();
+                let from = t
+                    .get("from_address")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let to = t
+                    .get("to_address")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let token = t
+                    .get("address")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or_default()
+                    .to_string();
                 let value_s = t.get("value").and_then(|v| v.as_str()).unwrap_or("0");
                 let value = Decimal::from_str(value_s).unwrap_or(Decimal::ZERO);
                 out.push(TransferEntry {
@@ -205,11 +222,7 @@ impl OnchainProvider for MoralisProvider {
         Ok(out)
     }
 
-    async fn get_token_metadata(
-        &self,
-        chain: &str,
-        token: &str,
-    ) -> OnchainResult<TokenMetadata> {
+    async fn get_token_metadata(&self, chain: &str, token: &str) -> OnchainResult<TokenMetadata> {
         let v = self
             .get_json(
                 "/api/v2.2/erc20/metadata",
@@ -233,7 +246,11 @@ impl OnchainProvider for MoralisProvider {
             .get("decimals")
             .and_then(|d| d.as_str())
             .and_then(|s| s.parse::<u8>().ok())
-            .or_else(|| item.get("decimals").and_then(|d| d.as_u64()).map(|u| u as u8))
+            .or_else(|| {
+                item.get("decimals")
+                    .and_then(|d| d.as_u64())
+                    .map(|u| u as u8)
+            })
             .unwrap_or(18);
         let total_supply = item
             .get("total_supply")

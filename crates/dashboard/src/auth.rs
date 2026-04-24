@@ -107,8 +107,14 @@ impl std::fmt::Debug for ApiUser {
             .field("name", &self.name)
             .field("role", &self.role)
             .field("api_key", &"<redacted>")
-            .field("password_hash", &self.password_hash.as_ref().map(|_| "<redacted>"))
-            .field("totp_secret", &self.totp_secret.as_ref().map(|_| "<redacted>"))
+            .field(
+                "password_hash",
+                &self.password_hash.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "totp_secret",
+                &self.totp_secret.as_ref().map(|_| "<redacted>"),
+            )
             .field("allowed_symbols", &self.allowed_symbols)
             .field("client_id", &self.client_id)
             .finish()
@@ -325,7 +331,9 @@ impl AuthState {
     /// nobody can satisfy the 2FA check, preventing an
     /// auth-layer lockout.
     pub fn any_admin_has_totp(&self) -> bool {
-        let Ok(guard) = self.users.read() else { return false };
+        let Ok(guard) = self.users.read() else {
+            return false;
+        };
         guard
             .values()
             .any(|u| matches!(u.role, Role::Admin) && u.totp_secret.is_some())
@@ -474,7 +482,12 @@ impl AuthState {
         let payload = base64_decode(parts[0])?;
         let expected_sig = self.sign(&payload);
         // Constant-time comparison to prevent timing attacks.
-        if parts[1].as_bytes().ct_eq(expected_sig.as_bytes()).unwrap_u8() != 1 {
+        if parts[1]
+            .as_bytes()
+            .ct_eq(expected_sig.as_bytes())
+            .unwrap_u8()
+            != 1
+        {
             return None;
         }
         let claims: TokenClaims = serde_json::from_str(&payload).ok()?;
@@ -533,19 +546,19 @@ impl AuthState {
         }
         let payload = base64_decode(parts[0])?;
         let expected_sig = self.sign(&payload);
-        if parts[1].as_bytes().ct_eq(expected_sig.as_bytes()).unwrap_u8() != 1 {
+        if parts[1]
+            .as_bytes()
+            .ct_eq(expected_sig.as_bytes())
+            .unwrap_u8()
+            != 1
+        {
             return None;
         }
         let claims: InviteClaims = serde_json::from_str(&payload).ok()?;
         if claims.exp < Utc::now().timestamp() {
             return None;
         }
-        if self
-            .used_invites
-            .read()
-            .ok()?
-            .contains(&claims.invite_id)
-        {
+        if self.used_invites.read().ok()?.contains(&claims.invite_id) {
             return None;
         }
         Some(claims)
@@ -587,19 +600,19 @@ impl AuthState {
         }
         let payload = base64_decode(parts[0])?;
         let expected_sig = self.sign(&payload);
-        if parts[1].as_bytes().ct_eq(expected_sig.as_bytes()).unwrap_u8() != 1 {
+        if parts[1]
+            .as_bytes()
+            .ct_eq(expected_sig.as_bytes())
+            .unwrap_u8()
+            != 1
+        {
             return None;
         }
         let claims: ResetClaims = serde_json::from_str(&payload).ok()?;
         if claims.exp < Utc::now().timestamp() {
             return None;
         }
-        if self
-            .used_resets
-            .read()
-            .ok()?
-            .contains(&claims.reset_id)
-        {
+        if self.used_resets.read().ok()?.contains(&claims.reset_id) {
             return None;
         }
         Some(claims)
@@ -725,15 +738,15 @@ impl AuthState {
             .ok_or_else(|| "user not found".to_string())?;
         // Generate a 160-bit secret — RFC 4226 recommendation.
         let secret = Secret::generate_secret();
-        let secret_base32 = secret
-            .to_encoded()
-            .to_string();
+        let secret_base32 = secret.to_encoded().to_string();
         let totp = TOTP::new(
             Algorithm::SHA1,
             6,
             1,
             30,
-            secret.to_bytes().map_err(|e| format!("secret encode: {e}"))?,
+            secret
+                .to_bytes()
+                .map_err(|e| format!("secret encode: {e}"))?,
             Some(issuer.to_string()),
             user.name.clone(),
         )
@@ -751,7 +764,10 @@ impl AuthState {
             }
         }
         let _ = self.persist();
-        Ok(TotpEnrollment { secret_base32, otpauth })
+        Ok(TotpEnrollment {
+            secret_base32,
+            otpauth,
+        })
     }
 
     /// Verify a 6-digit TOTP code against the pending secret and,
@@ -1080,7 +1096,9 @@ fn unauthorized_should_warn(path: &str, client: &str) -> bool {
     const CACHE_CAP: usize = 1024;
 
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    let Ok(mut guard) = cache.lock() else { return true };
+    let Ok(mut guard) = cache.lock() else {
+        return true;
+    };
     let key = (path.to_string(), client.to_string());
     let now = Instant::now();
     // Cheap GC — if the map got huge, drop old entries
@@ -1162,8 +1180,7 @@ pub async fn tenant_scope_middleware(req: Request, next: Next) -> Response {
     // Allow the `/api/v1/client/self/*` alias for tenant-scoped
     // tokens — the self-endpoint handler rewrites the path id
     // from the token.
-    let is_self_alias = path.starts_with("/api/v1/client/self/")
-        || path == "/api/v1/client/self";
+    let is_self_alias = path.starts_with("/api/v1/client/self/") || path == "/api/v1/client/self";
     match (token_id, path_id) {
         (Some(tok), Some(p)) if tok == p => next.run(req).await,
         (Some(tok), Some(p)) => {
@@ -1249,19 +1266,18 @@ pub async fn login_handler(
 ) -> Response {
     let ip = addr.ip();
     // Prefer name+password when both are provided.
-    let (user, method) = if let (Some(name), Some(password)) =
-        (body.name.as_deref(), body.password.as_deref())
-    {
-        (auth.auth_by_password(name, password), "password")
-    } else if let Some(api_key) = body.api_key.as_deref() {
-        (auth.auth_by_key(api_key), "api_key")
-    } else {
-        auth.audit(
-            AuditEventType::LoginFailed,
-            &format!("ip={ip},reason=missing_credentials"),
-        );
-        return (StatusCode::BAD_REQUEST, "provide name+password or api_key").into_response();
-    };
+    let (user, method) =
+        if let (Some(name), Some(password)) = (body.name.as_deref(), body.password.as_deref()) {
+            (auth.auth_by_password(name, password), "password")
+        } else if let Some(api_key) = body.api_key.as_deref() {
+            (auth.auth_by_key(api_key), "api_key")
+        } else {
+            auth.audit(
+                AuditEventType::LoginFailed,
+                &format!("ip={ip},reason=missing_credentials"),
+            );
+            return (StatusCode::BAD_REQUEST, "provide name+password or api_key").into_response();
+        };
 
     if let Some(user) = user {
         // Wave H3 — hard gate: if the deployment requires TOTP
@@ -1285,8 +1301,7 @@ pub async fn login_handler(
                 StatusCode::FORBIDDEN,
                 axum::Json(LoginResponseTotpRequired {
                     must_enroll_totp: true,
-                    message:
-                        "admin accounts must have TOTP enrolled before login is allowed",
+                    message: "admin accounts must have TOTP enrolled before login is allowed",
                 }),
             )
                 .into_response();
@@ -1308,10 +1323,7 @@ pub async fn login_handler(
                     if !auth.verify_totp_for(&user.id, code) {
                         auth.audit(
                             AuditEventType::LoginFailed,
-                            &format!(
-                                "user_id={},ip={},reason=bad_totp_code",
-                                user.id, ip
-                            ),
+                            &format!("user_id={},ip={},reason=bad_totp_code", user.id, ip),
                         );
                         return StatusCode::UNAUTHORIZED.into_response();
                     }
@@ -1387,10 +1399,7 @@ pub async fn bootstrap_handler(
     let token = auth.generate_token(&user);
     auth.audit(
         AuditEventType::LoginSucceeded,
-        &format!(
-            "user_id={},role=Admin,method=bootstrap,ip={}",
-            user.id, ip
-        ),
+        &format!("user_id={},role=Admin,method=bootstrap,ip={}", user.id, ip),
     );
     axum::Json(LoginResponse {
         token,
@@ -1694,7 +1703,11 @@ pub async fn change_password_handler(
         Ok(p) => p,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("bad body: {e}")).into_response(),
     };
-    match auth.change_password(&claims.user_id, &payload.old_password, &payload.new_password) {
+    match auth.change_password(
+        &claims.user_id,
+        &payload.old_password,
+        &payload.new_password,
+    ) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
     }

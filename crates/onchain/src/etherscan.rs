@@ -22,8 +22,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use crate::{
-    HolderEntry, OnchainError, OnchainProvider, OnchainResult, TokenMetadata,
-    TransferEntry,
+    HolderEntry, OnchainError, OnchainProvider, OnchainResult, TokenMetadata, TransferEntry,
 };
 
 #[derive(Debug, Clone)]
@@ -180,7 +179,11 @@ impl OnchainProvider for EtherscanFamilyProvider {
                 .and_then(|b| b.as_str())
                 .unwrap_or("0");
             let balance = Decimal::from_str(balance_s).unwrap_or(Decimal::ZERO);
-            out.push(HolderEntry { address, balance, label: None });
+            out.push(HolderEntry {
+                address,
+                balance,
+                label: None,
+            });
         }
         Ok(out)
     }
@@ -205,10 +208,7 @@ impl OnchainProvider for EtherscanFamilyProvider {
             )
             .await?;
         if v.get("status").and_then(|s| s.as_str()) == Some("0") {
-            let msg = v
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("");
+            let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or("");
             if msg == "No transactions found" {
                 return Ok(Vec::new());
             }
@@ -224,42 +224,47 @@ impl OnchainProvider for EtherscanFamilyProvider {
             .unwrap_or_default();
         let mut out = Vec::new();
         for row in items {
-            let ts_s = row
-                .get("timeStamp")
-                .and_then(|t| t.as_str())
-                .unwrap_or("0");
+            let ts_s = row.get("timeStamp").and_then(|t| t.as_str()).unwrap_or("0");
             let ts_i = ts_s.parse::<i64>().unwrap_or(0);
             let ts = DateTime::from_timestamp(ts_i, 0).unwrap_or_else(Utc::now);
             if ts < since_ts {
                 break;
             }
-            let from = row.get("from").and_then(|a| a.as_str()).unwrap_or_default().to_string();
-            let to = row.get("to").and_then(|a| a.as_str()).unwrap_or_default().to_string();
+            let from = row
+                .get("from")
+                .and_then(|a| a.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let to = row
+                .get("to")
+                .and_then(|a| a.as_str())
+                .unwrap_or_default()
+                .to_string();
             let token = row
                 .get("contractAddress")
                 .and_then(|a| a.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let value_s = row
-                .get("value")
-                .and_then(|v| v.as_str())
-                .unwrap_or("0");
+            let value_s = row.get("value").and_then(|v| v.as_str()).unwrap_or("0");
             let value = Decimal::from_str(value_s).unwrap_or(Decimal::ZERO);
             let tx_hash = row
                 .get("hash")
                 .and_then(|h| h.as_str())
                 .unwrap_or_default()
                 .to_string();
-            out.push(TransferEntry { from, to, token, value, tx_hash, timestamp: ts });
+            out.push(TransferEntry {
+                from,
+                to,
+                token,
+                value,
+                tx_hash,
+                timestamp: ts,
+            });
         }
         Ok(out)
     }
 
-    async fn get_token_metadata(
-        &self,
-        chain: &str,
-        token: &str,
-    ) -> OnchainResult<TokenMetadata> {
+    async fn get_token_metadata(&self, chain: &str, token: &str) -> OnchainResult<TokenMetadata> {
         let v = self
             .get_json(
                 chain,

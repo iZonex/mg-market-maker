@@ -26,14 +26,14 @@ use serde::{Deserialize, Serialize};
 use tower_http::services::{ServeDir, ServeFile};
 
 use mm_control::messages::{CommandPayload, DesiredStrategy};
-use mm_dashboard::auth::{
-    admin_middleware, auth_middleware, tenant_scope_middleware, AuthState,
-};
+use mm_dashboard::auth::{admin_middleware, auth_middleware, tenant_scope_middleware, AuthState};
 
 use crate::approvals::{AgentProfilePatch, ApprovalRecord, ApprovalStore};
 use crate::registry::SessionLifecycleEvent;
 use crate::tunables::{TunableField, Tunables, TunablesStore};
-use crate::vault::{CredentialCheck, CredentialDescriptor, VaultEntry, VaultError, VaultStore, VaultSummary};
+use crate::vault::{
+    CredentialCheck, CredentialDescriptor, VaultEntry, VaultError, VaultStore, VaultSummary,
+};
 use crate::{AgentRegistry, FleetState, RegistryError};
 
 #[derive(Clone)]
@@ -89,7 +89,10 @@ pub fn router_full_authed(
     let internal_view = Router::new()
         .route("/api/v1/fleet", get(get_fleet))
         .route("/api/v1/vault", get(list_vault_entries))
-        .route("/api/v1/agents/{agent_id}/deployments", get(get_deployments))
+        .route(
+            "/api/v1/agents/{agent_id}/deployments",
+            get(get_deployments),
+        )
         .route(
             "/api/v1/agents/{agent_id}/deployments/{deployment_id}/variables",
             axum::routing::get(get_deployment_variables),
@@ -111,7 +114,10 @@ pub fn router_full_authed(
         .route("/api/v1/tunables/schema", get(get_tunables_schema))
         .route("/api/v1/approvals", get(list_approvals))
         .route("/api/v1/surveillance/fleet", get(get_surveillance_fleet))
-        .route("/api/v1/reconciliation/fleet", get(get_reconciliation_fleet))
+        .route(
+            "/api/v1/reconciliation/fleet",
+            get(get_reconciliation_fleet),
+        )
         .route("/api/v1/alerts/fleet", get(get_alerts_fleet))
         // Tenant-scope gate blocks ClientReader (their token is
         // tenant-scoped, controller surface carries no `{id}`
@@ -220,7 +226,13 @@ pub fn router_full(
     approvals: Option<ApprovalStore>,
     tunables: Option<TunablesStore>,
 ) -> Router {
-    let state = AppState { fleet, registry, vault, approvals, tunables };
+    let state = AppState {
+        fleet,
+        registry,
+        vault,
+        approvals,
+        tunables,
+    };
 
     // API routes match first, everything else hits the Svelte
     // SPA. Resolve the `frontend/dist` location in this order:
@@ -255,8 +267,7 @@ pub fn router_full(
         )
         .route(
             "/api/v1/agents/{agent_id}/deployments/{deployment_id}/variables",
-            axum::routing::get(get_deployment_variables)
-                .patch(patch_deployment_variables),
+            axum::routing::get(get_deployment_variables).patch(patch_deployment_variables),
         )
         // Per-deployment operational endpoint. "Strategy = a
         // deployment" in the distributed model: kill / pause /
@@ -289,10 +300,7 @@ pub fn router_full(
         // monitoring) keep working — we route the (field, value)
         // pair to the matching deployment's variables PATCH.
         // See `post_admin_config_proxy` for the translation table.
-        .route(
-            "/api/admin/config/{symbol}",
-            post(post_admin_config_proxy),
-        )
+        .route("/api/admin/config/{symbol}", post(post_admin_config_proxy))
         // Sentiment headline broadcast — fleet-wide fan-out.
         // Iterates every live deployment and PATCHes a `news`
         // variable into it; the agent translator maps that into
@@ -319,26 +327,14 @@ pub fn router_full(
         // trading-box operator read off the agent's boot log;
         // when the agent actually connects, the handshake is
         // silent (no pending step).
-        .route(
-            "/api/v1/approvals/pre-approve",
-            post(pre_approve_agent),
-        )
+        .route("/api/v1/approvals/pre-approve", post(pre_approve_agent))
         .route(
             "/api/v1/approvals/{fingerprint}",
             axum::routing::delete(delete_approval),
         )
-        .route(
-            "/api/v1/approvals/{fingerprint}/accept",
-            post(accept_agent),
-        )
-        .route(
-            "/api/v1/approvals/{fingerprint}/reject",
-            post(reject_agent),
-        )
-        .route(
-            "/api/v1/approvals/{fingerprint}/revoke",
-            post(revoke_agent),
-        )
+        .route("/api/v1/approvals/{fingerprint}/accept", post(accept_agent))
+        .route("/api/v1/approvals/{fingerprint}/reject", post(reject_agent))
+        .route("/api/v1/approvals/{fingerprint}/revoke", post(revoke_agent))
         // Agent profile — description / labels / client / region.
         // Distinct from approval: editing profile never touches
         // admission state and vice versa.
@@ -352,36 +348,24 @@ pub fn router_full(
         // table without fanning out to each agent. Gauges are
         // engine-emitted as of Wave 1 R follow-up; this endpoint
         // just joins them across the fleet.
-        .route(
-            "/api/v1/surveillance/fleet",
-            get(get_surveillance_fleet),
-        )
+        .route("/api/v1/surveillance/fleet", get(get_surveillance_fleet))
         .route(
             "/api/v1/reconciliation/fleet",
             get(get_reconciliation_fleet),
         )
         // Wave D4 — fleet-wide alert stream with dedup.
-        .route(
-            "/api/v1/alerts/fleet",
-            get(get_alerts_fleet),
-        )
+        .route("/api/v1/alerts/fleet", get(get_alerts_fleet))
         // Fix #2 — real hash-chain verification. Fans out to
         // every running deployment, each agent verifies its
         // own JSONL file (computes SHA-256 row-by-row against
         // the stored `prev_hash`), controller aggregates.
-        .route(
-            "/api/v1/audit/verify",
-            post(post_audit_verify),
-        )
+        .route("/api/v1/audit/verify", post(post_audit_verify))
         // Wave C2 — fleet-wide ops. Applies an op to every
         // running deployment on every accepted agent. Today's
         // surface: `pause` / `resume`. Same body shape as the
         // per-deployment route, same translator so
         // pause/resume go through `paused` variable.
-        .route(
-            "/api/v1/ops/fleet/{op}",
-            post(post_fleet_op),
-        )
+        .route("/api/v1/ops/fleet/{op}", post(post_fleet_op))
         // `/health` is owned by the dashboard router — when the
         // controller is merged alongside it (mm-server main),
         // duplicating here panics on overlapping routes.
@@ -582,9 +566,7 @@ struct SurveillanceFleetRow {
     sampled_at_ms: i64,
 }
 
-async fn get_surveillance_fleet(
-    State(state): State<AppState>,
-) -> Json<Vec<SurveillanceFleetRow>> {
+async fn get_surveillance_fleet(State(state): State<AppState>) -> Json<Vec<SurveillanceFleetRow>> {
     let mut out = Vec::new();
     for view in state.fleet.snapshot() {
         for dep in view.deployments {
@@ -730,9 +712,7 @@ async fn post_vault_entry(
         ));
     };
     let cred_name = body.name.clone();
-    let summary = store
-        .insert(create_to_entry(body))
-        .map_err(vault_error)?;
+    let summary = store.insert(create_to_entry(body)).map_err(vault_error)?;
     push_credential_to_connected_agents(&state, &cred_name);
     Ok(Json(summary))
 }
@@ -750,9 +730,7 @@ async fn put_vault_entry(
     };
     body.name = name;
     let cred_name = body.name.clone();
-    let summary = store
-        .upsert(create_to_entry(body))
-        .map_err(vault_error)?;
+    let summary = store.upsert(create_to_entry(body)).map_err(vault_error)?;
     push_credential_to_connected_agents(&state, &cred_name);
     Ok(Json(summary))
 }
@@ -987,7 +965,10 @@ fn pre_validate_deploy(
                             ),
                         ));
                     }
-                    CredentialCheck::TenantMismatch { cred_tenant, agent_tenant } => {
+                    CredentialCheck::TenantMismatch {
+                        cred_tenant,
+                        agent_tenant,
+                    } => {
                         let agent_desc = if agent_tenant.is_empty() {
                             "<untagged>".to_string()
                         } else {
@@ -1002,11 +983,10 @@ fn pre_validate_deploy(
                         ));
                     }
                     CredentialCheck::Expired { expired_at_ms } => {
-                        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
-                            expired_at_ms,
-                        )
-                        .map(|d| d.to_rfc3339())
-                        .unwrap_or_else(|| format!("{expired_at_ms}"));
+                        let dt =
+                            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(expired_at_ms)
+                                .map(|d| d.to_rfc3339())
+                                .unwrap_or_else(|| format!("{expired_at_ms}"));
                         return Err((
                             StatusCode::PRECONDITION_FAILED,
                             format!(
@@ -1060,9 +1040,7 @@ async fn get_deployment_variables(
         .find(|d| d.deployment_id == deployment_id)
         .ok_or((
             StatusCode::NOT_FOUND,
-            format!(
-                "deployment {deployment_id} not found on agent {agent_id}"
-            ),
+            format!("deployment {deployment_id} not found on agent {agent_id}"),
         ))?;
     Ok(Json(DeploymentVariablesView {
         agent_id,
@@ -1141,10 +1119,7 @@ struct LegacyConfigOverride {
 /// `translate_variable_override` — if a match arm lands there, a
 /// matching branch goes here. `None` means the legacy field has
 /// no modern equivalent and the caller should surface a 400.
-fn legacy_config_to_variable(
-    field: &str,
-    value: &str,
-) -> Option<(String, serde_json::Value)> {
+fn legacy_config_to_variable(field: &str, value: &str) -> Option<(String, serde_json::Value)> {
     match field {
         "Gamma" => Some(("gamma".into(), serde_json::json!(value))),
         "MinSpreadBps" => Some(("min_spread_bps".into(), serde_json::json!(value))),
@@ -1228,9 +1203,7 @@ async fn post_admin_config_proxy(
     let Some((agent_id, deployment_id)) = find_deployment_for_symbol(&state, &symbol) else {
         return Err((
             StatusCode::NOT_FOUND,
-            format!(
-                "no running deployment matches symbol '{symbol}' in the fleet"
-            ),
+            format!("no running deployment matches symbol '{symbol}' in the fleet"),
         ));
     };
 
@@ -1309,36 +1282,71 @@ fn op_to_variables_patch(
     };
     match op {
         // Kill ladder L1–L5.
-        "widen"       => { m.insert("kill_level".into(), serde_json::json!(1)); m.insert("kill_reason".into(), serde_json::json!(reason)); }
-        "stop"        => { m.insert("kill_level".into(), serde_json::json!(2)); m.insert("kill_reason".into(), serde_json::json!(reason)); }
-        "cancel-all"  => { m.insert("kill_level".into(), serde_json::json!(3)); m.insert("kill_reason".into(), serde_json::json!(reason)); }
-        "flatten"     => { m.insert("kill_level".into(), serde_json::json!(4)); m.insert("kill_reason".into(), serde_json::json!(reason)); }
-        "disconnect"  => { m.insert("kill_level".into(), serde_json::json!(5)); m.insert("kill_reason".into(), serde_json::json!(reason)); }
-        "reset"       => { m.insert("kill_reset_reason".into(), serde_json::json!(reason)); }
+        "widen" => {
+            m.insert("kill_level".into(), serde_json::json!(1));
+            m.insert("kill_reason".into(), serde_json::json!(reason));
+        }
+        "stop" => {
+            m.insert("kill_level".into(), serde_json::json!(2));
+            m.insert("kill_reason".into(), serde_json::json!(reason));
+        }
+        "cancel-all" => {
+            m.insert("kill_level".into(), serde_json::json!(3));
+            m.insert("kill_reason".into(), serde_json::json!(reason));
+        }
+        "flatten" => {
+            m.insert("kill_level".into(), serde_json::json!(4));
+            m.insert("kill_reason".into(), serde_json::json!(reason));
+        }
+        "disconnect" => {
+            m.insert("kill_level".into(), serde_json::json!(5));
+            m.insert("kill_reason".into(), serde_json::json!(reason));
+        }
+        "reset" => {
+            m.insert("kill_reset_reason".into(), serde_json::json!(reason));
+        }
         // Pause / resume — already wired via the `paused`
         // variable translator.
-        "pause"       => { m.insert("paused".into(), serde_json::json!(true)); }
-        "resume"      => { m.insert("paused".into(), serde_json::json!(false)); }
+        "pause" => {
+            m.insert("paused".into(), serde_json::json!(true));
+        }
+        "resume" => {
+            m.insert("paused".into(), serde_json::json!(false));
+        }
         // Emulator + DCA + graph-swap — specs pass through
         // opaquely; agent translator emits the right variant.
         "emulator-register" => {
-            let spec = body.spec.as_ref().ok_or_else(|| "emulator-register requires body.spec".to_string())?;
+            let spec = body
+                .spec
+                .as_ref()
+                .ok_or_else(|| "emulator-register requires body.spec".to_string())?;
             m.insert("emulator_spec".into(), serde_json::json!(spec.to_string()));
         }
         "emulator-cancel" => {
-            let id = body.id.ok_or_else(|| "emulator-cancel requires body.id".to_string())?;
+            let id = body
+                .id
+                .ok_or_else(|| "emulator-cancel requires body.id".to_string())?;
             m.insert("emulator_cancel_id".into(), serde_json::json!(id));
         }
         "dca-start" => {
-            let spec = body.spec.as_ref().ok_or_else(|| "dca-start requires body.spec".to_string())?;
+            let spec = body
+                .spec
+                .as_ref()
+                .ok_or_else(|| "dca-start requires body.spec".to_string())?;
             m.insert("dca_spec".into(), serde_json::json!(spec.to_string()));
         }
         "dca-cancel" => {
             m.insert("dca_cancel".into(), serde_json::json!(true));
         }
         "graph-swap" => {
-            let graph = body.graph.as_ref().ok_or_else(|| "graph-swap requires body.graph".to_string())?;
-            m.insert("strategy_graph".into(), serde_json::json!(graph.to_string()));
+            let graph = body
+                .graph
+                .as_ref()
+                .ok_or_else(|| "graph-swap requires body.graph".to_string())?;
+            m.insert(
+                "strategy_graph".into(),
+                serde_json::json!(graph.to_string()),
+            );
         }
         other => return Err(format!("unknown op '{other}'")),
     }
@@ -1390,8 +1398,7 @@ async fn post_fleet_op(
     }
 
     let body = body.map(|Json(b)| b).unwrap_or_default();
-    let patch = op_to_variables_patch(&op, &body)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let patch = op_to_variables_patch(&op, &body).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
     let mut results = Vec::new();
     for view in state.fleet.snapshot() {
@@ -1452,8 +1459,7 @@ async fn post_deployment_op(
         }
     }
     let body = body.map(|Json(b)| b).unwrap_or_default();
-    let patch = op_to_variables_patch(&op, &body)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let patch = op_to_variables_patch(&op, &body).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     match state.registry.send(
         &agent_id,
         CommandPayload::PatchDeploymentVariables {
@@ -1525,10 +1531,7 @@ async fn post_sentiment_headline(
                 },
             ) {
                 Ok(()) => recipients += 1,
-                Err(e) => failed.push(format!(
-                    "{}/{}: {}",
-                    view.agent_id, dep.deployment_id, e
-                )),
+                Err(e) => failed.push(format!("{}/{}: {}", view.agent_id, dep.deployment_id, e)),
             }
         }
     }
@@ -1634,13 +1637,21 @@ async fn get_reconciliation_fleet(
                     .payload
                     .get("ghost_orders")
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let phantom: Vec<String> = reply
                     .payload
                     .get("phantom_orders")
                     .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let bal_mm: Vec<serde_json::Value> = reply
                     .payload
@@ -1666,7 +1677,11 @@ async fn get_reconciliation_fleet(
                         .and_then(|v| v.as_str())
                         .unwrap_or_default()
                         .to_string(),
-                    cycle: reply.payload.get("cycle").and_then(|v| v.as_u64()).unwrap_or(0),
+                    cycle: reply
+                        .payload
+                        .get("cycle")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
                     last_cycle_ms: reply
                         .payload
                         .get("last_cycle_ms")
@@ -1753,9 +1768,7 @@ struct AuditVerifyResponse {
 /// controller doesn't have to worry about re-serialisation
 /// changing the bytes. Returns per-deployment status + a
 /// rollup (valid / broken / missing-file counts).
-async fn post_audit_verify(
-    State(state): State<AppState>,
-) -> Json<AuditVerifyResponse> {
+async fn post_audit_verify(State(state): State<AppState>) -> Json<AuditVerifyResponse> {
     use mm_control::messages::CommandPayload;
     const PER_DEPLOYMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -1805,10 +1818,7 @@ async fn post_audit_verify(
                 let p = &reply.payload;
                 let exists = p.get("exists").and_then(|v| v.as_bool()).unwrap_or(false);
                 let valid = p.get("valid").and_then(|v| v.as_bool()).unwrap_or(false);
-                let rows_checked = p
-                    .get("rows_checked")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                let rows_checked = p.get("rows_checked").and_then(|v| v.as_u64()).unwrap_or(0);
                 let last_hash = p
                     .get("last_hash")
                     .and_then(|v| v.as_str())
@@ -1845,7 +1855,8 @@ async fn post_audit_verify(
     rows.sort_by(|a, b| {
         let a_bad = a.exists && !a.valid;
         let b_bad = b.exists && !b.valid;
-        b_bad.cmp(&a_bad)
+        b_bad
+            .cmp(&a_bad)
             .then_with(|| a.agent_id.cmp(&b.agent_id))
             .then_with(|| a.symbol.cmp(&b.symbol))
     });
@@ -1858,9 +1869,7 @@ async fn post_audit_verify(
     })
 }
 
-async fn get_alerts_fleet(
-    State(state): State<AppState>,
-) -> Json<Vec<AlertFleetRow>> {
+async fn get_alerts_fleet(State(state): State<AppState>) -> Json<Vec<AlertFleetRow>> {
     use mm_control::messages::CommandPayload;
     const PER_DEPLOYMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
     const DEDUP_WINDOW_MS: i64 = 60_000;
@@ -1911,11 +1920,7 @@ async fn get_alerts_fleet(
     for (request_id, agent_id, future) in handles {
         match future.await {
             Ok(Ok(reply)) => {
-                if let Some(alerts) = reply
-                    .payload
-                    .get("alerts")
-                    .and_then(|v| v.as_array())
-                {
+                if let Some(alerts) = reply.payload.get("alerts").and_then(|v| v.as_array()) {
                     for a in alerts {
                         raw.push((agent_id.clone(), a.clone()));
                     }
@@ -2233,16 +2238,18 @@ pub async fn run_http_server_full(
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(addr = %addr, "controller HTTP server listening");
-    axum::serve(listener, router_full(fleet, registry, vault, approvals, tunables)).await?;
+    axum::serve(
+        listener,
+        router_full(fleet, registry, vault, approvals, tunables),
+    )
+    .await?;
     Ok(())
 }
 
 impl IntoResponse for RegistryError {
     fn into_response(self) -> axum::response::Response {
         match self {
-            RegistryError::NotFound => {
-                (StatusCode::NOT_FOUND, self.to_string()).into_response()
-            }
+            RegistryError::NotFound => (StatusCode::NOT_FOUND, self.to_string()).into_response(),
             RegistryError::AgentGone => {
                 (StatusCode::SERVICE_UNAVAILABLE, self.to_string()).into_response()
             }

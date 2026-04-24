@@ -119,10 +119,7 @@ async fn health_handler() -> axum::Json<serde_json::Value> {
 
 // ── Test helpers ──────────────────────────────────────────
 
-async fn get_json(
-    router: &Router,
-    path: &str,
-) -> (StatusCode, serde_json::Value) {
+async fn get_json(router: &Router, path: &str) -> (StatusCode, serde_json::Value) {
     let req = Request::builder()
         .method(Method::GET)
         .uri(path)
@@ -163,8 +160,7 @@ async fn health_endpoint_returns_ok() {
 async fn rebalance_recommendations_empty_by_default() {
     let ds = DashboardState::new();
     let router = test_router(ds);
-    let (status, body) =
-        get_json(&router, "/api/v1/rebalance/recommendations").await;
+    let (status, body) = get_json(&router, "/api/v1/rebalance/recommendations").await;
     assert_eq!(status, StatusCode::OK);
     let recs = body
         .get("recommendations")
@@ -206,8 +202,7 @@ async fn manipulation_scores_projects_published_symbols() {
     });
     ds.update(s);
     let router = test_router(ds);
-    let (status, body) =
-        get_json(&router, "/api/v1/manipulation/scores").await;
+    let (status, body) = get_json(&router, "/api/v1/manipulation/scores").await;
     assert_eq!(status, StatusCode::OK);
     let rows = body
         .get("rows")
@@ -277,7 +272,10 @@ async fn restricted_env_gate_only_accepts_exact_literal() {
     let err = mm_strategy_graph::Evaluator::build(&raw)
         .expect_err("restricted should refuse with wrong env value");
     assert!(
-        matches!(err, mm_strategy_graph::ValidationError::RestrictedNotAllowed(_)),
+        matches!(
+            err,
+            mm_strategy_graph::ValidationError::RestrictedNotAllowed(_)
+        ),
         "expected RestrictedNotAllowed for env='1'; got {err:?}"
     );
 

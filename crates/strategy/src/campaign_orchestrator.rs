@@ -211,7 +211,11 @@ impl Strategy for CampaignOrchestratorStrategy {
                     return Vec::new();
                 }
                 vec![QuotePair {
-                    bid: Some(Quote { side: Side::Buy, price, qty }),
+                    bid: Some(Quote {
+                        side: Side::Buy,
+                        price,
+                        qty,
+                    }),
                     ask: None,
                 }]
             }
@@ -223,27 +227,34 @@ impl Strategy for CampaignOrchestratorStrategy {
                     return Vec::new();
                 }
                 vec![QuotePair {
-                    bid: Some(Quote { side: Side::Buy, price, qty }),
+                    bid: Some(Quote {
+                        side: Side::Buy,
+                        price,
+                        qty,
+                    }),
                     ask: None,
                 }]
             }
             CampaignPhase::Distribute => {
                 let rungs = self.config.distribute_rungs.max(1) as i64;
-                let base_offset =
-                    mid * self.config.distribute_offset_bps / dec!(10_000);
+                let base_offset = mid * self.config.distribute_offset_bps / dec!(10_000);
                 let step = mid * self.config.distribute_step_bps / dec!(10_000);
                 let qty = ctx.product.round_qty(self.config.distribute_size);
                 let mut out = Vec::with_capacity(rungs as usize);
                 for r in 0..rungs {
-                    let price = ctx.product.round_price(
-                        mid + base_offset + step * Decimal::from(r),
-                    );
+                    let price = ctx
+                        .product
+                        .round_price(mid + base_offset + step * Decimal::from(r));
                     if price <= mid || !ctx.product.meets_min_notional(price, qty) {
                         continue;
                     }
                     out.push(QuotePair {
                         bid: None,
-                        ask: Some(Quote { side: Side::Sell, price, qty }),
+                        ask: Some(Quote {
+                            side: Side::Sell,
+                            price,
+                            qty,
+                        }),
                     });
                 }
                 out
@@ -257,7 +268,11 @@ impl Strategy for CampaignOrchestratorStrategy {
                 }
                 vec![QuotePair {
                     bid: None,
-                    ask: Some(Quote { side: Side::Sell, price, qty }),
+                    ask: Some(Quote {
+                        side: Side::Sell,
+                        price,
+                        qty,
+                    }),
                 }]
             }
             CampaignPhase::Idle => Vec::new(),
@@ -289,8 +304,7 @@ impl Strategy for CampaignOrchestratorStrategy {
             ));
         }
         let first_ms = state.get("first_tick_ms").and_then(|v| v.as_i64());
-        let first = first_ms
-            .and_then(chrono::DateTime::<Utc>::from_timestamp_millis);
+        let first = first_ms.and_then(chrono::DateTime::<Utc>::from_timestamp_millis);
         let mut g = self
             .first_tick_at
             .lock()
@@ -377,7 +391,11 @@ mod tests {
 
         let dst = CampaignOrchestratorStrategy::new();
         dst.restore_state(&snap).unwrap();
-        let got = dst.first_tick_at.lock().unwrap().map(|t| t.timestamp_millis());
+        let got = dst
+            .first_tick_at
+            .lock()
+            .unwrap()
+            .map(|t| t.timestamp_millis());
         assert_eq!(got, Some(t0.timestamp_millis()));
     }
 

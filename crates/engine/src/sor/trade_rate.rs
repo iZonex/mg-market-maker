@@ -119,11 +119,7 @@ impl TradeRateEstimator {
     /// arrivals at the current trade rate. Returns `None`
     /// when the rate is unknown so callers can fall back to
     /// a config constant cleanly.
-    pub fn expected_queue_wait_secs(
-        &mut self,
-        now_ns: i64,
-        depth_qty: Decimal,
-    ) -> Option<Decimal> {
+    pub fn expected_queue_wait_secs(&mut self, now_ns: i64, depth_qty: Decimal) -> Option<Decimal> {
         let rate = self.rate_per_sec(now_ns)?;
         if rate <= Decimal::ZERO {
             return None;
@@ -180,7 +176,7 @@ mod tests {
     #[test]
     fn window_evicts_stale_samples() {
         let mut e = TradeRateEstimator::new(10); // 10s window.
-        // Seed 6 trades at t=0..5 with qty=1.
+                                                 // Seed 6 trades at t=0..5 with qty=1.
         for i in 0..6 {
             e.record(i * NS_PER_SEC, dec!(1));
         }

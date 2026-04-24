@@ -198,26 +198,23 @@ impl ExchangeConnector for BinanceFuturesConnector {
         // `{"openInterest":"123.456","symbol":"BTCUSDT","time":1700000000000}`.
         self.rate_limiter.acquire(1).await;
         let url = format!("{}/fapi/v1/openInterest?symbol={symbol}", self.base_url);
-        let body: Value = self
-            .client
-            .get(&url)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let body: Value = self.client.get(&url).send().await?.json().await?;
         let contracts_s = body.get("openInterest").and_then(|v| v.as_str());
         let contracts = contracts_s.and_then(|s| s.parse::<Decimal>().ok());
-        let ts_ms = body.get("time").and_then(|v| v.as_i64()).unwrap_or_else(|| {
-            chrono::Utc::now().timestamp_millis()
-        });
-        let timestamp = chrono::DateTime::from_timestamp_millis(ts_ms)
-            .unwrap_or_else(chrono::Utc::now);
-        Ok(contracts.map(|c| mm_exchange_core::connector::OpenInterestInfo {
-            symbol: symbol.to_string(),
-            oi_contracts: Some(c),
-            oi_usd: None,
-            timestamp,
-        }))
+        let ts_ms = body
+            .get("time")
+            .and_then(|v| v.as_i64())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        let timestamp =
+            chrono::DateTime::from_timestamp_millis(ts_ms).unwrap_or_else(chrono::Utc::now);
+        Ok(
+            contracts.map(|c| mm_exchange_core::connector::OpenInterestInfo {
+                symbol: symbol.to_string(),
+                oi_contracts: Some(c),
+                oi_usd: None,
+                timestamp,
+            }),
+        )
     }
 
     async fn get_long_short_ratio(
@@ -234,13 +231,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
             "{}/futures/data/globalLongShortAccountRatio?symbol={symbol}&period=5m&limit=1",
             self.base_url
         );
-        let body: Value = self
-            .client
-            .get(&url)
-            .send()
-            .await?
-            .json()
-            .await?;
+        let body: Value = self.client.get(&url).send().await?.json().await?;
         let Some(row) = body.as_array().and_then(|a| a.first()) else {
             return Ok(None);
         };
@@ -734,10 +725,9 @@ impl ExchangeConnector for BinanceFuturesConnector {
             .signed_get("/fapi/v2/account", &ts_param)
             .await
             .map_err(MarginError::Other)?;
-        parse_binance_futures_account(&resp)
-            .ok_or_else(|| MarginError::Other(anyhow::anyhow!(
-                "malformed /fapi/v2/account response"
-            )))
+        parse_binance_futures_account(&resp).ok_or_else(|| {
+            MarginError::Other(anyhow::anyhow!("malformed /fapi/v2/account response"))
+        })
     }
 
     /// Set per-symbol margin mode via
@@ -745,11 +735,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
     /// "already in this mode" as error `-4046` which we
     /// normalise to `Ok(())` so a re-run of the startup hook
     /// does not fail on a healthy account.
-    async fn set_margin_mode(
-        &self,
-        symbol: &str,
-        mode: MarginMode,
-    ) -> Result<(), MarginError> {
+    async fn set_margin_mode(&self, symbol: &str, mode: MarginMode) -> Result<(), MarginError> {
         let kind = match mode {
             MarginMode::Isolated => "ISOLATED",
             MarginMode::Cross => "CROSSED",
@@ -776,11 +762,7 @@ impl ExchangeConnector for BinanceFuturesConnector {
     /// clamps to the symbol's bracket limit if we request more
     /// than the tier allows — an under-quota value always
     /// succeeds.
-    async fn set_leverage(
-        &self,
-        symbol: &str,
-        leverage: u32,
-    ) -> Result<(), MarginError> {
+    async fn set_leverage(&self, symbol: &str, leverage: u32) -> Result<(), MarginError> {
         let ts = chrono::Utc::now().timestamp_millis();
         let params = format!("symbol={symbol}&leverage={leverage}&timestamp={ts}");
         self.signed_post("/fapi/v1/leverage", &params)
@@ -977,7 +959,10 @@ fn parse_binance_futures_position(pos: &Value) -> Option<PositionMargin> {
     // as Option.
     let adl_quantile = pos
         .get("adlQuantile")
-        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
         .and_then(|n| u8::try_from(n).ok());
     Some(PositionMargin {
         symbol,

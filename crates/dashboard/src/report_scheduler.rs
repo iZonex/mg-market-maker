@@ -316,10 +316,7 @@ mod tests {
 
     #[test]
     fn last_run_persistence_round_trips() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mm_lastrun_{}.jsonl",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("mm_lastrun_{}.jsonl", std::process::id()));
         let path_str = tmp.to_string_lossy().to_string();
 
         let now = Utc::now();
@@ -343,10 +340,7 @@ mod tests {
 
     #[test]
     fn catchup_decision_uses_last_successful() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mm_catchup_{}.jsonl",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("mm_catchup_{}.jsonl", std::process::id()));
         let path_str = tmp.to_string_lossy().to_string();
 
         // Seed a daily run 12 h ago (inside a 24 h window).

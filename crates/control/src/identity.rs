@@ -116,8 +116,8 @@ impl PublicKey {
         }
         let mut buf = [0u8; 32];
         buf.copy_from_slice(bytes);
-        let vk = VerifyingKey::from_bytes(&buf)
-            .map_err(|e| IdentityError::BadHex(e.to_string()))?;
+        let vk =
+            VerifyingKey::from_bytes(&buf).map_err(|e| IdentityError::BadHex(e.to_string()))?;
         Ok(Self(vk))
     }
 
@@ -145,7 +145,9 @@ impl PublicKey {
         let mut buf = [0u8; SIGNATURE_LENGTH];
         buf.copy_from_slice(sig);
         let parsed = ed25519_dalek::Signature::from_bytes(&buf);
-        self.0.verify(msg, &parsed).map_err(|_| IdentityError::VerifyFailed)
+        self.0
+            .verify(msg, &parsed)
+            .map_err(|_| IdentityError::VerifyFailed)
     }
 }
 

@@ -328,11 +328,7 @@ impl LearnedMicroprice {
                     for (di, ds) in neighbor_ring(d) {
                         let ni_idx = i as i64 + di;
                         let ns_idx = s as i64 + ds;
-                        if ni_idx < 0
-                            || ni_idx >= ni as i64
-                            || ns_idx < 0
-                            || ns_idx >= ns as i64
-                        {
+                        if ni_idx < 0 || ni_idx >= ni as i64 || ns_idx < 0 || ns_idx >= ns as i64 {
                             continue;
                         }
                         let ni_u = ni_idx as usize;
@@ -368,12 +364,7 @@ impl LearnedMicroprice {
     /// `imbalance` must be in `[-1, 1]`, `spread ≥ 0`,
     /// `delta_mid` is the observed forward-mid change at
     /// the same horizon the offline fit used.
-    pub fn update_online(
-        &mut self,
-        imbalance: Decimal,
-        spread: Decimal,
-        delta_mid: Decimal,
-    ) {
+    pub fn update_online(&mut self, imbalance: Decimal, spread: Decimal, delta_mid: Decimal) {
         if !self.finalized {
             return;
         }

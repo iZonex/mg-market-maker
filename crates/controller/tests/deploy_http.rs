@@ -15,10 +15,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mm_agent::{AgentConfig, LeaseClient, MockEngineFactory, StrategyRegistry};
-use mm_controller::{http_router, spawn_accept_loop, AgentRegistry, FleetState, LeasePolicy};
 use mm_control::lease::LeaseState;
 use mm_control::messages::AgentId;
 use mm_control::ws_transport::WsTransport;
+use mm_controller::{http_router, spawn_accept_loop, AgentRegistry, FleetState, LeasePolicy};
 use serde_json::json;
 use tokio::sync::watch;
 
@@ -43,7 +43,12 @@ async fn deploy_http_pushes_set_desired_strategies() {
         axum::serve(http_listener, http_app).await.unwrap();
     });
     // WS accept loop.
-    let accept_task = spawn_accept_loop(ws_addr, fleet.clone(), registry.clone(), Arc::clone(&policy));
+    let accept_task = spawn_accept_loop(
+        ws_addr,
+        fleet.clone(),
+        registry.clone(),
+        Arc::clone(&policy),
+    );
 
     // Give the accept loop a moment to bind.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -79,7 +84,10 @@ async fn deploy_http_pushes_set_desired_strategies() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    let url = format!("http://{}/api/v1/agents/eu-deploy-01/deployments", http_addr);
+    let url = format!(
+        "http://{}/api/v1/agents/eu-deploy-01/deployments",
+        http_addr
+    );
     let body = json!({
         "strategies": [
             {

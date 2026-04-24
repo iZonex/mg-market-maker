@@ -44,7 +44,10 @@ impl StuffStrategy {
         Self::default()
     }
     pub fn with_config(config: StuffConfig) -> Self {
-        Self { config, tick: AtomicU64::new(0) }
+        Self {
+            config,
+            tick: AtomicU64::new(0),
+        }
     }
 }
 
@@ -72,15 +75,23 @@ impl Strategy for StuffStrategy {
                 Side::Buy => ctx.product.round_price(mid - offset),
                 Side::Sell => ctx.product.round_price(mid + offset),
             };
-            if price <= Decimal::ZERO
-                || !ctx.product.meets_min_notional(price, qty)
-            {
+            if price <= Decimal::ZERO || !ctx.product.meets_min_notional(price, qty) {
                 continue;
             }
-            let q = Quote { side: self.config.push_side, price, qty };
+            let q = Quote {
+                side: self.config.push_side,
+                price,
+                qty,
+            };
             pairs.push(match self.config.push_side {
-                Side::Buy => QuotePair { bid: Some(q), ask: None },
-                Side::Sell => QuotePair { bid: None, ask: Some(q) },
+                Side::Buy => QuotePair {
+                    bid: Some(q),
+                    ask: None,
+                },
+                Side::Sell => QuotePair {
+                    bid: None,
+                    ask: Some(q),
+                },
             });
         }
         pairs

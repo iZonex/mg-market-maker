@@ -81,10 +81,7 @@ mod tests {
 
     #[test]
     fn round_trips_through_disk() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mm_articles_{}.jsonl",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("mm_articles_{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         let w = ArticleWriter::new(tmp.clone()).expect("open");
         let rec = ArticleRecord {

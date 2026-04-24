@@ -17,8 +17,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use crate::{
-    HolderEntry, OnchainError, OnchainProvider, OnchainResult, TokenMetadata,
-    TransferEntry,
+    HolderEntry, OnchainError, OnchainProvider, OnchainResult, TokenMetadata, TransferEntry,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.covalenthq.com";
@@ -56,10 +55,7 @@ impl GoldRushProvider {
         Ok(Self { config, client })
     }
 
-    async fn get_json(
-        &self,
-        path: &str,
-    ) -> OnchainResult<serde_json::Value> {
+    async fn get_json(&self, path: &str) -> OnchainResult<serde_json::Value> {
         let url = format!("{}{}", self.config.base_url, path);
         let resp = self
             .client
@@ -96,17 +92,13 @@ impl OnchainProvider for GoldRushProvider {
         token: &str,
         limit: u32,
     ) -> OnchainResult<Vec<HolderEntry>> {
-        let path = format!(
-            "/v1/{chain}/tokens/{token}/token_holders/?page-size={limit}"
-        );
+        let path = format!("/v1/{chain}/tokens/{token}/token_holders/?page-size={limit}");
         let v = self.get_json(&path).await?;
         let items = v
             .get("data")
             .and_then(|d| d.get("items"))
             .and_then(|i| i.as_array())
-            .ok_or_else(|| {
-                OnchainError::Decode("goldrush token_holders: missing items".into())
-            })?;
+            .ok_or_else(|| OnchainError::Decode("goldrush token_holders: missing items".into()))?;
         let mut out = Vec::with_capacity(items.len());
         for row in items {
             let address = row
@@ -114,12 +106,13 @@ impl OnchainProvider for GoldRushProvider {
                 .and_then(|a| a.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let balance_s = row
-                .get("balance")
-                .and_then(|b| b.as_str())
-                .unwrap_or("0");
+            let balance_s = row.get("balance").and_then(|b| b.as_str()).unwrap_or("0");
             let balance = Decimal::from_str(balance_s).unwrap_or(Decimal::ZERO);
-            out.push(HolderEntry { address, balance, label: None });
+            out.push(HolderEntry {
+                address,
+                balance,
+                label: None,
+            });
         }
         Ok(out)
     }
@@ -207,11 +200,7 @@ impl OnchainProvider for GoldRushProvider {
         Ok(out)
     }
 
-    async fn get_token_metadata(
-        &self,
-        chain: &str,
-        token: &str,
-    ) -> OnchainResult<TokenMetadata> {
+    async fn get_token_metadata(&self, chain: &str, token: &str) -> OnchainResult<TokenMetadata> {
         let path = format!("/v1/{chain}/tokens/{token}/");
         let v = self.get_json(&path).await?;
         let item = v
@@ -220,9 +209,7 @@ impl OnchainProvider for GoldRushProvider {
             .and_then(|i| i.as_array())
             .and_then(|a| a.first())
             .cloned()
-            .ok_or_else(|| {
-                OnchainError::Decode("goldrush token metadata: missing items".into())
-            })?;
+            .ok_or_else(|| OnchainError::Decode("goldrush token metadata: missing items".into()))?;
         let symbol = item
             .get("contract_ticker_symbol")
             .and_then(|s| s.as_str())

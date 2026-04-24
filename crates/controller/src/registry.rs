@@ -53,16 +53,17 @@ impl AgentCommandTx {
         tx: mpsc::UnboundedSender<CommandPayload>,
         lifecycle: mpsc::UnboundedSender<SessionLifecycleEvent>,
     ) -> Self {
-        Self { inner: tx, lifecycle }
+        Self {
+            inner: tx,
+            lifecycle,
+        }
     }
 
     /// Push a command. Returns `Err` when the session on the
     /// other end has dropped (disconnected agent). Callers
     /// translate that into a 503 / 404 as appropriate.
     pub fn push(&self, cmd: CommandPayload) -> Result<(), RegistryError> {
-        self.inner
-            .send(cmd)
-            .map_err(|_| RegistryError::AgentGone)
+        self.inner.send(cmd).map_err(|_| RegistryError::AgentGone)
     }
 
     /// Push a session-lifecycle event. Same error semantics as
@@ -101,8 +102,7 @@ pub struct AgentRegistry {
     /// Entries expire via the HTTP handler's timeout — the
     /// handler removes its own entry on timeout so a late reply
     /// just logs + drops.
-    pending_details:
-        Arc<RwLock<HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<DetailsReply>>>>,
+    pending_details: Arc<RwLock<HashMap<uuid::Uuid, tokio::sync::oneshot::Sender<DetailsReply>>>>,
 }
 
 impl AgentRegistry {

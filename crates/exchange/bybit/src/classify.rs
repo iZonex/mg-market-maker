@@ -21,9 +21,7 @@ pub fn classify_message(msg: &str) -> VenueError {
             // Rate limiting
             10006 | 10018 | 10016 => VenueErrorKind::RateLimit,
             // Auth / signature / permission
-            10003 | 10004 | 10005 | 10007 | 10009 | 10010 | 10017 => {
-                VenueErrorKind::AuthRejected
-            }
+            10003 | 10004 | 10005 | 10007 | 10009 | 10010 | 10017 => VenueErrorKind::AuthRejected,
             // Timestamp skew / retry class
             10002 => VenueErrorKind::TransientNetwork,
             // Order-not-found / stale state
@@ -109,7 +107,10 @@ mod tests {
     #[test]
     fn price_out_of_bounds() {
         assert_eq!(
-            classify(&err("Bybit API error 110003: Price exceeds allowed deviation")).kind,
+            classify(&err(
+                "Bybit API error 110003: Price exceeds allowed deviation"
+            ))
+            .kind,
             VenueErrorKind::PriceOutOfBounds
         );
     }

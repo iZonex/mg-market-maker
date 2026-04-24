@@ -11,9 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use mm_agent::{
-    default_registry_builder, run_with_reconnect, CredentialCatalog, ReconnectConfig,
-};
+use mm_agent::{default_registry_builder, run_with_reconnect, CredentialCatalog, ReconnectConfig};
 use mm_common::settings::SettingsFile;
 use mm_control::identity::IdentityKey;
 use mm_control::messages::AgentId;
@@ -42,7 +40,9 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let settings_path: PathBuf = std::env::var(SETTINGS_ENV)
@@ -104,9 +104,14 @@ async fn main() -> Result<()> {
         }
     });
 
-    let cfg = ReconnectConfig::new(controller_addr, agent_id, build_registry, Arc::clone(&catalog))
-        .with_identity(identity)
-        .with_dashboard(dashboard);
+    let cfg = ReconnectConfig::new(
+        controller_addr,
+        agent_id,
+        build_registry,
+        Arc::clone(&catalog),
+    )
+    .with_identity(identity)
+    .with_dashboard(dashboard);
     run_with_reconnect(cfg, shutdown_rx).await?;
     Ok(())
 }
@@ -118,12 +123,12 @@ fn load_or_generate_identity(path: &PathBuf) -> Result<IdentityKey> {
     let key = IdentityKey::generate();
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("create identity parent dir {}", parent.display())
-            })?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create identity parent dir {}", parent.display()))?;
         }
     }
-    key.save_to_file(path).map_err(|e| anyhow!("save identity: {e}"))?;
+    key.save_to_file(path)
+        .map_err(|e| anyhow!("save identity: {e}"))?;
     // Best-effort 0600 on Unix — non-fatal if it fails (Windows
     // + weird filesystems are out of scope for this path).
     #[cfg(unix)]

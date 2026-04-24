@@ -13,10 +13,8 @@ use crate::types::{Port, PortType, Value};
 use anyhow::Result;
 use once_cell::sync::Lazy;
 
-static SPREAD_INPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("mult", PortType::Number)]);
-static UNIT_OUT: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("action", PortType::Unit)]);
+static SPREAD_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("mult", PortType::Number)]);
+static UNIT_OUT: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("action", PortType::Unit)]);
 
 /// `Out.SpreadMult` — pushes the input number into the engine's
 /// autotuner as the graph-authored spread multiplier. Floor at 1.0
@@ -47,8 +45,7 @@ impl NodeKind for SpreadMult {
     }
 }
 
-static SIZE_INPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("mult", PortType::Number)]);
+static SIZE_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("mult", PortType::Number)]);
 
 /// `Out.SizeMult` — pushes into the autotuner as the graph-authored
 /// size multiplier. Clamped to `(0, 1]` engine-side.
@@ -128,8 +125,7 @@ impl NodeKind for KillEscalate {
     }
 }
 
-static QUOTES_INPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("quotes", PortType::Quotes)]);
+static QUOTES_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("quotes", PortType::Quotes)]);
 
 static VENUE_QUOTES_INPUTS: Lazy<Vec<Port>> =
     Lazy::new(|| vec![Port::new("quotes", PortType::Quotes)]);

@@ -77,3 +77,6 @@ zip = { version = "2.2", default-features = false, features = ["deflate-flate2",
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
+
+[lints]
+workspace = true

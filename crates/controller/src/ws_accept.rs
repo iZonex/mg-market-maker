@@ -19,9 +19,7 @@ use mm_control::ws_transport::WsListener;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
-use crate::{
-    AgentRegistry, AgentSession, ApprovalStore, VaultStore, FleetState, LeasePolicy,
-};
+use crate::{AgentRegistry, AgentSession, ApprovalStore, FleetState, LeasePolicy, VaultStore};
 
 /// Bind `addr`, accept incoming WS connections, spawn one
 /// [`AgentSession`] per accepted socket. Each session runs until
@@ -36,7 +34,9 @@ pub async fn run_accept_loop(
     policy: Arc<LeasePolicy>,
     tls: Option<TlsAcceptor>,
 ) -> anyhow::Result<()> {
-    let bare = WsListener::bind(addr).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let bare = WsListener::bind(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let local = bare.local_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
     let listener = match tls {
         Some(acceptor) => {

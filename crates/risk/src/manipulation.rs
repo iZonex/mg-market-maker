@@ -163,10 +163,8 @@ impl PumpDumpDetector {
     /// volume scores near zero, same for a volume surge
     /// without price movement. Real pump-dumps have both.
     pub fn score(&self) -> Decimal {
-        let velocity =
-            (self.price_change_bps() / self.config.velocity_saturation_bps).min(dec!(1));
-        let surge =
-            (self.volume_surge_ratio() / self.config.surge_saturation_ratio).min(dec!(1));
+        let velocity = (self.price_change_bps() / self.config.velocity_saturation_bps).min(dec!(1));
+        let surge = (self.volume_surge_ratio() / self.config.surge_saturation_ratio).min(dec!(1));
         velocity * surge
     }
 }
@@ -270,8 +268,7 @@ impl WashPrintDetector {
                 if pa.is_zero() {
                     continue;
                 }
-                let px_diff_bps =
-                    ((*pb - *pa) / *pa * Decimal::from(10_000)).abs();
+                let px_diff_bps = ((*pb - *pa) / *pa * Decimal::from(10_000)).abs();
                 if px_diff_bps > self.config.price_tolerance_bps {
                     continue;
                 }
@@ -298,8 +295,7 @@ impl WashPrintDetector {
             return Decimal::ZERO;
         }
         let n = self.matched_pairs();
-        (Decimal::from(n) / Decimal::from(self.config.saturation_pairs))
-            .min(dec!(1))
+        (Decimal::from(n) / Decimal::from(self.config.saturation_pairs)).min(dec!(1))
     }
 }
 
@@ -391,8 +387,7 @@ impl ThinBookGuard {
             }
         }
 
-        let trailing_notional: Decimal =
-            self.notional_window.iter().map(|(_, n)| *n).sum();
+        let trailing_notional: Decimal = self.notional_window.iter().map(|(_, n)| *n).sum();
         if trailing_notional.is_zero() {
             self.last_score = Decimal::ZERO;
             return;
@@ -413,8 +408,7 @@ impl ThinBookGuard {
         } else if ratio >= self.config.min_ratio * dec!(2) {
             Decimal::ZERO
         } else {
-            let slope =
-                (self.config.min_ratio * dec!(2) - ratio) / self.config.min_ratio;
+            let slope = (self.config.min_ratio * dec!(2) - ratio) / self.config.min_ratio;
             slope.max(Decimal::ZERO).min(dec!(1))
         };
         self.last_score = score;
@@ -507,11 +501,10 @@ impl ManipulationScoreAggregator {
         let pd = self.pump_dump.score();
         let wa = self.wash.score();
         let tb = self.thin_book.score();
-        let combined = (pd * self.weights.pump_dump
-            + wa * self.weights.wash
-            + tb * self.weights.thin_book)
-            .min(dec!(1))
-            .max(Decimal::ZERO);
+        let combined =
+            (pd * self.weights.pump_dump + wa * self.weights.wash + tb * self.weights.thin_book)
+                .min(dec!(1))
+                .max(Decimal::ZERO);
         ManipulationScoreSnapshot {
             pump_dump: pd,
             wash: wa,
@@ -569,7 +562,10 @@ impl ListingAgeGuard {
     }
 
     pub fn with_config(config: ListingAgeConfig) -> Self {
-        Self { config, first_seen: None }
+        Self {
+            config,
+            first_seen: None,
+        }
     }
 
     /// Stamp the first-seen timestamp if unset. Safe to call
@@ -582,8 +578,7 @@ impl ListingAgeGuard {
 
     /// Age in seconds since first_seen. `None` pre-stamp.
     pub fn age_secs(&self, now: DateTime<Utc>) -> Option<i64> {
-        self.first_seen
-            .map(|ts| (now - ts).num_seconds().max(0))
+        self.first_seen.map(|ts| (now - ts).num_seconds().max(0))
     }
 
     pub fn score(&self, now: DateTime<Utc>) -> Decimal {
@@ -648,10 +643,7 @@ impl MarketCapProxyGuard {
         Self::with_config(circulating_supply, MarketCapProxyConfig::default())
     }
 
-    pub fn with_config(
-        circulating_supply: Decimal,
-        config: MarketCapProxyConfig,
-    ) -> Self {
+    pub fn with_config(circulating_supply: Decimal, config: MarketCapProxyConfig) -> Self {
         Self {
             config,
             circulating_supply,
@@ -795,7 +787,10 @@ mod phase2_tests {
 
     #[test]
     fn listing_age_score_decays_linearly() {
-        let now = Utc.timestamp_millis_opt(1_000_000_000_000).single().unwrap();
+        let now = Utc
+            .timestamp_millis_opt(1_000_000_000_000)
+            .single()
+            .unwrap();
         let mut g = ListingAgeGuard::with_config(ListingAgeConfig { mature_days: 10 });
         // Pre-stamp → conservative (fresh).
         assert_eq!(g.score(now), dec!(1));
@@ -855,14 +850,22 @@ mod phase2_tests {
         assert_eq!(s.combined, dec!(1));
         // All at 0 → combined = 0.
         let s0 = compute_rug_score(
-            Decimal::ZERO, Decimal::ZERO, Decimal::ZERO,
-            Decimal::ZERO, Decimal::ZERO, &w,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            &w,
         );
         assert_eq!(s0.combined, Decimal::ZERO);
         // Manipulation alone at 1.0 → combined = 0.35 (the weight).
         let sm = compute_rug_score(
-            dec!(1), Decimal::ZERO, Decimal::ZERO,
-            Decimal::ZERO, Decimal::ZERO, &w,
+            dec!(1),
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            Decimal::ZERO,
+            &w,
         );
         assert_eq!(sm.combined, dec!(0.35));
     }
@@ -956,8 +959,14 @@ mod tests {
         // Book with ~$100 total visible depth ± 2 %.
         let mut book = LocalOrderBook::new("RAVEUSDT".to_string());
         book.apply_snapshot(
-            vec![PriceLevel { price: dec!(99.5), qty: dec!(0.5) }],
-            vec![PriceLevel { price: dec!(100.5), qty: dec!(0.5) }],
+            vec![PriceLevel {
+                price: dec!(99.5),
+                qty: dec!(0.5),
+            }],
+            vec![PriceLevel {
+                price: dec!(100.5),
+                qty: dec!(0.5),
+            }],
             1,
         );
         let now = Utc.timestamp_millis_opt(30_000).single().unwrap();
@@ -975,8 +984,14 @@ mod tests {
         }
         let mut book = LocalOrderBook::new("BTCUSDT".to_string());
         book.apply_snapshot(
-            vec![PriceLevel { price: dec!(99.5), qty: dec!(1000) }],
-            vec![PriceLevel { price: dec!(100.5), qty: dec!(1000) }],
+            vec![PriceLevel {
+                price: dec!(99.5),
+                qty: dec!(1000),
+            }],
+            vec![PriceLevel {
+                price: dec!(100.5),
+                qty: dec!(1000),
+            }],
             1,
         );
         let now = Utc.timestamp_millis_opt(30_000).single().unwrap();
@@ -998,13 +1013,15 @@ mod tests {
             agg.on_trade(&trade(t, Side::Buy, px, dec!(50)));
         }
         let snap = agg.snapshot();
-        assert!(snap.pump_dump > dec!(0.3),
-            "expected pump_dump > 0.3, got {}", snap.pump_dump);
+        assert!(
+            snap.pump_dump > dec!(0.3),
+            "expected pump_dump > 0.3, got {}",
+            snap.pump_dump
+        );
         assert_eq!(snap.thin_book, Decimal::ZERO);
         // Combined = 0.5 * pump_dump + 0.3 * wash + 0.2 * thin.
-        let expected = snap.pump_dump * dec!(0.5)
-            + snap.wash * dec!(0.3)
-            + snap.thin_book * dec!(0.2);
+        let expected =
+            snap.pump_dump * dec!(0.5) + snap.wash * dec!(0.3) + snap.thin_book * dec!(0.2);
         assert_eq!(snap.combined, expected.min(dec!(1)));
     }
 }

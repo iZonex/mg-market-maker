@@ -94,11 +94,7 @@ pub struct DeploymentDetailsStore {
 impl DeploymentDetailsStore {
     /// Append one funding-arb event for `symbol`, dropping the
     /// oldest entry if the ring is already full.
-    pub fn push_funding_arb_event(
-        &self,
-        symbol: &str,
-        entry: FundingArbEventEntry,
-    ) {
+    pub fn push_funding_arb_event(&self, symbol: &str, entry: FundingArbEventEntry) {
         let Ok(mut g) = self.inner.lock() else { return };
         let ring = g.funding_arb.entry(symbol.to_string()).or_default();
         if ring.len() >= RING_CAP {
@@ -111,7 +107,9 @@ impl DeploymentDetailsStore {
     /// vec when nothing has been recorded yet. Newest-first so
     /// the UI can render without sorting.
     pub fn funding_arb_events(&self, symbol: &str) -> Vec<FundingArbEventEntry> {
-        let Ok(g) = self.inner.lock() else { return Vec::new() };
+        let Ok(g) = self.inner.lock() else {
+            return Vec::new();
+        };
         g.funding_arb
             .get(symbol)
             .map(|ring| ring.iter().rev().cloned().collect())
@@ -135,7 +133,9 @@ impl DeploymentDetailsStore {
     /// Read the latest decisions snapshot. Returns empty when
     /// the engine hasn't pushed one yet (fresh deployment).
     pub fn decisions_snapshot(&self, symbol: &str) -> Vec<serde_json::Value> {
-        let Ok(g) = self.inner.lock() else { return Vec::new() };
+        let Ok(g) = self.inner.lock() else {
+            return Vec::new();
+        };
         g.decisions.get(symbol).cloned().unwrap_or_default()
     }
 
@@ -154,7 +154,9 @@ impl DeploymentDetailsStore {
     /// newest-first. Empty when the deployment hasn't routed
     /// anything yet.
     pub fn sor_decisions(&self, symbol: &str) -> Vec<serde_json::Value> {
-        let Ok(g) = self.inner.lock() else { return Vec::new() };
+        let Ok(g) = self.inner.lock() else {
+            return Vec::new();
+        };
         g.sor_decisions
             .get(symbol)
             .map(|ring| ring.iter().rev().cloned().collect())
@@ -180,7 +182,9 @@ impl DeploymentDetailsStore {
     /// Returns up to `limit` entries; pass `None` for the whole
     /// buffer.
     pub fn graph_traces(&self, symbol: &str, limit: Option<usize>) -> Vec<TickTrace> {
-        let Ok(g) = self.inner.lock() else { return Vec::new() };
+        let Ok(g) = self.inner.lock() else {
+            return Vec::new();
+        };
         let Some(ring) = g.graph_traces.get(symbol) else {
             return Vec::new();
         };
@@ -209,7 +213,9 @@ impl DeploymentDetailsStore {
     /// Read the current graph analysis for `symbol`. Returns
     /// `None` before the first swap has landed.
     pub fn graph_analysis(&self, symbol: &str) -> Option<GraphAnalysis> {
-        let Ok(g) = self.inner.lock() else { return None };
+        let Ok(g) = self.inner.lock() else {
+            return None;
+        };
         g.graph_analysis.get(symbol).cloned()
     }
 }
@@ -267,7 +273,7 @@ mod tests {
         for i in 0..total {
             let mut t = TickTrace::default();
             t.tick_num = i;
-            t.tick_ms = i as u64;
+            t.tick_ms = i;
             s.push_graph_trace("BTCUSDT", t);
         }
         let all = s.graph_traces("BTCUSDT", None);

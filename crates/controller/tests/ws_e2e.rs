@@ -19,10 +19,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mm_agent::{AgentConfig, LeaseClient};
-use mm_controller::{http_router, spawn_accept_loop, AgentRegistry, FleetState, LeasePolicy};
 use mm_control::lease::LeaseState;
 use mm_control::messages::AgentId;
 use mm_control::ws_transport::WsTransport;
+use mm_controller::{http_router, spawn_accept_loop, AgentRegistry, FleetState, LeasePolicy};
 
 #[tokio::test]
 async fn controller_and_agent_talk_over_real_ws() {
@@ -51,7 +51,12 @@ async fn controller_and_agent_talk_over_real_ws() {
     });
 
     // WS accept loop.
-    let accept_task = spawn_accept_loop(ws_addr, fleet.clone(), registry.clone(), Arc::clone(&policy));
+    let accept_task = spawn_accept_loop(
+        ws_addr,
+        fleet.clone(),
+        registry.clone(),
+        Arc::clone(&policy),
+    );
 
     // Give the accept loop a beat to bind before dialing.
     tokio::time::sleep(Duration::from_millis(100)).await;

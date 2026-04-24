@@ -276,22 +276,22 @@ impl Graph {
 
         // 4. every edge: endpoints exist + port types match
         for e in &self.edges {
-            let src = shapes.get(&e.from.node).ok_or_else(|| {
-                ValidationError::DanglingEdge {
+            let src = shapes
+                .get(&e.from.node)
+                .ok_or_else(|| ValidationError::DanglingEdge {
                     from: e.from.node,
                     from_port: e.from.port.clone(),
                     to: e.to.node,
                     to_port: e.to.port.clone(),
-                }
-            })?;
-            let dst = shapes.get(&e.to.node).ok_or_else(|| {
-                ValidationError::DanglingEdge {
+                })?;
+            let dst = shapes
+                .get(&e.to.node)
+                .ok_or_else(|| ValidationError::DanglingEdge {
                     from: e.from.node,
                     from_port: e.from.port.clone(),
                     to: e.to.node,
                     to_port: e.to.port.clone(),
-                }
-            })?;
+                })?;
             let Some(src_ty) = src.output(&e.from.port) else {
                 return Err(ValidationError::DanglingEdge {
                     from: e.from.node,
@@ -321,8 +321,7 @@ impl Graph {
         }
 
         // 5. topological sort (Kahn's algorithm) — rejects cycles.
-        let mut indeg: HashMap<NodeId, usize> =
-            self.nodes.iter().map(|n| (n.id, 0)).collect();
+        let mut indeg: HashMap<NodeId, usize> = self.nodes.iter().map(|n| (n.id, 0)).collect();
         let mut fwd: HashMap<NodeId, Vec<NodeId>> =
             self.nodes.iter().map(|n| (n.id, Vec::new())).collect();
         for e in &self.edges {
@@ -368,10 +367,7 @@ impl Graph {
         // 7. at least one Out.SpreadMult reachable (fail-closed
         //    default: an operator cannot silently disable spread
         //    widening by deleting the last sink).
-        let has_sink = self
-            .nodes
-            .iter()
-            .any(|n| n.kind == "Out.SpreadMult");
+        let has_sink = self.nodes.iter().any(|n| n.kind == "Out.SpreadMult");
         if !has_sink {
             return Err(ValidationError::NoSpreadMultSink);
         }
@@ -393,10 +389,7 @@ impl Graph {
     ///
     /// Empty / missing venue strings are ignored — those nodes
     /// default to the engine's own venue, which is always valid.
-    pub fn validate_venues<I, S>(
-        &self,
-        known: I,
-    ) -> std::result::Result<(), ValidationError>
+    pub fn validate_venues<I, S>(&self, known: I) -> std::result::Result<(), ValidationError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -419,8 +412,7 @@ impl Graph {
                 }
                 let lower = v.to_lowercase();
                 if !known_set.contains(&lower) {
-                    let mut known_sorted: Vec<String> =
-                        known_set.iter().cloned().collect();
+                    let mut known_sorted: Vec<String> = known_set.iter().cloned().collect();
                     known_sorted.sort();
                     return Err(ValidationError::UnknownVenue {
                         node: n.id,
@@ -448,10 +440,7 @@ pub struct KindShape {
 
 impl KindShape {
     fn input(&self, name: &str) -> Option<PortType> {
-        self.inputs
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, t)| *t)
+        self.inputs.iter().find(|(n, _)| n == name).map(|(_, t)| *t)
     }
     fn output(&self, name: &str) -> Option<PortType> {
         self.outputs
@@ -520,17 +509,25 @@ fn validate_node_config(
         }
     }
     for field in &shape.config_schema {
-        let Some(v) = cfg.get(field.name) else { continue };
+        let Some(v) = cfg.get(field.name) else {
+            continue;
+        };
         if v.is_null() {
             continue;
         }
         let ok = match &field.widget {
             ConfigWidget::Number { .. } => {
-                v.is_number() || v.as_str().map(|s| s.parse::<f64>().is_ok()).unwrap_or(false)
+                v.is_number()
+                    || v.as_str()
+                        .map(|s| s.parse::<f64>().is_ok())
+                        .unwrap_or(false)
             }
             ConfigWidget::Integer { .. } => {
-                v.is_i64() || v.is_u64()
-                    || v.as_str().map(|s| s.parse::<i64>().is_ok()).unwrap_or(false)
+                v.is_i64()
+                    || v.is_u64()
+                    || v.as_str()
+                        .map(|s| s.parse::<i64>().is_ok())
+                        .unwrap_or(false)
             }
             ConfigWidget::Text => v.is_string(),
             ConfigWidget::Bool => v.is_boolean(),
@@ -586,4 +583,3 @@ fn describe_json_type(v: &serde_json::Value) -> String {
     }
     .to_string()
 }
-

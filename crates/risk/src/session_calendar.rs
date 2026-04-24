@@ -80,7 +80,11 @@ impl SessionCalendar {
                 best = seconds_delta;
             }
         }
-        if best == i64::MAX { None } else { Some(best) }
+        if best == i64::MAX {
+            None
+        } else {
+            Some(best)
+        }
     }
 
     /// Seconds *since* the most-recent boundary. Mirror of
@@ -104,7 +108,11 @@ impl SessionCalendar {
                 best = seconds_delta;
             }
         }
-        if best == i64::MAX { None } else { Some(best) }
+        if best == i64::MAX {
+            None
+        } else {
+            Some(best)
+        }
     }
 }
 

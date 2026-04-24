@@ -2,11 +2,11 @@
 //! mode, and key prefixing so callers (`shipper`, `bundle`)
 //! only touch a narrow API.
 
-use aws_sdk_s3::Client;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::ServerSideEncryption;
+use aws_sdk_s3::Client;
 use mm_common::config::ArchiveConfig;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,8 +25,7 @@ impl ArchiveClient {
     /// env, IMDS, SSO, profile all keep working.
     pub async fn from_config(cfg: ArchiveConfig) -> anyhow::Result<Self> {
         let region = Region::new(cfg.s3_region.clone());
-        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(region);
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest()).region(region);
         if let Some(ep) = cfg.s3_endpoint_url.as_deref() {
             loader = loader.endpoint_url(ep);
         }
@@ -95,11 +94,7 @@ impl ArchiveClient {
     /// bundle endpoint when a client wants a time-limited link
     /// they can hand off to a regulator without issuing
     /// long-lived IAM creds.
-    pub async fn presign_get(
-        &self,
-        rel: &str,
-        ttl: Duration,
-    ) -> anyhow::Result<String> {
+    pub async fn presign_get(&self, rel: &str, ttl: Duration) -> anyhow::Result<String> {
         let key = self.resolve_key(rel);
         let presign = PresigningConfig::expires_in(ttl)?;
         let presigned = self

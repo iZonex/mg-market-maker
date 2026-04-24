@@ -12,3 +12,6 @@ rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 rand = "0.9"
 rand_chacha = "0.9"
+
+[lints]
+workspace = true

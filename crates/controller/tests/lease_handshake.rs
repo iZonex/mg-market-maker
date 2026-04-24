@@ -22,10 +22,10 @@
 use std::time::Duration;
 
 use mm_agent::{AgentConfig, LeaseClient};
-use mm_controller::{AgentSession, LeasePolicy};
 use mm_control::in_memory_pair;
 use mm_control::lease::LeaseState;
 use mm_control::messages::AgentId;
+use mm_controller::{AgentSession, LeasePolicy};
 
 #[tokio::test]
 async fn agent_registers_and_receives_lease() {

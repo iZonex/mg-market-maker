@@ -218,12 +218,7 @@ impl PnlTracker {
     /// Idempotent on repeat of the same `next`: no re-seeding
     /// of `period_start`, so mid-period rate updates are
     /// consumed without resetting the accrual clock.
-    pub fn on_funding_update(
-        &mut self,
-        rate: Decimal,
-        next: DateTime<Utc>,
-        interval: Duration,
-    ) {
+    pub fn on_funding_update(&mut self, rate: Decimal, next: DateTime<Utc>, interval: Duration) {
         self.funding_rate = Some(rate);
         self.funding_interval = Some(interval);
         // If we've never seen a funding update or the venue
@@ -288,8 +283,7 @@ impl PnlTracker {
         // `−inventory × mark × rate × elapsed_frac` — positive
         // rate + long = payment (MTM negative). Recompute
         // fresh every tick, do not accumulate.
-        self.attribution.funding_pnl_mtm =
-            -self.inventory * mark * rate * elapsed_fraction;
+        self.attribution.funding_pnl_mtm = -self.inventory * mark * rate * elapsed_fraction;
     }
 
     /// Book the current funding period into `realised` (Epic

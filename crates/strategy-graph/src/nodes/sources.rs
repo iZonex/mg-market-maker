@@ -36,8 +36,7 @@ static BOOK_L1_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
     ]
 });
 static EMPTY_INPUTS: Lazy<Vec<Port>> = Lazy::new(Vec::new);
-static VALUE_NUMBER: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("value", PortType::Number)]);
+static VALUE_NUMBER: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("value", PortType::Number)]);
 
 impl NodeKind for BookL1 {
     fn kind(&self) -> &'static str {
@@ -77,10 +76,22 @@ impl NodeKind for BookL1 {
                 default: serde_json::json!(""),
                 widget: ConfigWidget::Enum {
                     options: vec![
-                        ConfigEnumOption { value: "", label: "(engine default)" },
-                        ConfigEnumOption { value: "spot", label: "Spot" },
-                        ConfigEnumOption { value: "linear_perp", label: "Linear perp" },
-                        ConfigEnumOption { value: "inverse_perp", label: "Inverse perp" },
+                        ConfigEnumOption {
+                            value: "",
+                            label: "(engine default)",
+                        },
+                        ConfigEnumOption {
+                            value: "spot",
+                            label: "Spot",
+                        },
+                        ConfigEnumOption {
+                            value: "linear_perp",
+                            label: "Linear perp",
+                        },
+                        ConfigEnumOption {
+                            value: "inverse_perp",
+                            label: "Inverse perp",
+                        },
                     ],
                 },
             },
@@ -143,8 +154,14 @@ impl NodeKind for CostSweep {
                 default: serde_json::json!("buy"),
                 widget: ConfigWidget::Enum {
                     options: vec![
-                        ConfigEnumOption { value: "buy", label: "Buy (sweep asks)" },
-                        ConfigEnumOption { value: "sell", label: "Sell (sweep bids)" },
+                        ConfigEnumOption {
+                            value: "buy",
+                            label: "Buy (sweep asks)",
+                        },
+                        ConfigEnumOption {
+                            value: "sell",
+                            label: "Sell (sweep bids)",
+                        },
                     ],
                 },
             },
@@ -153,7 +170,11 @@ impl NodeKind for CostSweep {
                 label: "Target qty (base)",
                 hint: Some("Hypothetical base-asset qty to take right now"),
                 default: serde_json::json!("0.01"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
         ]
     }
@@ -187,8 +208,7 @@ impl NodeKind for PortfolioCrossVenueNetDelta {
         &EMPTY_INPUTS
     }
     fn output_ports(&self) -> &[Port] {
-        static PORTS: Lazy<Vec<Port>> =
-            Lazy::new(|| vec![Port::new("value", PortType::Number)]);
+        static PORTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("value", PortType::Number)]);
         &PORTS
     }
     fn config_schema(&self) -> Vec<crate::node::ConfigField> {
@@ -249,17 +269,21 @@ impl NodeKind for BookFillProbability {
                 default: serde_json::json!("buy"),
                 widget: ConfigWidget::Enum {
                     options: vec![
-                        ConfigEnumOption { value: "buy", label: "Buy" },
-                        ConfigEnumOption { value: "sell", label: "Sell" },
+                        ConfigEnumOption {
+                            value: "buy",
+                            label: "Buy",
+                        },
+                        ConfigEnumOption {
+                            value: "sell",
+                            label: "Sell",
+                        },
                     ],
                 },
             },
             ConfigField {
                 name: "price",
                 label: "Price (optional)",
-                hint: Some(
-                    "Leave empty to target the frontmost own order on this side",
-                ),
+                hint: Some("Leave empty to target the frontmost own order on this side"),
                 default: serde_json::json!(""),
                 widget: ConfigWidget::Text,
             },
@@ -292,8 +316,7 @@ impl NodeKind for CumulativeTodayCost {
         &EMPTY_INPUTS
     }
     fn output_ports(&self) -> &[Port] {
-        static PORTS: Lazy<Vec<Port>> =
-            Lazy::new(|| vec![Port::new("value", PortType::Number)]);
+        static PORTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("value", PortType::Number)]);
         &PORTS
     }
     fn evaluate(
@@ -322,8 +345,7 @@ impl NodeKind for DecisionRealizedCostBps {
         &EMPTY_INPUTS
     }
     fn output_ports(&self) -> &[Port] {
-        static PORTS: Lazy<Vec<Port>> =
-            Lazy::new(|| vec![Port::new("value", PortType::Number)]);
+        static PORTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("value", PortType::Number)]);
         &PORTS
     }
     fn config_schema(&self) -> Vec<crate::node::ConfigField> {
@@ -333,7 +355,10 @@ impl NodeKind for DecisionRealizedCostBps {
             label: "Window (decisions)",
             hint: Some("Number of most-recent resolved decisions to average"),
             default: serde_json::json!(50),
-            widget: ConfigWidget::Integer { min: Some(1), max: Some(10_000) },
+            widget: ConfigWidget::Integer {
+                min: Some(1),
+                max: Some(10_000),
+            },
         }]
     }
     fn evaluate(
@@ -361,8 +386,7 @@ impl NodeKind for PositionCostBasis {
         &EMPTY_INPUTS
     }
     fn output_ports(&self) -> &[Port] {
-        static PORTS: Lazy<Vec<Port>> =
-            Lazy::new(|| vec![Port::new("value", PortType::Number)]);
+        static PORTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("value", PortType::Number)]);
         &PORTS
     }
     fn evaluate(
@@ -392,8 +416,7 @@ impl NodeKind for UnrealizedIfFlatten {
         &EMPTY_INPUTS
     }
     fn output_ports(&self) -> &[Port] {
-        static PORTS: Lazy<Vec<Port>> =
-            Lazy::new(|| vec![Port::new("value", PortType::Number)]);
+        static PORTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("value", PortType::Number)]);
         &PORTS
     }
     fn evaluate(
@@ -497,8 +520,7 @@ impl NodeKind for SentimentRate {
         &EMPTY_INPUTS
     }
     fn output_ports(&self) -> &[Port] {
-        static PORTS: Lazy<Vec<Port>> =
-            Lazy::new(|| vec![Port::new("value", PortType::Number)]);
+        static PORTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("value", PortType::Number)]);
         &PORTS
     }
     fn config_schema(&self) -> Vec<crate::node::ConfigField> {
@@ -535,8 +557,7 @@ impl NodeKind for SentimentScore {
         &EMPTY_INPUTS
     }
     fn output_ports(&self) -> &[Port] {
-        static PORTS: Lazy<Vec<Port>> =
-            Lazy::new(|| vec![Port::new("value", PortType::Number)]);
+        static PORTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("value", PortType::Number)]);
         &PORTS
     }
     fn config_schema(&self) -> Vec<crate::node::ConfigField> {
@@ -590,8 +611,7 @@ impl NodeKind for RiskCircuitBreakerTripped {
         &EMPTY_INPUTS
     }
     fn output_ports(&self) -> &[Port] {
-        static PORTS: Lazy<Vec<Port>> =
-            Lazy::new(|| vec![Port::new("tripped", PortType::Bool)]);
+        static PORTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("tripped", PortType::Bool)]);
         &PORTS
     }
     fn evaluate(
@@ -619,8 +639,7 @@ impl NodeKind for RiskNewsRetreatState {
         &EMPTY_INPUTS
     }
     fn output_ports(&self) -> &[Port] {
-        static PORTS: Lazy<Vec<Port>> =
-            Lazy::new(|| vec![Port::new("state", PortType::String)]);
+        static PORTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("state", PortType::String)]);
         &PORTS
     }
     fn evaluate(
@@ -647,8 +666,7 @@ impl NodeKind for RiskLeadLagMultiplier {
         &EMPTY_INPUTS
     }
     fn output_ports(&self) -> &[Port] {
-        static PORTS: Lazy<Vec<Port>> =
-            Lazy::new(|| vec![Port::new("mult", PortType::Number)]);
+        static PORTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("mult", PortType::Number)]);
         &PORTS
     }
     fn evaluate(
@@ -713,8 +731,7 @@ impl NodeKind for StrategyActive {
 #[derive(Debug, Default)]
 pub struct RegimeDetector;
 
-static REGIME_OUTPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("regime", PortType::String)]);
+static REGIME_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("regime", PortType::String)]);
 
 impl NodeKind for RegimeDetector {
     fn kind(&self) -> &'static str {
@@ -915,9 +932,18 @@ impl NodeKind for TradeOwnFill {
                 default: serde_json::json!("any"),
                 widget: ConfigWidget::Enum {
                     options: vec![
-                        ConfigEnumOption { value: "any", label: "Any" },
-                        ConfigEnumOption { value: "maker", label: "Maker only" },
-                        ConfigEnumOption { value: "taker", label: "Taker only" },
+                        ConfigEnumOption {
+                            value: "any",
+                            label: "Any",
+                        },
+                        ConfigEnumOption {
+                            value: "maker",
+                            label: "Maker only",
+                        },
+                        ConfigEnumOption {
+                            value: "taker",
+                            label: "Taker only",
+                        },
                     ],
                 },
             },
@@ -928,9 +954,18 @@ impl NodeKind for TradeOwnFill {
                 default: serde_json::json!("any"),
                 widget: ConfigWidget::Enum {
                     options: vec![
-                        ConfigEnumOption { value: "any", label: "Any" },
-                        ConfigEnumOption { value: "buy", label: "Buy only" },
-                        ConfigEnumOption { value: "sell", label: "Sell only" },
+                        ConfigEnumOption {
+                            value: "any",
+                            label: "Any",
+                        },
+                        ConfigEnumOption {
+                            value: "buy",
+                            label: "Buy only",
+                        },
+                        ConfigEnumOption {
+                            value: "sell",
+                            label: "Sell only",
+                        },
                     ],
                 },
             },
@@ -1149,10 +1184,22 @@ fn cross_venue_config_fields(
             default: serde_json::json!(""),
             widget: ConfigWidget::Enum {
                 options: vec![
-                    ConfigEnumOption { value: "", label: "(engine default)" },
-                    ConfigEnumOption { value: "spot", label: "Spot" },
-                    ConfigEnumOption { value: "linear_perp", label: "Linear perp" },
-                    ConfigEnumOption { value: "inverse_perp", label: "Inverse perp" },
+                    ConfigEnumOption {
+                        value: "",
+                        label: "(engine default)",
+                    },
+                    ConfigEnumOption {
+                        value: "spot",
+                        label: "Spot",
+                    },
+                    ConfigEnumOption {
+                        value: "linear_perp",
+                        label: "Linear perp",
+                    },
+                    ConfigEnumOption {
+                        value: "inverse_perp",
+                        label: "Inverse perp",
+                    },
                 ],
             },
         },
@@ -1163,7 +1210,10 @@ fn cross_venue_config_fields(
             label,
             hint: None,
             default: serde_json::json!(default),
-            widget: ConfigWidget::Integer { min: Some(1), max: Some(3600) },
+            widget: ConfigWidget::Integer {
+                min: Some(1),
+                max: Some(3600),
+            },
         });
     }
     fields
@@ -1509,8 +1559,7 @@ impl NodeKind for LiquidationLevelEstimateSource {
 #[derive(Debug, Default)]
 pub struct CascadeCompletedSource;
 
-static CASCADE_OUTPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("value", PortType::Bool)]);
+static CASCADE_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("value", PortType::Bool)]);
 
 impl NodeKind for CascadeCompletedSource {
     fn kind(&self) -> &'static str {
@@ -1532,15 +1581,17 @@ impl NodeKind for CascadeCompletedSource {
     }
     fn config_schema(&self) -> Vec<crate::node::ConfigField> {
         use crate::node::{ConfigField, ConfigWidget};
-        vec![
-            ConfigField {
-                name: "threshold_notional",
-                label: "Cascade-complete threshold (notional)",
-                hint: Some("Value above which rolling-window liquidation total flips `true`."),
-                default: serde_json::json!("100000"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(1000.0) },
+        vec![ConfigField {
+            name: "threshold_notional",
+            label: "Cascade-complete threshold (notional)",
+            hint: Some("Value above which rolling-window liquidation total flips `true`."),
+            default: serde_json::json!("100000"),
+            widget: ConfigWidget::Number {
+                min: Some(0.0),
+                max: None,
+                step: Some(1000.0),
             },
-        ]
+        }]
     }
 }
 
@@ -1717,21 +1768,32 @@ impl NodeKind for SpoofingScore {
                 label: "Cancel/fill ratio (hot)",
                 hint: Some("≥ this → full score contribution"),
                 default: serde_json::json!("0.9"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: Some(1.0), step: Some(0.01) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: Some(1.0),
+                    step: Some(0.01),
+                },
             },
             ConfigField {
                 name: "lifetime_hot_ms",
                 label: "Order lifetime (hot, ms)",
                 hint: Some("≤ this → full score contribution"),
                 default: serde_json::json!(100),
-                widget: ConfigWidget::Integer { min: Some(1), max: Some(5000) },
+                widget: ConfigWidget::Integer {
+                    min: Some(1),
+                    max: Some(5000),
+                },
             },
             ConfigField {
                 name: "size_ratio_hot",
                 label: "Order size vs avg trade (hot)",
                 hint: Some("≥ this × avg trade → full contribution"),
                 default: serde_json::json!("5"),
-                widget: ConfigWidget::Number { min: Some(1.0), max: Some(50.0), step: Some(0.5) },
+                widget: ConfigWidget::Number {
+                    min: Some(1.0),
+                    max: Some(50.0),
+                    step: Some(0.5),
+                },
             },
         ]
     }
@@ -1845,11 +1907,17 @@ macro_rules! simple_surveillance_score {
 simple_surveillance_score!(CrossMarketScore, "Surveillance.CrossMarketScore");
 simple_surveillance_score!(LatencyExploitScore, "Surveillance.LatencyExploitScore");
 simple_surveillance_score!(RebateAbuseScore, "Surveillance.RebateAbuseScore");
-simple_surveillance_score!(ImbalanceManipulationScore, "Surveillance.ImbalanceManipulationScore");
+simple_surveillance_score!(
+    ImbalanceManipulationScore,
+    "Surveillance.ImbalanceManipulationScore"
+);
 simple_surveillance_score!(CancelOnReactionScore, "Surveillance.CancelOnReactionScore");
 simple_surveillance_score!(OneSidedQuotingScore, "Surveillance.OneSidedQuotingScore");
 simple_surveillance_score!(InventoryPushingScore, "Surveillance.InventoryPushingScore");
-simple_surveillance_score!(StrategicNonFillingScore, "Surveillance.StrategicNonFillingScore");
+simple_surveillance_score!(
+    StrategicNonFillingScore,
+    "Surveillance.StrategicNonFillingScore"
+);
 
 /// `Session.TimeToBoundary` — seconds to the next session
 /// boundary (funding window / settlement). Pairs with
@@ -2055,8 +2123,8 @@ mod tests {
             Value::Bool(b) => assert!(!*b, "fired must default to false"),
             other => panic!("expected Bool, got {other:?}"),
         }
-        for i in 1..=3 {
-            match &out[i] {
+        for v in out.iter().skip(1).take(3) {
+            match v {
                 Value::Number(n) => assert_eq!(*n, rust_decimal::Decimal::ZERO),
                 other => panic!("expected Number, got {other:?}"),
             }

@@ -14,8 +14,8 @@
 use crate::types::Article;
 use async_trait::async_trait;
 
-pub mod rss;
 pub mod cryptopanic;
+pub mod rss;
 pub mod twitter;
 
 /// Trait implemented by every news/social collector.

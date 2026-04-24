@@ -11,9 +11,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Stable identifier for a node within a graph.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NodeId(pub Uuid);
 
 impl NodeId {

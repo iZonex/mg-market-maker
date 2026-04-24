@@ -119,7 +119,7 @@ async fn reconcile_responds_to_brain_set_desired_strategies() {
     let _ = controller.recv().await;
     let after_swap = read_probe_eventually(&mut probe_rx, spawns_after_first + 1).await;
     assert!(
-        after_swap >= spawns_after_first + 1,
+        after_swap > spawns_after_first,
         "swap spawns exactly one new (C)"
     );
 
@@ -127,9 +127,7 @@ async fn reconcile_responds_to_brain_set_desired_strategies() {
     controller
         .send(SignedEnvelope::unsigned(Envelope::command(
             Seq(4),
-            CommandPayload::SetDesiredStrategies {
-                strategies: vec![],
-            },
+            CommandPayload::SetDesiredStrategies { strategies: vec![] },
         )))
         .await
         .unwrap();

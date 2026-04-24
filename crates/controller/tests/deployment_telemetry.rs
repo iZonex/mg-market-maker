@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mm_agent::{AgentConfig, LeaseClient, MockEngineFactory, StrategyRegistry};
-use mm_controller::{http_router, spawn_accept_loop, AgentRegistry, FleetState, LeasePolicy};
 use mm_control::lease::LeaseState;
 use mm_control::messages::AgentId;
 use mm_control::ws_transport::WsTransport;
+use mm_controller::{http_router, spawn_accept_loop, AgentRegistry, FleetState, LeasePolicy};
 use serde_json::json;
 use tokio::sync::watch;
 
@@ -30,7 +30,12 @@ async fn deployment_telemetry_surfaces_on_http() {
     let http_task = tokio::spawn(async move {
         axum::serve(http_listener, http_app).await.unwrap();
     });
-    let accept_task = spawn_accept_loop(ws_addr, fleet.clone(), registry.clone(), Arc::clone(&policy));
+    let accept_task = spawn_accept_loop(
+        ws_addr,
+        fleet.clone(),
+        registry.clone(),
+        Arc::clone(&policy),
+    );
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -61,13 +66,15 @@ async fn deployment_telemetry_surfaces_on_http() {
 
     // Before any deploy, GET returns an empty array (agent is
     // connected but hasn't pushed deployment state yet).
-    let empty_body: serde_json::Value =
-        reqwest::get(format!("http://{}/api/v1/agents/eu-tel-01/deployments", http_addr))
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+    let empty_body: serde_json::Value = reqwest::get(format!(
+        "http://{}/api/v1/agents/eu-tel-01/deployments",
+        http_addr
+    ))
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
     assert_eq!(empty_body.as_array().map(|a| a.len()), Some(0));
 
     // Push a deployment + wait for the telemetry to land.
@@ -90,7 +97,12 @@ async fn deployment_telemetry_surfaces_on_http() {
     // sends telemetry asynchronously, so give it a short window.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
-        let body: serde_json::Value = reqwest::get(&deploy_url).await.unwrap().json().await.unwrap();
+        let body: serde_json::Value = reqwest::get(&deploy_url)
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         if body.as_array().map(|a| a.len()).unwrap_or(0) == 2 {
             let mut ids: Vec<String> = body
                 .as_array()
@@ -121,7 +133,12 @@ async fn deployment_telemetry_surfaces_on_http() {
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     loop {
-        let body: serde_json::Value = reqwest::get(&deploy_url).await.unwrap().json().await.unwrap();
+        let body: serde_json::Value = reqwest::get(&deploy_url)
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         if body.as_array().map(|a| a.len()) == Some(0) {
             break;
         }
@@ -150,9 +167,12 @@ async fn deployment_endpoint_returns_404_for_unknown_agent() {
         axum::serve(http_listener, app).await.unwrap();
     });
 
-    let resp = reqwest::get(format!("http://{}/api/v1/agents/ghost/deployments", http_addr))
-        .await
-        .unwrap();
+    let resp = reqwest::get(format!(
+        "http://{}/api/v1/agents/ghost/deployments",
+        http_addr
+    ))
+    .await
+    .unwrap();
     assert_eq!(resp.status(), 404);
 
     task.abort();

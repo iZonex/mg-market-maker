@@ -161,9 +161,5 @@ pub trait OnchainProvider: Send + Sync {
     ) -> OnchainResult<Vec<TransferEntry>>;
 
     /// Fetch token metadata — symbol, decimals, total supply.
-    async fn get_token_metadata(
-        &self,
-        chain: &str,
-        token: &str,
-    ) -> OnchainResult<TokenMetadata>;
+    async fn get_token_metadata(&self, chain: &str, token: &str) -> OnchainResult<TokenMetadata>;
 }

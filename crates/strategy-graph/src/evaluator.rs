@@ -131,7 +131,9 @@ pub fn replay_source_inputs(
     // default, which for literal-style sources is read from config.
     let mut kind_counts: HashMap<&str, usize> = HashMap::new();
     for id in &candidate.order {
-        let Some(order) = candidate.input_order.get(id) else { continue };
+        let Some(order) = candidate.input_order.get(id) else {
+            continue;
+        };
         if !order.is_empty() {
             continue;
         }
@@ -141,18 +143,24 @@ pub fn replay_source_inputs(
     }
 
     for id in &candidate.order {
-        let Some(order) = candidate.input_order.get(id) else { continue };
+        let Some(order) = candidate.input_order.get(id) else {
+            continue;
+        };
         if !order.is_empty() {
             continue;
         }
-        let Some(kind) = candidate.kinds.get(id).cloned() else { continue };
+        let Some(kind) = candidate.kinds.get(id).cloned() else {
+            continue;
+        };
         // Ambiguous dispatch — two source nodes share this kind;
         // we can't tell them apart from a kind-keyed trace. Fall
         // back to `evaluate()` so each literal uses its own config.
         if kind_counts.get(kind.as_str()).copied().unwrap_or(0) > 1 {
             continue;
         }
-        let Some(node) = candidate.nodes.get(id) else { continue };
+        let Some(node) = candidate.nodes.get(id) else {
+            continue;
+        };
         for p in node.output_ports() {
             if let Some(v) = kind_values.get(&(kind.clone(), p.name.clone())) {
                 out.insert((*id, p.name.clone()), v.clone());
@@ -276,7 +284,9 @@ impl Evaluator {
             .collect();
         let mut unconsumed_outputs: Vec<(NodeId, String)> = Vec::new();
         for id in &self.order {
-            let Some(node) = self.nodes.get(id) else { continue };
+            let Some(node) = self.nodes.get(id) else {
+                continue;
+            };
             // Sinks don't expose useful outputs; skip them.
             let is_sink = self
                 .kinds
@@ -379,7 +389,8 @@ impl Evaluator {
         ctx: &EvalCtx,
         source_inputs: &HashMap<(NodeId, String), Value>,
     ) -> anyhow::Result<Vec<SinkAction>> {
-        self.tick_inner(ctx, source_inputs, &mut None).map(|(s, _)| s)
+        self.tick_inner(ctx, source_inputs, &mut None)
+            .map(|(s, _)| s)
     }
 
     /// Preview-mode evaluation: same as `tick` but ALSO captures
@@ -425,8 +436,7 @@ impl Evaluator {
         source_inputs: &HashMap<(NodeId, String), Value>,
         full_trace: &mut Option<TickTrace>,
     ) -> anyhow::Result<(Vec<SinkAction>, ())> {
-        let mut outputs: HashMap<NodeId, NodeOutputs> =
-            HashMap::with_capacity(self.order.len());
+        let mut outputs: HashMap<NodeId, NodeOutputs> = HashMap::with_capacity(self.order.len());
         let mut sinks: Vec<SinkAction> = Vec::new();
         let tick_started = full_trace.as_ref().map(|_| Instant::now());
         if let Some(t) = full_trace.as_mut() {
@@ -434,10 +444,7 @@ impl Evaluator {
         }
 
         for id in &self.order {
-            let node = self
-                .nodes
-                .get(id)
-                .expect("evaluator built with this id");
+            let node = self.nodes.get(id).expect("evaluator built with this id");
             let kind_name = self.kinds.get(id).cloned().unwrap_or_default();
             let node_started = full_trace.as_ref().map(|_| Instant::now());
 
@@ -484,10 +491,7 @@ impl Evaluator {
                             .and_then(|m| m.get(src_port))
                             .cloned()
                             .unwrap_or(Value::Missing),
-                        None => source_inputs
-                            .get(&key)
-                            .cloned()
-                            .unwrap_or(Value::Missing),
+                        None => source_inputs.get(&key).cloned().unwrap_or(Value::Missing),
                     };
                     input_vec.push(v);
                 }
@@ -556,16 +560,12 @@ impl Evaluator {
             // action (fail-closed default stays in effect).
             match kind_name.as_str() {
                 "Out.SpreadMult" => {
-                    if let Some(mult) =
-                        input_vec.first().and_then(Value::as_number)
-                    {
+                    if let Some(mult) = input_vec.first().and_then(Value::as_number) {
                         sinks.push(SinkAction::SpreadMult(mult));
                     }
                 }
                 "Out.SizeMult" => {
-                    if let Some(mult) =
-                        input_vec.first().and_then(Value::as_number)
-                    {
+                    if let Some(mult) = input_vec.first().and_then(Value::as_number) {
                         sinks.push(SinkAction::SizeMult(mult));
                     }
                 }
@@ -581,9 +581,7 @@ impl Evaluator {
                                 // so operators pipe Math.Const
                                 // into `level` directly. Clamp
                                 // to the 1..=5 KillLevel range.
-                                Value::Number(n) => n
-                                    .to_u8()
-                                    .map(|u| u.clamp(1, 5)),
+                                Value::Number(n) => n.to_u8().map(|u| u.clamp(1, 5)),
                                 _ => None,
                             })
                             .unwrap_or(2);
@@ -604,12 +602,15 @@ impl Evaluator {
                             .and_then(|v| v.as_str())
                             .filter(|s| !s.is_empty())
                             .map(|s| s.to_string());
-                        sinks.push(SinkAction::KillEscalate { level, reason, venue });
+                        sinks.push(SinkAction::KillEscalate {
+                            level,
+                            reason,
+                            venue,
+                        });
                     }
                 }
                 "Out.Flatten" => {
-                    let trigger =
-                        input_vec.first().and_then(Value::as_bool).unwrap_or(false);
+                    let trigger = input_vec.first().and_then(Value::as_bool).unwrap_or(false);
                     if trigger {
                         let policy = input_vec
                             .get(1)
@@ -641,10 +642,7 @@ impl Evaluator {
                     // caller's primary venue). Missing trigger or
                     // quotes → no-op, so a stale upstream source
                     // never fires an unguarded hedge.
-                    let trigger = input_vec
-                        .first()
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
+                    let trigger = input_vec.first().and_then(Value::as_bool).unwrap_or(false);
                     if !trigger {
                         continue;
                     }
@@ -689,9 +687,11 @@ impl Evaluator {
                         .map(|d| d.trunc().to_string().parse::<u64>().unwrap_or(2_000))
                         .unwrap_or(2_000);
                     if let (Some(maker), Some(hedge)) = (maker, hedge) {
-                        sinks.push(SinkAction::AtomicBundle(Box::new(
-                            AtomicBundleSpec { maker, hedge, timeout_ms },
-                        )));
+                        sinks.push(SinkAction::AtomicBundle(Box::new(AtomicBundleSpec {
+                            maker,
+                            hedge,
+                            timeout_ms,
+                        })));
                     }
                 }
                 _ => {}

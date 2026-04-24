@@ -205,10 +205,8 @@ impl VenueStateAggregator {
     /// `(venue, symbol)` combination. Idempotent on re-
     /// registration.
     pub fn register_venue(&mut self, venue: VenueId, seed: VenueSeed) {
-        self.seeds.insert(
-            (venue, seed.venue_product, seed.symbol.clone()),
-            seed,
-        );
+        self.seeds
+            .insert((venue, seed.venue_product, seed.symbol.clone()), seed);
     }
 
     /// Update the best-bid / best-ask pair for the seed at
@@ -341,11 +339,8 @@ impl VenueStateAggregator {
     /// call sites don't care about the product distinction.
     pub fn venue_symbols(&self) -> Vec<(VenueId, String)> {
         use std::collections::HashSet;
-        let set: HashSet<(VenueId, String)> = self
-            .seeds
-            .keys()
-            .map(|(v, _, s)| (*v, s.clone()))
-            .collect();
+        let set: HashSet<(VenueId, String)> =
+            self.seeds.keys().map(|(v, _, s)| (*v, s.clone())).collect();
         let mut out: Vec<(VenueId, String)> = set.into_iter().collect();
         out.sort_by(|a, b| (a.0 as u8).cmp(&(b.0 as u8)).then_with(|| a.1.cmp(&b.1)));
         out
@@ -356,7 +351,8 @@ impl VenueStateAggregator {
     pub fn venue_slots(&self) -> Vec<VenueSlot> {
         let mut out: Vec<VenueSlot> = self.seeds.keys().cloned().collect();
         out.sort_by(|a, b| {
-            (a.0 as u8).cmp(&(b.0 as u8))
+            (a.0 as u8)
+                .cmp(&(b.0 as u8))
                 .then_with(|| (a.1 as u8).cmp(&(b.1 as u8)))
                 .then_with(|| a.2.cmp(&b.2))
         });
@@ -756,12 +752,16 @@ mod tests {
         agg.register_venue(VenueId::Binance, seed_named("ETHUSDT", dec!(10)));
         agg.update_queue_wait_for(VenueId::Binance, "ETHUSDT", dec!(42));
         assert_eq!(
-            agg.seed_for(VenueId::Binance, "BTCUSDT").unwrap().queue_wait_secs,
+            agg.seed_for(VenueId::Binance, "BTCUSDT")
+                .unwrap()
+                .queue_wait_secs,
             dec!(10),
             "BTC slot unchanged"
         );
         assert_eq!(
-            agg.seed_for(VenueId::Binance, "ETHUSDT").unwrap().queue_wait_secs,
+            agg.seed_for(VenueId::Binance, "ETHUSDT")
+                .unwrap()
+                .queue_wait_secs,
             dec!(42)
         );
     }

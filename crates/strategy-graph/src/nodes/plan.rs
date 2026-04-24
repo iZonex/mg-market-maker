@@ -36,9 +36,7 @@ use serde::Deserialize;
 use serde_json::Value as Json;
 use std::str::FromStr;
 
-use crate::node::{
-    ConfigEnumOption, ConfigField, ConfigWidget, EvalCtx, NodeKind, NodeState,
-};
+use crate::node::{ConfigEnumOption, ConfigField, ConfigWidget, EvalCtx, NodeKind, NodeState};
 use crate::types::{GraphQuote, Port, PortType, QuoteSide, Value};
 
 /// Per-node mutable state. Lives inside `NodeState` so graph
@@ -157,10 +155,8 @@ impl Accumulate {
     }
 }
 
-static PLAN_INPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("mid", PortType::Number)]);
-static PLAN_OUTPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("quotes", PortType::Quotes)]);
+static PLAN_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("mid", PortType::Number)]);
+static PLAN_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("quotes", PortType::Quotes)]);
 
 impl NodeKind for Accumulate {
     fn kind(&self) -> &'static str {
@@ -236,9 +232,8 @@ impl NodeKind for Accumulate {
         if duration_ms <= 0 {
             return Ok(vec![Value::Quotes(Vec::new())]);
         }
-        let frac_elapsed_bps = Decimal::from(elapsed_ms)
-            / Decimal::from(duration_ms)
-            * dec!(10_000);
+        let frac_elapsed_bps =
+            Decimal::from(elapsed_ms) / Decimal::from(duration_ms) * dec!(10_000);
         let target_frac = (frac_elapsed_bps / dec!(10_000)).min(Decimal::ONE);
         let target_qty_by_now = self.total_qty * target_frac;
 
@@ -284,8 +279,14 @@ impl NodeKind for Accumulate {
                 default: serde_json::json!("buy"),
                 widget: ConfigWidget::Enum {
                     options: vec![
-                        ConfigEnumOption { value: "buy", label: "Accumulate (buy)" },
-                        ConfigEnumOption { value: "sell", label: "Distribute (sell)" },
+                        ConfigEnumOption {
+                            value: "buy",
+                            label: "Accumulate (buy)",
+                        },
+                        ConfigEnumOption {
+                            value: "sell",
+                            label: "Distribute (sell)",
+                        },
                     ],
                 },
             },
@@ -294,28 +295,43 @@ impl NodeKind for Accumulate {
                 label: "Target size",
                 hint: Some("Total base-asset qty to accumulate"),
                 default: serde_json::json!("1"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
             ConfigField {
                 name: "duration_secs",
                 label: "Horizon (s)",
                 hint: Some("Time window over which to slice"),
                 default: serde_json::json!(3600),
-                widget: ConfigWidget::Integer { min: Some(1), max: Some(86_400 * 30) },
+                widget: ConfigWidget::Integer {
+                    min: Some(1),
+                    max: Some(86_400 * 30),
+                },
             },
             ConfigField {
                 name: "slice_qty",
                 label: "Per-slice qty",
                 hint: Some("Size of each slice when behind schedule"),
                 default: serde_json::json!("0.05"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
             ConfigField {
                 name: "post_offset_bps",
                 label: "Post offset (bps)",
                 hint: Some("How far behind mid to post each slice"),
                 default: serde_json::json!("1"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: Some(500.0), step: Some(0.5) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: Some(500.0),
+                    step: Some(0.5),
+                },
             },
             ConfigField {
                 name: "abort_price_ge",
@@ -336,7 +352,10 @@ impl NodeKind for Accumulate {
                 label: "Min gap between slices (ms)",
                 hint: Some("Throttle to avoid bursty slice emission"),
                 default: serde_json::json!(500),
-                widget: ConfigWidget::Integer { min: Some(0), max: Some(60_000) },
+                widget: ConfigWidget::Integer {
+                    min: Some(0),
+                    max: Some(60_000),
+                },
             },
         ]
     }

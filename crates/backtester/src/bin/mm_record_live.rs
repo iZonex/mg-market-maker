@@ -189,9 +189,8 @@ async fn record_binance(args: &Args, recorder: &mut EventRecorder) -> Result<(u6
         sequence: snap.last_update_id,
     })?;
 
-    let url = format!(
-        "wss://stream.binance.com:9443/stream?streams={sym}@depth20@100ms/{sym}@trade"
-    );
+    let url =
+        format!("wss://stream.binance.com:9443/stream?streams={sym}@depth20@100ms/{sym}@trade");
     let (ws, _) = connect_async(&url).await.context("binance ws")?;
     let (_w, mut r) = ws.split();
     info!(%url, "binance ws connected");
@@ -199,18 +198,23 @@ async fn record_binance(args: &Args, recorder: &mut EventRecorder) -> Result<(u6
     let deadline = tokio::time::Instant::now() + args.duration;
     let (mut book, mut trade) = (0u64, 0u64);
     while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, r.next()).await {
-        let Ok(Message::Text(txt)) = msg else { continue };
+        let Ok(Message::Text(txt)) = msg else {
+            continue;
+        };
         let Ok(env) = serde_json::from_str::<BinEnvelope>(&txt) else {
             continue;
         };
         if env.stream.ends_with("@trade") {
             if let Ok(t) = serde_json::from_value::<BinTrade>(env.data) {
-                let (Ok(p), Ok(q)) =
-                    (Decimal::from_str(&t.price), Decimal::from_str(&t.qty))
+                let (Ok(p), Ok(q)) = (Decimal::from_str(&t.price), Decimal::from_str(&t.qty))
                 else {
                     continue;
                 };
-                let side = if t.buyer_is_maker { Side::Sell } else { Side::Buy };
+                let side = if t.buyer_is_maker {
+                    Side::Sell
+                } else {
+                    Side::Buy
+                };
                 recorder.record(&RecordedEvent::Trade {
                     timestamp: Utc::now(),
                     price: p as Price,
@@ -280,7 +284,9 @@ async fn record_bybit(args: &Args, recorder: &mut EventRecorder) -> Result<(u64,
     let deadline = tokio::time::Instant::now() + args.duration;
     let (mut book, mut trade) = (0u64, 0u64);
     while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, r.next()).await {
-        let Ok(Message::Text(txt)) = msg else { continue };
+        let Ok(Message::Text(txt)) = msg else {
+            continue;
+        };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
             continue;
         };
@@ -308,8 +314,7 @@ async fn record_bybit(args: &Args, recorder: &mut EventRecorder) -> Result<(u64,
                     let Ok(t) = serde_json::from_value::<BybitTrade>(t.clone()) else {
                         continue;
                     };
-                    let (Ok(p), Ok(q)) =
-                        (Decimal::from_str(&t.price), Decimal::from_str(&t.qty))
+                    let (Ok(p), Ok(q)) = (Decimal::from_str(&t.price), Decimal::from_str(&t.qty))
                     else {
                         continue;
                     };
@@ -354,7 +359,9 @@ async fn record_hyperliquid(args: &Args, recorder: &mut EventRecorder) -> Result
     let deadline = tokio::time::Instant::now() + args.duration;
     let (mut book, mut trade) = (0u64, 0u64);
     while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, r.next()).await {
-        let Ok(Message::Text(txt)) = msg else { continue };
+        let Ok(Message::Text(txt)) = msg else {
+            continue;
+        };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
             continue;
         };
@@ -379,10 +386,9 @@ async fn record_hyperliquid(args: &Args, recorder: &mut EventRecorder) -> Result
                                 .filter_map(|e| {
                                     let px = e.get("px")?.as_str()?;
                                     let sz = e.get("sz")?.as_str()?;
-                                    let (Ok(p), Ok(q)) = (
-                                        Decimal::from_str(px),
-                                        Decimal::from_str(sz),
-                                    ) else {
+                                    let (Ok(p), Ok(q)) =
+                                        (Decimal::from_str(px), Decimal::from_str(sz))
+                                    else {
                                         return None;
                                     };
                                     if q.is_zero() {
@@ -417,8 +423,7 @@ async fn record_hyperliquid(args: &Args, recorder: &mut EventRecorder) -> Result
                     let px = t.get("px").and_then(|x| x.as_str()).unwrap_or("0");
                     let sz = t.get("sz").and_then(|x| x.as_str()).unwrap_or("0");
                     let side_str = t.get("side").and_then(|x| x.as_str()).unwrap_or("");
-                    let (Ok(p), Ok(q)) = (Decimal::from_str(px), Decimal::from_str(sz))
-                    else {
+                    let (Ok(p), Ok(q)) = (Decimal::from_str(px), Decimal::from_str(sz)) else {
                         continue;
                     };
                     let taker_side = match side_str {

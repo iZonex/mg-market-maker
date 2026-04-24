@@ -271,8 +271,7 @@ impl BybitConnector {
         let req = if self.api_key.is_empty() {
             self.client.get(&url)
         } else {
-            let (ts, recv, sig) =
-                auth::auth_headers(&self.api_key, &self.api_secret, params);
+            let (ts, recv, sig) = auth::auth_headers(&self.api_key, &self.api_secret, params);
             self.client
                 .get(&url)
                 .header("X-BAPI-API-KEY", &self.api_key)
@@ -738,11 +737,8 @@ impl ExchangeConnector for BybitConnector {
         let result = resp
             .get("result")
             .ok_or_else(|| FundingRateError::Other(anyhow::anyhow!("missing `result`")))?;
-        parse_bybit_funding_rate(result, symbol).ok_or_else(|| {
-            FundingRateError::Other(anyhow::anyhow!(
-                "no funding row for {symbol}"
-            ))
-        })
+        parse_bybit_funding_rate(result, symbol)
+            .ok_or_else(|| FundingRateError::Other(anyhow::anyhow!("no funding row for {symbol}")))
     }
 
     /// Native V5 amend — preserves queue priority on Bybit.
@@ -870,9 +866,7 @@ impl ExchangeConnector for BybitConnector {
         // empty credentials. `turnover24h` = quote-currency
         // 24h turnover.
         let params = format!("category={}&symbol={symbol}", self.category.as_str());
-        let result = self
-            .signed_get("/v5/market/tickers", &params)
-            .await?;
+        let result = self.signed_get("/v5/market/tickers", &params).await?;
         let row = result
             .get("list")
             .and_then(|l| l.as_array())
@@ -940,10 +934,7 @@ impl ExchangeConnector for BybitConnector {
         address: &str,
         network: &str,
     ) -> anyhow::Result<String> {
-        mm_exchange_core::validate_withdraw_address(
-            self.withdraw_whitelist.as_deref(),
-            address,
-        )?;
+        mm_exchange_core::validate_withdraw_address(self.withdraw_whitelist.as_deref(), address)?;
         let body = serde_json::json!({
             "coin": asset,
             "amount": qty.to_string(),
@@ -1009,10 +1000,11 @@ impl ExchangeConnector for BybitConnector {
             )
             .await
             .map_err(MarginError::Other)?;
-        parse_bybit_account_margin(&wallet, &positions)
-            .ok_or_else(|| MarginError::Other(anyhow::anyhow!(
+        parse_bybit_account_margin(&wallet, &positions).ok_or_else(|| {
+            MarginError::Other(anyhow::anyhow!(
                 "malformed Bybit wallet-balance / position-list response"
-            )))
+            ))
+        })
     }
 
     /// Set account-wide margin mode via
@@ -1022,11 +1014,7 @@ impl ExchangeConnector for BybitConnector {
     /// (Binance per-symbol, HL per-asset — Bybit is the
     /// outlier). Error `110026` = "already in this mode",
     /// mapped to `Ok(())`.
-    async fn set_margin_mode(
-        &self,
-        _symbol: &str,
-        mode: MarginMode,
-    ) -> Result<(), MarginError> {
+    async fn set_margin_mode(&self, _symbol: &str, mode: MarginMode) -> Result<(), MarginError> {
         if !self.category.has_funding() {
             return Err(MarginError::NotSupported);
         }
@@ -1054,11 +1042,7 @@ impl ExchangeConnector for BybitConnector {
     /// takes separate `buyLeverage` / `sellLeverage` fields —
     /// we set both to the requested value since we run in
     /// one-way-position mode.
-    async fn set_leverage(
-        &self,
-        symbol: &str,
-        leverage: u32,
-    ) -> Result<(), MarginError> {
+    async fn set_leverage(&self, symbol: &str, leverage: u32) -> Result<(), MarginError> {
         if !self.category.has_funding() {
             return Err(MarginError::NotSupported);
         }
@@ -1105,9 +1089,11 @@ pub(crate) fn parse_bybit_account_margin(
     //               "totalInitialMargin": "…",
     //               "totalMaintenanceMargin": "…",
     //               "totalAvailableBalance": "…" } ] }
-    let row = wallet_result.get("list")?.as_array()?.iter().find(|r| {
-        r.get("accountType").and_then(|v| v.as_str()) == Some("UNIFIED")
-    })?;
+    let row = wallet_result
+        .get("list")?
+        .as_array()?
+        .iter()
+        .find(|r| r.get("accountType").and_then(|v| v.as_str()) == Some("UNIFIED"))?;
     let total_equity = parse_dec(row.get("totalEquity"));
     let total_initial_margin = parse_dec(row.get("totalInitialMargin"));
     let total_maintenance_margin = parse_dec(row.get("totalMaintenanceMargin"));
@@ -1120,11 +1106,7 @@ pub(crate) fn parse_bybit_account_margin(
     let positions = positions_result
         .get("list")
         .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(parse_bybit_position_margin)
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(parse_bybit_position_margin).collect())
         .unwrap_or_default();
     Some(AccountMarginInfo {
         total_equity,
@@ -1371,10 +1353,7 @@ fn build_subscribe_topics(
         .iter()
         .map(|s| s.to_uppercase())
         .flat_map(|s| {
-            let mut v = vec![
-                format!("orderbook.{depth}.{s}"),
-                format!("publicTrade.{s}"),
-            ];
+            let mut v = vec![format!("orderbook.{depth}.{s}"), format!("publicTrade.{s}")];
             if include_liquidations {
                 v.push(format!("liquidation.{s}"));
             }
@@ -1456,9 +1435,10 @@ fn parse_bybit_event(v: &Value) -> Option<MarketEvent> {
         };
         let qty: Decimal = d.get("size").and_then(|q| q.as_str())?.parse().ok()?;
         let price: Decimal = d.get("price").and_then(|p| p.as_str())?.parse().ok()?;
-        let ts_ms = d.get("updatedTime").and_then(|t| t.as_i64()).unwrap_or_else(|| {
-            chrono::Utc::now().timestamp_millis()
-        });
+        let ts_ms = d
+            .get("updatedTime")
+            .and_then(|t| t.as_i64())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
         Some(MarketEvent::Liquidation {
             venue: VenueId::Bybit,
             symbol,

@@ -542,7 +542,10 @@ mod tests {
             "5-min window should have evicted the t=0 bucket"
         );
         // Cumulative still remembers.
-        assert_eq!(t.ratio(OtrTier::Tob, OtrWindow::Cumulative, future), dec!(2));
+        assert_eq!(
+            t.ratio(OtrTier::Tob, OtrWindow::Cumulative, future),
+            dec!(2)
+        );
     }
 
     /// Events landing in different minute buckets aggregate in

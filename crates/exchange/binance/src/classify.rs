@@ -35,7 +35,7 @@ pub fn classify_message(msg: &str) -> VenueError {
             -1021 => VenueErrorKind::TransientNetwork, // timestamp skew, retry
             -1022 | -2014 | -2015 => VenueErrorKind::AuthRejected,
             -1100 | -1102 | -1104 | -1106 => VenueErrorKind::Other, // client-side param bug
-            -1121 => VenueErrorKind::Other, // invalid symbol
+            -1121 => VenueErrorKind::Other,                         // invalid symbol
             -1013 => VenueErrorKind::OrderTooSmall, // filter failure (NOTIONAL / LOT_SIZE)
             // -2010 is overloaded: "insufficient balance", "order
             // would match" (LIMIT_MAKER cross), plus a few other
@@ -119,25 +119,31 @@ mod tests {
 
     #[test]
     fn insufficient_balance_from_code() {
-        let e = err(r#"Binance API error 400 Bad Request: {"code":-2010,"msg":"Account has insufficient balance for requested action."}"#);
+        let e = err(
+            r#"Binance API error 400 Bad Request: {"code":-2010,"msg":"Account has insufficient balance for requested action."}"#,
+        );
         assert_eq!(classify(&e).kind, VenueErrorKind::InsufficientBalance);
     }
 
     #[test]
     fn post_only_cross_detected_from_2010_msg() {
-        let e = err(r#"Binance API error 400 Bad Request: {"code":-2010,"msg":"Order would immediately match and take."}"#);
+        let e = err(
+            r#"Binance API error 400 Bad Request: {"code":-2010,"msg":"Order would immediately match and take."}"#,
+        );
         assert_eq!(classify(&e).kind, VenueErrorKind::PostOnlyCross);
     }
 
     #[test]
     fn auth_rejected_from_code() {
-        let e = err(r#"Binance API error 401 Unauthorized: {"code":-2015,"msg":"Invalid API-key"}"#);
+        let e =
+            err(r#"Binance API error 401 Unauthorized: {"code":-2015,"msg":"Invalid API-key"}"#);
         assert_eq!(classify(&e).kind, VenueErrorKind::AuthRejected);
     }
 
     #[test]
     fn order_too_small_from_code() {
-        let e = err(r#"Binance API error 400: {"code":-1013,"msg":"Filter failure: MIN_NOTIONAL"}"#);
+        let e =
+            err(r#"Binance API error 400: {"code":-1013,"msg":"Filter failure: MIN_NOTIONAL"}"#);
         assert_eq!(classify(&e).kind, VenueErrorKind::OrderTooSmall);
     }
 

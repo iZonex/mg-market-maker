@@ -31,8 +31,7 @@ use serde_json::Value as Json;
 // Shared empty-input + single String output ports for every preset
 // emitter. All four Exec.*Config nodes are sources.
 static EMPTY_INPUTS: Lazy<Vec<Port>> = Lazy::new(Vec::new);
-static POLICY_OUTPUT: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("policy", PortType::String)]);
+static POLICY_OUTPUT: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("policy", PortType::String)]);
 
 // ── Exec.TwapConfig ────────────────────────────────────────
 
@@ -95,14 +94,20 @@ impl NodeKind for TwapConfig {
                 label: "Duration (s)",
                 hint: Some("Total schedule window"),
                 default: serde_json::json!(120),
-                widget: ConfigWidget::Integer { min: Some(1), max: Some(86_400) },
+                widget: ConfigWidget::Integer {
+                    min: Some(1),
+                    max: Some(86_400),
+                },
             },
             ConfigField {
                 name: "slice_count",
                 label: "Slices",
                 hint: Some("Number of equal-time slices (1-1000)"),
                 default: serde_json::json!(5),
-                widget: ConfigWidget::Integer { min: Some(1), max: Some(1000) },
+                widget: ConfigWidget::Integer {
+                    min: Some(1),
+                    max: Some(1000),
+                },
             },
         ]
     }
@@ -128,9 +133,7 @@ pub struct VwapConfig {
 
 impl Default for VwapConfig {
     fn default() -> Self {
-        Self {
-            duration_secs: 300,
-        }
+        Self { duration_secs: 300 }
     }
 }
 
@@ -171,7 +174,10 @@ impl NodeKind for VwapConfig {
             label: "Duration (s)",
             hint: Some("Schedule window for the volume-weighted slicer"),
             default: serde_json::json!(300),
-            widget: ConfigWidget::Integer { min: Some(1), max: Some(86_400) },
+            widget: ConfigWidget::Integer {
+                min: Some(1),
+                max: Some(86_400),
+            },
         }]
     }
     fn evaluate(
@@ -234,7 +240,10 @@ impl NodeKind for PovConfig {
             label: "Target % of volume",
             hint: Some("1-100 — how much of market volume to capture"),
             default: serde_json::json!(10),
-            widget: ConfigWidget::Integer { min: Some(1), max: Some(100) },
+            widget: ConfigWidget::Integer {
+                min: Some(1),
+                max: Some(100),
+            },
         }]
     }
     fn evaluate(
@@ -310,10 +319,7 @@ impl NodeKind for IcebergConfig {
         _inputs: &[Value],
         _state: &mut NodeState,
     ) -> Result<Vec<Value>> {
-        Ok(vec![Value::String(format!(
-            "iceberg:{}",
-            self.display_qty
-        ))])
+        Ok(vec![Value::String(format!("iceberg:{}", self.display_qty))])
     }
 }
 
@@ -352,8 +358,7 @@ mod tests {
 
     #[test]
     fn iceberg_emits_policy_with_display_qty() {
-        let n =
-            IcebergConfig::from_config(&serde_json::json!({ "display_qty": "0.25" })).unwrap();
+        let n = IcebergConfig::from_config(&serde_json::json!({ "display_qty": "0.25" })).unwrap();
         assert_eq!(policy(&n), "iceberg:0.25");
     }
 
@@ -370,8 +375,6 @@ mod tests {
 
     #[test]
     fn iceberg_rejects_non_numeric_display_qty() {
-        assert!(
-            IcebergConfig::from_config(&serde_json::json!({ "display_qty": "abc" })).is_none()
-        );
+        assert!(IcebergConfig::from_config(&serde_json::json!({ "display_qty": "abc" })).is_none());
     }
 }

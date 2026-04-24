@@ -34,7 +34,8 @@ impl std::fmt::Debug for GlftStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let g = self.calibration.lock();
         match g {
-            Ok(cal) => f.debug_struct("GlftStrategy")
+            Ok(cal) => f
+                .debug_struct("GlftStrategy")
                 .field("a", &cal.a)
                 .field("k", &cal.k)
                 .field("samples", &cal.fill_depths.len())
@@ -384,9 +385,7 @@ impl Strategy for GlftStrategy {
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<Decimal>().ok())
             .ok_or_else(|| "glft: missing/invalid field `k`".to_string())?;
-        let last_recal = state
-            .get("last_recalibrated_ms")
-            .and_then(|v| v.as_i64());
+        let last_recal = state.get("last_recalibrated_ms").and_then(|v| v.as_i64());
         let depths: VecDeque<Decimal> = state
             .get("fill_depths")
             .and_then(|v| v.as_array())

@@ -49,7 +49,10 @@ impl MarkStrategy {
         Self::default()
     }
     pub fn with_config(config: MarkConfig) -> Self {
-        Self { config, seconds_to_boundary: std::sync::atomic::AtomicI64::new(i64::MAX) }
+        Self {
+            config,
+            seconds_to_boundary: std::sync::atomic::AtomicI64::new(i64::MAX),
+        }
     }
     pub fn set_seconds_to_boundary(&self, s: i64) {
         self.seconds_to_boundary
@@ -86,7 +89,11 @@ impl Strategy for MarkStrategy {
                     return Vec::new();
                 }
                 vec![QuotePair {
-                    bid: Some(Quote { side: Side::Buy, price, qty }),
+                    bid: Some(Quote {
+                        side: Side::Buy,
+                        price,
+                        qty,
+                    }),
                     ask: None,
                 }]
             }
@@ -97,7 +104,11 @@ impl Strategy for MarkStrategy {
                 }
                 vec![QuotePair {
                     bid: None,
-                    ask: Some(Quote { side: Side::Sell, price, qty }),
+                    ask: Some(Quote {
+                        side: Side::Sell,
+                        price,
+                        qty,
+                    }),
                 }]
             }
         }

@@ -259,15 +259,19 @@ impl WebhookDispatcher {
         // the full audit stream.
         let event_type = serde_json::from_str::<serde_json::Value>(&json)
             .ok()
-            .and_then(|v| v.get("event")
-                .and_then(|e| e.get("kind").and_then(|k| k.as_str()).map(String::from)
-                    .or_else(|| {
-                        // Unwrap the `#[serde(tag = "kind")]`
-                        // variant where serde flattens the tag
-                        // into the enclosing object.
-                        e.as_object()
-                            .and_then(|o| o.keys().next().cloned())
-                    })))
+            .and_then(|v| {
+                v.get("event").and_then(|e| {
+                    e.get("kind")
+                        .and_then(|k| k.as_str())
+                        .map(String::from)
+                        .or_else(|| {
+                            // Unwrap the `#[serde(tag = "kind")]`
+                            // variant where serde flattens the tag
+                            // into the enclosing object.
+                            e.as_object().and_then(|o| o.keys().next().cloned())
+                        })
+                })
+            })
             .unwrap_or_else(|| "unknown".into());
         tokio::spawn(async move {
             for url in &urls {

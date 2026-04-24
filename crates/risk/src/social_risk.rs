@@ -39,8 +39,8 @@
 
 use chrono::{DateTime, Duration, Utc};
 use mm_sentiment::SentimentTick;
-use rust_decimal::Decimal;
 use rust_decimal::prelude::Signed;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 /// Operator-tuned knobs. Defaults match the MVP rules
@@ -194,8 +194,7 @@ impl SocialRiskEngine {
         // A spiking rate on a quiet market is chatter, not a
         // dump. Require confirmation from realised vol before
         // escalating from "widen" to "flatten".
-        if rate >= self.cfg.kill_mentions_rate
-            && market.realised_vol >= self.cfg.kill_vol_threshold
+        if rate >= self.cfg.kill_mentions_rate && market.realised_vol >= self.cfg.kill_vol_threshold
         {
             self.last_active = Some(now);
             return SocialRiskState {

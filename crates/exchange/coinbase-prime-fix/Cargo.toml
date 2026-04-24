@@ -19,3 +19,6 @@ thiserror = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 base64 = "0.22"
+
+[lints]
+workspace = true

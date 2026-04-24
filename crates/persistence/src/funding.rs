@@ -100,8 +100,7 @@ pub struct FundingArbConfig {
     /// DOGEUSDT = 25
     /// ```
     #[serde(default)]
-    pub per_pair_min_rate_annual_pct:
-        std::collections::HashMap<String, Decimal>,
+    pub per_pair_min_rate_annual_pct: std::collections::HashMap<String, Decimal>,
     /// Epic 40.5 — estimated cross-venue transfer latency cost,
     /// in bps. Subtracted from the expected carry when the
     /// strategy evaluates entry profitability on a symbol that

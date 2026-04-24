@@ -80,9 +80,7 @@ pub struct OllamaClient {
 
 impl OllamaClient {
     pub fn new(cfg: OllamaConfig) -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder()
-            .timeout(cfg.timeout)
-            .build()?;
+        let http = reqwest::Client::builder().timeout(cfg.timeout).build()?;
         Ok(Self { cfg, http })
     }
 
@@ -91,11 +89,7 @@ impl OllamaClient {
     /// `scorer = "ollama"`. Propagates HTTP / parse errors
     /// unchanged so the caller can decide whether to retry or
     /// fall back to [`crate::keyword::score`].
-    pub async fn analyze(
-        &self,
-        title: &str,
-        summary: &str,
-    ) -> anyhow::Result<SentimentAnalysis> {
+    pub async fn analyze(&self, title: &str, summary: &str) -> anyhow::Result<SentimentAnalysis> {
         self.analyze_multimodal(title, summary, &[]).await
     }
 
@@ -210,8 +204,7 @@ mod tests {
 
     #[test]
     fn parse_body_handles_valid_json() {
-        let body =
-            r#"{"signal":"bullish","score":0.8,"assets":["bitcoin","ETH"],"reasoning":"ETF approved"}"#;
+        let body = r#"{"signal":"bullish","score":0.8,"assets":["bitcoin","ETH"],"reasoning":"ETF approved"}"#;
         let a = parse_body(body);
         assert_eq!(a.signal, SentimentSignal::Bullish);
         assert_eq!(a.score, dec!(0.8));

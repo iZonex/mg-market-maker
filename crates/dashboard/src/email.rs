@@ -131,23 +131,18 @@ impl EmailDispatcher {
                     .port(config.smtp_port)
                     .tls(Tls::Wrapper(tls));
                 if let Some(p) = &password {
-                    b = b.credentials(Credentials::new(
-                        config.username.clone(),
-                        p.clone(),
-                    ));
+                    b = b.credentials(Credentials::new(config.username.clone(), p.clone()));
                 }
                 b.timeout(Some(Duration::from_secs(20))).build()
             }
             SmtpTls::Starttls => {
                 let tls = TlsParameters::new(config.smtp_host.clone())?;
-                let mut b = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.smtp_host)?
-                    .port(config.smtp_port)
-                    .tls(Tls::Required(tls));
+                let mut b =
+                    AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.smtp_host)?
+                        .port(config.smtp_port)
+                        .tls(Tls::Required(tls));
                 if let Some(p) = &password {
-                    b = b.credentials(Credentials::new(
-                        config.username.clone(),
-                        p.clone(),
-                    ));
+                    b = b.credentials(Credentials::new(config.username.clone(), p.clone()));
                 }
                 b.timeout(Some(Duration::from_secs(20))).build()
             }
@@ -156,15 +151,11 @@ impl EmailDispatcher {
                     "SMTP configured with TLS=none — only acceptable on a trusted \
                      localhost relay. NEVER use against a remote provider."
                 );
-                let mut b = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(
-                    &config.smtp_host,
-                )
-                .port(config.smtp_port);
+                let mut b =
+                    AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&config.smtp_host)
+                        .port(config.smtp_port);
                 if let Some(p) = &password {
-                    b = b.credentials(Credentials::new(
-                        config.username.clone(),
-                        p.clone(),
-                    ));
+                    b = b.credentials(Credentials::new(config.username.clone(), p.clone()));
                 }
                 b.timeout(Some(Duration::from_secs(20))).build()
             }
@@ -263,10 +254,10 @@ impl EmailDispatcher {
 
         let mut mixed = MultiPart::mixed().multipart(alt);
         for (name, mime, bytes) in &msg.attachments {
-            let ct: ContentType = mime.parse().unwrap_or(ContentType::parse("application/octet-stream").unwrap());
-            mixed = mixed.singlepart(
-                Attachment::new(name.clone()).body(bytes.clone(), ct),
-            );
+            let ct: ContentType = mime
+                .parse()
+                .unwrap_or(ContentType::parse("application/octet-stream").unwrap());
+            mixed = mixed.singlepart(Attachment::new(name.clone()).body(bytes.clone(), ct));
         }
 
         let email = builder.multipart(mixed)?;
@@ -349,7 +340,11 @@ mod tests {
             subject: "Daily Report 2026-04-17".into(),
             body_text: "See attached PDF.".into(),
             body_html: Some("<p>See attached PDF.</p>".into()),
-            attachments: vec![("daily.pdf".into(), "application/pdf".into(), b"%PDF-fake".to_vec())],
+            attachments: vec![(
+                "daily.pdf".into(),
+                "application/pdf".into(),
+                b"%PDF-fake".to_vec(),
+            )],
         };
         // Build-message should succeed with a valid multipart.
         let built = d.build_message(&msg).unwrap();
@@ -361,10 +356,7 @@ mod tests {
 
     #[test]
     fn dead_letter_persists_record() {
-        let tmp = std::env::temp_dir().join(format!(
-            "mm_dead_{}.jsonl",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("mm_dead_{}.jsonl", std::process::id()));
         let mut cfg = mk_config();
         cfg.dead_letter_path = tmp.to_string_lossy().to_string();
         let d = EmailDispatcher::new(cfg, Some("pw".into())).unwrap();

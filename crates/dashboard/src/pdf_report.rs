@@ -27,10 +27,7 @@ use crate::report_export::{MonthlyReportData, ReportManifest};
 ///     top-level printpdf API doesn't separate hard errors from
 ///     layout hints; a log line at trace level surfaces them
 ///     without failing the request).
-pub fn render_pdf(
-    data: &MonthlyReportData,
-    manifest: &ReportManifest,
-) -> anyhow::Result<Vec<u8>> {
+pub fn render_pdf(data: &MonthlyReportData, manifest: &ReportManifest) -> anyhow::Result<Vec<u8>> {
     let html = build_html(data, manifest);
 
     let mut doc = PdfDocument::new(&format!(
@@ -41,8 +38,8 @@ pub fn render_pdf(
     let mut warnings = Vec::new();
     let pages = PdfDocument::from_html(
         &html,
-        &BTreeMap::new(),     // images map
-        &BTreeMap::new(),     // fonts map (use built-in)
+        &BTreeMap::new(), // images map
+        &BTreeMap::new(), // fonts map (use built-in)
         &GeneratePdfOptions::default(),
         &mut warnings,
     )

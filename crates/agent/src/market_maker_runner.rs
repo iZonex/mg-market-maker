@@ -35,8 +35,7 @@ use mm_control::lease::LeaseState;
 use mm_engine::{ConnectorBundle, MarketMakerEngine};
 use mm_exchange_core::connector::ExchangeConnector;
 use mm_strategy::{
-    AvellanedaStoikov, BasisStrategy, CrossExchangeStrategy, GlftStrategy, GridStrategy,
-    Strategy,
+    AvellanedaStoikov, BasisStrategy, CrossExchangeStrategy, GlftStrategy, GridStrategy, Strategy,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -168,9 +167,7 @@ impl MarketMakerRunner {
         // `config.hedge` gets populated by `app_config::build` iff
         // a hedge credential resolved; if the strategy type
         // structurally requires a hedge and it didn't, stop now.
-        if strategy_requires_hedge(&config.market_maker.strategy)
-            && config.hedge.is_none()
-        {
+        if strategy_requires_hedge(&config.market_maker.strategy) && config.hedge.is_none() {
             return Err(anyhow::anyhow!(
                 "strategy {:?} requires a hedge credential \
                  (AppConfig.hedge) but none was configured — \
@@ -197,7 +194,10 @@ impl MarketMakerRunner {
                     hedge_symbol = %pair.hedge_symbol,
                     "dual-connector bundle with hedge leg"
                 );
-                (ConnectorBundle::dual(connector.clone(), hedge_conn, pair), Some(hedge_rx))
+                (
+                    ConnectorBundle::dual(connector.clone(), hedge_conn, pair),
+                    Some(hedge_rx),
+                )
             }
             (Some(_), None) => {
                 return Err(anyhow::anyhow!(
@@ -368,10 +368,7 @@ mod hedge_predicate_tests {
             StrategyType::CrossExchange,
             StrategyType::StatArb,
         ] {
-            assert!(
-                strategy_requires_hedge(&s),
-                "{s:?} must require hedge"
-            );
+            assert!(strategy_requires_hedge(&s), "{s:?} must require hedge");
         }
     }
 
@@ -382,10 +379,7 @@ mod hedge_predicate_tests {
             StrategyType::Glft,
             StrategyType::Grid,
         ] {
-            assert!(
-                !strategy_requires_hedge(&s),
-                "{s:?} must not require hedge"
-            );
+            assert!(!strategy_requires_hedge(&s), "{s:?} must not require hedge");
         }
     }
 }

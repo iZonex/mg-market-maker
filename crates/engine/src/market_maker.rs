@@ -15,6 +15,7 @@ use mm_portfolio::Portfolio;
 use mm_risk::audit::{AuditEventType, AuditLog};
 use mm_risk::borrow::BorrowManager;
 use mm_risk::circuit_breaker::{CircuitBreaker, TripReason};
+use mm_risk::dca::{self, DcaSlice, DcaSpec};
 use mm_risk::exposure::ExposureManager;
 use mm_risk::hedge_optimizer::{FactorCovarianceEstimator, HedgeBasket, HedgeOptimizer};
 use mm_risk::inventory::InventoryManager;
@@ -23,7 +24,6 @@ use mm_risk::kill_switch::{KillLevel, KillSwitch, KillSwitchConfig};
 use mm_risk::lead_lag_guard::LeadLagGuard;
 use mm_risk::margin_guard::{MarginGuard, MarginGuardThresholds};
 use mm_risk::news_retreat::{NewsRetreatState, NewsRetreatStateMachine, NewsRetreatTransition};
-use mm_risk::dca::{self, DcaSlice, DcaSpec};
 use mm_risk::order_emulator::{
     EmulatorAction, EmulatorOrder, EmulatorOrderId, EmulatorOrderSpec, OrderEmulator,
 };
@@ -39,7 +39,6 @@ use mm_risk::toxicity::{
 };
 use mm_risk::var_guard::{VarGuard, VarGuardConfig};
 use mm_strategy::autotune::{AutoTuner, RegimeDetector};
-use mm_strategy::xemm::{XemmConfig, XemmDecision, XemmExecutor};
 use mm_strategy::funding_arb_driver::{DriverEvent, FundingArbDriver};
 use mm_strategy::inventory_skew::AdvancedInventoryManager;
 use mm_strategy::market_resilience::{MarketResilienceCalculator, MrConfig};
@@ -49,6 +48,7 @@ use mm_strategy::r#trait::{Strategy, StrategyContext};
 use mm_strategy::stat_arb::{SpreadDirection, StatArbDriver, StatArbEvent};
 use mm_strategy::twap::TwapExecutor;
 use mm_strategy::volatility::VolatilityEstimator;
+use mm_strategy::xemm::{XemmConfig, XemmDecision, XemmExecutor};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tokio::sync::mpsc;
@@ -78,9 +78,13 @@ fn build_portfolio(
 ) -> mm_risk::portfolio_balance::PortfolioBalanceTracker {
     use mm_risk::portfolio_balance::{BalanceInput, PortfolioBalanceTracker};
     let mut tracker = PortfolioBalanceTracker::new();
-    let Some(dash) = dashboard else { return tracker };
+    let Some(dash) = dashboard else {
+        return tracker;
+    };
     let bus = dash.data_bus();
-    let Ok(map) = bus.balances.read() else { return tracker };
+    let Ok(map) = bus.balances.read() else {
+        return tracker;
+    };
     let inputs: Vec<BalanceInput> = map
         .iter()
         .map(|((venue, asset), bal)| BalanceInput {
@@ -687,10 +691,8 @@ pub struct MarketMakerEngine {
     /// `strategy_pool` on every graph swap. Missing entries
     /// fall through to `self.config.market_maker` — legacy
     /// graphs with no overrides keep their current behaviour.
-    strategy_node_configs: std::collections::HashMap<
-        mm_strategy_graph::NodeId,
-        mm_common::config::MarketMakerConfig,
-    >,
+    strategy_node_configs:
+        std::collections::HashMap<mm_strategy_graph::NodeId, mm_common::config::MarketMakerConfig>,
     /// S4.2 — per-node StrategyContext field overrides
     /// (`as_prob*`, `borrow_cost_bps`). Populated in the same
     /// `swap_strategy_graph` pass as `strategy_node_configs`;
@@ -703,10 +705,8 @@ pub struct MarketMakerEngine {
     /// `refresh_quotes` once the StrategyContext is built — the
     /// next graph tick reads this map and injects the bundle as
     /// the node's `quotes` output.
-    last_strategy_quotes_per_node: std::collections::HashMap<
-        mm_strategy_graph::NodeId,
-        Vec<mm_common::types::QuotePair>,
-    >,
+    last_strategy_quotes_per_node:
+        std::collections::HashMap<mm_strategy_graph::NodeId, Vec<mm_common::types::QuotePair>>,
     /// Epic R — surveillance event lifecycle tracker. Fed by the
     /// order_manager's placement / cancel / fill callbacks; read
     /// by every `Surveillance.*Score` detector through the strategy
@@ -732,10 +732,7 @@ pub struct MarketMakerEngine {
     /// without the counter-leg showing up in
     /// `order_manager.live_orders`. Keyed on a bundle id string
     /// we assign at dispatch.
-    inflight_atomic_bundles: std::collections::HashMap<
-        String,
-        InflightAtomicBundle,
-    >,
+    inflight_atomic_bundles: std::collections::HashMap<String, InflightAtomicBundle>,
     /// Epic R Week 6 feed — inventory sampled on the previous
     /// surveillance tick; feeds the `InventoryPushingDetector`.
     last_inventory_for_push: rust_decimal::Decimal,
@@ -757,16 +754,12 @@ pub struct MarketMakerEngine {
     /// vwap-price) and emits as source values, then clears.
     /// Capped at 32 entries so a burst-fill loop can't grow memory
     /// while the graph isn't ticking.
-    pending_own_fills: std::collections::VecDeque<(
-        mm_exchange_core::connector::VenueId,
-        mm_common::types::Fill,
-    )>,
+    pending_own_fills:
+        std::collections::VecDeque<(mm_exchange_core::connector::VenueId, mm_common::types::Fill)>,
     /// Cancel-to-nearby-trade timing for `CancelOnReactionDetector`.
     cancel_reaction_deltas_ms: std::collections::VecDeque<Option<i64>>,
     /// Imbalance sample history for `ImbalanceManipulationDetector`.
-    imbalance_history: std::collections::VecDeque<
-        mm_risk::surveillance::ImbalanceSample,
-    >,
+    imbalance_history: std::collections::VecDeque<mm_risk::surveillance::ImbalanceSample>,
     /// Near-touch placement counter for `StrategicNonFillingDetector`.
     near_touch_placements: usize,
     near_touch_fills: usize,
@@ -906,8 +899,8 @@ impl MarketMakerEngine {
         // override by setting a non-zero `sla.min_depth_quote` in
         // the deployment config — we only null it out when the
         // config left it at the built-in $2k default.
-        let paper_min_depth = config.mode.eq_ignore_ascii_case("paper")
-            && config.sla.min_depth_quote == dec!(2000);
+        let paper_min_depth =
+            config.mode.eq_ignore_ascii_case("paper") && config.sla.min_depth_quote == dec!(2000);
         let sla_config = SlaConfig {
             max_spread_bps: config.sla.max_spread_bps,
             min_depth_quote: if paper_min_depth {
@@ -939,7 +932,6 @@ impl MarketMakerEngine {
             } else {
                 300
             },
-            ..Default::default()
         };
 
         // Audit log: data/audit/{symbol}.jsonl
@@ -1062,11 +1054,7 @@ impl MarketMakerEngine {
                             .to_f64()
                             .unwrap_or(1.0)
                             .clamp(0.0, 1.0),
-                        prob_slippage: cfg
-                            .prob_slippage
-                            .to_f64()
-                            .unwrap_or(0.0)
-                            .clamp(0.0, 1.0),
+                        prob_slippage: cfg.prob_slippage.to_f64().unwrap_or(0.0).clamp(0.0, 1.0),
                         slippage_bps: cfg.slippage_bps,
                         latency_ms: cfg.latency_ms,
                     };
@@ -1075,9 +1063,7 @@ impl MarketMakerEngine {
                     // symbol replay identically for comparison.
                     let mut seed: u64 = 0;
                     for b in symbol.bytes() {
-                        seed = seed
-                            .wrapping_mul(31)
-                            .wrapping_add(b as u64);
+                        seed = seed.wrapping_mul(31).wrapping_add(b as u64);
                     }
                     mm_backtester::ProbabilisticFiller::new(pf_cfg, seed)
                 })
@@ -1148,9 +1134,10 @@ impl MarketMakerEngine {
             listing_age_guard: mm_risk::manipulation::ListingAgeGuard::new(),
             mcap_proxy_guard: {
                 let supplies = &config.market_maker.symbol_circulating_supply;
-                supplies.get(&symbol).copied().map(|supply| {
-                    mm_risk::manipulation::MarketCapProxyGuard::new(supply)
-                })
+                supplies
+                    .get(&symbol)
+                    .copied()
+                    .map(mm_risk::manipulation::MarketCapProxyGuard::new)
             },
             liquidation_heatmap: mm_risk::liquidation_heatmap::LiquidationHeatmap::new(),
             last_open_interest: None,
@@ -1271,9 +1258,7 @@ impl MarketMakerEngine {
             },
             venue_regime_classifiers: std::collections::HashMap::new(),
             adaptive_tuner: {
-                let mut t = mm_strategy::AdaptiveTuner::new(
-                    mm_strategy::AdaptiveConfig::default(),
-                );
+                let mut t = mm_strategy::AdaptiveTuner::new(mm_strategy::AdaptiveConfig::default());
                 if config.market_maker.adaptive_enabled {
                     t.enable(true);
                 }
@@ -1351,12 +1336,16 @@ impl MarketMakerEngine {
                 let maker = std::env::var("MM_PAPER_FEE_MAKER_BPS")
                     .ok()
                     .and_then(|s| s.parse::<f64>().ok())
-                    .map(|bps| Decimal::from_f64_retain(bps / 10_000.0).unwrap_or(product.maker_fee))
+                    .map(|bps| {
+                        Decimal::from_f64_retain(bps / 10_000.0).unwrap_or(product.maker_fee)
+                    })
                     .unwrap_or(product.maker_fee);
                 let taker = std::env::var("MM_PAPER_FEE_TAKER_BPS")
                     .ok()
                     .and_then(|s| s.parse::<f64>().ok())
-                    .map(|bps| Decimal::from_f64_retain(bps / 10_000.0).unwrap_or(product.taker_fee))
+                    .map(|bps| {
+                        Decimal::from_f64_retain(bps / 10_000.0).unwrap_or(product.taker_fee)
+                    })
                     .unwrap_or(product.taker_fee);
                 PnlTracker::new(maker, taker)
             },
@@ -1364,12 +1353,8 @@ impl MarketMakerEngine {
                 config.risk.max_daily_volume_quote,
                 config.risk.max_hourly_volume_quote,
             ),
-            decision_ledger: Arc::new(
-                mm_risk::decision_ledger::DecisionLedger::default(),
-            ),
-            foreign_twap: Mutex::new(
-                mm_risk::foreign_twap::ForeignTwapDetector::default(),
-            ),
+            decision_ledger: Arc::new(mm_risk::decision_ledger::DecisionLedger::default()),
+            foreign_twap: Mutex::new(mm_risk::foreign_twap::ForeignTwapDetector::default()),
             dashboard,
             alerts,
             portfolio: None,
@@ -1396,10 +1381,7 @@ impl MarketMakerEngine {
         // shared dashboard so `/api/v1/decisions/recent` can read
         // without touching the engine.
         if let Some(dash) = &engine.dashboard {
-            dash.register_decision_ledger(
-                &engine.symbol,
-                Arc::clone(&engine.decision_ledger),
-            );
+            dash.register_decision_ledger(&engine.symbol, Arc::clone(&engine.decision_ledger));
         }
         engine
     }
@@ -1452,10 +1434,7 @@ impl MarketMakerEngine {
     /// per-client loss aggregate still shows up on the dashboard
     /// but no enforcement happens — tests and single-client
     /// deployments do not need the circuit wired.
-    pub fn with_per_client_circuit(
-        mut self,
-        circuit: Arc<mm_risk::PerClientLossCircuit>,
-    ) -> Self {
+    pub fn with_per_client_circuit(mut self, circuit: Arc<mm_risk::PerClientLossCircuit>) -> Self {
         self.per_client_circuit = Some(circuit);
         self
     }
@@ -1666,9 +1645,7 @@ impl MarketMakerEngine {
     pub fn inflight_atomic_bundles_checkpoint(&self) -> Vec<serde_json::Value> {
         self.inflight_atomic_bundles
             .iter()
-            .filter_map(|(id, bundle)| {
-                serde_json::to_value((id, bundle)).ok()
-            })
+            .filter_map(|(id, bundle)| serde_json::to_value((id, bundle)).ok())
             .collect()
     }
 
@@ -1842,11 +1819,10 @@ impl MarketMakerEngine {
             .iter()
             .filter(|s| s.is_available() && !winner_venues.contains(&s.venue))
             .map(|s| {
-                let cost = self.sor_router.cost_model.price(
-                    s,
-                    decision.target_side,
-                    urgency_clamped,
-                );
+                let cost =
+                    self.sor_router
+                        .cost_model
+                        .price(s, decision.target_side, urgency_clamped);
                 mm_dashboard::state::SorLegRecord {
                     venue: format!("{:?}", s.venue).to_lowercase(),
                     qty: s.available_qty,
@@ -1871,8 +1847,7 @@ impl MarketMakerEngine {
         // `/details/sor_decisions_recent` endpoint serves fresh
         // data even without a local dashboard.
         if let Ok(value) = serde_json::to_value(&record) {
-            mm_dashboard::details_store::global()
-                .push_sor_decision(&self.symbol, value);
+            mm_dashboard::details_store::global().push_sor_decision(&self.symbol, value);
         }
         if let Some(dash) = self.dashboard.as_ref() {
             dash.record_sor_decision(record);
@@ -1986,8 +1961,12 @@ impl MarketMakerEngine {
     async fn poll_extra_venues_for_data_bus(&self) {
         use mm_exchange_core::connector::VenueProduct;
 
-        let Some(dash) = self.dashboard.as_ref() else { return };
-        if self.connectors.extra.is_empty() { return; }
+        let Some(dash) = self.dashboard.as_ref() else {
+            return;
+        };
+        if self.connectors.extra.is_empty() {
+            return;
+        }
 
         let slots = self.sor_aggregator.venue_slots();
         for conn in &self.connectors.extra {
@@ -2019,8 +1998,12 @@ impl MarketMakerEngine {
                 }
             };
 
-            let Some(best_bid) = bids.first().map(|l| l.price) else { continue };
-            let Some(best_ask) = asks.first().map(|l| l.price) else { continue };
+            let Some(best_bid) = bids.first().map(|l| l.price) else {
+                continue;
+            };
+            let Some(best_ask) = asks.first().map(|l| l.price) else {
+                continue;
+            };
             if best_bid <= Decimal::ZERO || best_ask <= Decimal::ZERO {
                 continue;
             }
@@ -2088,7 +2071,9 @@ impl MarketMakerEngine {
     ///   agent-side `regime_label` decoder + metrics encoder
     ///   stay shared.
     fn classify_venue_regimes_tick(&mut self) {
-        let Some(dash) = self.dashboard.as_ref() else { return };
+        let Some(dash) = self.dashboard.as_ref() else {
+            return;
+        };
         let entries = dash.data_bus().l1_entries();
         let now = chrono::Utc::now();
         for (key, snap) in entries {
@@ -2167,10 +2152,8 @@ impl MarketMakerEngine {
                 if basket.is_empty() {
                     return;
                 }
-                let Some((_sym, entry_qty)) = basket
-                    .entries
-                    .iter()
-                    .find(|(sym, _)| *sym == self.symbol)
+                let Some((_sym, entry_qty)) =
+                    basket.entries.iter().find(|(sym, _)| *sym == self.symbol)
                 else {
                     return;
                 };
@@ -2387,10 +2370,8 @@ impl MarketMakerEngine {
     fn build_strategy_node_configs(
         graph: &mm_strategy_graph::Graph,
         baseline: &mm_common::config::MarketMakerConfig,
-    ) -> std::collections::HashMap<
-        mm_strategy_graph::NodeId,
-        mm_common::config::MarketMakerConfig,
-    > {
+    ) -> std::collections::HashMap<mm_strategy_graph::NodeId, mm_common::config::MarketMakerConfig>
+    {
         use rust_decimal::Decimal;
         use std::str::FromStr;
 
@@ -2420,9 +2401,7 @@ impl MarketMakerEngine {
             let max_distance_bps = dec("max_distance_bps");
             // S4.2 — time_horizon_secs landed on the config
             // struct too; `u64` so parsed directly.
-            let time_horizon_secs = cfg
-                .get("time_horizon_secs")
-                .and_then(|v| v.as_u64());
+            let time_horizon_secs = cfg.get("time_horizon_secs").and_then(|v| v.as_u64());
 
             let has_override = gamma.is_some()
                 || kappa.is_some()
@@ -2553,23 +2532,15 @@ impl MarketMakerEngine {
 
     fn build_strategy_pool(
         graph: &mm_strategy_graph::Graph,
-    ) -> std::collections::HashMap<
-        mm_strategy_graph::NodeId,
-        Box<dyn mm_strategy::r#trait::Strategy>,
-    > {
+    ) -> std::collections::HashMap<mm_strategy_graph::NodeId, Box<dyn mm_strategy::r#trait::Strategy>>
+    {
         use mm_strategy::r#trait::Strategy as StrategyTrait;
-        let mut pool: std::collections::HashMap<
-            mm_strategy_graph::NodeId,
-            Box<dyn StrategyTrait>,
-        > = std::collections::HashMap::new();
+        let mut pool: std::collections::HashMap<mm_strategy_graph::NodeId, Box<dyn StrategyTrait>> =
+            std::collections::HashMap::new();
         for n in &graph.nodes {
             let built: Option<Box<dyn StrategyTrait>> = match n.kind.as_str() {
-                "Strategy.Avellaneda" => {
-                    Some(Box::new(mm_strategy::AvellanedaStoikov))
-                }
-                "Strategy.GLFT" => {
-                    Some(Box::new(mm_strategy::glft::GlftStrategy::default()))
-                }
+                "Strategy.Avellaneda" => Some(Box::new(mm_strategy::AvellanedaStoikov)),
+                "Strategy.GLFT" => Some(Box::new(mm_strategy::glft::GlftStrategy::default())),
                 "Strategy.Grid" => Some(Box::new(mm_strategy::grid::GridStrategy)),
                 "Strategy.Basis" => {
                     // Basis params come from engine config today —
@@ -2610,7 +2581,9 @@ impl MarketMakerEngine {
                         real_size_mult: parse_dec("real_size_mult", dec!(1)),
                         real_distance_bps: parse_dec("real_distance_bps", dec!(3)),
                     };
-                    Some(Box::new(mm_strategy::spoof::SpoofStrategy::with_config(spoof_cfg)))
+                    Some(Box::new(mm_strategy::spoof::SpoofStrategy::with_config(
+                        spoof_cfg,
+                    )))
                 }
                 "Strategy.Wash" => {
                     let cfg = &n.config;
@@ -2624,7 +2597,9 @@ impl MarketMakerEngine {
                         leg_size: parse_dec("leg_size", dec!(0.001)),
                         offset_bps: parse_dec("offset_bps", dec!(0)),
                     };
-                    Some(Box::new(mm_strategy::wash::WashStrategy::with_config(wash_cfg)))
+                    Some(Box::new(mm_strategy::wash::WashStrategy::with_config(
+                        wash_cfg,
+                    )))
                 }
                 "Strategy.Stuff" => {
                     use mm_common::types::Side;
@@ -2641,7 +2616,8 @@ impl MarketMakerEngine {
                     };
                     let sc = mm_strategy::stuff::StuffConfig {
                         push_side,
-                        orders_per_tick: cfg.get("orders_per_tick")
+                        orders_per_tick: cfg
+                            .get("orders_per_tick")
                             .and_then(|v| v.as_i64())
                             .map(|i| i as usize)
                             .unwrap_or(20),
@@ -2676,9 +2652,9 @@ impl MarketMakerEngine {
                         offset_bps: parse_dec("offset_bps", dec!(5)),
                         leg_size: parse_dec("leg_size", dec!(0.001)),
                     };
-                    Some(Box::new(
-                        mm_strategy::layer::LayerStrategy::with_config(layer_cfg),
-                    ))
+                    Some(Box::new(mm_strategy::layer::LayerStrategy::with_config(
+                        layer_cfg,
+                    )))
                 }
                 "Strategy.Mark" => {
                     use mm_common::types::Side;
@@ -2728,9 +2704,9 @@ impl MarketMakerEngine {
                         burst_ticks: parse_i64("burst_ticks", 5) as u64,
                         rest_ticks: parse_i64("rest_ticks", 3) as u64,
                     };
-                    Some(Box::new(
-                        mm_strategy::ignite::IgniteStrategy::with_config(ignite_cfg),
-                    ))
+                    Some(Box::new(mm_strategy::ignite::IgniteStrategy::with_config(
+                        ignite_cfg,
+                    )))
                 }
                 "Strategy.CrossMarket" => {
                     use mm_common::types::Side;
@@ -2915,10 +2891,7 @@ impl MarketMakerEngine {
                             .and_then(|s| s.parse().ok())
                             .unwrap_or(default)
                     };
-                    let side = match cfg
-                        .get("side")
-                        .and_then(|v| v.as_str())
-                    {
+                    let side = match cfg.get("side").and_then(|v| v.as_str()) {
                         Some("buy") => mm_common::types::Side::Buy,
                         _ => mm_common::types::Side::Sell,
                     };
@@ -2931,9 +2904,9 @@ impl MarketMakerEngine {
                         burst_ticks: 1,
                         rest_ticks: 5,
                     };
-                    Some(Box::new(
-                        mm_strategy::ignite::IgniteStrategy::with_config(hunt_cfg),
-                    ))
+                    Some(Box::new(mm_strategy::ignite::IgniteStrategy::with_config(
+                        hunt_cfg,
+                    )))
                 }
                 // ⚠ R4.3 — LiquidationHunt pentest wrapper.
                 // Reuses IgniteStrategy internally: the
@@ -2957,9 +2930,9 @@ impl MarketMakerEngine {
                         burst_ticks: 3,
                         rest_ticks: 7,
                     };
-                    Some(Box::new(
-                        mm_strategy::ignite::IgniteStrategy::with_config(hunt_cfg),
-                    ))
+                    Some(Box::new(mm_strategy::ignite::IgniteStrategy::with_config(
+                        hunt_cfg,
+                    )))
                 }
                 // ⚠ R4.5 — LeverageBuilder pentest wrapper.
                 // V1 reuses IgniteStrategy with a one-shot
@@ -2975,10 +2948,7 @@ impl MarketMakerEngine {
                             .and_then(|s| s.parse().ok())
                             .unwrap_or(default)
                     };
-                    let direction = match cfg
-                        .get("direction")
-                        .and_then(|v| v.as_str())
-                    {
+                    let direction = match cfg.get("direction").and_then(|v| v.as_str()) {
                         Some("short") => mm_common::types::Side::Sell,
                         _ => mm_common::types::Side::Buy,
                     };
@@ -2991,9 +2961,9 @@ impl MarketMakerEngine {
                         burst_ticks: 1,
                         rest_ticks: 1_000_000,
                     };
-                    Some(Box::new(
-                        mm_strategy::ignite::IgniteStrategy::with_config(cfg_lev),
-                    ))
+                    Some(Box::new(mm_strategy::ignite::IgniteStrategy::with_config(
+                        cfg_lev,
+                    )))
                 }
                 // ⚠ R6.1 — CampaignOrchestrator real FSM.
                 // Replaces Sprint 10's advisory stub with a
@@ -3010,9 +2980,7 @@ impl MarketMakerEngine {
                             .unwrap_or(default)
                     };
                     let parse_u64 = |k: &str, default: u64| {
-                        cfg.get(k)
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(default)
+                        cfg.get(k).and_then(|v| v.as_u64()).unwrap_or(default)
                     };
                     let parse_u32 = |k: &str, default: u32| {
                         cfg.get(k)
@@ -3053,9 +3021,7 @@ impl MarketMakerEngine {
                             .unwrap_or(default)
                     };
                     let parse_u64 = |k: &str, default: u64| {
-                        cfg.get(k)
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(default)
+                        cfg.get(k).and_then(|v| v.as_u64()).unwrap_or(default)
                     };
                     let parse_u32 = |k: &str, default: u32| {
                         cfg.get(k)
@@ -3131,8 +3097,7 @@ impl MarketMakerEngine {
         self.strategy_graph_name = Some(graph.name.clone());
         self.strategy_graph_hash = Some(graph.content_hash());
         self.strategy_graph_scope = Some(graph.scope.clone());
-        self.strategy_graph_deployed_at_ms =
-            Some(chrono::Utc::now().timestamp_millis());
+        self.strategy_graph_deployed_at_ms = Some(chrono::Utc::now().timestamp_millis());
         self.strategy_graph_node_count = Some(graph.nodes.len());
         self.strategy_pool = Self::build_strategy_pool(graph);
         self.strategy_node_configs =
@@ -3200,8 +3165,7 @@ impl MarketMakerEngine {
         self.strategy_graph_name = Some(graph.name.clone());
         self.strategy_graph_hash = Some(graph.content_hash());
         self.strategy_graph_scope = Some(graph.scope.clone());
-        self.strategy_graph_deployed_at_ms =
-            Some(chrono::Utc::now().timestamp_millis());
+        self.strategy_graph_deployed_at_ms = Some(chrono::Utc::now().timestamp_millis());
         self.strategy_graph_node_count = Some(graph.nodes.len());
         self.strategy_pool = Self::build_strategy_pool(graph);
         self.strategy_node_configs =
@@ -3222,11 +3186,7 @@ impl MarketMakerEngine {
         self.audit.risk_event(
             &self.symbol,
             mm_risk::audit::AuditEventType::StrategyGraphDeployed,
-            &format!(
-                "graph={} hash={}",
-                graph.name,
-                graph.content_hash()
-            ),
+            &format!("graph={} hash={}", graph.name, graph.content_hash()),
         );
         mm_dashboard::metrics::STRATEGY_GRAPH_DEPLOYS_TOTAL
             .with_label_values(&["accepted"])
@@ -3254,11 +3214,28 @@ impl MarketMakerEngine {
         engine_product: mm_common::config::ProductType,
         read_extra: bool,
     ) -> (String, String, mm_common::config::ProductType, usize) {
-        let v = cfg.and_then(|c| c.get("venue")).and_then(|v| v.as_str()).unwrap_or("");
-        let s = cfg.and_then(|c| c.get("symbol")).and_then(|v| v.as_str()).unwrap_or("");
-        let p_str = cfg.and_then(|c| c.get("product")).and_then(|v| v.as_str()).unwrap_or("");
-        let venue = if v.is_empty() { engine_venue } else { v.to_string() };
-        let symbol = if s.is_empty() { engine_symbol } else { s.to_string() };
+        let v = cfg
+            .and_then(|c| c.get("venue"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let s = cfg
+            .and_then(|c| c.get("symbol"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let p_str = cfg
+            .and_then(|c| c.get("product"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let venue = if v.is_empty() {
+            engine_venue
+        } else {
+            v.to_string()
+        };
+        let symbol = if s.is_empty() {
+            engine_symbol
+        } else {
+            s.to_string()
+        };
         let product = match p_str {
             "spot" => mm_common::config::ProductType::Spot,
             "linear_perp" => mm_common::config::ProductType::LinearPerp,
@@ -3364,8 +3341,7 @@ impl MarketMakerEngine {
     }
 
     pub(crate) fn sweep_atomic_bundle_acks(&mut self) {
-        let self_venue = format!("{:?}", self.config.exchange.exchange_type)
-            .to_lowercase();
+        let self_venue = format!("{:?}", self.config.exchange.exchange_type).to_lowercase();
         let live = self.order_manager.live_orders_snapshot();
         // Price tolerance: half a tick lets venue-side rounding
         // still match.
@@ -3403,14 +3379,19 @@ impl MarketMakerEngine {
                 if venue != self_venue || symbol != self.symbol {
                     return false;
                 }
-                live.iter().any(|(_oid, live_side, live_price, _qty, _status)| {
-                    *live_side == side && (*live_price - price).abs() <= tol
-                })
+                live.iter()
+                    .any(|(_oid, live_side, live_price, _qty, _status)| {
+                        *live_side == side && (*live_price - price).abs() <= tol
+                    })
             };
-            if !b.maker_acked && local_match(&b.maker_venue, &b.maker_symbol, b.maker_side, b.maker_price) {
+            if !b.maker_acked
+                && local_match(&b.maker_venue, &b.maker_symbol, b.maker_side, b.maker_price)
+            {
                 b.maker_acked = true;
             }
-            if !b.hedge_acked && local_match(&b.hedge_venue, &b.hedge_symbol, b.hedge_side, b.hedge_price) {
+            if !b.hedge_acked
+                && local_match(&b.hedge_venue, &b.hedge_symbol, b.hedge_side, b.hedge_price)
+            {
                 b.hedge_acked = true;
             }
         }
@@ -3525,18 +3506,19 @@ impl MarketMakerEngine {
         // Epic R — surveillance alerts detected this tick. Emitted
         // AFTER the source overlay loop releases its `&graph` borrow
         // so the dedupe map + audit writer can mutate self freely.
-        let mut pending_alerts: Vec<(
-            String,
-            NodeId,
-            mm_risk::surveillance::DetectorOutput,
-        )> = Vec::new();
+        let mut pending_alerts: Vec<(String, NodeId, mm_risk::surveillance::DetectorOutput)> =
+            Vec::new();
         // Pre-compute values so the closure loop is cheap.
         let book = &self.book_keeper.book;
         let (bid_px, bid_qty, ask_px, ask_qty, mid, spread_bps) = (
             book.best_bid().map(Value::Number).unwrap_or(Value::Missing),
-            book.best_bid_qty().map(Value::Number).unwrap_or(Value::Missing),
+            book.best_bid_qty()
+                .map(Value::Number)
+                .unwrap_or(Value::Missing),
             book.best_ask().map(Value::Number).unwrap_or(Value::Missing),
-            book.best_ask_qty().map(Value::Number).unwrap_or(Value::Missing),
+            book.best_ask_qty()
+                .map(Value::Number)
+                .unwrap_or(Value::Missing),
             book.mid_price()
                 .map(Value::Number)
                 .unwrap_or(Value::Missing),
@@ -3588,15 +3570,30 @@ impl MarketMakerEngine {
                     // Empty config → default to this engine's own
                     // view (current behaviour).
                     let cfg = graph.node_configs().get(id);
-                    let v = cfg.and_then(|c| c.get("venue")).and_then(|v| v.as_str()).unwrap_or("");
-                    let s = cfg.and_then(|c| c.get("symbol")).and_then(|v| v.as_str()).unwrap_or("");
-                    let p_str = cfg.and_then(|c| c.get("product")).and_then(|v| v.as_str()).unwrap_or("");
+                    let v = cfg
+                        .and_then(|c| c.get("venue"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let s = cfg
+                        .and_then(|c| c.get("symbol"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let p_str = cfg
+                        .and_then(|c| c.get("product"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let cross = !v.is_empty() || !s.is_empty() || !p_str.is_empty();
                     if cross {
                         let venue = if v.is_empty() {
                             format!("{:?}", self.config.exchange.exchange_type).to_lowercase()
-                        } else { v.to_string() };
-                        let symbol = if s.is_empty() { self.symbol.clone() } else { s.to_string() };
+                        } else {
+                            v.to_string()
+                        };
+                        let symbol = if s.is_empty() {
+                            self.symbol.clone()
+                        } else {
+                            s.to_string()
+                        };
                         let product = match p_str {
                             "spot" => mm_common::config::ProductType::Spot,
                             "linear_perp" => mm_common::config::ProductType::LinearPerp,
@@ -3615,7 +3612,12 @@ impl MarketMakerEngine {
                                 s.mid.map(Value::Number).unwrap_or(Value::Missing),
                                 s.spread_bps.map(Value::Number).unwrap_or(Value::Missing),
                             ),
-                            None => (Value::Missing, Value::Missing, Value::Missing, Value::Missing),
+                            None => (
+                                Value::Missing,
+                                Value::Missing,
+                                Value::Missing,
+                                Value::Missing,
+                            ),
                         };
                         src.insert((*id, "bid_px".into()), b);
                         src.insert((*id, "bid_qty".into()), Value::Missing);
@@ -3661,8 +3663,14 @@ impl MarketMakerEngine {
                             (
                                 Value::String(fmt(&s.bids)),
                                 Value::String(fmt(&s.asks)),
-                                s.bids.first().map(|(p, _)| Value::Number(*p)).unwrap_or(Value::Missing),
-                                s.asks.first().map(|(p, _)| Value::Number(*p)).unwrap_or(Value::Missing),
+                                s.bids
+                                    .first()
+                                    .map(|(p, _)| Value::Number(*p))
+                                    .unwrap_or(Value::Missing),
+                                s.asks
+                                    .first()
+                                    .map(|(p, _)| Value::Number(*p))
+                                    .unwrap_or(Value::Missing),
                             )
                         }
                         None => (
@@ -3911,10 +3919,7 @@ impl MarketMakerEngine {
                     src.insert((*id, "value".into()), v);
                 }
                 "Risk.OTR" => {
-                    src.insert(
-                        (*id, "value".into()),
-                        Value::Number(self.otr.ratio()),
-                    );
+                    src.insert((*id, "value".into()), Value::Number(self.otr.ratio()));
                 }
                 // S4.1 — kill-switch guards as graph sources.
                 "Risk.CircuitBreakerTripped" => {
@@ -3926,9 +3931,7 @@ impl MarketMakerEngine {
                 "Risk.NewsRetreatState" => {
                     let v = match self.news_retreat.as_mut() {
                         Some(sm) => {
-                            let s = sm.current_state(
-                                chrono::Utc::now().timestamp_millis(),
-                            );
+                            let s = sm.current_state(chrono::Utc::now().timestamp_millis());
                             Value::String(format!("{s:?}"))
                         }
                         None => Value::Missing,
@@ -3972,12 +3975,8 @@ impl MarketMakerEngine {
                     // signal they can compose today.
                     let a = &self.pnl_tracker.attribution;
                     let rt = rust_decimal::Decimal::from(a.round_trips);
-                    let v = if a.round_trips > 0
-                        && !a.total_volume.is_zero()
-                    {
-                        Value::Number(
-                            a.total_volume / (rt * rust_decimal::Decimal::from(2u32)),
-                        )
+                    let v = if a.round_trips > 0 && !a.total_volume.is_zero() {
+                        Value::Number(a.total_volume / (rt * rust_decimal::Decimal::from(2u32)))
                     } else {
                         Value::Missing
                     };
@@ -3988,7 +3987,10 @@ impl MarketMakerEngine {
                     // the online fit produces its first estimate.
                     let mid = self.book_keeper.book.mid_price();
                     let v = mid
-                        .and_then(|m| self.momentum.learned_microprice_drift(&self.book_keeper.book, m))
+                        .and_then(|m| {
+                            self.momentum
+                                .learned_microprice_drift(&self.book_keeper.book, m)
+                        })
                         .map(Value::Number)
                         .unwrap_or(Value::Missing);
                     src.insert((*id, "value".into()), v);
@@ -4003,10 +4005,7 @@ impl MarketMakerEngine {
                 }
                 "Regime.Detector" => {
                     let regime = self.auto_tuner.regime_detector.regime();
-                    src.insert(
-                        (*id, "regime".into()),
-                        Value::String(format!("{regime:?}")),
-                    );
+                    src.insert((*id, "regime".into()), Value::String(format!("{regime:?}")));
                 }
                 "PairClass.Current" => {
                     let label = self
@@ -4040,9 +4039,7 @@ impl MarketMakerEngine {
                     };
                     let v = match (kind.as_str(), tick) {
                         ("Sentiment.Rate", Some(t)) => Value::Number(t.mentions_rate),
-                        ("Sentiment.Score", Some(t)) => {
-                            Value::Number(t.sentiment_score_5min)
-                        }
+                        ("Sentiment.Score", Some(t)) => Value::Number(t.sentiment_score_5min),
                         _ => Value::Missing,
                     };
                     src.insert((*id, "value".into()), v);
@@ -4102,8 +4099,11 @@ impl MarketMakerEngine {
                             baseline_vol += t.qty;
                         }
                     }
-                    let out = mm_risk::surveillance::MarkingCloseDetector::new()
-                        .score(ttb.unwrap_or(i64::MAX), window_vol, baseline_vol);
+                    let out = mm_risk::surveillance::MarkingCloseDetector::new().score(
+                        ttb.unwrap_or(i64::MAX),
+                        window_vol,
+                        baseline_vol,
+                    );
                     src.insert((*id, "value".into()), Value::Number(out.score));
                     if out.score >= rust_decimal_macros::dec!(0.8) {
                         pending_alerts.push((kind.clone(), *id, out));
@@ -4136,24 +4136,26 @@ impl MarketMakerEngine {
                         .as_ref()
                         .map(|d| d.data_bus().get_trades(&key))
                         .unwrap_or_default();
-                    let vol: rust_decimal::Decimal =
-                        trades.iter().map(|t| t.qty).sum();
+                    let vol: rust_decimal::Decimal = trades.iter().map(|t| t.qty).sum();
                     // Normalise against our own baseline order
                     // size so the ratio stays in sensible units
                     // regardless of symbol.
-                    let baseline = self.config.market_maker.order_size.max(rust_decimal_macros::dec!(0.0001));
+                    let baseline = self
+                        .config
+                        .market_maker
+                        .order_size
+                        .max(rust_decimal_macros::dec!(0.0001));
                     let ratio = vol / baseline;
                     // Mid-move proxy across the last minute.
                     let mut move_bps = rust_decimal::Decimal::ZERO;
                     if let (Some(first), Some(last)) = (trades.first(), trades.last()) {
                         if first.price > rust_decimal::Decimal::ZERO {
-                            move_bps = (last.price - first.price).abs()
-                                / first.price
+                            move_bps = (last.price - first.price).abs() / first.price
                                 * rust_decimal_macros::dec!(10_000);
                         }
                     }
-                    let out = mm_risk::surveillance::CrossMarketDetector::new()
-                        .score(ratio, move_bps);
+                    let out =
+                        mm_risk::surveillance::CrossMarketDetector::new().score(ratio, move_bps);
                     src.insert((*id, "value".into()), Value::Number(out.score));
                     if out.score >= rust_decimal_macros::dec!(0.8) {
                         pending_alerts.push((kind.clone(), *id, out));
@@ -4164,8 +4166,7 @@ impl MarketMakerEngine {
                     // — `(fill_ts - last_reprice_ts).millis`. Score
                     // counts those inside the stale-window.
                     let deltas: Vec<i64> = self.fill_reprice_deltas_ms.iter().copied().collect();
-                    let out = mm_risk::surveillance::LatencyExploitDetector::new()
-                        .score(&deltas);
+                    let out = mm_risk::surveillance::LatencyExploitDetector::new().score(&deltas);
                     src.insert((*id, "value".into()), Value::Number(out.score));
                     if out.score >= rust_decimal_macros::dec!(0.8) {
                         pending_alerts.push((kind.clone(), *id, out));
@@ -4203,18 +4204,17 @@ impl MarketMakerEngine {
                     } else {
                         rust_decimal::Decimal::ZERO
                     };
-                    self.imbalance_history.push_back(
-                        mm_risk::surveillance::ImbalanceSample {
+                    self.imbalance_history
+                        .push_back(mm_risk::surveillance::ImbalanceSample {
                             ts: chrono::Utc::now(),
                             imbalance,
-                        },
-                    );
+                        });
                     if self.imbalance_history.len() > 200 {
                         self.imbalance_history.pop_front();
                     }
                     let samples: Vec<_> = self.imbalance_history.iter().cloned().collect();
-                    let out = mm_risk::surveillance::ImbalanceManipulationDetector::new()
-                        .score(&samples);
+                    let out =
+                        mm_risk::surveillance::ImbalanceManipulationDetector::new().score(&samples);
                     src.insert((*id, "value".into()), Value::Number(out.score));
                     if out.score >= rust_decimal_macros::dec!(0.8) {
                         pending_alerts.push((kind.clone(), *id, out));
@@ -4225,9 +4225,9 @@ impl MarketMakerEngine {
                     // happen within the reaction window of a
                     // nearby public trade (see
                     // record_cancel_reaction below).
-                    let deltas: Vec<Option<i64>> = self.cancel_reaction_deltas_ms.iter().copied().collect();
-                    let out = mm_risk::surveillance::CancelOnReactionDetector::new()
-                        .score(&deltas);
+                    let deltas: Vec<Option<i64>> =
+                        self.cancel_reaction_deltas_ms.iter().copied().collect();
+                    let out = mm_risk::surveillance::CancelOnReactionDetector::new().score(&deltas);
                     src.insert((*id, "value".into()), Value::Number(out.score));
                     if out.score >= rust_decimal_macros::dec!(0.8) {
                         pending_alerts.push((kind.clone(), *id, out));
@@ -4239,11 +4239,7 @@ impl MarketMakerEngine {
                     // this tick. The ring is updated at the end of
                     // refresh_quotes; here we just score.
                     let total = self.one_sided_tick_ring.len();
-                    let one_sided = self
-                        .one_sided_tick_ring
-                        .iter()
-                        .filter(|b| **b)
-                        .count();
+                    let one_sided = self.one_sided_tick_ring.iter().filter(|b| **b).count();
                     let out = mm_risk::surveillance::OneSidedQuotingDetector::new()
                         .score(one_sided, total);
                     src.insert((*id, "value".into()), Value::Number(out.score));
@@ -4259,9 +4255,15 @@ impl MarketMakerEngine {
                     // delta through a small divisor so absolute
                     // scale doesn't dominate the product.
                     let inv = self.inventory_manager.inventory();
-                    let mid = self.book_keeper.book.mid_price().unwrap_or(rust_decimal::Decimal::ZERO);
+                    let mid = self
+                        .book_keeper
+                        .book
+                        .mid_price()
+                        .unwrap_or(rust_decimal::Decimal::ZERO);
                     let inv_delta = inv - self.last_inventory_for_push;
-                    let mid_delta = if self.last_mid_for_push > rust_decimal::Decimal::ZERO && mid > rust_decimal::Decimal::ZERO {
+                    let mid_delta = if self.last_mid_for_push > rust_decimal::Decimal::ZERO
+                        && mid > rust_decimal::Decimal::ZERO
+                    {
                         mid - self.last_mid_for_push
                     } else {
                         rust_decimal::Decimal::ZERO
@@ -4272,10 +4274,14 @@ impl MarketMakerEngine {
                     // don't explode for large price levels.
                     let inv_norm = if inv.abs() > rust_decimal::Decimal::ZERO {
                         inv_delta / inv.abs().max(rust_decimal_macros::dec!(0.001))
-                    } else { rust_decimal::Decimal::ZERO };
+                    } else {
+                        rust_decimal::Decimal::ZERO
+                    };
                     let mid_norm = if mid > rust_decimal::Decimal::ZERO {
                         mid_delta / mid
-                    } else { rust_decimal::Decimal::ZERO };
+                    } else {
+                        rust_decimal::Decimal::ZERO
+                    };
                     let out = mm_risk::surveillance::InventoryPushingDetector::new()
                         .score(inv_norm, mid_norm);
                     src.insert((*id, "value".into()), Value::Number(out.score));
@@ -4382,24 +4388,19 @@ impl MarketMakerEngine {
                         "sell" => Some(mm_common::types::Side::Sell),
                         _ => None,
                     };
-                    let price_opt: Option<Decimal> = cfg
-                        .and_then(|c| c.get("price"))
-                        .and_then(|v| {
+                    let price_opt: Option<Decimal> =
+                        cfg.and_then(|c| c.get("price")).and_then(|v| {
                             v.as_str()
                                 .and_then(|s| s.parse::<Decimal>().ok())
                                 .or_else(|| v.as_f64().and_then(Decimal::from_f64_retain))
                         });
                     let value = match side_opt {
                         Some(side) => {
-                            let price = price_opt.or_else(|| {
-                                self.queue_tracker.best_price_on(&self.symbol, side)
-                            });
-                            match price
-                                .and_then(|p| {
-                                    self.queue_tracker
-                                        .fill_probability(&self.symbol, side, p)
-                                })
-                            {
+                            let price = price_opt
+                                .or_else(|| self.queue_tracker.best_price_on(&self.symbol, side));
+                            match price.and_then(|p| {
+                                self.queue_tracker.fill_probability(&self.symbol, side, p)
+                            }) {
                                 Some(p) => Value::Number(p),
                                 None => Value::Missing,
                             }
@@ -4460,19 +4461,13 @@ impl MarketMakerEngine {
                     let inv = self.inventory_manager.inventory();
                     let cb = self.inventory_manager.avg_entry_price();
                     let mut out = Value::Missing;
-                    if inv != rust_decimal::Decimal::ZERO
-                        && cb > rust_decimal::Decimal::ZERO
-                    {
+                    if inv != rust_decimal::Decimal::ZERO && cb > rust_decimal::Decimal::ZERO {
                         let flatten_side = if inv > rust_decimal::Decimal::ZERO {
                             Side::Sell
                         } else {
                             Side::Buy
                         };
-                        if let Some(r) = self
-                            .book_keeper
-                            .book
-                            .sweep_vwap(flatten_side, inv.abs())
-                        {
+                        if let Some(r) = self.book_keeper.book.sweep_vwap(flatten_side, inv.abs()) {
                             // `inv` is signed, (vwap - cb) times
                             // signed inventory gives quote-asset
                             // PnL directly — positive means we'd
@@ -4495,10 +4490,8 @@ impl MarketMakerEngine {
                     ) {
                         if mid > rust_decimal::Decimal::ZERO {
                             if let Some(info) = guard.last() {
-                                if let Some(pos) = info
-                                    .positions
-                                    .iter()
-                                    .find(|p| p.symbol == self.symbol)
+                                if let Some(pos) =
+                                    info.positions.iter().find(|p| p.symbol == self.symbol)
                                 {
                                     if let Some(liq) = pos.liq_price {
                                         let ten_k = rust_decimal::Decimal::from(10_000);
@@ -4522,10 +4515,7 @@ impl MarketMakerEngine {
                     use mm_common::types::Side;
                     use std::str::FromStr;
                     let cfg = graph.node_configs().get(id);
-                    let side = match cfg
-                        .and_then(|c| c.get("side"))
-                        .and_then(|v| v.as_str())
-                    {
+                    let side = match cfg.and_then(|c| c.get("side")).and_then(|v| v.as_str()) {
                         Some("sell") => Side::Sell,
                         _ => Side::Buy,
                     };
@@ -4556,7 +4546,10 @@ impl MarketMakerEngine {
                         self.symbol.clone(),
                         self.config.exchange.product,
                     );
-                    let current = self.dashboard.as_ref().and_then(|d| d.data_bus().get_l2(&key));
+                    let current = self
+                        .dashboard
+                        .as_ref()
+                        .and_then(|d| d.data_bus().get_l2(&key));
                     let score = match (self.prev_l2_snapshot.as_ref(), current.as_ref()) {
                         (Some(prev), Some(now_snap)) => {
                             let to_levels = |v: &[(rust_decimal::Decimal, rust_decimal::Decimal)]|
@@ -4592,8 +4585,7 @@ impl MarketMakerEngine {
                         .ok()
                         .map(|t| t.recent_fills(&self.symbol))
                         .unwrap_or_default();
-                    let out = mm_risk::surveillance::WashDetector::new()
-                        .score_from_fills(&fills);
+                    let out = mm_risk::surveillance::WashDetector::new().score_from_fills(&fills);
                     src.insert((*id, "value".into()), Value::Number(out.score));
                     if out.score >= rust_decimal_macros::dec!(0.8) {
                         pending_alerts.push((kind.clone(), *id, out));
@@ -4628,8 +4620,8 @@ impl MarketMakerEngine {
                             }),
                         })
                         .collect();
-                    let out = mm_risk::surveillance::MomentumIgnitionDetector::new()
-                        .score(&samples);
+                    let out =
+                        mm_risk::surveillance::MomentumIgnitionDetector::new().score(&samples);
                     src.insert((*id, "value".into()), Value::Number(out.score));
                     if out.score >= rust_decimal_macros::dec!(0.8) {
                         pending_alerts.push((kind.clone(), *id, out));
@@ -4658,28 +4650,23 @@ impl MarketMakerEngine {
                     // tick — bucketing depends on it.
                     self.liquidation_heatmap.on_mid(self.last_mid);
                     let total = self.liquidation_heatmap.total_notional();
-                    let count = rust_decimal::Decimal::from(
-                        self.liquidation_heatmap.event_count() as u64,
-                    );
+                    let count =
+                        rust_decimal::Decimal::from(self.liquidation_heatmap.event_count() as u64);
                     // Nearest above / below — ignored when the
                     // heatmap has no buckets.
                     use mm_common::types::Side;
-                    let above = self
-                        .liquidation_heatmap
-                        .nearest_cluster_above_threshold(
-                            Side::Buy,
-                            rust_decimal::Decimal::ZERO,
-                            10,
-                            1000,
-                        );
-                    let below = self
-                        .liquidation_heatmap
-                        .nearest_cluster_above_threshold(
-                            Side::Sell,
-                            rust_decimal::Decimal::ZERO,
-                            10,
-                            1000,
-                        );
+                    let above = self.liquidation_heatmap.nearest_cluster_above_threshold(
+                        Side::Buy,
+                        rust_decimal::Decimal::ZERO,
+                        10,
+                        1000,
+                    );
+                    let below = self.liquidation_heatmap.nearest_cluster_above_threshold(
+                        Side::Sell,
+                        rust_decimal::Decimal::ZERO,
+                        10,
+                        1000,
+                    );
                     src.insert((*id, "total_notional".into()), Value::Number(total));
                     src.insert((*id, "event_count".into()), Value::Number(count));
                     match above {
@@ -4741,20 +4728,18 @@ impl MarketMakerEngine {
                 // R7.1 — Signal.LongShortRatio. `Missing` on
                 // cold tracker / spot venues; graph source
                 // emits 3 numbers when data available.
-                "Signal.LongShortRatio" => {
-                    match self.last_long_short.as_ref() {
-                        Some(ls) => {
-                            src.insert((*id, "long_pct".into()), Value::Number(ls.long_pct));
-                            src.insert((*id, "short_pct".into()), Value::Number(ls.short_pct));
-                            src.insert((*id, "ratio".into()), Value::Number(ls.ratio));
-                        }
-                        None => {
-                            src.insert((*id, "long_pct".into()), Value::Missing);
-                            src.insert((*id, "short_pct".into()), Value::Missing);
-                            src.insert((*id, "ratio".into()), Value::Missing);
-                        }
+                "Signal.LongShortRatio" => match self.last_long_short.as_ref() {
+                    Some(ls) => {
+                        src.insert((*id, "long_pct".into()), Value::Number(ls.long_pct));
+                        src.insert((*id, "short_pct".into()), Value::Number(ls.short_pct));
+                        src.insert((*id, "ratio".into()), Value::Number(ls.ratio));
                     }
-                }
+                    None => {
+                        src.insert((*id, "long_pct".into()), Value::Missing);
+                        src.insert((*id, "short_pct".into()), Value::Missing);
+                        src.insert((*id, "ratio".into()), Value::Missing);
+                    }
+                },
                 // R7.2 — Signal.LiquidationLevelEstimate. Pure
                 // math from config `avg_leverage` + mid.
                 // Leveraged long liquidates at `-10_000 / leverage`
@@ -4772,14 +4757,8 @@ impl MarketMakerEngine {
                     // go liq BELOW entry (negative), shorts ABOVE.
                     let bps = rust_decimal::Decimal::from(10_000u64)
                         / rust_decimal::Decimal::from(leverage);
-                    src.insert(
-                        (*id, "long_liq_bps".into()),
-                        Value::Number(-bps),
-                    );
-                    src.insert(
-                        (*id, "short_liq_bps".into()),
-                        Value::Number(bps),
-                    );
+                    src.insert((*id, "long_liq_bps".into()), Value::Number(-bps));
+                    src.insert((*id, "short_liq_bps".into()), Value::Number(bps));
                 }
                 // R13.2 — Signal.FundingExtreme. Bool output.
                 // Reads engine's cached funding rate (via the
@@ -4800,9 +4779,7 @@ impl MarketMakerEngine {
                     let funding_extreme = self
                         .pnl_tracker
                         .funding_rate()
-                        .map(|r: rust_decimal::Decimal| {
-                            r.abs() > funding_threshold
-                        })
+                        .map(|r: rust_decimal::Decimal| r.abs() > funding_threshold)
                         .unwrap_or(false);
                     let oi_significant = self
                         .last_open_interest
@@ -4910,18 +4887,24 @@ impl MarketMakerEngine {
                     src.insert((*id, "value".into()), val);
                     src.insert((*id, "events".into()), events);
                 }
-                "Surveillance.SpoofingScore" |
-                "Surveillance.LayeringScore" |
-                "Surveillance.QuoteStuffingScore" => {
+                "Surveillance.SpoofingScore"
+                | "Surveillance.LayeringScore"
+                | "Surveillance.QuoteStuffingScore" => {
                     let out = {
-                        let Ok(t) = self.surveillance_tracker.lock() else { continue };
+                        let Ok(t) = self.surveillance_tracker.lock() else {
+                            continue;
+                        };
                         match kind.as_str() {
-                            "Surveillance.SpoofingScore" =>
-                                mm_risk::surveillance::SpoofingDetector::new().score(&self.symbol, &t),
-                            "Surveillance.LayeringScore" =>
-                                mm_risk::surveillance::LayeringDetector::new().score(&self.symbol, &t),
-                            _ =>
-                                mm_risk::surveillance::QuoteStuffingDetector::new().score(&self.symbol, &t),
+                            "Surveillance.SpoofingScore" => {
+                                mm_risk::surveillance::SpoofingDetector::new()
+                                    .score(&self.symbol, &t)
+                            }
+                            "Surveillance.LayeringScore" => {
+                                mm_risk::surveillance::LayeringDetector::new()
+                                    .score(&self.symbol, &t)
+                            }
+                            _ => mm_risk::surveillance::QuoteStuffingDetector::new()
+                                .score(&self.symbol, &t),
                         }
                     };
                     src.insert((*id, "value".into()), Value::Number(out.score));
@@ -4987,8 +4970,7 @@ impl MarketMakerEngine {
                     // count since we don't have node-state here.
                     // Monotone enough for the (burst, rest) gate.
                     let tick = self.tick_count;
-                    let in_burst = cycle == 0
-                        || tick % cycle < burst_ticks;
+                    let in_burst = cycle == 0 || tick % cycle < burst_ticks;
                     if !in_burst {
                         src.insert((*id, "quotes".into()), Value::Missing);
                         continue;
@@ -4997,8 +4979,8 @@ impl MarketMakerEngine {
                         .and_then(|c| c.get("basket"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("[]");
-                    let legs_cfg: Vec<serde_json::Value> = serde_json::from_str(basket_raw)
-                        .unwrap_or_default();
+                    let legs_cfg: Vec<serde_json::Value> =
+                        serde_json::from_str(basket_raw).unwrap_or_default();
                     let cross_depth = getdec("cross_depth_bps", rust_decimal_macros::dec!(30));
                     let bus = self.dashboard.as_ref().map(|d| d.data_bus());
                     let mut vqs: Vec<mm_strategy_graph::VenueQuote> = Vec::new();
@@ -5018,18 +5000,11 @@ impl MarketMakerEngine {
                             .and_then(|v| v.as_str())
                             .unwrap_or("spot");
                         let product = match product_s.to_lowercase().as_str() {
-                            "linear_perp" | "perp" => {
-                                mm_common::config::ProductType::LinearPerp
-                            }
-                            "inverse_perp" => {
-                                mm_common::config::ProductType::InversePerp
-                            }
+                            "linear_perp" | "perp" => mm_common::config::ProductType::LinearPerp,
+                            "inverse_perp" => mm_common::config::ProductType::InversePerp,
                             _ => mm_common::config::ProductType::Spot,
                         };
-                        let side_s = leg
-                            .get("side")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("buy");
+                        let side_s = leg.get("side").and_then(|v| v.as_str()).unwrap_or("buy");
                         let side = if side_s.eq_ignore_ascii_case("sell") {
                             mm_strategy_graph::QuoteSide::Sell
                         } else {
@@ -5045,9 +5020,7 @@ impl MarketMakerEngine {
                         }
                         let leg_mid = bus
                             .as_ref()
-                            .and_then(|b| {
-                                b.get_l1(&(venue.clone(), sym.clone(), product))
-                            })
+                            .and_then(|b| b.get_l1(&(venue.clone(), sym.clone(), product)))
                             .and_then(|s| s.mid)
                             .unwrap_or(rust_decimal::Decimal::ZERO);
                         if leg_mid.is_zero() {
@@ -5069,10 +5042,7 @@ impl MarketMakerEngine {
                             qty: size,
                         });
                     }
-                    src.insert(
-                        (*id, "quotes".into()),
-                        Value::VenueQuotes(vqs),
-                    );
+                    src.insert((*id, "quotes".into()), Value::VenueQuotes(vqs));
                 }
                 "Strategy.BasisArb" => {
                     let cfg = graph.node_configs().get(id);
@@ -5164,10 +5134,10 @@ impl MarketMakerEngine {
                 // Falls back to the shared `last_strategy_quotes` so
                 // legacy graphs with no pool instance keep working.
                 k if k.starts_with("Strategy.") => {
-                    let qs: Option<&Vec<mm_common::types::QuotePair>> =
-                        self.last_strategy_quotes_per_node
-                            .get(id)
-                            .or(self.last_strategy_quotes.as_ref());
+                    let qs: Option<&Vec<mm_common::types::QuotePair>> = self
+                        .last_strategy_quotes_per_node
+                        .get(id)
+                        .or(self.last_strategy_quotes.as_ref());
                     let v = match qs {
                         Some(qs) => {
                             use mm_common::types::Side;
@@ -5251,15 +5221,12 @@ impl MarketMakerEngine {
         // The evaluator is clock-free — fill timestamp, tick counter,
         // and graph hash here where the engine owns that context.
         trace.tick_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-        self.strategy_graph_tick_counter = self
-            .strategy_graph_tick_counter
-            .wrapping_add(1);
+        self.strategy_graph_tick_counter = self.strategy_graph_tick_counter.wrapping_add(1);
         trace.tick_num = self.strategy_graph_tick_counter;
         if let Some(h) = self.strategy_graph_hash.as_deref() {
             trace.graph_hash = h.to_string();
         }
-        mm_dashboard::details_store::global()
-            .push_graph_trace(&self.symbol, trace);
+        mm_dashboard::details_store::global().push_graph_trace(&self.symbol, trace);
         for a in actions {
             match a {
                 SinkAction::SpreadMult(m) => {
@@ -5268,18 +5235,19 @@ impl MarketMakerEngine {
                 SinkAction::SizeMult(m) => {
                     self.auto_tuner.set_graph_size_mult(m);
                 }
-                SinkAction::KillEscalate { level, reason, venue } => {
+                SinkAction::KillEscalate {
+                    level,
+                    reason,
+                    venue,
+                } => {
                     // GR-2 — per-venue scoped kill. When the
                     // sink's `venue` string is set and doesn't
                     // match this engine's venue, skip the kill
                     // entirely so the sibling engine on the
                     // named venue catches it instead.
                     if let Some(ref target) = venue {
-                        let own_venue = format!(
-                            "{:?}",
-                            self.config.exchange.exchange_type
-                        )
-                        .to_lowercase();
+                        let own_venue =
+                            format!("{:?}", self.config.exchange.exchange_type).to_lowercase();
                         if !target.eq_ignore_ascii_case(&own_venue) {
                             debug!(
                                 symbol = %self.symbol,
@@ -5386,8 +5354,8 @@ impl MarketMakerEngine {
                     //     registered for the target symbol.
                     use mm_common::types::{Quote, QuotePair, Side};
                     use mm_strategy_graph::QuoteSide;
-                    let self_venue = format!("{:?}", self.config.exchange.exchange_type)
-                        .to_lowercase();
+                    let self_venue =
+                        format!("{:?}", self.config.exchange.exchange_type).to_lowercase();
                     let self_product_label =
                         format!("{:?}", self.config.exchange.product).to_lowercase();
                     let (mut local_bids, mut local_asks): (Vec<Quote>, Vec<Quote>) =
@@ -5437,9 +5405,7 @@ impl MarketMakerEngine {
                                     .unwrap_or_else(|_| "[]".to_string());
                                 let ok = dash.send_config_override(
                                     sym,
-                                    mm_dashboard::state::ConfigOverride::ExternalVenueQuotes(
-                                        json,
-                                    ),
+                                    mm_dashboard::state::ConfigOverride::ExternalVenueQuotes(json),
                                 );
                                 if !ok {
                                     warn!(
@@ -5507,9 +5473,7 @@ impl MarketMakerEngine {
                                 .unwrap_or_else(|_| "[]".into());
                             let _ = dash.send_config_override(
                                 &leg.symbol,
-                                mm_dashboard::state::ConfigOverride::ExternalVenueQuotes(
-                                    payload,
-                                ),
+                                mm_dashboard::state::ConfigOverride::ExternalVenueQuotes(payload),
                             );
                         }
                     }
@@ -5518,8 +5482,8 @@ impl MarketMakerEngine {
                     // the legs targets this engine's symbol.
                     use mm_common::types::{Quote, QuotePair, Side};
                     use mm_strategy_graph::QuoteSide;
-                    let self_venue = format!("{:?}", self.config.exchange.exchange_type)
-                        .to_lowercase();
+                    let self_venue =
+                        format!("{:?}", self.config.exchange.exchange_type).to_lowercase();
                     let mut bids = Vec::new();
                     let mut asks = Vec::new();
                     for leg in &legs {
@@ -5557,8 +5521,7 @@ impl MarketMakerEngine {
                     // regulator-facing.
                     let bundle_id = format!(
                         "{}-{}-{}-{}",
-                        spec.maker.venue, spec.maker.symbol,
-                        spec.hedge.venue, spec.hedge.symbol,
+                        spec.maker.venue, spec.maker.symbol, spec.hedge.venue, spec.hedge.symbol,
                     );
                     let to_side = |s: QuoteSide| match s {
                         QuoteSide::Buy => Side::Buy,
@@ -5662,7 +5625,11 @@ impl MarketMakerEngine {
             self.symbol.clone(),
             self.config.exchange.product,
         );
-        if let Some(snap) = self.dashboard.as_ref().and_then(|d| d.data_bus().get_l2(&key)) {
+        if let Some(snap) = self
+            .dashboard
+            .as_ref()
+            .and_then(|d| d.data_bus().get_l2(&key))
+        {
             let to_levels =
                 |v: &[(rust_decimal::Decimal, rust_decimal::Decimal)]|
                  -> Vec<mm_risk::surveillance::L2Level> {
@@ -5707,12 +5674,8 @@ impl MarketMakerEngine {
                     .unwrap_or_else(|| "-".into()),
             );
             let pattern_tag = surveillance_pattern_tag(&pattern).unwrap_or("unknown");
-            self.audit.surveillance_alert(
-                &self.symbol,
-                pattern_tag,
-                out.score,
-                &extra,
-            );
+            self.audit
+                .surveillance_alert(&self.symbol, pattern_tag, out.score, &extra);
             // Sprint 4 — per-pattern alert counter, incremented
             // once per audit row so the dedupe is honoured.
             mm_dashboard::metrics::SURVEILLANCE_ALERTS_TOTAL
@@ -5725,22 +5688,18 @@ impl MarketMakerEngine {
         // can render progress bars without per-tick polling of
         // the engine. Cheap — just walks the evaluator's state
         // map for the handful of Plan nodes the operator wired.
-        if let (Some(ev), Some(dash)) =
-            (self.strategy_graph.as_ref(), self.dashboard.as_ref())
-        {
+        if let (Some(ev), Some(dash)) = (self.strategy_graph.as_ref(), self.dashboard.as_ref()) {
             let plans: Vec<mm_dashboard::state::PlanSnapshot> = ev
                 .plan_snapshots()
                 .into_iter()
-                .map(|(node_id, kind, st)| {
-                    mm_dashboard::state::PlanSnapshot {
-                        node_id: node_id.to_string(),
-                        kind,
-                        symbol: self.symbol.clone(),
-                        started_at_ms: st.started_at_ms,
-                        qty_emitted: st.qty_emitted,
-                        aborted: st.aborted,
-                        last_slice_ms: st.last_slice_ms,
-                    }
+                .map(|(node_id, kind, st)| mm_dashboard::state::PlanSnapshot {
+                    node_id: node_id.to_string(),
+                    kind,
+                    symbol: self.symbol.clone(),
+                    started_at_ms: st.started_at_ms,
+                    qty_emitted: st.qty_emitted,
+                    aborted: st.aborted,
+                    last_slice_ms: st.last_slice_ms,
                 })
                 .collect();
             dash.publish_active_plans(&self.symbol, plans);
@@ -5753,8 +5712,7 @@ impl MarketMakerEngine {
         // current book mid; `None` while the book is still
         // warming up.
         if let Some(dash) = self.dashboard.as_ref() {
-            let venue = format!("{:?}", self.config.exchange.exchange_type)
-                .to_lowercase();
+            let venue = format!("{:?}", self.config.exchange.exchange_type).to_lowercase();
             dash.publish_inventory(
                 &self.symbol,
                 &venue,
@@ -5773,10 +5731,7 @@ impl MarketMakerEngine {
     /// L2. The orchestrator (`mm-sentiment`-driven, in
     /// `server/src/main.rs`) is the canonical producer of
     /// these ticks.
-    pub fn with_social_risk(
-        mut self,
-        engine: mm_risk::social_risk::SocialRiskEngine,
-    ) -> Self {
+    pub fn with_social_risk(mut self, engine: mm_risk::social_risk::SocialRiskEngine) -> Self {
         self.social_risk = Some(engine);
         self
     }
@@ -6184,8 +6139,7 @@ impl MarketMakerEngine {
         // interval entirely; non-zero values are clamped to at
         // least 1 s so the interval is well-formed.
         let sor_extra_l1_secs = self.config.market_maker.sor_extra_l1_poll_secs;
-        let sor_extra_l1_enabled =
-            sor_extra_l1_secs > 0 && !self.connectors.extra.is_empty();
+        let sor_extra_l1_enabled = sor_extra_l1_secs > 0 && !self.connectors.extra.is_empty();
         let mut sor_extra_l1_interval =
             tokio::time::interval(tokio::time::Duration::from_secs(sor_extra_l1_secs.max(1)));
         // Skip the first immediate tick so a fresh process doesn't
@@ -6201,9 +6155,8 @@ impl MarketMakerEngine {
         // least 1 s so the interval stays well-formed.
         let venue_regime_secs = self.config.market_maker.venue_regime_classify_secs;
         let venue_regime_enabled = venue_regime_secs > 0;
-        let mut venue_regime_interval = tokio::time::interval(
-            tokio::time::Duration::from_secs(venue_regime_secs.max(1)),
-        );
+        let mut venue_regime_interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(venue_regime_secs.max(1)));
         venue_regime_interval.tick().await;
 
         self.cycle_start = Instant::now();
@@ -6454,8 +6407,12 @@ impl MarketMakerEngine {
             DriverEvent::Entered { .. } => "entered",
             DriverEvent::Exited { .. } => "exited",
             DriverEvent::TakerRejected { .. } => "taker_rejected",
-            DriverEvent::PairBreak { compensated: true, .. } => "pair_break",
-            DriverEvent::PairBreak { compensated: false, .. } => "pair_break_uncompensated",
+            DriverEvent::PairBreak {
+                compensated: true, ..
+            } => "pair_break",
+            DriverEvent::PairBreak {
+                compensated: false, ..
+            } => "pair_break_uncompensated",
             DriverEvent::Hold => "hold",
             DriverEvent::InputUnavailable { .. } => "input_unavailable",
         };
@@ -6876,10 +6833,8 @@ impl MarketMakerEngine {
                 let phantoms: Vec<_> = venue_ids.difference(&internal_ids).copied().collect();
 
                 recon_snapshot.venue_orders = venue_ids.len() as u32;
-                recon_snapshot.ghost_orders =
-                    ghosts.iter().map(|id| id.to_string()).collect();
-                recon_snapshot.phantom_orders =
-                    phantoms.iter().map(|id| id.to_string()).collect();
+                recon_snapshot.ghost_orders = ghosts.iter().map(|id| id.to_string()).collect();
+                recon_snapshot.phantom_orders = phantoms.iter().map(|id| id.to_string()).collect();
 
                 if !ghosts.is_empty() {
                     warn!(
@@ -7011,8 +6966,8 @@ impl MarketMakerEngine {
         let bought = self.inventory_manager.total_bought();
         let sold = self.inventory_manager.total_sold();
         let reported = self.inventory_manager.inventory();
-        let tolerance = self.config.market_maker.inventory_drift_tolerance
-            * rust_decimal_macros::dec!(2);
+        let tolerance =
+            self.config.market_maker.inventory_drift_tolerance * rust_decimal_macros::dec!(2);
         let delta_report =
             mm_risk::reconciliation::reconcile_position_delta(bought, sold, reported, tolerance);
         if delta_report.drifted {
@@ -7123,10 +7078,9 @@ impl MarketMakerEngine {
         // classifier's rolling std would otherwise be skewed
         // by gaps). `flush_if_due` returns the closed bar
         // without resetting the trade anchor mid-bar.
-        if let (Some(agg), Some(classifier)) = (
-            self.bvc_bar_agg.as_mut(),
-            self.bvc_classifier.as_mut(),
-        ) {
+        if let (Some(agg), Some(classifier)) =
+            (self.bvc_bar_agg.as_mut(), self.bvc_classifier.as_mut())
+        {
             let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
             if let Some((dp, vol)) = agg.flush_if_due(now_ns) {
                 if let Some((buy, sell)) = classifier.classify(dp, vol) {
@@ -7199,9 +7153,8 @@ impl MarketMakerEngine {
             //      realised delta and emit a `FundingAccrued`
             //      audit event.
             if self.config.exchange.product.has_funding() {
-                self.pnl_tracker.set_inventory_for_funding(
-                    self.inventory_manager.inventory(),
-                );
+                self.pnl_tracker
+                    .set_inventory_for_funding(self.inventory_manager.inventory());
                 if self.tick_count.is_multiple_of(30) {
                     self.refresh_funding_rate().await;
                 }
@@ -7213,9 +7166,7 @@ impl MarketMakerEngine {
                     self.audit.risk_event(
                         &self.symbol,
                         AuditEventType::FundingAccrued,
-                        &format!(
-                            "rate={rate}, mark={mid}, inventory={inv}, delta={delta}"
-                        ),
+                        &format!("rate={rate}, mark={mid}, inventory={inv}, delta={delta}"),
                     );
                     info!(
                         symbol = %self.symbol,
@@ -7313,10 +7264,7 @@ impl MarketMakerEngine {
                         self.audit.risk_event(
                             &self.symbol,
                             AuditEventType::CircuitBreakerTripped,
-                            &format!(
-                                "hedge_book_stale_during_flatten: age_ms={}",
-                                age_ms
-                            ),
+                            &format!("hedge_book_stale_during_flatten: age_ms={}", age_ms),
                         );
                         self.paired_unwind_stale_audited = true;
                     }
@@ -7434,9 +7382,7 @@ impl MarketMakerEngine {
                     let notional_dd = inv.abs() * mid;
                     let start_delay = if let Some(dash) = &self.dashboard {
                         dash.register_flatten_priority(&self.symbol, notional_dd);
-                        let rank = dash
-                            .flatten_priority_rank(&self.symbol)
-                            .unwrap_or(0);
+                        let rank = dash.flatten_priority_rank(&self.symbol).unwrap_or(0);
                         (rank as u64) * WATERFALL_STAGGER_SECS
                     } else {
                         0
@@ -7478,7 +7424,11 @@ impl MarketMakerEngine {
                         );
                         self.record_incident(
                             "critical",
-                            &format!("Kill switch L4: paired unwind {} base (delay {}s)", inv.abs(), start_delay),
+                            &format!(
+                                "Kill switch L4: paired unwind {} base (delay {}s)",
+                                inv.abs(),
+                                start_delay
+                            ),
                         );
                     } else {
                         // 22A-3 — read TwapExecutor knobs from
@@ -7487,11 +7437,7 @@ impl MarketMakerEngine {
                         // (60 s / 10 slices / 5 bps) so
                         // deployments without the section see
                         // zero behaviour change.
-                        let exec = self
-                            .config
-                            .execution
-                            .clone()
-                            .unwrap_or_default();
+                        let exec = self.config.execution.clone().unwrap_or_default();
                         self.twap = Some(
                             TwapExecutor::new(
                                 self.symbol.clone(),
@@ -7515,7 +7461,11 @@ impl MarketMakerEngine {
                         );
                         self.record_incident(
                             "critical",
-                            &format!("Kill switch L4: TWAP flatten {side:?} {} (delay {}s)", inv.abs(), start_delay),
+                            &format!(
+                                "Kill switch L4: TWAP flatten {side:?} {} (delay {}s)",
+                                inv.abs(),
+                                start_delay
+                            ),
                         );
                     }
                 }
@@ -7566,8 +7516,7 @@ impl MarketMakerEngine {
                 };
                 self.book_keeper.on_event(&event);
                 let elapsed_ms = _bk_start.elapsed().as_secs_f64() * 1000.0;
-                let venue_tag = format!("{:?}", self.config.exchange.exchange_type)
-                    .to_lowercase();
+                let venue_tag = format!("{:?}", self.config.exchange.exchange_type).to_lowercase();
                 mm_dashboard::metrics::BOOK_UPDATE_LATENCY_MS
                     .with_label_values(&[&self.symbol, &venue_tag, _bk_kind])
                     .observe(elapsed_ms);
@@ -7715,7 +7664,11 @@ impl MarketMakerEngine {
                 // public trade near our touch. The
                 // `CancelOnReactionDetector` reads this to score
                 // cancels that fire within ms of such a trade.
-                let mid = self.book_keeper.book.mid_price().unwrap_or(rust_decimal::Decimal::ZERO);
+                let mid = self
+                    .book_keeper
+                    .book
+                    .mid_price()
+                    .unwrap_or(rust_decimal::Decimal::ZERO);
                 if mid > rust_decimal::Decimal::ZERO {
                     let dist = (trade.price - mid).abs() / mid;
                     if dist <= rust_decimal_macros::dec!(0.0010) {
@@ -7741,12 +7694,8 @@ impl MarketMakerEngine {
                         self.config.exchange.product,
                     );
                     let aggressor = match trade.taker_side {
-                        mm_common::types::Side::Buy => {
-                            mm_dashboard::data_bus::TradeSide::Buy
-                        }
-                        mm_common::types::Side::Sell => {
-                            mm_dashboard::data_bus::TradeSide::Sell
-                        }
+                        mm_common::types::Side::Buy => mm_dashboard::data_bus::TradeSide::Buy,
+                        mm_common::types::Side::Sell => mm_dashboard::data_bus::TradeSide::Sell,
                     };
                     bus.publish_trade(
                         key,
@@ -7765,16 +7714,10 @@ impl MarketMakerEngine {
                 // estimator prunes stale samples internally.
                 {
                     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                    let window = self
-                        .config
-                        .market_maker
-                        .sor_trade_rate_window_secs
-                        .max(1);
+                    let window = self.config.market_maker.sor_trade_rate_window_secs.max(1);
                     self.sor_trade_rates
                         .entry(trade_venue)
-                        .or_insert_with(|| {
-                            crate::sor::trade_rate::TradeRateEstimator::new(window)
-                        })
+                        .or_insert_with(|| crate::sor::trade_rate::TradeRateEstimator::new(window))
                         .record(now_ns, trade.qty);
                 }
                 // Epic D stage-2 — two classification paths for
@@ -7790,10 +7733,9 @@ impl MarketMakerEngine {
                 //      as the default so byte-identical
                 //      behaviour holds for every deployment
                 //      that didn't opt into BVC.
-                if let (Some(agg), Some(classifier)) = (
-                    self.bvc_bar_agg.as_mut(),
-                    self.bvc_classifier.as_mut(),
-                ) {
+                if let (Some(agg), Some(classifier)) =
+                    (self.bvc_bar_agg.as_mut(), self.bvc_classifier.as_mut())
+                {
                     let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
                     if let Some((dp, vol)) = agg.push(now_ns, trade.price, trade.qty) {
                         if let Some((buy, sell)) = classifier.classify(dp, vol) {
@@ -7906,8 +7848,7 @@ impl MarketMakerEngine {
                         trade.taker_side,
                         |id| {
                             match queue_tracker.queue_pos_of(id) {
-                                Some(pos)
-                                    if pos.front_q_qty <= rust_decimal::Decimal::ZERO => {}
+                                Some(pos) if pos.front_q_qty <= rust_decimal::Decimal::ZERO => {}
                                 Some(_) => return None,
                                 None => {
                                     tracing::warn!(
@@ -7944,7 +7885,10 @@ impl MarketMakerEngine {
                             trade_price = %trade.price,
                             "[PAPER] simulated fill"
                         );
-                        self.handle_ws_event(MarketEvent::Fill { venue: trade_venue, fill });
+                        self.handle_ws_event(MarketEvent::Fill {
+                            venue: trade_venue,
+                            fill,
+                        });
                     }
                 }
             }
@@ -7997,7 +7941,11 @@ impl MarketMakerEngine {
                         self.fill_reprice_deltas_ms.pop_front();
                     }
                 }
-                let mid = self.book_keeper.book.mid_price().unwrap_or(rust_decimal::Decimal::ZERO);
+                let mid = self
+                    .book_keeper
+                    .book
+                    .mid_price()
+                    .unwrap_or(rust_decimal::Decimal::ZERO);
                 if mid > rust_decimal::Decimal::ZERO {
                     let dist = (fill.price - mid).abs() / mid;
                     if dist <= rust_decimal_macros::dec!(0.0005) {
@@ -8037,12 +7985,8 @@ impl MarketMakerEngine {
                         dec!(0)
                     } else {
                         match fill.side {
-                            mm_common::types::Side::Buy => {
-                                (mid - fill.price) / mid * dec!(10_000)
-                            }
-                            mm_common::types::Side::Sell => {
-                                (fill.price - mid) / mid * dec!(10_000)
-                            }
+                            mm_common::types::Side::Buy => (mid - fill.price) / mid * dec!(10_000),
+                            mm_common::types::Side::Sell => (fill.price - mid) / mid * dec!(10_000),
                         }
                     };
                     let fee_rate = if fill.is_maker {
@@ -8098,8 +8042,8 @@ impl MarketMakerEngine {
                     // so we read it after the update and push the
                     // delta into Protections.
                     if let Some(p) = self.protections.as_mut() {
-                        let delta = self.pnl_tracker.attribution.spread_pnl
-                            - self.var_guard_last_total_pnl;
+                        let delta =
+                            self.pnl_tracker.attribution.spread_pnl - self.var_guard_last_total_pnl;
                         if !delta.is_zero() {
                             p.record_trade_pnl(&self.symbol, delta, std::time::Instant::now());
                         }
@@ -8128,18 +8072,11 @@ impl MarketMakerEngine {
                             self.hedge_book.as_ref(),
                             self.connectors.hedge.as_ref().cloned(),
                         ) {
-                            if let (Some(hb_bid), Some(hb_ask)) = (
-                                hedge_book.book.best_bid(),
-                                hedge_book.book.best_ask(),
-                            ) {
+                            if let (Some(hb_bid), Some(hb_ask)) =
+                                (hedge_book.book.best_bid(), hedge_book.book.best_ask())
+                            {
                                 let decision = xemm
-                                    .on_maker_fill(
-                                        fill.side,
-                                        fill.qty,
-                                        fill.price,
-                                        hb_bid,
-                                        hb_ask,
-                                    );
+                                    .on_maker_fill(fill.side, fill.qty, fill.price, hb_bid, hb_ask);
                                 let symbol = self.symbol.clone();
                                 let hedge_symbol = self
                                     .config
@@ -8203,9 +8140,7 @@ impl MarketMakerEngine {
                                 .with_label_values(&[&self.symbol, side_tag])
                                 .observe(v);
                         }
-                        if let Some(d) = resolved.vs_expected_bps
-                            .and_then(|v| v.to_f64())
-                        {
+                        if let Some(d) = resolved.vs_expected_bps.and_then(|v| v.to_f64()) {
                             mm_dashboard::metrics::DECISION_VS_EXPECTED_BPS
                                 .with_label_values(&[&self.symbol, side_tag])
                                 .observe(d);
@@ -8376,12 +8311,7 @@ impl MarketMakerEngine {
     /// accrual math falls through to the last-known rate
     /// until the next successful poll.
     async fn refresh_funding_rate(&mut self) {
-        match self
-            .connectors
-            .primary
-            .get_funding_rate(&self.symbol)
-            .await
-        {
+        match self.connectors.primary.get_funding_rate(&self.symbol).await {
             Ok(rate) => {
                 self.pnl_tracker.on_funding_update(
                     rate.rate,
@@ -8396,8 +8326,7 @@ impl MarketMakerEngine {
                 // product).
                 if let Some(dash) = &self.dashboard {
                     let key = (
-                        format!("{:?}", self.config.exchange.exchange_type)
-                            .to_lowercase(),
+                        format!("{:?}", self.config.exchange.exchange_type).to_lowercase(),
                         self.symbol.clone(),
                         self.config.exchange.product,
                     );
@@ -8552,7 +8481,11 @@ impl MarketMakerEngine {
                 .map(|a| a + reach)
                 .unwrap_or(mid + reach),
         };
-        let quote = mm_common::types::Quote { side: unwind_side, price, qty: slice_qty };
+        let quote = mm_common::types::Quote {
+            side: unwind_side,
+            price,
+            qty: slice_qty,
+        };
         self.audit.risk_event(
             &self.symbol,
             mm_risk::audit::AuditEventType::KillSwitchEscalated,
@@ -8717,9 +8650,7 @@ impl MarketMakerEngine {
         // available (pre-snapshot boot).
         if !self.order_emulator.is_empty() {
             if let Some(mid) = self.book_keeper.book.mid_price() {
-                let actions = self
-                    .order_emulator
-                    .on_tick(mid, std::time::Instant::now());
+                let actions = self.order_emulator.on_tick(mid, std::time::Instant::now());
                 for action in actions {
                     self.dispatch_emulator_action(action).await;
                 }
@@ -8766,10 +8697,8 @@ impl MarketMakerEngine {
                     // reset semantics match operator intent —
                     // auto-recovery is NOT allowed until the
                     // client circuit is explicitly reset.
-                    self.kill_switch.manual_trigger(
-                        mm_risk::KillLevel::CancelAll,
-                        "per-client loss circuit",
-                    );
+                    self.kill_switch
+                        .manual_trigger(mm_risk::KillLevel::CancelAll, "per-client loss circuit");
                     self.per_client_trip_noted = true;
                 }
                 // Fall through — the kill switch will cancel
@@ -8896,11 +8825,8 @@ impl MarketMakerEngine {
             self.margin_guard.as_ref(),
             self.book_keeper.book.mid_price(),
         ) {
-            let notional_delta =
-                self.config.market_maker.order_size * mid * Decimal::from(2u64);
-            if let Some(projected) =
-                guard.projected_ratio(notional_delta, self.margin_leverage)
-            {
+            let notional_delta = self.config.market_maker.order_size * mid * Decimal::from(2u64);
+            if let Some(projected) = guard.projected_ratio(notional_delta, self.margin_leverage) {
                 if projected >= guard.thresholds().stop_ratio {
                     warn!(
                         symbol = %self.symbol,
@@ -8930,15 +8856,9 @@ impl MarketMakerEngine {
                 .reason()
                 .map(|r| format!("{:?}", r))
                 .unwrap_or_else(|| "unknown".into());
-            self.audit.risk_event(
-                &self.symbol,
-                AuditEventType::CircuitBreakerTripped,
-                &reason,
-            );
-            self.record_incident(
-                "high",
-                &format!("Circuit breaker tripped: {reason}"),
-            );
+            self.audit
+                .risk_event(&self.symbol, AuditEventType::CircuitBreakerTripped, &reason);
+            self.record_incident("high", &format!("Circuit breaker tripped: {reason}"));
         }
 
         // Soft spread gate — skip quoting for this tick when the
@@ -8976,10 +8896,8 @@ impl MarketMakerEngine {
             let dd_breach = self
                 .exposure_manager
                 .is_drawdown_breached(equity, &self.config.risk);
-            let dd_was_tripped = matches!(
-                self.circuit_breaker.reason(),
-                Some(TripReason::MaxDrawdown)
-            );
+            let dd_was_tripped =
+                matches!(self.circuit_breaker.reason(), Some(TripReason::MaxDrawdown));
             self.circuit_breaker
                 .check_condition(TripReason::MaxDrawdown, dd_breach);
             if dd_breach && !dd_was_tripped {
@@ -8988,20 +8906,15 @@ impl MarketMakerEngine {
                     AuditEventType::CircuitBreakerTripped,
                     "drawdown",
                 );
-                self.record_incident(
-                    "high",
-                    "Circuit breaker tripped: max drawdown exceeded",
-                );
+                self.record_incident("high", "Circuit breaker tripped: max drawdown exceeded");
             }
             let exp_breach = self.exposure_manager.is_exposure_breached(
                 self.inventory_manager.inventory(),
                 mid,
                 &self.config.risk,
             );
-            let exp_was_tripped = matches!(
-                self.circuit_breaker.reason(),
-                Some(TripReason::MaxExposure)
-            );
+            let exp_was_tripped =
+                matches!(self.circuit_breaker.reason(), Some(TripReason::MaxExposure));
             self.circuit_breaker
                 .check_condition(TripReason::MaxExposure, exp_breach);
             if exp_breach && !exp_was_tripped {
@@ -9010,10 +8923,7 @@ impl MarketMakerEngine {
                     AuditEventType::CircuitBreakerTripped,
                     "exposure",
                 );
-                self.record_incident(
-                    "high",
-                    "Circuit breaker tripped: max exposure exceeded",
-                );
+                self.record_incident("high", "Circuit breaker tripped: max exposure exceeded");
             }
         }
 
@@ -9379,14 +9289,15 @@ impl MarketMakerEngine {
         // the shim on `product == Spot` so a perp-product engine
         // never threads a spurious borrow_cost_bps through the
         // strategy's reservation price.
-        let borrow_cost_bps = if self.config.exchange.product == mm_common::config::ProductType::Spot {
-            self.borrow_manager
-                .as_ref()
-                .map(|bm| bm.effective_carry_bps())
-                .filter(|bps| !bps.is_zero())
-        } else {
-            None
-        };
+        let borrow_cost_bps =
+            if self.config.exchange.product == mm_common::config::ProductType::Spot {
+                self.borrow_manager
+                    .as_ref()
+                    .map(|bm| bm.effective_carry_bps())
+                    .filter(|bps| !bps.is_zero())
+            } else {
+                None
+            };
         // Cross-venue staleness reading (P1.4 stage-1). Computed
         // here so the strategy gate has a single canonical value
         // per refresh tick rather than a re-derived one.
@@ -9491,25 +9402,20 @@ impl MarketMakerEngine {
         for strat in self.strategy_pool.values() {
             strat.recalibrate_if_due(now_ms_cal);
         }
-        let cal_state = self
-            .strategy
-            .calibration_state()
-            .or_else(|| {
-                self.strategy_pool
-                    .values()
-                    .find_map(|s| s.calibration_state())
-            });
+        let cal_state = self.strategy.calibration_state().or_else(|| {
+            self.strategy_pool
+                .values()
+                .find_map(|s| s.calibration_state())
+        });
         if let (Some(cs), Some(dashboard)) = (cal_state.as_ref(), self.dashboard.as_ref()) {
-            dashboard.publish_calibration(
-                mm_dashboard::state::CalibrationSnapshot {
-                    symbol: self.symbol.clone(),
-                    strategy: cs.strategy.clone(),
-                    a: cs.a,
-                    k: cs.k,
-                    samples: cs.samples,
-                    last_recalibrated_ms: cs.last_recalibrated_ms,
-                },
-            );
+            dashboard.publish_calibration(mm_dashboard::state::CalibrationSnapshot {
+                symbol: self.symbol.clone(),
+                strategy: cs.strategy.clone(),
+                a: cs.a,
+                k: cs.k,
+                samples: cs.samples,
+                last_recalibrated_ms: cs.last_recalibrated_ms,
+            });
         }
         // Wave 1 R follow-up — mirror the calibration state to
         // Prometheus so the agent telemetry scrape surfaces it
@@ -9582,9 +9488,8 @@ impl MarketMakerEngine {
                 // when the node declared no knob overrides). Two
                 // `Strategy.Avellaneda` nodes with different γ now
                 // actually produce different quotes.
-                let mut per_node = std::collections::HashMap::with_capacity(
-                    self.strategy_pool.len(),
-                );
+                let mut per_node =
+                    std::collections::HashMap::with_capacity(self.strategy_pool.len());
                 let inv = self.inventory_manager.inventory();
                 for (node_id, strat) in &self.strategy_pool {
                     let mut node_ctx = match self.strategy_node_configs.get(node_id) {
@@ -9828,37 +9733,40 @@ impl MarketMakerEngine {
             .into_iter()
             .map(|(oid, side, price, _qty, _status)| (oid, (side, price)))
             .collect();
-        let desired_levels: std::collections::HashSet<(mm_common::types::Side, Decimal)> =
-            quotes
-                .iter()
-                .flat_map(|p| {
-                    let bid = p.bid.as_ref().map(|q| {
-                        (mm_common::types::Side::Buy, self.product.round_price(q.price))
-                    });
-                    let ask = p.ask.as_ref().map(|q| {
-                        (mm_common::types::Side::Sell, self.product.round_price(q.price))
-                    });
-                    [bid, ask].into_iter().flatten()
-                })
-                .collect();
-        let pre_book_qty: std::collections::HashMap<
-            (mm_common::types::Side, Decimal),
-            Decimal,
-        > = desired_levels
+        let desired_levels: std::collections::HashSet<(mm_common::types::Side, Decimal)> = quotes
             .iter()
-            .map(|&(side, price)| {
-                let qty = match side {
-                    mm_common::types::Side::Buy => {
-                        self.book_keeper.book.bids.get(&price).copied()
-                    }
-                    mm_common::types::Side::Sell => {
-                        self.book_keeper.book.asks.get(&price).copied()
-                    }
-                }
-                .unwrap_or(Decimal::ZERO);
-                ((side, price), qty)
+            .flat_map(|p| {
+                let bid = p.bid.as_ref().map(|q| {
+                    (
+                        mm_common::types::Side::Buy,
+                        self.product.round_price(q.price),
+                    )
+                });
+                let ask = p.ask.as_ref().map(|q| {
+                    (
+                        mm_common::types::Side::Sell,
+                        self.product.round_price(q.price),
+                    )
+                });
+                [bid, ask].into_iter().flatten()
             })
             .collect();
+        let pre_book_qty: std::collections::HashMap<(mm_common::types::Side, Decimal), Decimal> =
+            desired_levels
+                .iter()
+                .map(|&(side, price)| {
+                    let qty = match side {
+                        mm_common::types::Side::Buy => {
+                            self.book_keeper.book.bids.get(&price).copied()
+                        }
+                        mm_common::types::Side::Sell => {
+                            self.book_keeper.book.asks.get(&price).copied()
+                        }
+                    }
+                    .unwrap_or(Decimal::ZERO);
+                    ((side, price), qty)
+                })
+                .collect();
 
         let amend_epsilon = if self.config.market_maker.amend_enabled {
             self.config.market_maker.amend_max_ticks
@@ -9905,10 +9813,8 @@ impl MarketMakerEngine {
         let post_exec_ids: std::collections::HashSet<mm_common::types::OrderId> =
             self.order_manager.live_order_ids().into_iter().collect();
         if !tick_decisions.is_empty() {
-            let fresh: Vec<mm_common::types::OrderId> = post_exec_ids
-                .difference(&pre_exec_ids)
-                .copied()
-                .collect();
+            let fresh: Vec<mm_common::types::OrderId> =
+                post_exec_ids.difference(&pre_exec_ids).copied().collect();
             if !fresh.is_empty() {
                 let live_snap = self.order_manager.live_orders_snapshot();
                 for (oid, side, _price, _qty, _status) in live_snap {
@@ -9947,16 +9853,19 @@ impl MarketMakerEngine {
         for (oid, (side, price)) in &post_live {
             match pre_live.get(oid) {
                 None => {
-                    let book_qty =
-                        pre_book_qty.get(&(*side, *price)).copied().unwrap_or(Decimal::ZERO);
+                    let book_qty = pre_book_qty
+                        .get(&(*side, *price))
+                        .copied()
+                        .unwrap_or(Decimal::ZERO);
                     self.queue_tracker
                         .on_order_placed(*oid, &self.symbol, *side, *price, book_qty);
                 }
                 Some((_old_side, old_price)) if old_price != price => {
-                    let book_qty =
-                        pre_book_qty.get(&(*side, *price)).copied().unwrap_or(Decimal::ZERO);
-                    self.queue_tracker
-                        .on_order_amended(*oid, *price, book_qty);
+                    let book_qty = pre_book_qty
+                        .get(&(*side, *price))
+                        .copied()
+                        .unwrap_or(Decimal::ZERO);
+                    self.queue_tracker.on_order_amended(*oid, *price, book_qty);
                 }
                 _ => {}
             }
@@ -10085,10 +9994,14 @@ impl MarketMakerEngine {
     /// `triggered` bookkeeping), so a failed dispatch is
     /// a regrettable one-shot miss, not a runaway retry.
     async fn dispatch_emulator_action(&mut self, action: EmulatorAction) {
-        use mm_exchange_core::connector::NewOrder;
         use mm_common::types::{OrderType, TimeInForce};
+        use mm_exchange_core::connector::NewOrder;
         let new_order = match &action {
-            EmulatorAction::PlaceMarket { side, qty, emulator_id } => NewOrder {
+            EmulatorAction::PlaceMarket {
+                side,
+                qty,
+                emulator_id,
+            } => NewOrder {
                 symbol: self.symbol.clone(),
                 side: *side,
                 order_type: OrderType::Market,
@@ -10098,7 +10011,12 @@ impl MarketMakerEngine {
                 client_order_id: Some(format!("emu-{}", emulator_id)),
                 reduce_only: false,
             },
-            EmulatorAction::PlaceLimit { side, price, qty, emulator_id } => NewOrder {
+            EmulatorAction::PlaceLimit {
+                side,
+                price,
+                qty,
+                emulator_id,
+            } => NewOrder {
                 symbol: self.symbol.clone(),
                 side: *side,
                 order_type: OrderType::Limit,
@@ -10108,7 +10026,10 @@ impl MarketMakerEngine {
                 client_order_id: Some(format!("emu-{}", emulator_id)),
                 reduce_only: false,
             },
-            EmulatorAction::CancelVenue { venue_order_id, emulator_id } => {
+            EmulatorAction::CancelVenue {
+                venue_order_id,
+                emulator_id,
+            } => {
                 let parsed = match uuid::Uuid::parse_str(venue_order_id) {
                     Ok(id) => id,
                     Err(e) => {
@@ -10195,7 +10116,10 @@ impl MarketMakerEngine {
         use mm_common::types::{OrderType, TimeInForce};
         use mm_exchange_core::connector::NewOrder;
         match decision {
-            XemmDecision::RejectSlippage { reason, adverse_bps } => {
+            XemmDecision::RejectSlippage {
+                reason,
+                adverse_bps,
+            } => {
                 audit.risk_event(
                     &symbol,
                     AuditEventType::XemmHedgeRejected,
@@ -10208,8 +10132,17 @@ impl MarketMakerEngine {
                     "xemm rejected hedge on adverse slippage"
                 );
             }
-            XemmDecision::Hedge { side, qty, expected_price }
-            | XemmDecision::HedgeWithWarning { side, qty, expected_price, .. } => {
+            XemmDecision::Hedge {
+                side,
+                qty,
+                expected_price,
+            }
+            | XemmDecision::HedgeWithWarning {
+                side,
+                qty,
+                expected_price,
+                ..
+            } => {
                 let order = NewOrder {
                     symbol: hedge_symbol,
                     side,
@@ -10337,7 +10270,11 @@ impl MarketMakerEngine {
             CommonSide::Sell
         };
         let qty = slice.delta.abs();
-        let tag = if slice.reduce_only { "dca-red" } else { "dca-add" };
+        let tag = if slice.reduce_only {
+            "dca-red"
+        } else {
+            "dca-add"
+        };
         let order = NewOrder {
             symbol: self.symbol.clone(),
             side,
@@ -10855,8 +10792,7 @@ impl MarketMakerEngine {
                     .unwrap_or_else(|| "unclassified".to_string()),
                 enabled: self.config.market_maker.adaptive_enabled,
                 gamma_factor: self.adaptive_tuner.gamma_factor(),
-                last_reason: format!("{:?}", self.adaptive_tuner.last_reason())
-                    .to_lowercase(),
+                last_reason: format!("{:?}", self.adaptive_tuner.last_reason()).to_lowercase(),
             }),
             open_orders: self
                 .order_manager
@@ -10883,18 +10819,13 @@ impl MarketMakerEngine {
             active_graph: self.strategy_graph_name.as_ref().map(|name| {
                 mm_dashboard::state::ActiveGraphSnapshot {
                     name: name.clone(),
-                    hash: self
-                        .strategy_graph_hash
-                        .clone()
-                        .unwrap_or_default(),
+                    hash: self.strategy_graph_hash.clone().unwrap_or_default(),
                     scope: self
                         .strategy_graph_scope
                         .as_ref()
                         .map(|s| format!("{s:?}").to_lowercase())
                         .unwrap_or_else(|| "unknown".to_string()),
-                    deployed_at_ms: self
-                        .strategy_graph_deployed_at_ms
-                        .unwrap_or(0),
+                    deployed_at_ms: self.strategy_graph_deployed_at_ms.unwrap_or(0),
                     node_count: self.strategy_graph_node_count.unwrap_or(0),
                 }
             }),
@@ -10906,10 +10837,8 @@ impl MarketMakerEngine {
             // on_book scan and publish `None` so Prometheus +
             // dashboard honestly show "detector not running".
             manipulation_score: if self.gate_manipulation {
-                self.manipulation.on_book(
-                    &self.book_keeper.book,
-                    chrono::Utc::now(),
-                );
+                self.manipulation
+                    .on_book(&self.book_keeper.book, chrono::Utc::now());
                 let snap = self.manipulation.snapshot();
                 Some(mm_dashboard::state::ManipulationScoreSnapshot {
                     pump_dump: snap.pump_dump,
@@ -10939,20 +10868,13 @@ impl MarketMakerEngine {
                         // Saturate inflow at 1M raw token
                         // units by default — operator tunes
                         // via future config if needed.
-                        let inflow_sat =
-                            rust_decimal_macros::dec!(1_000_000);
+                        let inflow_sat = rust_decimal_macros::dec!(1_000_000);
                         (
                             s.concentration_pct,
-                            mm_risk::manipulation::inflow_score(
-                                s.inflow_total,
-                                inflow_sat,
-                            ),
+                            mm_risk::manipulation::inflow_score(s.inflow_total, inflow_sat),
                         )
                     })
-                    .unwrap_or((
-                        rust_decimal::Decimal::ZERO,
-                        rust_decimal::Decimal::ZERO,
-                    ));
+                    .unwrap_or((rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO));
                 let age = self.listing_age_guard.score(now);
                 let mcap = self
                     .mcap_proxy_guard
@@ -10992,11 +10914,7 @@ impl MarketMakerEngine {
         if let Some(spread_bps) = self.book_keeper.book.spread_bps() {
             ds.push_spread_sample(&self.symbol, now_ms, spread_bps);
         }
-        ds.push_inventory_sample(
-            &self.symbol,
-            now_ms,
-            self.inventory_manager.inventory(),
-        );
+        ds.push_inventory_sample(&self.symbol, now_ms, self.inventory_manager.inventory());
 
         // 23-P1-1 — periodic checkpoint flush (every 60 ticks;
         // with the default ~500 ms refresh cadence that's
@@ -11013,11 +10931,7 @@ impl MarketMakerEngine {
                 symbol: self.symbol.clone(),
                 inventory: self.inventory_manager.inventory(),
                 avg_entry_price: self.inventory_manager.avg_entry_price(),
-                open_order_ids: self
-                    .order_manager
-                    .live_order_ids()
-                    .into_iter()
-                    .collect(),
+                open_order_ids: self.order_manager.live_order_ids().into_iter().collect(),
                 realized_pnl: self.pnl_tracker.attribution.spread_pnl,
                 total_volume: self.pnl_tracker.attribution.total_volume,
                 total_fills: self.pnl_tracker.attribution.round_trips * 2,

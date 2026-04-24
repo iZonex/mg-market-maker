@@ -840,12 +840,7 @@ impl AuditLog {
     /// Convenience: log a refused deploy. Fires when a graph
     /// references a restricted node kind (pentest-only strategies)
     /// and the runtime was not started with the explicit opt-in.
-    pub fn strategy_graph_deploy_rejected(
-        &self,
-        graph_name: &str,
-        reason: &str,
-        operator: &str,
-    ) {
+    pub fn strategy_graph_deploy_rejected(&self, graph_name: &str, reason: &str, operator: &str) {
         let detail = format!("graph={graph_name} reason={reason} operator={operator}");
         self.log(AuditEvent {
             seq: 0,
@@ -866,12 +861,7 @@ impl AuditLog {
     /// tick. `action` is the `Debug`-form of the `SinkAction` enum
     /// variant (`Flatten { policy }` / `KillEscalate { level, reason }`),
     /// `hash` is the active graph's content hash.
-    pub fn strategy_graph_sink_fired(
-        &self,
-        symbol: &str,
-        action: &str,
-        hash: &str,
-    ) {
+    pub fn strategy_graph_sink_fired(&self, symbol: &str, action: &str, hash: &str) {
         let detail = format!("action={action} hash={hash}");
         self.log(AuditEvent {
             seq: 0,
@@ -1168,8 +1158,8 @@ pub fn verify_chain(path: &Path) -> std::result::Result<ChainVerifyReport, Chain
         if line.trim().is_empty() {
             continue;
         }
-        let event: AuditEvent = serde_json::from_str(line)
-            .map_err(|_| ChainVerifyError::MalformedRow(row))?;
+        let event: AuditEvent =
+            serde_json::from_str(line).map_err(|_| ChainVerifyError::MalformedRow(row))?;
         if event.prev_hash != prev_hash {
             return Err(ChainVerifyError::ChainBroken {
                 row,
@@ -1294,7 +1284,10 @@ mod chain_verify_tests {
                 "pentest-spoof",
                 "abc123",
                 "operator-1",
-                &["Strategy.SpoofMaker".to_string(), "Strategy.WashTrader".to_string()],
+                &[
+                    "Strategy.SpoofMaker".to_string(),
+                    "Strategy.WashTrader".to_string(),
+                ],
             );
             drop(log);
         }

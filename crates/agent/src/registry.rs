@@ -158,9 +158,7 @@ fn read_gauge_by_symbol(metric_name: &str) -> HashMap<String, f64> {
 /// pair (funding-arb transitions). Returns a map keyed by
 /// `symbol → outcome → count`. Empty when the metric family
 /// hasn't been emitted yet.
-fn read_counter_by_symbol_outcome(
-    metric_name: &str,
-) -> HashMap<String, HashMap<String, u64>> {
+fn read_counter_by_symbol_outcome(metric_name: &str) -> HashMap<String, HashMap<String, u64>> {
     let mut out: HashMap<String, HashMap<String, u64>> = HashMap::new();
     for family in prometheus::gather() {
         if family.get_name() != metric_name {
@@ -176,7 +174,9 @@ fn read_counter_by_symbol_outcome(
                     _ => {}
                 }
             }
-            let (Some(sym), Some(out_label)) = (symbol, outcome) else { continue };
+            let (Some(sym), Some(out_label)) = (symbol, outcome) else {
+                continue;
+            };
             let value = metric.get_counter().get_value();
             if !value.is_finite() || value < 0.0 {
                 continue;
@@ -234,8 +234,12 @@ fn dashboard_field<F>(
 where
     F: Fn(&mm_dashboard::state::SymbolState) -> Option<rust_decimal::Decimal>,
 {
-    let Some(dash) = dashboard.as_ref() else { return String::new() };
-    let Some(state) = dash.get_symbol(symbol) else { return String::new() };
+    let Some(dash) = dashboard.as_ref() else {
+        return String::new();
+    };
+    let Some(state) = dash.get_symbol(symbol) else {
+        return String::new();
+    };
     match f(&state) {
         Some(v) if v == rust_decimal::Decimal::ZERO => String::new(),
         Some(v) => v.to_string(),
@@ -301,10 +305,7 @@ fn compose_multi_key_override(
         return Some(ConfigOverride::ManualKillSwitch { level, reason });
     }
     if let Some(reset_v) = patch.get("kill_reset_reason") {
-        let reason = reset_v
-            .as_str()
-            .unwrap_or("dashboard operator")
-            .to_string();
+        let reason = reset_v.as_str().unwrap_or("dashboard operator").to_string();
         return Some(ConfigOverride::ManualKillSwitchReset { reason });
     }
     None
@@ -332,11 +333,7 @@ fn translate_variable_override(
             Decimal::from_str(s).ok()
         } else if let Some(f) = value.as_f64() {
             Decimal::try_from(f).ok()
-        } else if let Some(i) = value.as_i64() {
-            Some(Decimal::from(i))
-        } else {
-            None
-        }
+        } else { value.as_i64().map(Decimal::from) }
     };
     let as_bool = || value.as_bool();
     let as_usize = || value.as_u64().map(|v| v as usize);
@@ -366,9 +363,7 @@ fn translate_variable_override(
         "emulator_spec" => value
             .as_str()
             .map(|s| ConfigOverride::RegisterEmulatedOrder(s.to_string())),
-        "emulator_cancel_id" => value
-            .as_u64()
-            .map(ConfigOverride::CancelEmulatedOrder),
+        "emulator_cancel_id" => value.as_u64().map(ConfigOverride::CancelEmulatedOrder),
         "dca_spec" => value
             .as_str()
             .map(|s| ConfigOverride::StartDcaReduction(s.to_string())),
@@ -379,9 +374,7 @@ fn translate_variable_override(
         "strategy_graph" => value
             .as_str()
             .map(|s| ConfigOverride::StrategyGraphSwap(s.to_string())),
-        "news" => value
-            .as_str()
-            .map(|s| ConfigOverride::News(s.to_string())),
+        "news" => value.as_str().map(|s| ConfigOverride::News(s.to_string())),
         _ => None,
     }
 }
@@ -391,7 +384,12 @@ fn feature_flags_from_variables(
 ) -> std::collections::BTreeMap<String, bool> {
     let mut out = std::collections::BTreeMap::new();
     for (k, v) in vars {
-        if !(k.ends_with("_enabled") || k.ends_with("_on") || k == "momentum_ofi" || k == "bvc_classifier" || k == "sor_inline") {
+        if !(k.ends_with("_enabled")
+            || k.ends_with("_on")
+            || k == "momentum_ofi"
+            || k == "bvc_classifier"
+            || k == "sor_inline")
+        {
             continue;
         }
         if let Some(b) = v.as_bool() {
@@ -425,10 +423,7 @@ impl StrategyRegistry {
     /// telemetry can pull operator-visible fields (mid, spread,
     /// toxicity signals, SLA) from the `SymbolState` the engine
     /// populates every refresh cycle.
-    pub fn with_dashboard(
-        mut self,
-        dashboard: mm_dashboard::state::DashboardState,
-    ) -> Self {
+    pub fn with_dashboard(mut self, dashboard: mm_dashboard::state::DashboardState) -> Self {
         self.dashboard = Some(dashboard);
         self
     }
@@ -570,8 +565,7 @@ impl StrategyRegistry {
         // forwards.
         let sor_fill_by_symbol = read_gauge_by_symbol("mm_sor_dispatch_filled_qty");
         let sor_success_by_symbol = read_counter_by_symbol("mm_sor_dispatch_success_total");
-        let bundles_inflight_by_symbol =
-            read_gauge_by_symbol("mm_atomic_bundles_inflight");
+        let bundles_inflight_by_symbol = read_gauge_by_symbol("mm_atomic_bundles_inflight");
         let bundles_completed_by_symbol =
             read_counter_by_symbol("mm_atomic_bundles_completed_total");
         // Wave 1 R follow-up — engine-side gauge emission now
@@ -584,9 +578,8 @@ impl StrategyRegistry {
         let manip_thin_by_symbol = read_gauge_by_symbol("mm_manipulation_thin_book");
         let manip_combined_by_symbol = read_gauge_by_symbol("mm_manipulation_combined");
         let funding_active_by_symbol = read_gauge_by_symbol("mm_funding_arb_active");
-        let funding_transitions = read_counter_by_symbol_outcome(
-            "mm_funding_arb_transitions_total",
-        );
+        let funding_transitions =
+            read_counter_by_symbol_outcome("mm_funding_arb_transitions_total");
         self.running
             .iter()
             .map(|(id, r)| DeploymentStateRow {
@@ -654,10 +647,7 @@ impl StrategyRegistry {
                     .get(&r.symbol)
                     .map(|v| regime_label(*v as i32))
                     .unwrap_or_default(),
-                kill_level: kill_by_symbol
-                    .get(&r.symbol)
-                    .map(|v| *v as u8)
-                    .unwrap_or(0),
+                kill_level: kill_by_symbol.get(&r.symbol).map(|v| *v as u8).unwrap_or(0),
                 adaptive_gamma: read_gauge_by_symbol("mm_adaptive_gamma")
                     .get(&r.symbol)
                     .map(|v| format_gauge(*v))
@@ -674,10 +664,7 @@ impl StrategyRegistry {
                     .get(&r.symbol)
                     .map(|v| format_gauge(*v))
                     .unwrap_or_default(),
-                sor_dispatch_success: sor_success_by_symbol
-                    .get(&r.symbol)
-                    .copied()
-                    .unwrap_or(0),
+                sor_dispatch_success: sor_success_by_symbol.get(&r.symbol).copied().unwrap_or(0),
                 atomic_bundles_inflight: bundles_inflight_by_symbol
                     .get(&r.symbol)
                     .map(|v| *v as u32)
@@ -749,22 +736,12 @@ impl StrategyRegistry {
                 // already writes a full SymbolState each tick;
                 // we forward the fields the Overview / Admin
                 // panels need.
-                mid_price: dashboard_field(&self.dashboard, &r.symbol, |s| {
-                    Some(s.mid_price)
-                }),
-                spread_bps: dashboard_field(&self.dashboard, &r.symbol, |s| {
-                    Some(s.spread_bps)
-                }),
-                volatility: dashboard_field(&self.dashboard, &r.symbol, |s| {
-                    Some(s.volatility)
-                }),
+                mid_price: dashboard_field(&self.dashboard, &r.symbol, |s| Some(s.mid_price)),
+                spread_bps: dashboard_field(&self.dashboard, &r.symbol, |s| Some(s.spread_bps)),
+                volatility: dashboard_field(&self.dashboard, &r.symbol, |s| Some(s.volatility)),
                 vpin: dashboard_field(&self.dashboard, &r.symbol, |s| Some(s.vpin)),
-                kyle_lambda: dashboard_field(&self.dashboard, &r.symbol, |s| {
-                    Some(s.kyle_lambda)
-                }),
-                adverse_bps: dashboard_field(&self.dashboard, &r.symbol, |s| {
-                    Some(s.adverse_bps)
-                }),
+                kyle_lambda: dashboard_field(&self.dashboard, &r.symbol, |s| Some(s.kyle_lambda)),
+                adverse_bps: dashboard_field(&self.dashboard, &r.symbol, |s| Some(s.adverse_bps)),
                 sla_uptime_pct: dashboard_field(&self.dashboard, &r.symbol, |s| {
                     Some(s.sla_uptime_pct)
                 }),
@@ -800,23 +777,35 @@ impl StrategyRegistry {
                     .dashboard
                     .as_ref()
                     .and_then(|d| d.get_symbol(&r.symbol))
-                    .map(|s| s.minutes_with_data_24h as u32)
+                    .map(|s| s.minutes_with_data_24h)
                     .unwrap_or(0),
                 market_impact: self
                     .dashboard
                     .as_ref()
                     .and_then(|d| d.get_symbol(&r.symbol))
-                    .and_then(|s| s.market_impact.as_ref().and_then(|mi| serde_json::to_value(mi).ok())),
+                    .and_then(|s| {
+                        s.market_impact
+                            .as_ref()
+                            .and_then(|mi| serde_json::to_value(mi).ok())
+                    }),
                 performance: self
                     .dashboard
                     .as_ref()
                     .and_then(|d| d.get_symbol(&r.symbol))
-                    .and_then(|s| s.performance.as_ref().and_then(|p| serde_json::to_value(p).ok())),
+                    .and_then(|s| {
+                        s.performance
+                            .as_ref()
+                            .and_then(|p| serde_json::to_value(p).ok())
+                    }),
                 active_graph: self
                     .dashboard
                     .as_ref()
                     .and_then(|d| d.get_symbol(&r.symbol))
-                    .and_then(|s| s.active_graph.as_ref().and_then(|g| serde_json::to_value(g).ok())),
+                    .and_then(|s| {
+                        s.active_graph
+                            .as_ref()
+                            .and_then(|g| serde_json::to_value(g).ok())
+                    }),
             })
             .collect()
     }
@@ -1003,7 +992,8 @@ mod tests {
     async fn snapshot_rows_reflects_running_set() {
         let (tx, _rx) = watch::channel(0u64);
         let mut reg = StrategyRegistry::new(Arc::new(MockEngineFactory::new(tx)));
-        reg.reconcile(&[desc("a", "BTCUSDT"), desc("b", "ETHUSDT")]).await;
+        reg.reconcile(&[desc("a", "BTCUSDT"), desc("b", "ETHUSDT")])
+            .await;
         let rows = reg.snapshot_rows();
         assert_eq!(rows.len(), 2);
         let mut ids: Vec<_> = rows.iter().map(|r| r.deployment_id.clone()).collect();
@@ -1054,7 +1044,10 @@ mod tests {
 
         // Snapshot-level merge happened.
         let row = &reg.snapshot_rows()[0];
-        assert_eq!(row.variables.get("gamma").unwrap(), &serde_json::json!("0.015"));
+        assert_eq!(
+            row.variables.get("gamma").unwrap(),
+            &serde_json::json!("0.015")
+        );
         // Two recognised keys → two ConfigOverride messages.
         let first = override_rx.try_recv().expect("first override");
         let second = override_rx.try_recv().expect("second override");
@@ -1076,7 +1069,10 @@ mod tests {
         patch.insert("gamma".into(), serde_json::json!("0.05"));
         assert!(reg.patch_variables("d", &patch));
         let row = &reg.snapshot_rows()[0];
-        assert_eq!(row.variables.get("gamma").unwrap(), &serde_json::json!("0.05"));
+        assert_eq!(
+            row.variables.get("gamma").unwrap(),
+            &serde_json::json!("0.05")
+        );
     }
 
     #[tokio::test]

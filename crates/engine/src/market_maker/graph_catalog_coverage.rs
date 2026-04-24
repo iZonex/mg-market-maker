@@ -1,8 +1,8 @@
-    /// Kinds that are **intentionally** not matched by a
-    /// `"Kind" =>` arm in `tick_strategy_graph`. Each entry
-    /// needs a one-line rationale so a future reader knows
-    /// whether the skip is valid.
-    const EXEMPT: &[(&str, &str)] = &[
+/// Kinds that are **intentionally** not matched by a
+/// `"Kind" =>` arm in `tick_strategy_graph`. Each entry
+/// needs a one-line rationale so a future reader knows
+/// whether the skip is valid.
+const EXEMPT: &[(&str, &str)] = &[
         // ── Pure graph-internal nodes: evaluate from inputs,
         //    no engine state required. No arm by design.
         ("Math.Add", "math op — evaluated by graph"),
@@ -76,68 +76,67 @@
         ("Out.AtomicBundle", "sink — SinkAction::AtomicBundle"),
     ];
 
-    #[test]
-    fn every_catalog_kind_is_wired_or_explicitly_exempt() {
-        let engine_src: &str = include_str!("../market_maker.rs");
-        let exempt: std::collections::HashSet<&str> =
-            EXEMPT.iter().map(|(k, _)| *k).collect();
+#[test]
+fn every_catalog_kind_is_wired_or_explicitly_exempt() {
+    let engine_src: &str = include_str!("../market_maker.rs");
+    let exempt: std::collections::HashSet<&str> = EXEMPT.iter().map(|(k, _)| *k).collect();
 
-        let mut missing: Vec<String> = Vec::new();
-        for (kind, shape) in mm_strategy_graph::catalog::kinds() {
-            if exempt.contains(kind) {
-                continue;
-            }
-            // Nodes that declare input ports compute their
-            // output from those inputs via `evaluate()` — the
-            // engine doesn't need a source-overlay arm for
-            // them (Risk.ToxicityWiden / Risk.InventoryUrgency
-            // / Risk.CircuitBreaker are the canonical case).
-            if !shape.inputs.is_empty() {
-                continue;
-            }
-            // Source overlay patterns the engine uses:
-            //   `"Kind" =>`                (solo arm)
-            //   `"Kind" | "OtherKind" =>`  (compound arm, left)
-            //   `| "Kind" =>`              (compound arm, right)
-            //   `| "Kind" |`               (compound arm, middle)
-            // Any of them counts as "wired".
-            let solo = format!("\"{kind}\" =>");
-            let left = format!("\"{kind}\" |");
-            let right = format!("| \"{kind}\" =>");
-            let mid = format!("| \"{kind}\" |");
-            let wired = engine_src.contains(&solo)
-                || engine_src.contains(&left)
-                || engine_src.contains(&right)
-                || engine_src.contains(&mid);
-            if !wired {
-                missing.push(kind.to_string());
-            }
+    let mut missing: Vec<String> = Vec::new();
+    for (kind, shape) in mm_strategy_graph::catalog::kinds() {
+        if exempt.contains(kind) {
+            continue;
         }
+        // Nodes that declare input ports compute their
+        // output from those inputs via `evaluate()` — the
+        // engine doesn't need a source-overlay arm for
+        // them (Risk.ToxicityWiden / Risk.InventoryUrgency
+        // / Risk.CircuitBreaker are the canonical case).
+        if !shape.inputs.is_empty() {
+            continue;
+        }
+        // Source overlay patterns the engine uses:
+        //   `"Kind" =>`                (solo arm)
+        //   `"Kind" | "OtherKind" =>`  (compound arm, left)
+        //   `| "Kind" =>`              (compound arm, right)
+        //   `| "Kind" |`               (compound arm, middle)
+        // Any of them counts as "wired".
+        let solo = format!("\"{kind}\" =>");
+        let left = format!("\"{kind}\" |");
+        let right = format!("| \"{kind}\" =>");
+        let mid = format!("| \"{kind}\" |");
+        let wired = engine_src.contains(&solo)
+            || engine_src.contains(&left)
+            || engine_src.contains(&right)
+            || engine_src.contains(&mid);
+        if !wired {
+            missing.push(kind.to_string());
+        }
+    }
 
-        assert!(
-            missing.is_empty(),
-            "catalog kinds with no engine arm (and no exemption): {missing:?}. \
+    assert!(
+        missing.is_empty(),
+        "catalog kinds with no engine arm (and no exemption): {missing:?}. \
              Either add a match arm in `tick_strategy_graph` or document the \
              skip in `graph_catalog_coverage::EXEMPT` with a one-line reason."
-        );
-    }
+    );
+}
 
-    /// Companion guard — any EXEMPT entry that doesn't
-    /// match a current catalog kind is probably a rename
-    /// drift. Fail so the next audit notices.
-    #[test]
-    fn every_exempt_kind_still_exists_in_catalog() {
-        let live: std::collections::HashSet<&str> = mm_strategy_graph::catalog::kinds()
-            .iter()
-            .map(|(k, _)| *k)
-            .collect();
-        let stale: Vec<&&str> = EXEMPT
-            .iter()
-            .map(|(k, _)| k)
-            .filter(|k| !live.contains(*k))
-            .collect();
-        assert!(
-            stale.is_empty(),
-            "EXEMPT entries whose catalog kind no longer exists: {stale:?}"
-        );
-    }
+/// Companion guard — any EXEMPT entry that doesn't
+/// match a current catalog kind is probably a rename
+/// drift. Fail so the next audit notices.
+#[test]
+fn every_exempt_kind_still_exists_in_catalog() {
+    let live: std::collections::HashSet<&str> = mm_strategy_graph::catalog::kinds()
+        .iter()
+        .map(|(k, _)| *k)
+        .collect();
+    let stale: Vec<&&str> = EXEMPT
+        .iter()
+        .map(|(k, _)| k)
+        .filter(|k| !live.contains(*k))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "EXEMPT entries whose catalog kind no longer exists: {stale:?}"
+    );
+}

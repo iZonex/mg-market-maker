@@ -67,7 +67,10 @@ pub enum LeaseState {
     Expired(LeaderLease),
     /// Controller explicitly revoked our authority. Same effect as
     /// `Expired` but labelled separately for audit clarity.
-    Revoked { previous: LeaderLease, reason: String },
+    Revoked {
+        previous: LeaderLease,
+        reason: String,
+    },
 }
 
 impl LeaseState {

@@ -110,8 +110,8 @@ impl SignedEnvelope {
         envelope: Envelope,
         key: &crate::identity::IdentityKey,
     ) -> Result<Self, VerifyError> {
-        let bytes = serde_json::to_vec(&envelope)
-            .map_err(|e| VerifyError::Encoding(e.to_string()))?;
+        let bytes =
+            serde_json::to_vec(&envelope).map_err(|e| VerifyError::Encoding(e.to_string()))?;
         let sig = key.sign(&bytes);
         Ok(Self {
             envelope,
@@ -127,9 +127,10 @@ impl SignedEnvelope {
         if self.signature.is_empty() {
             return Err(VerifyError::Unsigned);
         }
-        let bytes = serde_json::to_vec(&self.envelope)
-            .map_err(|e| VerifyError::Encoding(e.to_string()))?;
-        peer.verify(&bytes, &self.signature).map_err(|_| VerifyError::BadSignature)
+        let bytes =
+            serde_json::to_vec(&self.envelope).map_err(|e| VerifyError::Encoding(e.to_string()))?;
+        peer.verify(&bytes, &self.signature)
+            .map_err(|_| VerifyError::BadSignature)
     }
 
     /// Compatibility wrapper — when `peer` is `None`, the path
@@ -186,7 +187,7 @@ mod sig_hex {
     }
 
     fn hex_decode(s: &str) -> Result<Vec<u8>, &'static str> {
-        if s.len() % 2 != 0 {
+        if !s.len().is_multiple_of(2) {
             return Err("odd-length hex");
         }
         let mut out = Vec::with_capacity(s.len() / 2);
@@ -225,10 +226,7 @@ mod tests {
 
     #[test]
     fn telemetry_envelope_sets_direction() {
-        let e = Envelope::telemetry(
-            Seq(1),
-            TelemetryPayload::Heartbeat { agent_clock_ms: 0 },
-        );
+        let e = Envelope::telemetry(Seq(1), TelemetryPayload::Heartbeat { agent_clock_ms: 0 });
         assert!(matches!(e.kind, EnvelopeKind::Telemetry));
         assert!(e.telemetry.is_some());
         assert!(e.command.is_none());

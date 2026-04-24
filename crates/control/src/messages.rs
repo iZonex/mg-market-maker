@@ -84,7 +84,10 @@ impl DesiredStrategy {
     /// each referenced ID exists + is authorised for the target
     /// agent.
     pub fn credential_ids(&self) -> impl Iterator<Item = &str> {
-        self.credentials.iter().map(|s| s.as_str()).filter(|s| !s.is_empty())
+        self.credentials
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|s| !s.is_empty())
     }
 }
 
@@ -271,7 +274,6 @@ pub struct DeploymentStateRow {
     // All fields are optional — older agents that don't
     // populate them simply leave them as None / empty, the
     // dashboard renders "—".
-
     /// Which template the agent spawned this deployment from.
     /// Useful for the drilldown header.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -332,7 +334,6 @@ pub struct DeploymentStateRow {
     // a pulse per topic without pushing full arrays every tick.
     // Detailed per-decision / per-bundle arrays stay on an
     // on-demand endpoint (follow-up work).
-
     /// Last SOR dispatch's filled quantity (gauge
     /// `mm_sor_dispatch_filled_qty`). Empty when this deployment
     /// never dispatched a route.
@@ -406,7 +407,6 @@ pub struct DeploymentStateRow {
     // All decimal-strings so the controller re-serialises
     // without f64 rounding. Empty string = "no sample yet"
     // (distinct from literal 0).
-
     /// Current mid price (bid+ask)/2. Empty while the book is
     /// warming up.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -445,7 +445,6 @@ pub struct DeploymentStateRow {
     // ── Richer structures carried opaquely (engine's
     // SymbolState substructures that the dashboard consumes
     // as-is). Zero-cost when absent: serde skips the field.
-
     /// Live open-order snapshot list. Shape matches
     /// `mm_dashboard::state::OrderSnapshot` — carried as opaque
     /// JSON so the control crate stays dashboard-type-free.
@@ -546,8 +545,14 @@ mod tests {
         let mut vars = serde_json::Map::new();
         vars.insert("gamma".into(), serde_json::json!("0.12"));
         vars.insert("spread_bps".into(), serde_json::json!("4"));
-        vars.insert("primary_credential".into(), serde_json::json!("binance_spot_main"));
-        vars.insert("hedge_credential".into(), serde_json::json!("bybit_perp_hedge"));
+        vars.insert(
+            "primary_credential".into(),
+            serde_json::json!("binance_spot_main"),
+        );
+        vars.insert(
+            "hedge_credential".into(),
+            serde_json::json!("bybit_perp_hedge"),
+        );
         let d = DesiredStrategy {
             deployment_id: "dep-xex".into(),
             template: "cross-exchange-basic".into(),
@@ -558,7 +563,10 @@ mod tests {
         };
         let json = serde_json::to_string(&d).unwrap();
         let back: DesiredStrategy = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.credentials, vec!["binance_spot_main", "bybit_perp_hedge"]);
+        assert_eq!(
+            back.credentials,
+            vec!["binance_spot_main", "bybit_perp_hedge"]
+        );
         assert_eq!(
             back.variables.get("primary_credential"),
             Some(&serde_json::json!("binance_spot_main"))

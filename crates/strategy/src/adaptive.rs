@@ -192,13 +192,7 @@ impl AdaptiveTuner {
     /// `handle_ws_event(Fill)`. `edge_bps` is realised spread
     /// capture in bps (positive = we earned edge), `fee_bps` is
     /// the fee charged on this fill (always non-negative).
-    pub fn on_fill(
-        &mut self,
-        price: Decimal,
-        qty: Decimal,
-        edge_bps: Decimal,
-        fee_bps: Decimal,
-    ) {
+    pub fn on_fill(&mut self, price: Decimal, qty: Decimal, edge_bps: Decimal, fee_bps: Decimal) {
         if !self.enabled {
             return;
         }
@@ -275,14 +269,14 @@ impl AdaptiveTuner {
 
     fn compute_target(&self) -> (Decimal, AdjustmentReason) {
         // Use the most recent ≤window_buckets of buckets.
-        let (total_fills, net_edge, adverse_avg, adverse_count) = self.buckets.iter().fold(
-            (0u32, dec!(0), dec!(0), 0u32),
-            |(f, e, aa, ac), b| {
-                let new_ac = ac + b.adverse_bps_count;
-                let new_aa = aa + b.adverse_bps_sum;
-                (f + b.fills, e + b.net_edge(), new_aa, new_ac)
-            },
-        );
+        let (total_fills, net_edge, adverse_avg, adverse_count) =
+            self.buckets
+                .iter()
+                .fold((0u32, dec!(0), dec!(0), 0u32), |(f, e, aa, ac), b| {
+                    let new_ac = ac + b.adverse_bps_count;
+                    let new_aa = aa + b.adverse_bps_sum;
+                    (f + b.fills, e + b.net_edge(), new_aa, new_ac)
+                });
         let n = Decimal::from(self.buckets.len().max(1) as u32);
         let fills_per_min = Decimal::from(total_fills) / n;
         let adverse_avg = if adverse_count == 0 {
@@ -465,7 +459,11 @@ mod tests {
         }
         let advanced = start + Duration::from_secs(2);
         t.tick(advanced);
-        assert!(t.gamma_factor() > dec!(1), "expected widening, got {}", t.gamma_factor());
+        assert!(
+            t.gamma_factor() > dec!(1),
+            "expected widening, got {}",
+            t.gamma_factor()
+        );
     }
 
     #[test]
@@ -503,7 +501,11 @@ mod tests {
             let tick_at = start + Duration::from_secs((i + 1) as u64 * 2);
             t.tick(tick_at);
         }
-        assert!(t.gamma_factor() < dec!(1), "expected tightening, got {}", t.gamma_factor());
+        assert!(
+            t.gamma_factor() < dec!(1),
+            "expected tightening, got {}",
+            t.gamma_factor()
+        );
     }
 
     #[test]

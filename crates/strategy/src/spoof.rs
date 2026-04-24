@@ -83,7 +83,10 @@ impl SpoofStrategy {
         Self::default()
     }
     pub fn with_config(config: SpoofConfig) -> Self {
-        Self { config, tick: AtomicU64::new(0) }
+        Self {
+            config,
+            tick: AtomicU64::new(0),
+        }
     }
 }
 
@@ -104,8 +107,12 @@ impl Strategy for SpoofStrategy {
         let tick_n = self.tick.fetch_add(1, Ordering::Relaxed);
         let show_pressure = tick_n.is_multiple_of(2);
 
-        let pressure_qty = ctx.product.round_qty(base_size * self.config.pressure_size_mult);
-        let real_qty = ctx.product.round_qty(base_size * self.config.real_size_mult);
+        let pressure_qty = ctx
+            .product
+            .round_qty(base_size * self.config.pressure_size_mult);
+        let real_qty = ctx
+            .product
+            .round_qty(base_size * self.config.real_size_mult);
 
         let mut pairs: Vec<QuotePair> = Vec::with_capacity(2);
 
@@ -120,17 +127,21 @@ impl Strategy for SpoofStrategy {
             Side::Sell => ctx.product.round_price(mid + real_px_shift),
             Side::Buy => ctx.product.round_price(mid - real_px_shift),
         };
-        if real_px > Decimal::ZERO
-            && ctx.product.meets_min_notional(real_px, real_qty)
-        {
+        if real_px > Decimal::ZERO && ctx.product.meets_min_notional(real_px, real_qty) {
             let real = Quote {
                 side: real_side,
                 price: real_px,
                 qty: real_qty,
             };
             pairs.push(match real_side {
-                Side::Buy => QuotePair { bid: Some(real), ask: None },
-                Side::Sell => QuotePair { bid: None, ask: Some(real) },
+                Side::Buy => QuotePair {
+                    bid: Some(real),
+                    ask: None,
+                },
+                Side::Sell => QuotePair {
+                    bid: None,
+                    ask: Some(real),
+                },
             });
         }
 
@@ -150,8 +161,14 @@ impl Strategy for SpoofStrategy {
                     qty: pressure_qty,
                 };
                 pairs.push(match self.config.pressure_side {
-                    Side::Buy => QuotePair { bid: Some(pressure), ask: None },
-                    Side::Sell => QuotePair { bid: None, ask: Some(pressure) },
+                    Side::Buy => QuotePair {
+                        bid: Some(pressure),
+                        ask: None,
+                    },
+                    Side::Sell => QuotePair {
+                        bid: None,
+                        ask: Some(pressure),
+                    },
                 });
             }
         }
@@ -185,16 +202,26 @@ mod tests {
         // canonical shape so the StrategyContext compiles, then
         // only order_size is load-bearing for the assertions.
         MarketMakerConfig {
-            gamma: dec!(0.1), kappa: dec!(1.5), sigma: dec!(0.02),
-            time_horizon_secs: 300, num_levels: 1,
-            order_size: dec!(0.01), refresh_interval_ms: 500,
-            min_spread_bps: dec!(5), max_distance_bps: dec!(500),
+            gamma: dec!(0.1),
+            kappa: dec!(1.5),
+            sigma: dec!(0.02),
+            time_horizon_secs: 300,
+            num_levels: 1,
+            order_size: dec!(0.01),
+            refresh_interval_ms: 500,
+            min_spread_bps: dec!(5),
+            max_distance_bps: dec!(500),
             strategy: mm_common::config::StrategyType::Grid,
-            momentum_enabled: false, momentum_window: 200,
-            basis_shift: dec!(0.5), market_resilience_enabled: false,
-            otr_enabled: false, hma_enabled: false,
-            adaptive_enabled: false, apply_pair_class_template: false,
-            hma_window: 9, momentum_ofi_enabled: false,
+            momentum_enabled: false,
+            momentum_window: 200,
+            basis_shift: dec!(0.5),
+            market_resilience_enabled: false,
+            otr_enabled: false,
+            hma_enabled: false,
+            adaptive_enabled: false,
+            apply_pair_class_template: false,
+            hma_window: 9,
+            momentum_ofi_enabled: false,
             momentum_learned_microprice_path: None,
             momentum_learned_microprice_pair_paths: std::collections::HashMap::new(),
             momentum_learned_microprice_online: false,
@@ -202,26 +229,39 @@ mod tests {
             user_stream_enabled: false,
             inventory_drift_tolerance: dec!(0.0001),
             inventory_drift_auto_correct: false,
-            amend_enabled: false, amend_max_ticks: 2,
+            amend_enabled: false,
+            amend_max_ticks: 2,
             margin_reduce_slice_pct: rust_decimal_macros::dec!(0.1),
-            fee_tier_refresh_enabled: false, fee_tier_refresh_secs: 600,
-            borrow_enabled: false, borrow_rate_refresh_secs: 1800,
-            borrow_holding_secs: 3600, borrow_max_base: dec!(0),
+            fee_tier_refresh_enabled: false,
+            fee_tier_refresh_secs: 600,
+            borrow_enabled: false,
+            borrow_rate_refresh_secs: 1800,
+            borrow_holding_secs: 3600,
+            borrow_max_base: dec!(0),
             borrow_buffer_base: dec!(0),
-            pair_lifecycle_enabled: false, pair_lifecycle_refresh_secs: 300,
-            var_guard_enabled: false, var_guard_limit_95: None,
-            var_guard_limit_99: None, var_guard_ewma_lambda: None,
-            var_guard_cvar_limit_95: None, var_guard_cvar_limit_99: None,
+            pair_lifecycle_enabled: false,
+            pair_lifecycle_refresh_secs: 300,
+            var_guard_enabled: false,
+            var_guard_limit_95: None,
+            var_guard_limit_99: None,
+            var_guard_ewma_lambda: None,
+            var_guard_cvar_limit_95: None,
+            var_guard_cvar_limit_99: None,
             cross_venue_basis_max_staleness_ms: 1500,
             strategy_capital_budget: std::collections::HashMap::new(),
             symbol_circulating_supply: std::collections::HashMap::new(),
             cross_exchange_min_profit_bps: dec!(5),
             max_cross_venue_divergence_pct: None,
-            sor_inline_enabled: false, sor_dispatch_interval_secs: 5,
+            sor_inline_enabled: false,
+            sor_dispatch_interval_secs: 5,
             sor_urgency: dec!(0.4),
             sor_target_qty_source: mm_common::config::SorTargetSource::InventoryExcess,
             sor_inventory_threshold: rust_decimal::Decimal::ZERO,
-            sor_trade_rate_window_secs: 60, sor_queue_refresh_secs: 2, sor_extra_l1_poll_secs: 5, venue_regime_classify_secs: 2, }
+            sor_trade_rate_window_secs: 60,
+            sor_queue_refresh_secs: 2,
+            sor_extra_l1_poll_secs: 5,
+            venue_regime_classify_secs: 2,
+        }
     }
     fn ctx<'a>(
         book: &'a LocalOrderBook,
@@ -230,7 +270,9 @@ mod tests {
         mid: Decimal,
     ) -> StrategyContext<'a> {
         StrategyContext {
-            book, product, config: cfg,
+            book,
+            product,
+            config: cfg,
             inventory: Decimal::ZERO,
             volatility: dec!(0.02),
             time_remaining: dec!(1),

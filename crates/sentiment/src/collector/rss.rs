@@ -106,7 +106,11 @@ fn split_items(body: &str) -> Vec<String> {
         let Some(end) = close else { break };
         // end is relative to rest too; take block from after the open tag
         // to just before the closing tag.
-        let tag_len = if rest[open..].starts_with("<item>") { 6 } else { 7 };
+        let tag_len = if rest[open..].starts_with("<item>") {
+            6
+        } else {
+            7
+        };
         let inner_start = open + tag_len;
         if end <= inner_start {
             break;

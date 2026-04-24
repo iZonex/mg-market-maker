@@ -265,7 +265,9 @@ mod tests {
             sor_inventory_threshold: rust_decimal::Decimal::ZERO,
             sor_trade_rate_window_secs: 60,
             sor_queue_refresh_secs: 2,
-            sor_extra_l1_poll_secs: 5, venue_regime_classify_secs: 2, }
+            sor_extra_l1_poll_secs: 5,
+            venue_regime_classify_secs: 2,
+        }
     }
 
     #[test]
@@ -745,8 +747,14 @@ mod tests {
     fn seed_book(mid: Decimal) -> LocalOrderBook {
         let mut b = LocalOrderBook::new("BTCUSDT".into());
         b.apply_snapshot(
-            vec![mm_common::PriceLevel { price: mid - dec!(0.5), qty: dec!(1) }],
-            vec![mm_common::PriceLevel { price: mid + dec!(0.5), qty: dec!(1) }],
+            vec![mm_common::PriceLevel {
+                price: mid - dec!(0.5),
+                qty: dec!(1),
+            }],
+            vec![mm_common::PriceLevel {
+                price: mid + dec!(0.5),
+                qty: dec!(1),
+            }],
             1,
         );
         b

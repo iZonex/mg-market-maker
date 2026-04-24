@@ -33,9 +33,7 @@ pub struct InMemoryEndpoint {
 #[async_trait]
 impl Transport for InMemoryEndpoint {
     async fn send(&self, envelope: SignedEnvelope) -> Result<(), TransportError> {
-        self.tx
-            .send(envelope)
-            .map_err(|_| TransportError::Closed)
+        self.tx.send(envelope).map_err(|_| TransportError::Closed)
     }
 
     async fn recv(&mut self) -> Result<Option<SignedEnvelope>, TransportError> {
@@ -78,10 +76,7 @@ mod tests {
     async fn envelopes_roundtrip_both_directions() {
         let (controller, mut agent) = in_memory_pair();
 
-        let cmd = SignedEnvelope::unsigned(Envelope::command(
-            Seq(1),
-            CommandPayload::Heartbeat,
-        ));
+        let cmd = SignedEnvelope::unsigned(Envelope::command(Seq(1), CommandPayload::Heartbeat));
         controller.send(cmd.clone()).await.unwrap();
 
         let got = agent.recv().await.unwrap().expect("agent receives");
@@ -93,7 +88,11 @@ mod tests {
         ));
         agent.send(tele).await.unwrap();
         let mut controller = controller;
-        let got = controller.recv().await.unwrap().expect("controller receives");
+        let got = controller
+            .recv()
+            .await
+            .unwrap()
+            .expect("controller receives");
         assert!(got.envelope.telemetry.is_some());
     }
 
@@ -109,10 +108,7 @@ mod tests {
     async fn send_after_peer_drop_returns_closed_error() {
         let (controller, agent) = in_memory_pair();
         drop(agent);
-        let cmd = SignedEnvelope::unsigned(Envelope::command(
-            Seq(1),
-            CommandPayload::Heartbeat,
-        ));
+        let cmd = SignedEnvelope::unsigned(Envelope::command(Seq(1), CommandPayload::Heartbeat));
         let err = controller.send(cmd).await;
         assert!(matches!(err, Err(TransportError::Closed)));
     }

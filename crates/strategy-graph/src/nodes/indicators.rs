@@ -20,10 +20,8 @@ use std::str::FromStr;
 
 // Shared input/output port shapes — every single-series
 // indicator takes a Number on `x` and emits a Number on `out`.
-static IND_INPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("x", PortType::Number)]);
-static IND_OUTPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("out", PortType::Number)]);
+static IND_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("x", PortType::Number)]);
+static IND_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("out", PortType::Number)]);
 
 #[derive(Deserialize)]
 struct PeriodCfg {
@@ -515,7 +513,8 @@ mod tests {
     use super::*;
 
     fn tick(node: &dyn NodeKind, st: &mut NodeState, x: Decimal) -> Vec<Value> {
-        node.evaluate(&EvalCtx::default(), &[Value::Number(x)], st).unwrap()
+        node.evaluate(&EvalCtx::default(), &[Value::Number(x)], st)
+            .unwrap()
     }
 
     #[test]

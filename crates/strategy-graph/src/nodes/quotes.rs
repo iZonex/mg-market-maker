@@ -36,8 +36,7 @@ static GRID_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
         Port::new("skew_bps", PortType::Number),
     ]
 });
-static QUOTES_OUT: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("quotes", PortType::Quotes)]);
+static QUOTES_OUT: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("quotes", PortType::Quotes)]);
 
 /// Symmetric grid builder. Produces 2N quote levels around a mid
 /// price, spaced by `step_bps` bps (so level `k` sits at
@@ -182,7 +181,7 @@ impl NodeKind for Mux {
 // input is Missing. Downstream gates fail closed on Missing, so
 // a skipped tick never fires an unguarded hedge.
 
-use crate::node::{ConfigField, ConfigWidget, ConfigEnumOption};
+use crate::node::{ConfigEnumOption, ConfigField, ConfigWidget};
 
 static HEDGE_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
     vec![
@@ -267,21 +266,37 @@ impl NodeKind for Hedge {
             ConfigField {
                 name: "hedge_product",
                 label: "Hedge product",
-                hint: Some("Overrides engine product when targeting a different market (spot vs perp)."),
+                hint: Some(
+                    "Overrides engine product when targeting a different market (spot vs perp).",
+                ),
                 default: serde_json::json!(""),
                 widget: ConfigWidget::Enum {
                     options: vec![
-                        ConfigEnumOption { value: "", label: "(engine default)" },
-                        ConfigEnumOption { value: "spot", label: "Spot" },
-                        ConfigEnumOption { value: "linear_perp", label: "Linear perp" },
-                        ConfigEnumOption { value: "inverse_perp", label: "Inverse perp" },
+                        ConfigEnumOption {
+                            value: "",
+                            label: "(engine default)",
+                        },
+                        ConfigEnumOption {
+                            value: "spot",
+                            label: "Spot",
+                        },
+                        ConfigEnumOption {
+                            value: "linear_perp",
+                            label: "Linear perp",
+                        },
+                        ConfigEnumOption {
+                            value: "inverse_perp",
+                            label: "Inverse perp",
+                        },
                     ],
                 },
             },
             ConfigField {
                 name: "cross_bps",
                 label: "Cross depth (bps)",
-                hint: Some("How many bps past the fill price the hedge aims — guarantees IoC fill."),
+                hint: Some(
+                    "How many bps past the fill price the hedge aims — guarantees IoC fill.",
+                ),
                 default: serde_json::json!("10"),
                 widget: ConfigWidget::Number {
                     min: Some(0.0),
@@ -368,11 +383,11 @@ mod tests {
             .evaluate(
                 &ctx(),
                 &[
-                    Value::Number(dec!(100)),  // mid
-                    Value::Number(dec!(10)),   // step_bps
-                    Value::Number(dec!(3)),    // levels
-                    Value::Number(dec!(0.5)),  // size
-                    Value::Number(dec!(0)),    // skew
+                    Value::Number(dec!(100)), // mid
+                    Value::Number(dec!(10)),  // step_bps
+                    Value::Number(dec!(3)),   // levels
+                    Value::Number(dec!(0.5)), // size
+                    Value::Number(dec!(0)),   // skew
                 ],
                 &mut state,
             )

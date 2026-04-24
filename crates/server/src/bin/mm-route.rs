@@ -110,60 +110,64 @@ fn build_connector(cfg: &ExchangeConfig) -> Result<Arc<dyn ExchangeConnector>> {
         ExchangeType::Binance => {
             use mm_common::config::ProductType;
             match cfg.product {
-                ProductType::Spot => Ok(Arc::new(
-                    mm_exchange_binance::BinanceConnector::new(
-                        &cfg.rest_url,
-                        &cfg.ws_url,
-                        &api_key,
-                        &api_secret,
-                    ),
-                )),
+                ProductType::Spot => Ok(Arc::new(mm_exchange_binance::BinanceConnector::new(
+                    &cfg.rest_url,
+                    &cfg.ws_url,
+                    &api_key,
+                    &api_secret,
+                ))),
                 ProductType::LinearPerp => Ok(Arc::new(
                     mm_exchange_binance::BinanceFuturesConnector::new(&api_key, &api_secret),
                 )),
-                ProductType::InversePerp => anyhow::bail!(
-                    "Binance COIN-M (inverse perp) not supported by mm-route yet"
-                ),
+                ProductType::InversePerp => {
+                    anyhow::bail!("Binance COIN-M (inverse perp) not supported by mm-route yet")
+                }
             }
         }
         ExchangeType::BinanceTestnet => {
             use mm_common::config::ProductType;
             match cfg.product {
-                ProductType::Spot => Ok(Arc::new(
-                    mm_exchange_binance::BinanceConnector::testnet(&api_key, &api_secret),
-                )),
+                ProductType::Spot => Ok(Arc::new(mm_exchange_binance::BinanceConnector::testnet(
+                    &api_key,
+                    &api_secret,
+                ))),
                 ProductType::LinearPerp => Ok(Arc::new(
                     mm_exchange_binance::BinanceFuturesConnector::testnet(&api_key, &api_secret),
                 )),
-                ProductType::InversePerp => anyhow::bail!(
-                    "Binance COIN-M (inverse perp) not supported by mm-route yet"
-                ),
+                ProductType::InversePerp => {
+                    anyhow::bail!("Binance COIN-M (inverse perp) not supported by mm-route yet")
+                }
             }
         }
         ExchangeType::Bybit => {
             use mm_common::config::ProductType;
             let conn: Arc<dyn ExchangeConnector> = match cfg.product {
-                ProductType::Spot => Arc::new(
-                    mm_exchange_bybit::BybitConnector::spot(&api_key, &api_secret),
-                ),
-                ProductType::LinearPerp => Arc::new(
-                    mm_exchange_bybit::BybitConnector::linear(&api_key, &api_secret),
-                ),
-                ProductType::InversePerp => Arc::new(
-                    mm_exchange_bybit::BybitConnector::inverse(&api_key, &api_secret),
-                ),
+                ProductType::Spot => Arc::new(mm_exchange_bybit::BybitConnector::spot(
+                    &api_key,
+                    &api_secret,
+                )),
+                ProductType::LinearPerp => Arc::new(mm_exchange_bybit::BybitConnector::linear(
+                    &api_key,
+                    &api_secret,
+                )),
+                ProductType::InversePerp => Arc::new(mm_exchange_bybit::BybitConnector::inverse(
+                    &api_key,
+                    &api_secret,
+                )),
             };
             Ok(conn)
         }
         ExchangeType::BybitTestnet => {
             use mm_common::config::ProductType;
             let conn: Arc<dyn ExchangeConnector> = match cfg.product {
-                ProductType::Spot => Arc::new(
-                    mm_exchange_bybit::BybitConnector::testnet_spot(&api_key, &api_secret),
-                ),
-                ProductType::LinearPerp => Arc::new(
-                    mm_exchange_bybit::BybitConnector::testnet(&api_key, &api_secret),
-                ),
+                ProductType::Spot => Arc::new(mm_exchange_bybit::BybitConnector::testnet_spot(
+                    &api_key,
+                    &api_secret,
+                )),
+                ProductType::LinearPerp => Arc::new(mm_exchange_bybit::BybitConnector::testnet(
+                    &api_key,
+                    &api_secret,
+                )),
                 ProductType::InversePerp => Arc::new(
                     mm_exchange_bybit::BybitConnector::testnet_inverse(&api_key, &api_secret),
                 ),
@@ -238,7 +242,10 @@ async fn main() -> Result<()> {
         let product: ProductSpec = match v.connector.get_product_spec(&v.symbol).await {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("  ⚠ {:?} get_product_spec({}) failed: {e}", v.venue, v.symbol);
+                eprintln!(
+                    "  ⚠ {:?} get_product_spec({}) failed: {e}",
+                    v.venue, v.symbol
+                );
                 continue;
             }
         };
@@ -259,8 +266,12 @@ async fn main() -> Result<()> {
             "  {:?} {}  bid={}  ask={}",
             v.venue,
             v.symbol,
-            agg.seed(v.venue).map(|s| s.best_bid).unwrap_or(Decimal::ZERO),
-            agg.seed(v.venue).map(|s| s.best_ask).unwrap_or(Decimal::ZERO),
+            agg.seed(v.venue)
+                .map(|s| s.best_bid)
+                .unwrap_or(Decimal::ZERO),
+            agg.seed(v.venue)
+                .map(|s| s.best_ask)
+                .unwrap_or(Decimal::ZERO),
         );
     }
 

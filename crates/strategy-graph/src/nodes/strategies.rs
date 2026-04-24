@@ -27,15 +27,12 @@
 //! a subset of those fields so the same Avellaneda can run with
 //! different γ under two branches of a `Quote.Mux`.
 
-use crate::node::{
-    ConfigEnumOption, ConfigField, ConfigWidget, EvalCtx, NodeKind, NodeState,
-};
+use crate::node::{ConfigEnumOption, ConfigField, ConfigWidget, EvalCtx, NodeKind, NodeState};
 use crate::types::{Port, PortType, Value};
 use anyhow::Result;
 use once_cell::sync::Lazy;
 
-static QUOTES_OUT: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("quotes", PortType::Quotes)]);
+static QUOTES_OUT: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("quotes", PortType::Quotes)]);
 
 macro_rules! strategy_node {
     ($struct_name:ident, $kind_str:literal) => {
@@ -127,7 +124,10 @@ impl NodeKind for QueueAware {
         // the work — conservative, matches the rest of the
         // graph's fail-closed posture.
         let p = p_raw
-            .map(|v| v.max(rust_decimal::Decimal::ZERO).min(rust_decimal::Decimal::ONE))
+            .map(|v| {
+                v.max(rust_decimal::Decimal::ZERO)
+                    .min(rust_decimal::Decimal::ONE)
+            })
             .unwrap_or(rust_decimal::Decimal::ZERO);
         let floor = rust_decimal::Decimal::from_f64(0.3).unwrap_or(rust_decimal::Decimal::ZERO);
         let mult = floor + (rust_decimal::Decimal::ONE - floor) * p;
@@ -208,28 +208,44 @@ impl NodeKind for BasisArb {
                 label: "Leg size",
                 hint: Some("Per-leg order qty in base asset"),
                 default: serde_json::json!("0.001"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
             ConfigField {
                 name: "maker_offset_bps",
                 label: "Maker offset (bps)",
                 hint: Some("How far behind mid the maker-post leg sits"),
                 default: serde_json::json!("2"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: Some(200.0), step: Some(0.5) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: Some(200.0),
+                    step: Some(0.5),
+                },
             },
             ConfigField {
                 name: "min_basis_bps",
                 label: "Min basis (bps)",
                 hint: Some("Don't enter if basis is below this"),
                 default: serde_json::json!("10"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: Some(1000.0), step: Some(1.0) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: Some(1000.0),
+                    step: Some(1.0),
+                },
             },
             ConfigField {
                 name: "max_delta",
                 label: "Max net delta",
                 hint: Some("Drop the long / short leg when over this"),
                 default: serde_json::json!("0.05"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
         ]
     }
@@ -268,14 +284,22 @@ impl NodeKind for Wash {
                 label: "Leg size",
                 hint: Some("Per-leg order qty (same on buy + sell)"),
                 default: serde_json::json!("0.001"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
             ConfigField {
                 name: "offset_bps",
                 label: "Offset from mid (bps)",
                 hint: Some("0 = trade at mid (most visible)"),
                 default: serde_json::json!("0"),
-                widget: ConfigWidget::Number { min: Some(-200.0), max: Some(200.0), step: Some(1.0) },
+                widget: ConfigWidget::Number {
+                    min: Some(-200.0),
+                    max: Some(200.0),
+                    step: Some(1.0),
+                },
             },
         ]
     }
@@ -316,8 +340,14 @@ impl NodeKind for Ignite {
                 default: serde_json::json!("buy"),
                 widget: ConfigWidget::Enum {
                     options: vec![
-                        ConfigEnumOption { value: "buy", label: "Buy (up)" },
-                        ConfigEnumOption { value: "sell", label: "Sell (down)" },
+                        ConfigEnumOption {
+                            value: "buy",
+                            label: "Buy (up)",
+                        },
+                        ConfigEnumOption {
+                            value: "sell",
+                            label: "Sell (down)",
+                        },
                     ],
                 },
             },
@@ -326,28 +356,42 @@ impl NodeKind for Ignite {
                 label: "Burst size",
                 hint: Some("Per-burst order qty"),
                 default: serde_json::json!("0.001"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
             ConfigField {
                 name: "cross_depth_bps",
                 label: "Cross depth (bps)",
                 hint: Some("How far past the opposite touch to cross"),
                 default: serde_json::json!("30"),
-                widget: ConfigWidget::Number { min: Some(1.0), max: Some(500.0), step: Some(1.0) },
+                widget: ConfigWidget::Number {
+                    min: Some(1.0),
+                    max: Some(500.0),
+                    step: Some(1.0),
+                },
             },
             ConfigField {
                 name: "burst_ticks",
                 label: "Burst ticks",
                 hint: Some("Consecutive ticks to push per cycle"),
                 default: serde_json::json!(5),
-                widget: ConfigWidget::Integer { min: Some(1), max: Some(100) },
+                widget: ConfigWidget::Integer {
+                    min: Some(1),
+                    max: Some(100),
+                },
             },
             ConfigField {
                 name: "rest_ticks",
                 label: "Rest ticks",
                 hint: Some("Flat ticks between bursts"),
                 default: serde_json::json!(3),
-                widget: ConfigWidget::Integer { min: Some(0), max: Some(100) },
+                widget: ConfigWidget::Integer {
+                    min: Some(0),
+                    max: Some(100),
+                },
             },
         ]
     }
@@ -390,8 +434,14 @@ impl NodeKind for Mark {
                 default: serde_json::json!("buy"),
                 widget: ConfigWidget::Enum {
                     options: vec![
-                        ConfigEnumOption { value: "buy", label: "Buy (mark up)" },
-                        ConfigEnumOption { value: "sell", label: "Sell (mark down)" },
+                        ConfigEnumOption {
+                            value: "buy",
+                            label: "Buy (mark up)",
+                        },
+                        ConfigEnumOption {
+                            value: "sell",
+                            label: "Sell (mark down)",
+                        },
                     ],
                 },
             },
@@ -400,21 +450,32 @@ impl NodeKind for Mark {
                 label: "Close window (s)",
                 hint: Some("How many seconds before boundary to start marking"),
                 default: serde_json::json!(60),
-                widget: ConfigWidget::Integer { min: Some(1), max: Some(3600) },
+                widget: ConfigWidget::Integer {
+                    min: Some(1),
+                    max: Some(3600),
+                },
             },
             ConfigField {
                 name: "burst_size",
                 label: "Burst size",
                 hint: Some("Per-tick aggressive order qty"),
                 default: serde_json::json!("0.001"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
             ConfigField {
                 name: "cross_depth_bps",
                 label: "Cross depth (bps)",
                 hint: Some("How far past opposite touch to cross"),
                 default: serde_json::json!("30"),
-                widget: ConfigWidget::Number { min: Some(1.0), max: Some(500.0), step: Some(1.0) },
+                widget: ConfigWidget::Number {
+                    min: Some(1.0),
+                    max: Some(500.0),
+                    step: Some(1.0),
+                },
             },
         ]
     }
@@ -455,8 +516,14 @@ impl NodeKind for Layer {
                 default: serde_json::json!("buy"),
                 widget: ConfigWidget::Enum {
                     options: vec![
-                        ConfigEnumOption { value: "buy", label: "Buy" },
-                        ConfigEnumOption { value: "sell", label: "Sell" },
+                        ConfigEnumOption {
+                            value: "buy",
+                            label: "Buy",
+                        },
+                        ConfigEnumOption {
+                            value: "sell",
+                            label: "Sell",
+                        },
                     ],
                 },
             },
@@ -465,28 +532,43 @@ impl NodeKind for Layer {
                 label: "Layers",
                 hint: Some("How many stacked levels per cycle"),
                 default: serde_json::json!(5),
-                widget: ConfigWidget::Integer { min: Some(2), max: Some(20) },
+                widget: ConfigWidget::Integer {
+                    min: Some(2),
+                    max: Some(20),
+                },
             },
             ConfigField {
                 name: "cluster_bps",
                 label: "Cluster spacing (bps)",
                 hint: Some("Tight = clear layering signal"),
                 default: serde_json::json!("1"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: Some(100.0), step: Some(0.5) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: Some(100.0),
+                    step: Some(0.5),
+                },
             },
             ConfigField {
                 name: "offset_bps",
                 label: "Innermost offset (bps)",
                 hint: None,
                 default: serde_json::json!("5"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: Some(200.0), step: Some(1.0) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: Some(200.0),
+                    step: Some(1.0),
+                },
             },
             ConfigField {
                 name: "leg_size",
                 label: "Per-level size",
                 hint: None,
                 default: serde_json::json!("0.001"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
         ]
     }
@@ -527,8 +609,14 @@ impl NodeKind for Stuff {
                 default: serde_json::json!("buy"),
                 widget: ConfigWidget::Enum {
                     options: vec![
-                        ConfigEnumOption { value: "buy", label: "Buy" },
-                        ConfigEnumOption { value: "sell", label: "Sell" },
+                        ConfigEnumOption {
+                            value: "buy",
+                            label: "Buy",
+                        },
+                        ConfigEnumOption {
+                            value: "sell",
+                            label: "Sell",
+                        },
                     ],
                 },
             },
@@ -537,21 +625,32 @@ impl NodeKind for Stuff {
                 label: "Orders per tick",
                 hint: Some("Higher = more stuffing noise"),
                 default: serde_json::json!(20),
-                widget: ConfigWidget::Integer { min: Some(1), max: Some(200) },
+                widget: ConfigWidget::Integer {
+                    min: Some(1),
+                    max: Some(200),
+                },
             },
             ConfigField {
                 name: "step_bps",
                 label: "Step (bps)",
                 hint: Some("Tiny offsets between tiered orders"),
                 default: serde_json::json!("0.1"),
-                widget: ConfigWidget::Number { min: Some(0.01), max: Some(10.0), step: Some(0.1) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.01),
+                    max: Some(10.0),
+                    step: Some(0.1),
+                },
             },
             ConfigField {
                 name: "leg_size",
                 label: "Leg size",
                 hint: None,
                 default: serde_json::json!("0.001"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
         ]
     }
@@ -592,8 +691,14 @@ impl NodeKind for CrossMarket {
                 default: serde_json::json!("buy"),
                 widget: ConfigWidget::Enum {
                     options: vec![
-                        ConfigEnumOption { value: "buy", label: "Buy" },
-                        ConfigEnumOption { value: "sell", label: "Sell" },
+                        ConfigEnumOption {
+                            value: "buy",
+                            label: "Buy",
+                        },
+                        ConfigEnumOption {
+                            value: "sell",
+                            label: "Sell",
+                        },
                     ],
                 },
             },
@@ -602,28 +707,42 @@ impl NodeKind for CrossMarket {
                 label: "Burst size",
                 hint: None,
                 default: serde_json::json!("0.01"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
             ConfigField {
                 name: "cross_depth_bps",
                 label: "Cross depth (bps)",
                 hint: None,
                 default: serde_json::json!("25"),
-                widget: ConfigWidget::Number { min: Some(1.0), max: Some(500.0), step: Some(1.0) },
+                widget: ConfigWidget::Number {
+                    min: Some(1.0),
+                    max: Some(500.0),
+                    step: Some(1.0),
+                },
             },
             ConfigField {
                 name: "burst_ticks",
                 label: "Burst ticks",
                 hint: None,
                 default: serde_json::json!(8),
-                widget: ConfigWidget::Integer { min: Some(1), max: Some(100) },
+                widget: ConfigWidget::Integer {
+                    min: Some(1),
+                    max: Some(100),
+                },
             },
             ConfigField {
                 name: "rest_ticks",
                 label: "Rest ticks",
                 hint: None,
                 default: serde_json::json!(4),
-                widget: ConfigWidget::Integer { min: Some(0), max: Some(100) },
+                widget: ConfigWidget::Integer {
+                    min: Some(0),
+                    max: Some(100),
+                },
             },
         ]
     }
@@ -662,21 +781,33 @@ impl NodeKind for LatencyHunt {
                 label: "Burst size",
                 hint: None,
                 default: serde_json::json!("0.001"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
             ConfigField {
                 name: "cross_depth_bps",
                 label: "Cross depth (bps)",
                 hint: None,
                 default: serde_json::json!("50"),
-                widget: ConfigWidget::Number { min: Some(1.0), max: Some(500.0), step: Some(1.0) },
+                widget: ConfigWidget::Number {
+                    min: Some(1.0),
+                    max: Some(500.0),
+                    step: Some(1.0),
+                },
             },
             ConfigField {
                 name: "skew_threshold",
                 label: "Skew threshold",
                 hint: Some("|bid_qty - ask_qty| / total above which to fire"),
                 default: serde_json::json!("0.5"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: Some(1.0), step: Some(0.05) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: Some(1.0),
+                    step: Some(0.05),
+                },
             },
         ]
     }
@@ -715,14 +846,22 @@ impl NodeKind for RebateFarm {
                 label: "Leg size",
                 hint: None,
                 default: serde_json::json!("0.01"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
             ConfigField {
                 name: "offset_bps",
                 label: "Offset from mid (bps)",
                 hint: Some("Tight offset maximises churn"),
                 default: serde_json::json!("1"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: Some(200.0), step: Some(0.5) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: Some(200.0),
+                    step: Some(0.5),
+                },
             },
         ]
     }
@@ -761,28 +900,43 @@ impl NodeKind for Imbalance {
                 label: "Heavy-side size",
                 hint: None,
                 default: serde_json::json!("0.05"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
             ConfigField {
                 name: "light_size",
                 label: "Light-side size",
                 hint: None,
                 default: serde_json::json!("0.001"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
             ConfigField {
                 name: "offset_bps",
                 label: "Offset from mid (bps)",
                 hint: None,
                 default: serde_json::json!("2"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: Some(200.0), step: Some(0.5) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: Some(200.0),
+                    step: Some(0.5),
+                },
             },
             ConfigField {
                 name: "flip_ticks",
                 label: "Flip interval (ticks)",
                 hint: Some("Ticks held before swapping heavy side"),
                 default: serde_json::json!(3),
-                widget: ConfigWidget::Integer { min: Some(1), max: Some(100) },
+                widget: ConfigWidget::Integer {
+                    min: Some(1),
+                    max: Some(100),
+                },
             },
         ]
     }
@@ -823,8 +977,14 @@ impl NodeKind for ReactCancel {
                 default: serde_json::json!("buy"),
                 widget: ConfigWidget::Enum {
                     options: vec![
-                        ConfigEnumOption { value: "buy", label: "Buy" },
-                        ConfigEnumOption { value: "sell", label: "Sell" },
+                        ConfigEnumOption {
+                            value: "buy",
+                            label: "Buy",
+                        },
+                        ConfigEnumOption {
+                            value: "sell",
+                            label: "Sell",
+                        },
                     ],
                 },
             },
@@ -833,21 +993,32 @@ impl NodeKind for ReactCancel {
                 label: "Burst size",
                 hint: None,
                 default: serde_json::json!("0.001"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
             ConfigField {
                 name: "offset_bps",
                 label: "Offset from mid (bps)",
                 hint: None,
                 default: serde_json::json!("3"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: Some(200.0), step: Some(0.5) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: Some(200.0),
+                    step: Some(0.5),
+                },
             },
             ConfigField {
                 name: "idle_ticks",
                 label: "Idle ticks between posts",
                 hint: Some("Cancels synchronously between posts"),
                 default: serde_json::json!(2),
-                widget: ConfigWidget::Integer { min: Some(1), max: Some(20) },
+                widget: ConfigWidget::Integer {
+                    min: Some(1),
+                    max: Some(20),
+                },
             },
         ]
     }
@@ -888,8 +1059,14 @@ impl NodeKind for OneSided {
                 default: serde_json::json!("buy"),
                 widget: ConfigWidget::Enum {
                     options: vec![
-                        ConfigEnumOption { value: "buy", label: "Buy-only" },
-                        ConfigEnumOption { value: "sell", label: "Sell-only" },
+                        ConfigEnumOption {
+                            value: "buy",
+                            label: "Buy-only",
+                        },
+                        ConfigEnumOption {
+                            value: "sell",
+                            label: "Sell-only",
+                        },
                     ],
                 },
             },
@@ -898,14 +1075,22 @@ impl NodeKind for OneSided {
                 label: "Offset from mid (bps)",
                 hint: None,
                 default: serde_json::json!("2"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: Some(200.0), step: Some(0.5) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: Some(200.0),
+                    step: Some(0.5),
+                },
             },
             ConfigField {
                 name: "leg_size",
                 label: "Leg size",
                 hint: None,
                 default: serde_json::json!("0.001"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
         ]
     }
@@ -944,21 +1129,33 @@ impl NodeKind for InvPush {
                 label: "Burst size",
                 hint: None,
                 default: serde_json::json!("0.001"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
             ConfigField {
                 name: "cross_depth_bps",
                 label: "Cross depth (bps)",
                 hint: None,
                 default: serde_json::json!("20"),
-                widget: ConfigWidget::Number { min: Some(1.0), max: Some(500.0), step: Some(1.0) },
+                widget: ConfigWidget::Number {
+                    min: Some(1.0),
+                    max: Some(500.0),
+                    step: Some(1.0),
+                },
             },
             ConfigField {
                 name: "min_inventory",
                 label: "Minimum |inventory|",
                 hint: Some("Fires only when inventory magnitude ≥ this"),
                 default: serde_json::json!("0.01"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
         ]
     }
@@ -999,8 +1196,14 @@ impl NodeKind for NonFill {
                 default: serde_json::json!("buy"),
                 widget: ConfigWidget::Enum {
                     options: vec![
-                        ConfigEnumOption { value: "buy", label: "Buy" },
-                        ConfigEnumOption { value: "sell", label: "Sell" },
+                        ConfigEnumOption {
+                            value: "buy",
+                            label: "Buy",
+                        },
+                        ConfigEnumOption {
+                            value: "sell",
+                            label: "Sell",
+                        },
                     ],
                 },
             },
@@ -1009,14 +1212,22 @@ impl NodeKind for NonFill {
                 label: "Leg size",
                 hint: None,
                 default: serde_json::json!("0.001"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
             ConfigField {
                 name: "offset_bps",
                 label: "Offset from touch (bps)",
                 hint: Some("Near-touch so placements look real before yank"),
                 default: serde_json::json!("1"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: Some(50.0), step: Some(0.5) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: Some(50.0),
+                    step: Some(0.5),
+                },
             },
         ]
     }
@@ -1126,56 +1337,83 @@ impl NodeKind for PumpAndDump {
                 label: "Accumulate ticks",
                 hint: Some("How long to quietly build inventory before the pump."),
                 default: serde_json::json!(20),
-                widget: ConfigWidget::Integer { min: Some(0), max: Some(10_000) },
+                widget: ConfigWidget::Integer {
+                    min: Some(0),
+                    max: Some(10_000),
+                },
             },
             ConfigField {
                 name: "accumulate_size",
                 label: "Accumulate size",
                 hint: Some("Per-tick passive bid qty during accumulate."),
                 default: serde_json::json!("0.002"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
             ConfigField {
                 name: "pump_ticks",
                 label: "Pump ticks",
                 hint: Some("How long to aggressively push price up."),
                 default: serde_json::json!(10),
-                widget: ConfigWidget::Integer { min: Some(0), max: Some(10_000) },
+                widget: ConfigWidget::Integer {
+                    min: Some(0),
+                    max: Some(10_000),
+                },
             },
             ConfigField {
                 name: "pump_depth_bps",
                 label: "Pump depth (bps)",
                 hint: Some("How far across the ask the crossing buy goes."),
                 default: serde_json::json!("50"),
-                widget: ConfigWidget::Number { min: Some(1.0), max: Some(1000.0), step: Some(1.0) },
+                widget: ConfigWidget::Number {
+                    min: Some(1.0),
+                    max: Some(1000.0),
+                    step: Some(1.0),
+                },
             },
             ConfigField {
                 name: "distribute_ticks",
                 label: "Distribute ticks",
                 hint: Some("How long to sell into FOMO via an ask ladder."),
                 default: serde_json::json!(20),
-                widget: ConfigWidget::Integer { min: Some(0), max: Some(10_000) },
+                widget: ConfigWidget::Integer {
+                    min: Some(0),
+                    max: Some(10_000),
+                },
             },
             ConfigField {
                 name: "distribute_rungs",
                 label: "Distribute rungs",
                 hint: Some("Simultaneous ask ladder rungs above mid."),
                 default: serde_json::json!(4),
-                widget: ConfigWidget::Integer { min: Some(1), max: Some(50) },
+                widget: ConfigWidget::Integer {
+                    min: Some(1),
+                    max: Some(50),
+                },
             },
             ConfigField {
                 name: "dump_ticks",
                 label: "Dump ticks",
                 hint: Some("Aggressive cross-through sell tail at the end."),
                 default: serde_json::json!(10),
-                widget: ConfigWidget::Integer { min: Some(0), max: Some(10_000) },
+                widget: ConfigWidget::Integer {
+                    min: Some(0),
+                    max: Some(10_000),
+                },
             },
             ConfigField {
                 name: "dump_depth_bps",
                 label: "Dump depth (bps)",
                 hint: Some("How far across the bid the crossing sell goes."),
                 default: serde_json::json!("60"),
-                widget: ConfigWidget::Number { min: Some(1.0), max: Some(1000.0), step: Some(1.0) },
+                widget: ConfigWidget::Number {
+                    min: Some(1.0),
+                    max: Some(1000.0),
+                    step: Some(1.0),
+                },
             },
         ]
     }
@@ -1249,14 +1487,24 @@ impl NodeKind for LiquidationHunt {
                 label: "⚠ Push order size",
                 hint: Some("Per-tick cross-through qty. PENTEST ONLY — authorized venue only."),
                 default: serde_json::json!("0.002"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
             ConfigField {
                 name: "max_bps_overshoot",
                 label: "⚠ Max bps past cluster",
-                hint: Some("Bps to cross past the target cluster. Higher = more aggressive trigger."),
+                hint: Some(
+                    "Bps to cross past the target cluster. Higher = more aggressive trigger.",
+                ),
                 default: serde_json::json!("5"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: Some(200.0), step: Some(1.0) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: Some(200.0),
+                    step: Some(1.0),
+                },
             },
         ]
     }
@@ -1301,12 +1549,20 @@ impl NodeKind for LeverageBuilder {
             ConfigField {
                 name: "direction",
                 label: "⚠ Direction",
-                hint: Some("long = buy perp to set up a squeeze; short = sell perp before spot dump"),
+                hint: Some(
+                    "long = buy perp to set up a squeeze; short = sell perp before spot dump",
+                ),
                 default: serde_json::json!("long"),
                 widget: ConfigWidget::Enum {
                     options: vec![
-                        ConfigEnumOption { value: "long", label: "Long (buy)" },
-                        ConfigEnumOption { value: "short", label: "Short (sell)" },
+                        ConfigEnumOption {
+                            value: "long",
+                            label: "Long (buy)",
+                        },
+                        ConfigEnumOption {
+                            value: "short",
+                            label: "Short (sell)",
+                        },
                     ],
                 },
             },
@@ -1315,21 +1571,32 @@ impl NodeKind for LeverageBuilder {
                 label: "⚠ Position size (base units)",
                 hint: Some("Notional = size × current mark. Bigger = more market impact."),
                 default: serde_json::json!("0.01"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.001) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.001),
+                },
             },
             ConfigField {
                 name: "leverage",
                 label: "⚠ Leverage (1–125)",
                 hint: Some("Higher = more position per margin dollar. Venue-capped."),
                 default: serde_json::json!(5),
-                widget: ConfigWidget::Integer { min: Some(1), max: Some(125) },
+                widget: ConfigWidget::Integer {
+                    min: Some(1),
+                    max: Some(125),
+                },
             },
             ConfigField {
                 name: "max_slippage_bps",
                 label: "⚠ Max slippage (bps)",
                 hint: Some("Refuse to open if fill would cross further than this past mid."),
                 default: serde_json::json!("100"),
-                widget: ConfigWidget::Number { min: Some(1.0), max: Some(1000.0), step: Some(1.0) },
+                widget: ConfigWidget::Number {
+                    min: Some(1.0),
+                    max: Some(1000.0),
+                    step: Some(1.0),
+                },
             },
         ]
     }
@@ -1615,7 +1882,11 @@ mod tests {
             &Basis,
             &CrossExchange,
         ] {
-            assert!(node.input_ports().is_empty(), "{} must have no inputs", node.kind());
+            assert!(
+                node.input_ports().is_empty(),
+                "{} must have no inputs",
+                node.kind()
+            );
             assert_eq!(node.output_ports().len(), 1);
             assert_eq!(node.output_ports()[0].name, "quotes");
             assert_eq!(node.output_ports()[0].ty, PortType::Quotes);

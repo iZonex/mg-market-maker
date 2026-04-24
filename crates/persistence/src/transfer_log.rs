@@ -100,10 +100,7 @@ impl TransferLogWriter {
     /// log uses.
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self {
             path,
             file: Mutex::new(file),

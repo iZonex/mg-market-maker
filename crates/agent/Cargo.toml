@@ -69,3 +69,6 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] 
 
 [dev-dependencies]
 tokio = { workspace = true }
+
+[lints]
+workspace = true

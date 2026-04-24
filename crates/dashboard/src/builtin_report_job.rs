@@ -47,7 +47,10 @@ impl BuiltinReportJob {
         }
     }
 
-    fn period_for(cadence: ReportCadence, fired_at: DateTime<Utc>) -> (NaiveDate, NaiveDate, String) {
+    fn period_for(
+        cadence: ReportCadence,
+        fired_at: DateTime<Utc>,
+    ) -> (NaiveDate, NaiveDate, String) {
         let today = fired_at.date_naive();
         match cadence {
             // Daily for the closed UTC day (fired_at is
@@ -60,10 +63,8 @@ impl BuiltinReportJob {
             ReportCadence::Weekly => {
                 // Scheduler fires Monday 08:00 UTC. Previous week
                 // = Mon..Sun preceding that.
-                let this_mon = today
-                    - Duration::days(
-                        today.weekday().num_days_from_monday() as i64,
-                    );
+                let this_mon =
+                    today - Duration::days(today.weekday().num_days_from_monday() as i64);
                 let prev_mon = this_mon - Duration::days(7);
                 let prev_sun = this_mon - Duration::days(1);
                 let iso = prev_mon.iso_week();
@@ -72,12 +73,11 @@ impl BuiltinReportJob {
             }
             // Monthly: previous full calendar month.
             ReportCadence::Monthly => {
-                let first_this = NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
-                    .unwrap_or(today);
+                let first_this =
+                    NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap_or(today);
                 let last_prev = first_this - Duration::days(1);
-                let first_prev =
-                    NaiveDate::from_ymd_opt(last_prev.year(), last_prev.month(), 1)
-                        .unwrap_or(last_prev);
+                let first_prev = NaiveDate::from_ymd_opt(last_prev.year(), last_prev.month(), 1)
+                    .unwrap_or(last_prev);
                 let folder = format!("{:04}-{:02}", first_prev.year(), first_prev.month());
                 (first_prev, last_prev, folder)
             }
@@ -95,11 +95,7 @@ impl BuiltinReportJob {
 
 #[async_trait]
 impl ReportJob for BuiltinReportJob {
-    async fn run(
-        &self,
-        cadence: ReportCadence,
-        fired_at: DateTime<Utc>,
-    ) -> anyhow::Result<()> {
+    async fn run(&self, cadence: ReportCadence, fired_at: DateTime<Utc>) -> anyhow::Result<()> {
         let label = Self::cadence_folder(cadence);
         crate::metrics::SCHEDULER_RUNS_TOTAL
             .with_label_values(&[label])
@@ -129,10 +125,7 @@ impl BuiltinReportJob {
         fired_at: DateTime<Utc>,
     ) -> anyhow::Result<()> {
         let (from, to, folder) = Self::period_for(cadence, fired_at);
-        let out_dir = self
-            .root
-            .join(Self::cadence_folder(cadence))
-            .join(&folder);
+        let out_dir = self.root.join(Self::cadence_folder(cadence)).join(&folder);
         tokio::fs::create_dir_all(&out_dir).await?;
 
         let audit_path = self.state.audit_log_path();
@@ -153,8 +146,7 @@ impl BuiltinReportJob {
         )
         .await?;
         tokio::fs::write(out_dir.join("summary.csv"), render_csv(&data)).await?;
-        tokio::fs::write(out_dir.join("summary.xlsx"), render_xlsx(&data, &manifest)?)
-            .await?;
+        tokio::fs::write(out_dir.join("summary.xlsx"), render_xlsx(&data, &manifest)?).await?;
         tokio::fs::write(
             out_dir.join("summary.pdf"),
             crate::pdf_report::render_pdf(&data, &manifest)?,

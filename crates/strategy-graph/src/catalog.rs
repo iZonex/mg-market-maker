@@ -92,8 +92,9 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Indicator.ATR" => {
             indicators::AtrNode::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
         }
-        "Indicator.Bollinger" => indicators::BollingerNode::from_config(config)
-            .map(|n| Box::new(n) as Box<dyn NodeKind>),
+        "Indicator.Bollinger" => {
+            indicators::BollingerNode::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
+        }
         "Signal.ImbalanceDepth" => Some(Box::new(sources::SignalImbalance)),
         "Signal.TradeFlow" => Some(Box::new(sources::SignalTradeFlow)),
         "Signal.Microprice" => Some(Box::new(sources::SignalMicroprice)),
@@ -171,7 +172,9 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Signal.OpenInterest" => Some(Box::new(sources::OpenInterestSource)),
         // R7.1 / R7.2 / R7.3 — liquidation cascade signals
         "Signal.LongShortRatio" => Some(Box::new(sources::LongShortRatioSource)),
-        "Signal.LiquidationLevelEstimate" => Some(Box::new(sources::LiquidationLevelEstimateSource)),
+        "Signal.LiquidationLevelEstimate" => {
+            Some(Box::new(sources::LiquidationLevelEstimateSource))
+        }
         "Signal.CascadeCompleted" => Some(Box::new(sources::CascadeCompletedSource)),
         "Signal.FundingExtreme" => Some(Box::new(sources::FundingExtremeSource)),
         "Surveillance.SpoofingScore" => Some(Box::new(sources::SpoofingScore)),
@@ -185,11 +188,15 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Surveillance.CrossMarketScore" => Some(Box::new(sources::CrossMarketScore)),
         "Surveillance.LatencyExploitScore" => Some(Box::new(sources::LatencyExploitScore)),
         "Surveillance.RebateAbuseScore" => Some(Box::new(sources::RebateAbuseScore)),
-        "Surveillance.ImbalanceManipulationScore" => Some(Box::new(sources::ImbalanceManipulationScore)),
+        "Surveillance.ImbalanceManipulationScore" => {
+            Some(Box::new(sources::ImbalanceManipulationScore))
+        }
         "Surveillance.CancelOnReactionScore" => Some(Box::new(sources::CancelOnReactionScore)),
         "Surveillance.OneSidedQuotingScore" => Some(Box::new(sources::OneSidedQuotingScore)),
         "Surveillance.InventoryPushingScore" => Some(Box::new(sources::InventoryPushingScore)),
-        "Surveillance.StrategicNonFillingScore" => Some(Box::new(sources::StrategicNonFillingScore)),
+        "Surveillance.StrategicNonFillingScore" => {
+            Some(Box::new(sources::StrategicNonFillingScore))
+        }
         "Surveillance.ForeignTwap" => Some(Box::new(sources::ForeignTwap)),
         "Cost.Sweep" => Some(Box::new(sources::CostSweep)),
         "Risk.LiquidationDistance" => Some(Box::new(sources::LiquidationDistanceSource)),
@@ -607,10 +614,7 @@ mod tests {
         assert!(!list.is_empty());
         let null = Json::Null;
         for (k, _) in &list {
-            assert!(
-                build(k, &null).is_some(),
-                "catalog key {k} failed to build"
-            );
+            assert!(build(k, &null).is_some(), "catalog key {k} failed to build");
         }
     }
 

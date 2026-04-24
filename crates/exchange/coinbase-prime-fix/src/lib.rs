@@ -166,8 +166,11 @@ impl ExchangeConnector for CoinbasePrimeConnector {
         &self,
         _symbol: &str,
         _depth: u32,
-    ) -> anyhow::Result<(Vec<mm_common::types::PriceLevel>, Vec<mm_common::types::PriceLevel>, u64)>
-    {
+    ) -> anyhow::Result<(
+        Vec<mm_common::types::PriceLevel>,
+        Vec<mm_common::types::PriceLevel>,
+        u64,
+    )> {
         not_connected()
     }
 

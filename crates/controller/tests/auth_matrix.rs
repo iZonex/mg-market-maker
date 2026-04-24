@@ -20,20 +20,11 @@ use mm_dashboard::auth::{AuthState, Role};
 async fn sec1_controller_routes_require_auth_and_respect_role_tiers() {
     let fleet = FleetState::new();
     let registry = AgentRegistry::new();
-    let auth = AuthState::new(
-        "0123456789abcdef0123456789abcdef0123456789abcdef",
-    );
+    let auth = AuthState::new("0123456789abcdef0123456789abcdef0123456789abcdef");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
-    let app = http_router_full_authed(
-        fleet,
-        registry,
-        None,
-        None,
-        None,
-        auth.clone(),
-    );
+    let app = http_router_full_authed(fleet, registry, None, None, None, auth.clone());
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -70,11 +61,7 @@ async fn sec1_controller_routes_require_auth_and_respect_role_tiers() {
         "/api/v1/templates",
     ] {
         let r = http.get(format!("{base}{path}")).send().await.unwrap();
-        assert_eq!(
-            r.status(),
-            StatusCode::UNAUTHORIZED,
-            "anon GET {path}"
-        );
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "anon GET {path}");
     }
     for path in [
         "/api/v1/vault",
@@ -87,11 +74,7 @@ async fn sec1_controller_routes_require_auth_and_respect_role_tiers() {
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            r.status(),
-            StatusCode::UNAUTHORIZED,
-            "anon POST {path}"
-        );
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "anon POST {path}");
     }
 
     // 2) Read tier (internal_view) — admin/op/view=200, CR=403.
@@ -135,15 +118,10 @@ async fn sec1_controller_routes_require_auth_and_respect_role_tiers() {
             .await
             .unwrap();
         if blocked {
-            assert_eq!(
-                r.status(),
-                StatusCode::FORBIDDEN,
-                "{label} POST deploy"
-            );
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "{label} POST deploy");
         } else {
             assert!(
-                r.status() != StatusCode::UNAUTHORIZED
-                    && r.status() != StatusCode::FORBIDDEN,
+                r.status() != StatusCode::UNAUTHORIZED && r.status() != StatusCode::FORBIDDEN,
                 "{label} POST deploy passed auth? got {}",
                 r.status()
             );
@@ -171,15 +149,10 @@ async fn sec1_controller_routes_require_auth_and_respect_role_tiers() {
                 .await
                 .unwrap();
             if blocked {
-                assert_eq!(
-                    r.status(),
-                    StatusCode::FORBIDDEN,
-                    "{label} POST {path}"
-                );
+                assert_eq!(r.status(), StatusCode::FORBIDDEN, "{label} POST {path}");
             } else {
                 assert!(
-                    r.status() != StatusCode::UNAUTHORIZED
-                        && r.status() != StatusCode::FORBIDDEN,
+                    r.status() != StatusCode::UNAUTHORIZED && r.status() != StatusCode::FORBIDDEN,
                     "{label} POST {path} passed auth? got {}",
                     r.status()
                 );
@@ -202,15 +175,10 @@ async fn sec1_controller_routes_require_auth_and_respect_role_tiers() {
             .await
             .unwrap();
         if blocked {
-            assert_eq!(
-                r.status(),
-                StatusCode::FORBIDDEN,
-                "{label} PUT tunables"
-            );
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "{label} PUT tunables");
         } else {
             assert!(
-                r.status() != StatusCode::UNAUTHORIZED
-                    && r.status() != StatusCode::FORBIDDEN,
+                r.status() != StatusCode::UNAUTHORIZED && r.status() != StatusCode::FORBIDDEN,
                 "{label} PUT tunables passed auth? got {}",
                 r.status()
             );

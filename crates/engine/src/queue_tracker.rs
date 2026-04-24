@@ -210,13 +210,7 @@ impl QueueTracker {
     /// own `last_book_qty` cache (book-keeper only reports the
     /// new state), splits it front/back via the probability
     /// model, and advances every queue-pos at this level.
-    pub fn on_depth_change(
-        &mut self,
-        symbol: &str,
-        side: Side,
-        price: Price,
-        new_qty: Qty,
-    ) {
+    pub fn on_depth_change(&mut self, symbol: &str, side: Side, price: Price, new_qty: Qty) {
         let key = (symbol.to_string(), side, price);
         // Bound the cache to levels we have active orders at —
         // depth changes elsewhere aren't interesting and would
@@ -250,12 +244,7 @@ impl QueueTracker {
     /// first-passage probability — but it's monotone in both Q
     /// and λ, bounded in [0,1], and gives strategy nodes a
     /// workable ordering signal.
-    pub fn fill_probability(
-        &self,
-        symbol: &str,
-        side: Side,
-        price: Price,
-    ) -> Option<Decimal> {
+    pub fn fill_probability(&self, symbol: &str, side: Side, price: Price) -> Option<Decimal> {
         let key = (symbol.to_string(), side, price);
         let ids = self.by_level.get(&key)?;
         let min_front = ids

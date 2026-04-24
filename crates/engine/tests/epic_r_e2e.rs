@@ -11,8 +11,7 @@
 //!     paper-mode deploys would feed the same state).
 
 use mm_risk::surveillance::{
-    new_shared_tracker, OrderLifecycleTracker, Side, SpoofingDetector,
-    SurveillanceEvent,
+    new_shared_tracker, OrderLifecycleTracker, Side, SpoofingDetector, SurveillanceEvent,
 };
 use rust_decimal_macros::dec;
 
@@ -57,7 +56,8 @@ fn run_spoof_silhouette() -> (
     // open order 10× trade avg.
     for i in 0..20 {
         let id = format!("spoof{i}");
-        let ts = t0 + chrono::Duration::seconds(1) + chrono::Duration::milliseconds((i * 25) as i64);
+        let ts =
+            t0 + chrono::Duration::seconds(1) + chrono::Duration::milliseconds((i * 25) as i64);
         let mut t = tracker.lock().unwrap();
         t.feed(&SurveillanceEvent::OrderPlaced {
             order_id: id.clone(),

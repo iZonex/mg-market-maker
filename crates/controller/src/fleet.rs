@@ -224,10 +224,7 @@ impl FleetState {
     }
 
     pub fn get(&self, id: &str) -> Option<AgentView> {
-        self.inner
-            .read()
-            .ok()
-            .and_then(|g| g.get(id).cloned())
+        self.inner.read().ok().and_then(|g| g.get(id).cloned())
     }
 
     /// Returns the internal shared reference so tests /

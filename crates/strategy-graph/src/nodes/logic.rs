@@ -20,8 +20,7 @@ static AND_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
         Port::new("b", PortType::Bool),
     ]
 });
-static AND_OUTPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("out", PortType::Bool)]);
+static AND_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("out", PortType::Bool)]);
 
 impl NodeKind for And {
     fn kind(&self) -> &'static str {
@@ -61,8 +60,7 @@ static MUX_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
         Port::new("else", PortType::Number),
     ]
 });
-static MUX_OUTPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("out", PortType::Number)]);
+static MUX_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("out", PortType::Number)]);
 
 impl NodeKind for Mux {
     fn kind(&self) -> &'static str {
@@ -103,8 +101,7 @@ static STRING_MUX_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
         Port::new("else", PortType::String),
     ]
 });
-static STRING_MUX_OUTPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("out", PortType::String)]);
+static STRING_MUX_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("out", PortType::String)]);
 
 impl NodeKind for StringMux {
     fn kind(&self) -> &'static str {
@@ -159,8 +156,7 @@ impl StrategyEq {
 
 static STRATEGY_EQ_INPUTS: Lazy<Vec<Port>> =
     Lazy::new(|| vec![Port::new("kind", PortType::StrategyKind)]);
-static BOOL_OUT: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("out", PortType::Bool)]);
+static BOOL_OUT: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("out", PortType::Bool)]);
 
 impl NodeKind for StrategyEq {
     fn kind(&self) -> &'static str {

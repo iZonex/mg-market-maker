@@ -50,13 +50,11 @@ pub mod tls;
 pub mod transport;
 pub mod ws_transport;
 
+pub use cursor_store::{CursorStoreError, FileCursorStore};
 pub use envelope::{Envelope, EnvelopeKind, SignedEnvelope};
+pub use fail_ladder::{FailLadder, FailRung, StrategyClass};
 pub use identity::{IdentityError, IdentityKey, PublicKey};
 pub use in_memory::in_memory_pair;
-pub use cursor_store::{CursorStoreError, FileCursorStore};
-pub use tls::{build_acceptor, TlsError};
-pub use ws_transport::{WsListener, WsTransport};
-pub use fail_ladder::{FailLadder, FailRung, StrategyClass};
 pub use lease::{LeaderLease, LeaseState};
 pub use lkg::{LkgCache, LkgEntry};
 pub use messages::{
@@ -64,7 +62,9 @@ pub use messages::{
     TelemetryPayload,
 };
 pub use seq::{Cursor, Seq};
+pub use tls::{build_acceptor, TlsError};
 pub use transport::{Transport, TransportError};
+pub use ws_transport::{WsListener, WsTransport};
 
 /// Protocol version. Bumped when any wire-format shape changes in a
 /// non-additive way. Controller and agent refuse to interop across

@@ -247,7 +247,11 @@ impl ApprovalStore {
                 HashMap::new()
             } else {
                 let parsed: ApprovalFile = serde_json::from_str(&raw)?;
-                parsed.records.into_iter().map(|r| (r.fingerprint.clone(), r)).collect()
+                parsed
+                    .records
+                    .into_iter()
+                    .map(|r| (r.fingerprint.clone(), r))
+                    .collect()
             }
         } else {
             HashMap::new()
@@ -334,7 +338,10 @@ impl ApprovalStore {
     }
 
     pub fn get(&self, fingerprint: &str) -> Option<ApprovalRecord> {
-        self.inner.read().ok().and_then(|g| g.get(fingerprint).cloned())
+        self.inner
+            .read()
+            .ok()
+            .and_then(|g| g.get(fingerprint).cloned())
     }
 
     pub fn list(&self) -> Vec<ApprovalRecord> {
@@ -400,7 +407,11 @@ impl ApprovalStore {
         Ok(rec)
     }
 
-    pub fn accept(&self, fingerprint: &str, by: &str) -> Result<ApprovalRecord, ApprovalStoreError> {
+    pub fn accept(
+        &self,
+        fingerprint: &str,
+        by: &str,
+    ) -> Result<ApprovalRecord, ApprovalStoreError> {
         let updated = {
             let mut guard = self.inner.write().map_err(|_| {
                 ApprovalStoreError::Io(std::io::Error::other("approval store poisoned"))
@@ -421,7 +432,12 @@ impl ApprovalStore {
         Ok(updated)
     }
 
-    pub fn revoke(&self, fingerprint: &str, by: &str, reason: &str) -> Result<ApprovalRecord, ApprovalStoreError> {
+    pub fn revoke(
+        &self,
+        fingerprint: &str,
+        by: &str,
+        reason: &str,
+    ) -> Result<ApprovalRecord, ApprovalStoreError> {
         let updated = {
             let mut guard = self.inner.write().map_err(|_| {
                 ApprovalStoreError::Io(std::io::Error::other("approval store poisoned"))
@@ -501,7 +517,12 @@ impl ApprovalStore {
     /// for pulling authority from an already-accepted agent
     /// (triggers LeaseRevoke); `reject` is for pending agents we
     /// decided not to admit in the first place.
-    pub fn reject(&self, fingerprint: &str, by: &str, reason: &str) -> Result<ApprovalRecord, ApprovalStoreError> {
+    pub fn reject(
+        &self,
+        fingerprint: &str,
+        by: &str,
+        reason: &str,
+    ) -> Result<ApprovalRecord, ApprovalStoreError> {
         let updated = {
             let mut guard = self.inner.write().map_err(|_| {
                 ApprovalStoreError::Io(std::io::Error::other("approval store poisoned"))
@@ -676,15 +697,34 @@ mod tests {
             labels: Some(labels),
         };
         let updated = s.update_profile("abc", patch).unwrap();
-        assert_eq!(updated.state, ApprovalState::Accepted, "profile patch must not touch approval");
-        assert_eq!(updated.profile.description.as_deref(), Some("Frankfurt box 3"));
+        assert_eq!(
+            updated.state,
+            ApprovalState::Accepted,
+            "profile patch must not touch approval"
+        );
+        assert_eq!(
+            updated.profile.description.as_deref(),
+            Some("Frankfurt box 3")
+        );
         assert_eq!(updated.profile.client_id.as_deref(), Some("alice"));
         assert_eq!(updated.profile.region.as_deref(), Some("eu-fra"));
         assert_eq!(updated.profile.environment.as_deref(), Some("production"));
-        assert_eq!(updated.profile.purpose.as_deref(), Some("primary BTC/ETH maker"));
-        assert_eq!(updated.profile.owner_contact.as_deref(), Some("oncall@example.com"));
-        assert_eq!(updated.profile.notes.as_deref(), Some("Colocated with Binance FRA gateway"));
-        assert_eq!(updated.profile.labels.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(
+            updated.profile.purpose.as_deref(),
+            Some("primary BTC/ETH maker")
+        );
+        assert_eq!(
+            updated.profile.owner_contact.as_deref(),
+            Some("oncall@example.com")
+        );
+        assert_eq!(
+            updated.profile.notes.as_deref(),
+            Some("Colocated with Binance FRA gateway")
+        );
+        assert_eq!(
+            updated.profile.labels.get("env").map(String::as_str),
+            Some("prod")
+        );
     }
 
     #[test]

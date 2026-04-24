@@ -4,6 +4,7 @@ pub mod autotune;
 pub mod avellaneda;
 pub mod basis;
 pub mod basis_arb;
+pub mod campaign_orchestrator;
 pub mod cartea_spread;
 pub mod cks_ofi;
 pub mod cross_exchange;
@@ -15,22 +16,21 @@ pub mod funding_arb_driver;
 pub mod glft;
 pub mod grid;
 pub mod ignite;
-pub mod layer;
-pub mod mark;
-pub mod stuff;
 pub mod inventory_skew;
+pub mod layer;
 pub mod learned_microprice;
+pub mod mark;
 pub mod market_resilience;
 pub mod momentum;
-pub mod campaign_orchestrator;
 pub mod paired_unwind;
 pub mod pump_and_dump;
 pub mod spoof;
 pub mod stat_arb;
-pub mod wash;
+pub mod stuff;
 pub mod r#trait;
 pub mod twap;
 pub mod volatility;
+pub mod wash;
 /// Cross-exchange executor (22W-5 wire-in). Consumes maker-leg
 /// fills from `CrossExchangeStrategy`, emits hedge-leg market
 /// orders via the engine's spawned XEMM dispatch. Opt-in via

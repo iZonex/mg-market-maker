@@ -371,7 +371,9 @@ impl VaultStore {
 
     pub fn pushable_exchange_for_agent(&self, agent_id: &str) -> Vec<PushedCredential> {
         let mut out = Vec::new();
-        let Ok(guard) = self.inner.read() else { return out };
+        let Ok(guard) = self.inner.read() else {
+            return out;
+        };
         for entry in guard.values() {
             if entry.kind != kinds::EXCHANGE {
                 continue;
@@ -409,7 +411,9 @@ impl VaultStore {
 
     pub fn exchange_descriptors_for_agent(&self, agent_id: &str) -> Vec<CredentialDescriptor> {
         let mut out = Vec::new();
-        let Ok(guard) = self.inner.read() else { return out };
+        let Ok(guard) = self.inner.read() else {
+            return out;
+        };
         let now_ms = chrono::Utc::now().timestamp_millis();
         for entry in guard.values() {
             if entry.kind != kinds::EXCHANGE {
@@ -464,9 +468,7 @@ impl VaultStore {
             return CredentialCheck::Unknown;
         };
         if entry.kind != kinds::EXCHANGE {
-            return CredentialCheck::WrongKind {
-                actual: entry.kind,
-            };
+            return CredentialCheck::WrongKind { actual: entry.kind };
         }
         // Fix #4 — block expired credentials BEFORE tenant
         // gate. Expiry is operator-facing sanity (force
@@ -600,14 +602,22 @@ fn validate(entry: &VaultEntry) -> Result<(), VaultError> {
                 "hyperliquid",
                 "hyperliquid_testnet",
             ];
-            let ex = entry.metadata.get("exchange").map(String::as_str).unwrap_or("");
+            let ex = entry
+                .metadata
+                .get("exchange")
+                .map(String::as_str)
+                .unwrap_or("");
             if !allowed.contains(&ex) {
                 return Err(VaultError::Invalid(format!(
                     "unknown exchange '{ex}' — allowed: {allowed:?}"
                 )));
             }
             let allowed_products = ["spot", "linear_perp", "inverse_perp"];
-            let pr = entry.metadata.get("product").map(String::as_str).unwrap_or("");
+            let pr = entry
+                .metadata
+                .get("product")
+                .map(String::as_str)
+                .unwrap_or("");
             if !allowed_products.contains(&pr) {
                 return Err(VaultError::Invalid(format!(
                     "unknown product '{pr}' — allowed: {allowed_products:?}"
@@ -648,10 +658,17 @@ fn summary(r: &VaultEntry) -> VaultSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialCheck {
-    Ok { exchange: String, product: String },
+    Ok {
+        exchange: String,
+        product: String,
+    },
     Unknown,
-    WrongKind { actual: String },
-    NotAuthorised { whitelist: Vec<String> },
+    WrongKind {
+        actual: String,
+    },
+    NotAuthorised {
+        whitelist: Vec<String>,
+    },
     /// Wave 2b — credential's tenant (`client_id`) doesn't match
     /// the target agent's profile `client_id`. `cred_tenant` and
     /// `agent_tenant` surface the clash for the UI error banner.
@@ -891,7 +908,10 @@ mod tests {
         v.insert(e).unwrap();
         // Agent belongs to tenant "bob" — tenant mismatch fires.
         match v.can_exchange_access("alice_cred", "eu-01", Some("bob")) {
-            CredentialCheck::TenantMismatch { cred_tenant, agent_tenant } => {
+            CredentialCheck::TenantMismatch {
+                cred_tenant,
+                agent_tenant,
+            } => {
                 assert_eq!(cred_tenant, "alice");
                 assert_eq!(agent_tenant, "bob");
             }
@@ -908,7 +928,10 @@ mod tests {
         // Agent profile has no client_id — also refused; the
         // shared-infra escape only runs in the opposite direction.
         match v.can_exchange_access("alice_cred", "eu-01", None) {
-            CredentialCheck::TenantMismatch { cred_tenant, agent_tenant } => {
+            CredentialCheck::TenantMismatch {
+                cred_tenant,
+                agent_tenant,
+            } => {
                 assert_eq!(cred_tenant, "alice");
                 assert_eq!(agent_tenant, "");
             }

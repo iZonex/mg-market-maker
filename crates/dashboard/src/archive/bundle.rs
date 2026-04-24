@@ -22,12 +22,12 @@
 
 use crate::monthly_report::build_monthly_report;
 use crate::report_export::{
-    MonthlyReportData, ReportManifest, build_manifest, render_csv, render_xlsx,
+    build_manifest, render_csv, render_xlsx, MonthlyReportData, ReportManifest,
 };
 use crate::state::DashboardState;
 use chrono::NaiveDate;
 use std::io::{Cursor, Write};
-use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 pub struct BundleRequest<'a> {
     pub state: &'a DashboardState,
@@ -62,8 +62,7 @@ pub fn build_zip(req: BundleRequest<'_>) -> anyhow::Result<BundleOutput> {
     {
         let cursor = Cursor::new(&mut buf);
         let mut zip = ZipWriter::new(cursor);
-        let opt = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Deflated);
+        let opt = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
         zip.start_file("summary.json", opt)?;
         zip.write_all(serde_json::to_string_pretty(&data)?.as_bytes())?;
@@ -98,9 +97,9 @@ pub fn build_zip(req: BundleRequest<'_>) -> anyhow::Result<BundleOutput> {
         // carry the same hash) back to the intent.
         if let Some(store) = req.state.strategy_graph_store() {
             if let Ok(records) = store.deploys() {
-                let from_ts = req.from.and_hms_opt(0, 0, 0)
-                    .map(|dt| dt.and_utc());
-                let to_ts = req.to
+                let from_ts = req.from.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc());
+                let to_ts = req
+                    .to
                     .succ_opt()
                     .and_then(|d| d.and_hms_opt(0, 0, 0))
                     .map(|dt| dt.and_utc());
@@ -123,12 +122,9 @@ pub fn build_zip(req: BundleRequest<'_>) -> anyhow::Result<BundleOutput> {
                         continue;
                     }
                     if let Ok(graph) = store.load_by_hash(&rec.name, &rec.hash) {
-                        let body = serde_json::to_string_pretty(&graph)
-                            .unwrap_or_default();
-                        let path = format!(
-                            "strategy_graphs/snapshots/{hash}.json",
-                            hash = rec.hash
-                        );
+                        let body = serde_json::to_string_pretty(&graph).unwrap_or_default();
+                        let path =
+                            format!("strategy_graphs/snapshots/{hash}.json", hash = rec.hash);
                         zip.start_file(path, opt)?;
                         zip.write_all(body.as_bytes())?;
                     }
@@ -178,15 +174,15 @@ fn readme_text(data: &MonthlyReportData, manifest: &ReportManifest) -> String {
          \n\
          manifest.sig   : {sig}\n\
         ",
-        cid    = data.client_id,
-        cname  = data.client_name,
-        from   = data.period_from,
-        to     = data.period_to,
-        gen    = data.generated_at.to_rfc3339(),
-        n_sym  = data.summaries.len(),
+        cid = data.client_id,
+        cname = data.client_name,
+        from = data.period_from,
+        to = data.period_to,
+        gen = data.generated_at.to_rfc3339(),
+        n_sym = data.summaries.len(),
         n_fill = data.fills.len(),
-        n_aud  = data.audit_events.len(),
-        sig    = manifest.sig,
+        n_aud = data.audit_events.len(),
+        sig = manifest.sig,
     )
 }
 
@@ -208,7 +204,10 @@ mod tests {
             to,
         })
         .expect("build zip");
-        assert!(out.bytes.len() > 100, "zip body should not be trivially small");
+        assert!(
+            out.bytes.len() > 100,
+            "zip body should not be trivially small"
+        );
         // ZIP magic
         assert_eq!(&out.bytes[0..4], b"PK\x03\x04");
         assert_eq!(out.manifest.formats.len(), 4);

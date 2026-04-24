@@ -56,7 +56,11 @@ fn parse_args() -> Args {
             _ => i += 1,
         }
     }
-    Args { input, out, strategy }
+    Args {
+        input,
+        out,
+        strategy,
+    }
 }
 
 fn main() -> Result<()> {
@@ -76,7 +80,12 @@ fn main() -> Result<()> {
 
     for ev in &events {
         match ev {
-            RecordedEvent::BookSnapshot { timestamp, bids, asks, .. } => {
+            RecordedEvent::BookSnapshot {
+                timestamp,
+                bids,
+                asks,
+                ..
+            } => {
                 window_start.get_or_insert(*timestamp);
                 window_end = Some(*timestamp);
                 let (Some(bb), Some(ba)) = (bids.first(), asks.first()) else {
@@ -140,7 +149,11 @@ fn main() -> Result<()> {
         let total_secs = (trade_ts.last().unwrap().timestamp_millis()
             - trade_ts.first().unwrap().timestamp_millis()) as f64
             / 1000.0;
-        let rate = if total_secs > 0.0 { trade_count as f64 / total_secs } else { 0.0 };
+        let rate = if total_secs > 0.0 {
+            trade_count as f64 / total_secs
+        } else {
+            0.0
+        };
         let avg_size = trade_qty_sum / trade_count as f64;
         (rate, avg_size)
     } else {

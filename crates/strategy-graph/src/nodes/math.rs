@@ -25,8 +25,7 @@ static ADD_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
         Port::new("b", PortType::Number),
     ]
 });
-static ADD_OUTPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("out", PortType::Number)]);
+static ADD_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("out", PortType::Number)]);
 
 impl NodeKind for Add {
     fn kind(&self) -> &'static str {
@@ -114,19 +113,11 @@ mod tests {
         .unwrap();
         let mut st = NodeState::default();
         let hit = node
-            .evaluate(
-                &EvalCtx::default(),
-                &[Value::Number(dec!(5.1))],
-                &mut st,
-            )
+            .evaluate(&EvalCtx::default(), &[Value::Number(dec!(5.1))], &mut st)
             .unwrap();
         assert_eq!(hit, vec![Value::Bool(true)]);
         let miss = node
-            .evaluate(
-                &EvalCtx::default(),
-                &[Value::Number(dec!(4.9))],
-                &mut st,
-            )
+            .evaluate(&EvalCtx::default(), &[Value::Number(dec!(4.9))], &mut st)
             .unwrap();
         assert_eq!(miss, vec![Value::Bool(false)]);
     }
@@ -135,9 +126,7 @@ mod tests {
     fn const_returns_configured_value() {
         let node = Const::from_config(&serde_json::json!({ "value": "1.75" })).unwrap();
         let mut st = NodeState::default();
-        let out = node
-            .evaluate(&EvalCtx::default(), &[], &mut st)
-            .unwrap();
+        let out = node.evaluate(&EvalCtx::default(), &[], &mut st).unwrap();
         assert_eq!(out, vec![Value::Number(dec!(1.75))]);
     }
 
@@ -145,9 +134,7 @@ mod tests {
     fn const_default_is_zero() {
         let node = Const::from_config(&serde_json::Value::Null).unwrap();
         let mut st = NodeState::default();
-        let out = node
-            .evaluate(&EvalCtx::default(), &[], &mut st)
-            .unwrap();
+        let out = node.evaluate(&EvalCtx::default(), &[], &mut st).unwrap();
         assert_eq!(out, vec![Value::Number(dec!(0))]);
     }
 
@@ -200,8 +187,7 @@ impl Const {
     }
 }
 
-static CONST_OUTPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("value", PortType::Number)]);
+static CONST_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("value", PortType::Number)]);
 static EMPTY_INPUTS: Lazy<Vec<Port>> = Lazy::new(Vec::new);
 
 impl NodeKind for Const {
@@ -221,7 +207,11 @@ impl NodeKind for Const {
             label: "Value",
             hint: None,
             default: serde_json::json!("0"),
-            widget: ConfigWidget::Number { min: None, max: None, step: Some(0.01) },
+            widget: ConfigWidget::Number {
+                min: None,
+                max: None,
+                step: Some(0.01),
+            },
         }]
     }
     fn evaluate(
@@ -244,8 +234,7 @@ static MUL_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
         Port::new("b", PortType::Number),
     ]
 });
-static MUL_OUTPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("out", PortType::Number)]);
+static MUL_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("out", PortType::Number)]);
 
 impl NodeKind for Mul {
     fn kind(&self) -> &'static str {
@@ -335,10 +324,8 @@ impl ToBool {
     }
 }
 
-static TOBOOL_INPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("x", PortType::Number)]);
-static TOBOOL_OUTPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("out", PortType::Bool)]);
+static TOBOOL_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("x", PortType::Number)]);
+static TOBOOL_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("out", PortType::Bool)]);
 
 impl NodeKind for ToBool {
     fn kind(&self) -> &'static str {
@@ -358,7 +345,11 @@ impl NodeKind for ToBool {
                 label: "Threshold",
                 hint: Some("Compared with the incoming number"),
                 default: serde_json::json!("0"),
-                widget: ConfigWidget::Number { min: None, max: None, step: Some(0.01) },
+                widget: ConfigWidget::Number {
+                    min: None,
+                    max: None,
+                    step: Some(0.01),
+                },
             },
             ConfigField {
                 name: "cmp",
@@ -367,11 +358,26 @@ impl NodeKind for ToBool {
                 default: serde_json::json!("ge"),
                 widget: ConfigWidget::Enum {
                     options: vec![
-                        ConfigEnumOption { value: "ge", label: "≥" },
-                        ConfigEnumOption { value: "gt", label: ">" },
-                        ConfigEnumOption { value: "le", label: "≤" },
-                        ConfigEnumOption { value: "lt", label: "<" },
-                        ConfigEnumOption { value: "eq", label: "=" },
+                        ConfigEnumOption {
+                            value: "ge",
+                            label: "≥",
+                        },
+                        ConfigEnumOption {
+                            value: "gt",
+                            label: ">",
+                        },
+                        ConfigEnumOption {
+                            value: "le",
+                            label: "≤",
+                        },
+                        ConfigEnumOption {
+                            value: "lt",
+                            label: "<",
+                        },
+                        ConfigEnumOption {
+                            value: "eq",
+                            label: "=",
+                        },
                     ],
                 },
             },
@@ -461,10 +467,8 @@ impl InventorySkew {
     }
 }
 
-static INV_SKEW_INPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("level", PortType::Number)]);
-static INV_SKEW_OUTPUTS: Lazy<Vec<Port>> =
-    Lazy::new(|| vec![Port::new("skew", PortType::Number)]);
+static INV_SKEW_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("level", PortType::Number)]);
+static INV_SKEW_OUTPUTS: Lazy<Vec<Port>> = Lazy::new(|| vec![Port::new("skew", PortType::Number)]);
 
 impl NodeKind for InventorySkew {
     fn kind(&self) -> &'static str {
@@ -484,14 +488,22 @@ impl NodeKind for InventorySkew {
                 label: "Inventory cap",
                 hint: Some("|level| ≥ cap → |skew|=1; absolute base-asset units"),
                 default: serde_json::json!("1"),
-                widget: ConfigWidget::Number { min: Some(0.0), max: None, step: Some(0.01) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.0),
+                    max: None,
+                    step: Some(0.01),
+                },
             },
             ConfigField {
                 name: "exponent",
                 label: "Curve exponent",
                 hint: Some("> 1 steepens the ramp near cap (default 2 = quadratic)"),
                 default: serde_json::json!("2"),
-                widget: ConfigWidget::Number { min: Some(0.1), max: Some(10.0), step: Some(0.1) },
+                widget: ConfigWidget::Number {
+                    min: Some(0.1),
+                    max: Some(10.0),
+                    step: Some(0.1),
+                },
             },
         ]
     }
