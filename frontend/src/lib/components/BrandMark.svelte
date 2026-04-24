@@ -1,9 +1,9 @@
 <script>
   /*
-   * Brand mark — glyph + optional wordmark. The short glyph
-   * ("MG" by default) and the rest-of-name ("Market Maker") both
-   * come from the `branding.js` constants so re-skinning the
-   * project is a single-file edit.
+   * Brand mark — glyph + optional wordmark. The short glyph and
+   * the rest-of-name wordmark both come from the `branding.js`
+   * constants (BRAND.shortName + BRAND.productName) so re-skinning
+   * the project is a single-file edit.
    *
    * Height is the control dimension; width follows (ratio ≈ 1.6).
    *

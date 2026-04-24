@@ -100,7 +100,7 @@
               {@const isDormant = isSource && requiredSet.size > 0 && !requiredSet.has(e.kind)}
               <button
                 type="button"
-                class="chip"
+                class="palette-chip"
                 class:restricted={e.restricted}
                 class:dormant={isDormant}
                 draggable="true"
@@ -222,10 +222,10 @@ ${e.kind} · ${e.inputs.length} in · ${e.outputs.length} out${e.restricted ? ' 
     padding: 2px var(--s-2) var(--s-2);
   }
 
-  /* Single-row chip: label (truncated) on the left, shape pill on
-   * the right. Summary lives in the title tooltip so it never breaks
-   * the layout, and the whole thing has one explicit height. */
-  .chip {
+  /* Single-row palette chip: bespoke — wider + taller than the
+     generic `.chip` utility. Named .palette-chip so it doesn't
+     collide with the utilities.css declaration. */
+  .palette-chip {
     display: flex; align-items: center; gap: 8px;
     width: 100%; min-width: 0; box-sizing: border-box;
     height: 28px;
@@ -235,7 +235,7 @@ ${e.kind} · ${e.inputs.length} in · ${e.outputs.length} out${e.restricted ? ' 
     cursor: grab; user-select: none; text-align: left;
     transition: background 0.08s, border-color 0.08s;
   }  /* M3-GOBS — dormant source (not referenced by current graph). */
-  .chip.dormant {
+  .palette-chip.dormant {
     opacity: 0.48;
     background:
       repeating-linear-gradient(

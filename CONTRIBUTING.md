@@ -23,8 +23,18 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 
 # Frontend (only if frontend touched)
-cd frontend && npm run build    # must build without errors
+cd frontend && npm run build              # must build without errors
+./scripts/lint-design-system.sh           # enforces design-system invariants
 ```
+
+The design-system linter catches: new `.btn {}` CSS rules outside
+`primitives/Button.svelte`, inline `class="btn"` usages, hex/rgba
+literals in components (should use `tokens.css`), brand-string
+hardcodes outside `branding.js`, duplicate chip/pill/tone utility
+CSS outside `utilities.css`, and hand-rolled `.modal-backdrop`
+chrome. Every new PR runs it; see
+**[docs/guides/frontend-style-guide.md](docs/guides/frontend-style-guide.md)**
+for the rules + available primitives.
 
 ### Code Style — Rust
 
