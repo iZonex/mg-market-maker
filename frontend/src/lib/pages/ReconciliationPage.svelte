@@ -16,6 +16,7 @@
   import Card from '../components/Card.svelte'
   import { createApiClient } from '../api.svelte.js'
   import { Button } from '../primitives/index.js'
+  import { fmtRelative as fmtAge } from '../format.js'
 
   let { auth } = $props()
   const api = $derived(createApiClient(auth))
@@ -66,13 +67,7 @@
     return { ghosts, phantoms, balMm, fetchFails }
   })
 
-  function fmtAge(ms) {
-    if (!ms) return '—'
-    const delta = Date.now() - ms
-    if (delta < 60_000) return `${Math.round(delta / 1000)}s ago`
-    if (delta < 3600_000) return `${Math.round(delta / 60_000)}m ago`
-    return `${Math.round(delta / 3600_000)}h ago`
-  }
+  // Use fmtRelative from format.js (returns "5s ago" / "3 min ago" / …).
 </script>
 
 <div class="page scroll">

@@ -14,7 +14,7 @@
    * so no new backend routes. Closes on Esc / backdrop click.
    */
   import { createApiClient } from '../api.svelte.js'
-  import { fmtPnl, fmtPrice, fmtBps, fmtRelative, fmtFixed } from '../format.js'
+  import { fmtPnl, fmtPrice, fmtBps, fmtRelative, fmtFixed, fmtCountdown } from '../format.js'
   import Icon from './Icon.svelte'
   import { Modal, Button } from '../primitives/index.js'
 
@@ -72,17 +72,8 @@
     }
   })
 
-  function fmtCountdown(ms) {
-    if (!ms) return '—'
-    const d = ms - now
-    if (d <= 0) return 'now'
-    const h = Math.floor(d / 3_600_000)
-    const m = Math.floor((d % 3_600_000) / 60_000)
-    const s = Math.floor((d % 60_000) / 1000)
-    if (h > 0) return `${h}h ${m}m`
-    if (m > 0) return `${m}m ${s}s`
-    return `${s}s`
-  }
+  // fmtCountdown imported from format.js — pass `now` so the render
+  // frame sees a monotone wall-clock.
 </script>
 
 <Modal
@@ -120,7 +111,7 @@
           </div>
           <div class="row">
             <span class="lbl">Next settlement</span>
-            <span class="num">{fmtCountdown(funding.next_funding_ts)}</span>
+            <span class="num">{fmtCountdown(funding.next_funding_ts, now)}</span>
           </div>
           <div class="row">
             <span class="lbl">ETA</span>

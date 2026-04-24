@@ -8,6 +8,7 @@
    * "BTC = +0.3 (Binance +0.5 · Bybit -0.2)" at a glance.
    */
   import { createApiClient } from '../api.svelte.js'
+  import { fmtCountdown } from '../format.js'
   import LegDetailModal from './LegDetailModal.svelte'
 
   let { auth } = $props()
@@ -92,17 +93,7 @@
     return fundingByLeg[`${leg.venue}|${leg.symbol}`] ?? null
   }
 
-  function fmtCountdown(ms) {
-    if (!ms) return null
-    const d = ms - now
-    if (d <= 0) return 'now'
-    const h = Math.floor(d / 3_600_000)
-    const m = Math.floor((d % 3_600_000) / 60_000)
-    const s = Math.floor((d % 60_000) / 1000)
-    if (h > 0) return `${h}h ${m}m`
-    if (m > 0) return `${m}m ${s}s`
-    return `${s}s`
-  }
+  // fmtCountdown imported from format.js — takes (ms, nowMs).
 
   function countdownSeverity(ms) {
     if (!ms) return 'muted'
@@ -166,7 +157,7 @@
                     {/if}
                     {#if f.next_funding_ts}
                       <span class="funding-eta mono" data-sev={countdownSeverity(f.next_funding_ts)}>
-                        {fmtCountdown(f.next_funding_ts)}
+                        {fmtCountdown(f.next_funding_ts, now)}
                       </span>
                     {/if}
                   </span>

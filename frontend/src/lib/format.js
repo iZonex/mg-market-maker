@@ -160,6 +160,82 @@ export function fmtRelative(ms) {
 }
 
 /**
+ * Human-friendly age for a past-timestamp — variant of `fmtRelative`
+ * without the "ago"/"in" suffix. Use for "last seen 5m 12s" style.
+ * Returns `—` on missing input.
+ */
+export function fmtAge(ms) {
+  if (ms == null || !Number.isFinite(ms)) return EMPTY
+  const now = Date.now()
+  const delta = Math.max(0, now - ms)
+  const s = Math.floor(delta / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m ${s % 60}s`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h}h ${m % 60}m`
+  return `${Math.floor(h / 24)}d ${h % 24}h`
+}
+
+/**
+ * Duration in ms → compact "2d 3h 5m 10s" / "45m 12s" / "12s" string.
+ * Input is a DELTA (not a timestamp). Returns `—` on null/non-finite.
+ */
+export function fmtDuration(ms) {
+  if (ms == null || !Number.isFinite(ms)) return EMPTY
+  const s = Math.max(0, Math.round(ms / 1000))
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m ${s % 60}s`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h}h ${m % 60}m`
+  return `${Math.floor(h / 24)}d ${h % 24}h`
+}
+
+/**
+ * Countdown to a future `ms` timestamp. Returns `now` when already
+ * elapsed, `—` on missing / non-finite input. Format:
+ *   - `{h}h {m}m` when > 1 hour
+ *   - `{m}m {s}s` when > 1 minute
+ *   - `{s}s` otherwise
+ *
+ * Pass `nowMs` explicitly when rendering inside a reactive loop so
+ * successive frames share a monotone wall-clock — avoids flicker.
+ */
+export function fmtCountdown(ms, nowMs = Date.now()) {
+  if (ms == null || !Number.isFinite(Number(ms))) return EMPTY
+  const d = Number(ms) - nowMs
+  if (d <= 0) return 'now'
+  const h = Math.floor(d / 3_600_000)
+  const m = Math.floor((d % 3_600_000) / 60_000)
+  const s = Math.floor((d % 60_000) / 1000)
+  if (h > 0) return `${h}h ${m}m`
+  if (m > 0) return `${m}m ${s}s`
+  return `${s}s`
+}
+
+/**
+ * Compact absolute-date render — "MMM D, HH:MM" or full "YYYY-MM-DD
+ * HH:MM" depending on `style`. Use when `fmtRelative` would be too
+ * vague (audit / compliance rows want the exact moment).
+ */
+export function fmtDate(ms, style = 'short') {
+  if (ms == null || !Number.isFinite(ms)) return EMPTY
+  const d = new Date(ms)
+  if (style === 'full') {
+    return d.toLocaleString(undefined, {
+      year: 'numeric', month: 'short', day: 'numeric',
+      hour: '2-digit', minute: '2-digit',
+    })
+  }
+  // short — 'Apr 24, 14:32'
+  return d.toLocaleString(undefined, {
+    month: 'short', day: 'numeric',
+    hour: '2-digit', minute: '2-digit',
+  })
+}
+
+/**
  * Tailwind-ish semantic CSS class hint for a signed number. Panels
  * typically wrap a value with `<span class={pnlClass(val)}>` to colour
  * positive values green and negative red. Returns `''` for zero/missing

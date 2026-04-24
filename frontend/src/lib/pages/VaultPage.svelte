@@ -23,6 +23,8 @@
   import Icon from '../components/Icon.svelte'
   import { createApiClient } from '../api.svelte.js'
   import { Button } from '../primitives/index.js'
+  import { fmtDate } from '../format.js'
+  const formatDate = (ms) => fmtDate(ms, 'full')
 
   let { auth } = $props()
   const api = $derived(createApiClient(auth))
@@ -300,13 +302,7 @@
     formMsg = null
   }
 
-  function formatDate(ms) {
-    if (!ms) return '—'
-    return new Date(ms).toLocaleString(undefined, {
-      year: 'numeric', month: 'short', day: 'numeric',
-      hour: '2-digit', minute: '2-digit',
-    })
-  }
+  // formatDate = fmtDate(ms, 'full') from format.js.
 
   // Wave C6 — tone the expiry chip based on time-to-expiry.
   // Returns 'ok' (>30d), 'warn' (7-30d), 'bad' (<7d), 'expired' (<0).

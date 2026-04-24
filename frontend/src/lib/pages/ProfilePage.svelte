@@ -13,6 +13,8 @@
   import TotpCard from '../components/profile/TotpCard.svelte'
   import { createApiClient } from '../api.svelte.js'
   import { Button } from '../primitives/index.js'
+  import { fmtDate } from '../format.js'
+  const formatDate = (ms) => fmtDate(ms, 'full')
 
   let { auth } = $props()
   const api = $derived(createApiClient(auth))
@@ -69,13 +71,7 @@
   }
 
 
-  function formatDate(ms) {
-    if (!ms) return '—'
-    return new Date(ms).toLocaleString(undefined, {
-      year: 'numeric', month: 'short', day: 'numeric',
-      hour: '2-digit', minute: '2-digit',
-    })
-  }
+  // formatDate = fmtDate(ms, 'full') from format.js.
 </script>
 
 <div class="page scroll">

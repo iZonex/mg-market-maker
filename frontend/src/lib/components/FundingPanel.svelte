@@ -14,7 +14,7 @@
    */
 
   import { createApiClient } from '../api.svelte.js'
-  import { fmtBps, fmtRelative } from '../format.js'
+  import { fmtBps, fmtRelative, fmtCountdown } from '../format.js'
   import Icon from './Icon.svelte'
 
   let { auth } = $props()
@@ -61,17 +61,8 @@
     return r * 1095 * 10_000
   }
 
-  function fmtCountdown(ms) {
-    if (!ms) return '—'
-    const delta = ms - now
-    if (delta <= 0) return 'now'
-    const h = Math.floor(delta / 3_600_000)
-    const m = Math.floor((delta % 3_600_000) / 60_000)
-    const s = Math.floor((delta % 60_000) / 1000)
-    if (h > 0) return `${h}h ${m}m`
-    if (m > 0) return `${m}m ${s}s`
-    return `${s}s`
-  }
+  /* fmtCountdown(ms, nowMs) comes from format.js — passed `now`
+     so successive render frames share a monotone wall-clock. */
 
   function severity(ms) {
     if (!ms) return 'muted'
@@ -133,7 +124,7 @@
             </td>
             <td class="num right">
               <span data-sev={severity(r.next_funding_ts)}>
-                {fmtCountdown(r.next_funding_ts)}
+                {fmtCountdown(r.next_funding_ts, now)}
               </span>
               {#if r.next_funding_ts}
                 <span class="sub">{fmtRelative(r.next_funding_ts)}</span>
