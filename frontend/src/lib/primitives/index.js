@@ -12,9 +12,16 @@
  *   import { Button, Modal, Chip, StatusPill, FormField, DataGrid } from '$lib/primitives'
  */
 
-export { default as Button }     from './Button.svelte'
-export { default as Modal }      from './Modal.svelte'
-export { default as Chip }       from './Chip.svelte'
-export { default as StatusPill } from './StatusPill.svelte'
-export { default as FormField }  from './FormField.svelte'
-export { default as DataGrid }   from './DataGrid.svelte'
+export { default as Button }        from './Button.svelte'
+export { default as Modal }         from './Modal.svelte'
+export { default as Chip }          from './Chip.svelte'
+export { default as StatusPill }    from './StatusPill.svelte'
+export { default as FormField }     from './FormField.svelte'
+export { default as DataGrid }      from './DataGrid.svelte'
+export { default as EmptyState }    from './EmptyState.svelte'
+export { default as StatTile }      from './StatTile.svelte'
+export { default as SectionHeader } from './SectionHeader.svelte'
+
+// Card is in components/ for historical reasons (many imports);
+// re-export from primitives for discovery. Migrate imports lazily.
+export { default as Card }          from '../components/Card.svelte'

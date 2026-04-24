@@ -1,36 +1,37 @@
 <script>
   /*
-   * 23-UX-9 — reusable empty-state component.
+   * <EmptyState> — consistent "there's nothing here yet" placeholder.
    *
-   * Every panel was rendering its own version of "No X yet" with
-   * slightly different icon sizes + copy styles. This gives a
-   * single source of truth so compliance / orderbook /
-   * surveillance feel like one app.
+   * Every panel used to render its own "No X yet" with slightly
+   * different icon sizes + copy styles; this gives a single source
+   * of truth so compliance / orderbook / surveillance feel like one
+   * app.
    *
-   * Usage:
-   *   <EmptyState
-   *     icon="history"
-   *     title="No events yet"
-   *     hint="Event stream appears once the engine starts ticking."
-   *     variant="waiting"|"done"|"muted" />
+   * Design-system contract:
+   *   - Tokens only.
+   *   - `variant` maps to a semantic tone (waiting=info, done=pos,
+   *     muted=neutral). Everything else follows.
    */
-  import Icon from './Icon.svelte'
+
+  import Icon from '../components/Icon.svelte'
+
   let {
     icon = 'info',
     title = '',
     hint = '',
+    /** @type {'waiting' | 'done' | 'muted'} */
     variant = 'muted',
   } = $props()
 </script>
 
-<div class="empty" data-variant={variant}>
+<div class="empty-state" data-variant={variant}>
   <span class="ico"><Icon name={icon} size={20} /></span>
   {#if title}<span class="title">{title}</span>{/if}
   {#if hint}<span class="hint">{hint}</span>{/if}
 </div>
 
 <style>
-  .empty {
+  .empty-state {
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -52,8 +53,8 @@
     color: var(--fg-muted);
     margin-bottom: var(--s-1);
   }
-  .empty[data-variant='waiting'] .ico { color: var(--info); background: rgba(59, 130, 246, 0.1); }
-  .empty[data-variant='done']    .ico { color: var(--pos); background: var(--pos-bg); }
+  .empty-state[data-variant='waiting'] .ico { color: var(--info); background: var(--info-bg); }
+  .empty-state[data-variant='done']    .ico { color: var(--pos); background: var(--pos-bg); }
   .title {
     font-size: var(--fs-sm);
     font-weight: 600;

@@ -115,6 +115,46 @@ Dense tabular data.
 ```
 Use the `cell` snippet for per-column custom rendering (embed a `<Chip>`, format a number, etc.).
 
+### `<StatTile>`
+One KPI — label, big value, optional delta/meta. Tone colours the value.
+```svelte
+<StatTile label="Mid" value="50,123.45" mono />
+<StatTile label="PnL (24h)" value="+$1,234" tone="positive" delta="+2.1%" />
+<StatTile label="Spread" value="12.4" meta="bps" tone="warn" />
+```
+Pre-format the string; missing values render as `—` automatically.
+
+### `<SectionHeader>`
+Consistent header for a grouped block INSIDE a Card or page section.
+```svelte
+<SectionHeader title="Recent fills" subtitle="last 20">
+  {#snippet actions()}
+    <Button variant="ghost" size="sm" onclick={refresh}>Refresh</Button>
+  {/snippet}
+</SectionHeader>
+```
+Use `<Card>` for the outer chrome (title + subtitle baked in), `<SectionHeader>` for sub-groups inside.
+
+### `<EmptyState>`
+"Nothing here yet" placeholder with an icon + title + hint. Variants: `waiting`, `done`, `muted`.
+```svelte
+<EmptyState
+  icon="history"
+  variant="waiting"
+  title="No fills yet"
+  hint="Engine starts emitting once the first quote lands."
+/>
+```
+
+### `<Card>`
+Page-panel chrome — title + actions + body + empty/loading states built in. Re-exported from primitives for discovery; lives in `components/` for historical import-path stability.
+```svelte
+<Card title="Fleet" subtitle="live sessions" span={2} empty={rows.length === 0}>
+  {#snippet actions()}<Button ...>...</Button>{/snippet}
+  {#snippet children()}<DataGrid {columns} {rows} />{/snippet}
+</Card>
+```
+
 ## When to roll your own vs extend a primitive
 
 - **New variant of an existing primitive** → extend the primitive (add a `variant` / `tone` / `severity` value). Don't fork.
