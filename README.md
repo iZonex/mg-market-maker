@@ -501,30 +501,94 @@ The engine handles order management, risk limits, PnL tracking, audit trail, and
 
 ## Configuration
 
+Configuration is **three-layered** — infrastructure, trading logic,
+and runtime tunables each have their own surface. There is no single
+monolithic TOML anymore.
+
+### Layer 1 — `mm-server` (env vars)
+
+The controller + dashboard process. Everything ephemeral (leases,
+tokens) is in memory; everything durable has a file path.
+
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `MM_HTTP_ADDR` | `127.0.0.1:9090` | Dashboard UI + API |
+| `MM_AGENT_WS_ADDR` | `127.0.0.1:9091` | Agent-facing WS |
+| `MM_MASTER_KEY` or `MM_MASTER_KEY_FILE` | `./master-key` | AES-256-GCM vault key (hex) |
+| `MM_AUTH_SECRET` or `MM_AUTH_SECRET_FILE` | `./auth-secret` | HMAC key for bearer tokens |
+| `MM_VAULT` | `./vault.json` | Encrypted vault file |
+| `MM_APPROVALS` | `./approvals.json` | Persistent agent admission records (`"memory"` to opt out) |
+| `MM_TUNABLES` | `./tunables.json` | Runtime tunables store (lease TTL, version pinning, deploy defaults) |
+| `MM_FRONTEND_DIR` | `frontend/dist` | Static asset root |
+| `MM_AUDIT_RESUME_ON_BROKEN` | *(unset)* | Set to `yes` to boot on a broken audit hash chain (default: refuse) |
+
+### Layer 2 — `mm-agent` (`settings.toml`)
+
+**Infrastructure**, not strategy parameters. Rarely changes. Lists
+venue credentials **by id** — the secrets themselves live in env
+vars named here (so the settings file is safely commit-able + scp-able
++ audit-loggable).
+
 ```toml
-symbols = ["BTCUSDT"]
+[agent]
+id = "eu-hft-01"                              # unique across the fleet
+controller_addr = "wss://controller:9091"     # controller WS
+identity_key_path = "./agent-identity.key"    # Ed25519 (auto-generated on first run)
 
-[exchange]
-exchange_type = "binance"
+[[credentials]]
+id = "binance-spot-main"
+exchange = "binance"
+product = "spot"
+api_key_env = "BINANCE_SPOT_KEY"              # env var name, not the secret
+api_secret_env = "BINANCE_SPOT_SECRET"
+max_notional_quote = "50000"                  # hard cap, belt on braces
+allowed_agents = ["eu-hft-01"]                # per-agent whitelist (empty = all)
 
-[market_maker]
-strategy = "avellaneda_stoikov"
-gamma = 0.1          # risk aversion
-kappa = 1.5          # order arrival intensity
-sigma = 0.02         # volatility (annualized)
-order_size = 0.001   # per level
-num_levels = 3
-min_spread_bps = 5
+[[credentials]]
+id = "bybit-linear-eu"
+exchange = "bybit"
+product = "linear_perp"
+api_key_env = "BYBIT_LINEAR_KEY"
+api_secret_env = "BYBIT_LINEAR_SECRET"
 
-[risk]
-max_inventory = 0.1
-max_drawdown_quote = 500
+[features]
+telegram_alerts = false
+audit_jsonl = true          # MiCA trail, default on
+mica_report = false
+paper_fill_simulation = false
 
-[kill_switch]
-daily_loss_limit = 1000
+[rails]
+daily_loss_limit = "1000"   # fleet-wide floor
+
+[dashboard]
+bind_addr = "127.0.0.1:9092"  # ignored in distributed mode
 ```
 
-**[Full config reference](docs/guides/configuration-reference.md)** — every field documented.
+The controller never sees raw API keys — it references credentials by
+`id` only. An agent resolves `api_key_env` → the actual secret locally
+at deploy time, so **a controller compromise cannot leak venue keys**.
+
+### Layer 3 — strategy graph (per-deployment, hot-reloadable)
+
+Strategy **parameters** (gamma, kappa, spread, size, thresholds) live
+on the graph nodes themselves, not in TOML. When you deploy a graph,
+each node's config travels with it; hot-reload flips one knob via
+PATCH without restart:
+
+```bash
+# Via the dashboard: Strategy page → Node → Config panel.
+# Via the CLI equivalent:
+curl -X PATCH -H "Authorization: Bearer $TOKEN" \
+  https://controller/api/v1/agents/eu-hft-01/deployments/btc-maker/variables \
+  -d '{"gamma": "0.02", "min_spread_bps": "7"}'
+```
+
+Every bundled template (`avellaneda-via-graph`, `glft-via-graph`,
+`basis-carry-spot-perp`, …) ships a starter node-config JSON. See
+**[Graph Authoring](docs/guides/graph-authoring.md)** for the full
+node catalog.
+
+**[Full config reference](docs/guides/configuration-reference.md)** — every field on every layer documented.
 
 ## Project Structure
 
