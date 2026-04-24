@@ -581,7 +581,7 @@ Legend:
   EACH active venue surface (spot `Quiet` vs perp `Volatile` is
   a real signal). Depends on UX-VENUE-1 landing first so there's
   per-venue mid data on the data bus to feed classifiers.
-- [ ] **UX-VENUE-3** Bybit hedge WS book stream is silent —
+- [x] **UX-VENUE-3** Bybit hedge WS book stream is silent —
   `hedge_conn.subscribe(BTCUSDT)` on Bybit linear perp delivers
   only a `Connected` event; no subsequent `BookSnapshot` /
   `BookDelta`. Initial REST orderbook load works (see
@@ -1528,7 +1528,7 @@ Epic R run. All non-restricted.
 - [ ] **HARD-3** Reconciliation loop real-exchange test —
   runbook at `docs/guides/reconciliation-live-test.md`. Needs
   testnet venue keys.
-- [ ] **R10.2** Integration test coverage audit: we have ~1600
+- [x] **R10.2** Integration test coverage audit: we have ~1600
   unit tests, but how many integration / E2E? Sprint 14 showed
   this gap is what lets gate drift hide. Enumerate, fill gaps.
 
@@ -2077,7 +2077,7 @@ regression stays cheap.
   `avellaneda-via-graph` (both closed) — catalog renames fail
   the test before silently leaving a detector running or
   starved in production.
-- [ ] **GOBS-M6-4** (deferred) UI palette badge — "unused —
+- [x] **GOBS-M6-4** (deferred) UI palette badge — "unused —
   will not compute" annotation on dormant detector sources
   (beyond the M3 diagonal-stripe fade). Design-doc M3.3 covers
   this partially. Skip for now unless operators ask.

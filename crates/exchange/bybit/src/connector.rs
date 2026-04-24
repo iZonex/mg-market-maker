@@ -369,19 +369,12 @@ impl ExchangeConnector for BybitConnector {
             self.category,
             BybitCategory::Linear | BybitCategory::Inverse
         );
-        let topics: Vec<String> = symbols
-            .iter()
-            .flat_map(|s| {
-                let mut v = vec![
-                    format!("orderbook.{depth}.{s}"),
-                    format!("publicTrade.{s}"),
-                ];
-                if include_liquidations {
-                    v.push(format!("liquidation.{s}"));
-                }
-                v
-            })
-            .collect();
+        // UX-VENUE-3 — Bybit V5 topic symbols are CASE-SENSITIVE.
+        // Server accepts the subscribe (`{success:true}`) for
+        // `btcusdt` but never pushes data for the mismatched
+        // case. Uppercase once at the edge so every path (REST
+        // / WS) sees the same symbol shape.
+        let topics = build_subscribe_topics(symbols, depth, include_liquidations);
 
         tokio::spawn(async move {
             use futures_util::{SinkExt, StreamExt};
@@ -395,7 +388,17 @@ impl ExchangeConnector for BybitConnector {
                         });
                         let (mut write, mut read) = ws.split();
 
-                        // Subscribe.
+                        // Subscribe. UX-VENUE-3 — log the outbound
+                        // topic list at info level so operators
+                        // debugging a silent-stream deployment
+                        // can confirm the server saw the request
+                        // we think we sent. The subscribe ACK is
+                        // logged below.
+                        tracing::info!(
+                            url = %ws_url,
+                            topics = ?topics,
+                            "Bybit WS subscribe",
+                        );
                         let sub = serde_json::json!({
                             "op": "subscribe",
                             "args": topics,
@@ -415,6 +418,22 @@ impl ExchangeConnector for BybitConnector {
                                     match msg {
                                         Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
                                             if let Ok(v) = serde_json::from_str::<Value>(&text.to_string()) {
+                                                // UX-VENUE-3 — log subscribe
+                                                // ACK so silent-stream
+                                                // deployments have a
+                                                // breadcrumb showing whether
+                                                // the server accepted the
+                                                // request. Ack shape:
+                                                // `{"success":true,"op":"subscribe",...}`.
+                                                if v.get("op").and_then(|o| o.as_str()) == Some("subscribe") {
+                                                    let ok = v.get("success").and_then(|b| b.as_bool()).unwrap_or(false);
+                                                    let msg = v.get("ret_msg").and_then(|s| s.as_str()).unwrap_or("");
+                                                    if ok {
+                                                        tracing::info!(ret_msg = %msg, "Bybit WS subscribe ACK");
+                                                    } else {
+                                                        tracing::warn!(ret_msg = %msg, raw = %v, "Bybit WS subscribe REJECTED");
+                                                    }
+                                                }
                                                 if let Some(evt) = parse_bybit_event(&v) {
                                                     if tx.send(evt).is_err() { return; }
                                                 }
@@ -1340,6 +1359,30 @@ fn bybit_tif(tif: Option<TimeInForce>) -> &'static str {
     }
 }
 
+/// UX-VENUE-3 — extracted from `subscribe` so the topic
+/// generation (uppercase symbols, per-category topic set) is
+/// unit-testable without opening a real WS connection.
+fn build_subscribe_topics(
+    symbols: &[String],
+    depth: u32,
+    include_liquidations: bool,
+) -> Vec<String> {
+    symbols
+        .iter()
+        .map(|s| s.to_uppercase())
+        .flat_map(|s| {
+            let mut v = vec![
+                format!("orderbook.{depth}.{s}"),
+                format!("publicTrade.{s}"),
+            ];
+            if include_liquidations {
+                v.push(format!("liquidation.{s}"));
+            }
+            v
+        })
+        .collect()
+}
+
 fn parse_bybit_event(v: &Value) -> Option<MarketEvent> {
     let topic = v.get("topic")?.as_str()?;
     let data = v.get("data")?;
@@ -1642,6 +1685,49 @@ mod tests {
         assert!(!spot.capabilities().supports_funding_rate);
         assert!(linear.capabilities().supports_funding_rate);
         assert!(inverse.capabilities().supports_funding_rate);
+    }
+
+    /// UX-VENUE-3 — Bybit V5 topic symbols are case-sensitive.
+    /// `build_subscribe_topics` must uppercase every input
+    /// regardless of what the caller passed, otherwise the
+    /// server silently accepts the subscription but never
+    /// pushes book / trade / liquidation data.
+    #[test]
+    fn subscribe_topics_uppercase_symbols() {
+        let t = build_subscribe_topics(&["btcusdt".to_string()], 50, true);
+        assert!(
+            t.contains(&"orderbook.50.BTCUSDT".to_string()),
+            "expected uppercase BTCUSDT in topics: {t:?}",
+        );
+        assert!(t.contains(&"publicTrade.BTCUSDT".to_string()));
+        assert!(t.contains(&"liquidation.BTCUSDT".to_string()));
+        for topic in &t {
+            assert!(
+                !topic.contains("btcusdt"),
+                "lowercase symbol leaked through: {topic}",
+            );
+        }
+    }
+
+    #[test]
+    fn subscribe_topics_omits_liquidation_for_spot() {
+        let t = build_subscribe_topics(&["ETHUSDT".to_string()], 50, false);
+        assert!(t.iter().any(|x| x.contains("orderbook.50.ETHUSDT")));
+        assert!(t.iter().any(|x| x.contains("publicTrade.ETHUSDT")));
+        assert!(!t.iter().any(|x| x.starts_with("liquidation.")));
+    }
+
+    #[test]
+    fn subscribe_topics_fan_out_multiple_symbols() {
+        let t = build_subscribe_topics(
+            &["btcusdt".to_string(), "ethusdt".to_string()],
+            50,
+            true,
+        );
+        // 3 topics per symbol × 2 symbols = 6.
+        assert_eq!(t.len(), 6);
+        assert!(t.contains(&"orderbook.50.BTCUSDT".to_string()));
+        assert!(t.contains(&"orderbook.50.ETHUSDT".to_string()));
     }
 
     /// `product()` returns the right `VenueProduct` for each

@@ -111,6 +111,11 @@ ${e.summary ?? ''}
 ${e.kind} · ${e.inputs.length} in · ${e.outputs.length} out${e.restricted ? ' · restricted' : ''}${isDormant ? '\n\ndormant — this source is not referenced by any downstream node in the current graph' : ''}`}
               >
                 <span class="chip-name">{e.label ?? e.kind.split('.').slice(1).join('.')}</span>
+                {#if isDormant}
+                  <span class="chip-dormant-badge" title="this source is not referenced by the current graph — dropping it in won't trigger detector work until you wire it to a downstream consumer">
+                    unused
+                  </span>
+                {/if}
                 <span class="chip-shape">
                   {e.inputs.length}<span class="sep">→</span>{e.outputs.length}
                 </span>
@@ -246,6 +251,20 @@ ${e.kind} · ${e.inputs.length} in · ${e.outputs.length} out${e.restricted ? ' 
       );
   }
   .chip.dormant:hover { opacity: 0.85; }
+  /* M6-4 GOBS — text badge doubles down on the diagonal-stripe
+     hint. Operators who didn't spot the fade see the word. */
+  .chip-dormant-badge {
+    flex-shrink: 0;
+    padding: 1px 5px;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    letter-spacing: 0.02em;
+    color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+    border-radius: 3px;
+    text-transform: lowercase;
+  }
 
   .chip-name {
     flex: 1; min-width: 0;
