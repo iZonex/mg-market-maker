@@ -80,6 +80,26 @@
       default:            return { text: (p || '—').toUpperCase(), cls: '' }
     }
   }
+
+  // UX-VENUE-2 — per-venue regime chip. Colour-codes match the
+  // Overview's primary market-quality card so operators read
+  // "spot Quiet vs perp Volatile" at a glance without context-
+  // switching between panels.
+  function regimeChip(label, ageMs) {
+    if (!label) return null
+    const stale = ageMs != null && ageMs > 10_000
+    const key = String(label).toLowerCase()
+    let cls = 'regime-quiet'
+    let text = label
+    switch (key) {
+      case 'quiet':         cls = 'regime-quiet';    text = 'QUIET';    break
+      case 'trending':      cls = 'regime-trending'; text = 'TREND';    break
+      case 'volatile':      cls = 'regime-volatile'; text = 'VOL';      break
+      case 'meanreverting': cls = 'regime-mr';       text = 'MR';       break
+      default:              cls = '';                text = label.toUpperCase()
+    }
+    return { text, cls, stale }
+  }
 </script>
 
 <div class="strip">
@@ -106,6 +126,7 @@
       {#each rows as r (r.venue + '|' + r.product + '|' + r.symbol)}
         {@const age = ageLabel(r.age_ms)}
         {@const p = productChip(r.product)}
+        {@const rg = regimeChip(r.regime, r.regime_age_ms)}
         <div class="row">
           <span class="venue">{r.venue}</span>
           <span class="chip {p.cls}">{p.text}</span>
@@ -115,6 +136,14 @@
             <span class="lbl">spr</span>
             <span>{fmtSpread(r.spread_bps)}<span class="unit">bps</span></span>
           </span>
+          {#if rg}
+            <span class="regime {rg.cls}" class:stale={rg.stale}
+                  title="Regime classifier for this venue's mid stream">
+              {rg.text}
+            </span>
+          {:else}
+            <span class="regime muted" title="Regime classifier warming up">—</span>
+          {/if}
           <span class="age" data-sev={age.sev}>{age.text}</span>
         </div>
       {/each}
@@ -150,7 +179,7 @@
   .rows { display: flex; flex-direction: column; gap: 2px; }
   .row {
     display: grid;
-    grid-template-columns: 90px 70px 1fr auto auto auto;
+    grid-template-columns: 90px 70px 1fr auto auto auto auto;
     gap: var(--s-3);
     align-items: baseline;
     padding: var(--s-1) var(--s-2);
@@ -193,4 +222,22 @@
     text-align: center;
   }
   .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .regime {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: var(--r-pill);
+    letter-spacing: var(--tracking-label);
+    text-transform: uppercase;
+    background: var(--bg-chip);
+    color: var(--fg-secondary);
+    text-align: center;
+    min-width: 44px;
+  }
+  .regime.muted       { color: var(--fg-muted); }
+  .regime.regime-quiet    { background: var(--pos-bg, rgba(16, 185, 129, 0.10)); color: var(--pos); }
+  .regime.regime-trending { background: var(--info-bg, rgba(59, 130, 246, 0.14)); color: var(--info, #60a5fa); }
+  .regime.regime-volatile { background: var(--danger-bg, rgba(239, 68, 68, 0.12)); color: var(--danger); font-weight: 600; }
+  .regime.regime-mr       { background: var(--warn-bg); color: var(--warn); }
+  .regime.stale { opacity: 0.55; }
 </style>

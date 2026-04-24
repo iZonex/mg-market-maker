@@ -2180,27 +2180,50 @@ struct VenueBookStateRow {
     /// has been seen yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     age_ms: Option<i64>,
+    /// UX-VENUE-2 — regime label for THIS venue's mid stream
+    /// (`Quiet` / `Trending` / `Volatile` / `MeanReverting`).
+    /// `None` when the engine's per-venue classifier has not
+    /// yet published a snapshot for this key — fresh start, or
+    /// `market_maker.venue_regime_classify_secs = 0`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    regime: Option<String>,
+    /// UX-VENUE-2 — milliseconds since the regime label was
+    /// last published. Lets the UI flag a stale classifier
+    /// (e.g. a venue whose feed stopped) without having to
+    /// infer it from `age_ms`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    regime_age_ms: Option<i64>,
 }
 
 async fn venues_book_state(
     State(state): State<DashboardState>,
 ) -> Json<Vec<VenueBookStateRow>> {
     let now = chrono::Utc::now();
+    let regime_map: std::collections::HashMap<_, _> = state
+        .data_bus()
+        .regime_entries()
+        .into_iter()
+        .collect();
     let mut rows: Vec<VenueBookStateRow> = state
         .data_bus()
         .l1_entries()
         .into_iter()
-        .map(|(key, snap)| VenueBookStateRow {
-            venue: key.0,
-            symbol: key.1,
-            product: format!("{:?}", key.2).to_lowercase(),
-            bid: snap.bid_px,
-            ask: snap.ask_px,
-            mid: snap.mid,
-            spread_bps: snap.spread_bps,
-            age_ms: snap
-                .ts
-                .map(|t| (now - t).num_milliseconds().max(0)),
+        .map(|(key, snap)| {
+            let regime_snap = regime_map.get(&key);
+            VenueBookStateRow {
+                venue: key.0.clone(),
+                symbol: key.1.clone(),
+                product: format!("{:?}", key.2).to_lowercase(),
+                bid: snap.bid_px,
+                ask: snap.ask_px,
+                mid: snap.mid,
+                spread_bps: snap.spread_bps,
+                age_ms: snap.ts.map(|t| (now - t).num_milliseconds().max(0)),
+                regime: regime_snap.map(|r| r.label.clone()),
+                regime_age_ms: regime_snap
+                    .and_then(|r| r.ts)
+                    .map(|t| (now - t).num_milliseconds().max(0)),
+            }
         })
         .collect();
     // Deterministic ordering: spot first, then perp classes, then

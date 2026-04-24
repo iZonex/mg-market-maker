@@ -38,7 +38,7 @@ use mm_risk::toxicity::{
     AdverseSelectionTracker, BvcBarAggregator, BvcClassifier, KyleLambda, VpinEstimator,
 };
 use mm_risk::var_guard::{VarGuard, VarGuardConfig};
-use mm_strategy::autotune::AutoTuner;
+use mm_strategy::autotune::{AutoTuner, RegimeDetector};
 use mm_strategy::xemm::{XemmConfig, XemmDecision, XemmExecutor};
 use mm_strategy::funding_arb_driver::{DriverEvent, FundingArbDriver};
 use mm_strategy::inventory_skew::AdvancedInventoryManager;
@@ -550,6 +550,18 @@ pub struct MarketMakerEngine {
     // Strategy augmentation.
     momentum: MomentumSignals,
     auto_tuner: AutoTuner,
+    /// UX-VENUE-2 — one `RegimeDetector` per `(venue, symbol,
+    /// product)` L1 stream this engine publishes to the data
+    /// bus. `(detector, last_mid)` — the `last_mid` lets the
+    /// per-venue sampler feed real returns without relying on
+    /// the primary tick loop. Entries are created lazily when
+    /// the classifier first sees a mid for a key it hasn't
+    /// classified before; nothing removes them (the key set is
+    /// bounded by the engine's own venues).
+    venue_regime_classifiers: std::collections::HashMap<
+        mm_dashboard::data_bus::StreamKey,
+        (RegimeDetector, Option<Decimal>),
+    >,
     /// Epic 30 — online closed-loop controller sitting on top of
     /// `auto_tuner`. Off by default; `market_maker.adaptive_enabled`
     /// flips it on. See `docs/research/adaptive-calibration.md`.
@@ -1257,6 +1269,7 @@ impl MarketMakerEngine {
                 }
                 t
             },
+            venue_regime_classifiers: std::collections::HashMap::new(),
             adaptive_tuner: {
                 let mut t = mm_strategy::AdaptiveTuner::new(
                     mm_strategy::AdaptiveConfig::default(),
@@ -2048,6 +2061,62 @@ impl MarketMakerEngine {
                     mid: Some(mid),
                     spread_bps: Some(spread_bps),
                     ts: Some(chrono::Utc::now()),
+                },
+            );
+        }
+    }
+
+    /// UX-VENUE-2 — sample every L1 stream on the data bus
+    /// whose symbol matches this engine's, feed the return vs
+    /// the last-seen mid into a per-stream `RegimeDetector`,
+    /// and republish the current regime label onto
+    /// `DataBus::venue_regimes` so the Overview strip can
+    /// render a chip per venue row.
+    ///
+    /// Design notes:
+    /// - Scoped to `self.symbol` so multi-engine deployments
+    ///   don't double-classify each other's streams (the bus
+    ///   is process-wide but each engine is per-symbol).
+    /// - Only advances the detector when the mid actually
+    ///   changed; feeding zero returns between identical
+    ///   samples would bias the detector toward `Quiet` when
+    ///   extras update on a 5 s REST poll but the classifier
+    ///   runs at 2 s.
+    /// - Labels use the same `Debug`-formatted encoding
+    ///   (`Quiet`, `Trending`, `Volatile`, `MeanReverting`)
+    ///   as the engine's own `SymbolState.regime` field so the
+    ///   agent-side `regime_label` decoder + metrics encoder
+    ///   stay shared.
+    fn classify_venue_regimes_tick(&mut self) {
+        let Some(dash) = self.dashboard.as_ref() else { return };
+        let entries = dash.data_bus().l1_entries();
+        let now = chrono::Utc::now();
+        for (key, snap) in entries {
+            if key.1 != self.symbol {
+                continue;
+            }
+            let Some(mid) = snap.mid else { continue };
+            if mid <= Decimal::ZERO {
+                continue;
+            }
+            let slot = self
+                .venue_regime_classifiers
+                .entry(key.clone())
+                .or_insert_with(|| (RegimeDetector::new(200), None));
+            match slot.1 {
+                Some(prev) if prev > Decimal::ZERO && prev != mid => {
+                    let ret = (mid - prev) / prev;
+                    slot.0.update(ret);
+                }
+                _ => {}
+            }
+            slot.1 = Some(mid);
+            let label = format!("{:?}", slot.0.regime());
+            dash.data_bus().publish_regime(
+                key,
+                mm_dashboard::data_bus::VenueRegimeSnapshot {
+                    label,
+                    ts: Some(now),
                 },
             );
         }
@@ -6124,6 +6193,19 @@ impl MarketMakerEngine {
         // handshake has landed.
         sor_extra_l1_interval.tick().await;
 
+        // UX-VENUE-2 — per-venue regime classifier tick. Samples
+        // every `self.symbol`-scoped L1 stream on the data bus,
+        // feeds returns into a per-stream detector, and publishes
+        // the resulting label into `DataBus::venue_regimes`. `0`
+        // disables the classifier; non-zero values clamp to at
+        // least 1 s so the interval stays well-formed.
+        let venue_regime_secs = self.config.market_maker.venue_regime_classify_secs;
+        let venue_regime_enabled = venue_regime_secs > 0;
+        let mut venue_regime_interval = tokio::time::interval(
+            tokio::time::Duration::from_secs(venue_regime_secs.max(1)),
+        );
+        venue_regime_interval.tick().await;
+
         self.cycle_start = Instant::now();
 
         loop {
@@ -6299,6 +6381,9 @@ impl MarketMakerEngine {
                 }
                 _ = sor_extra_l1_interval.tick(), if sor_extra_l1_enabled => {
                     self.poll_extra_venues_for_data_bus().await;
+                }
+                _ = venue_regime_interval.tick(), if venue_regime_enabled => {
+                    self.classify_venue_regimes_tick();
                 }
                 _ = funding_arb_interval.tick(),
                     if self.funding_arb_driver.is_some() =>
@@ -15472,6 +15557,147 @@ mod stage2_track1_integration {
             dash.data_bus().get_l1(&bybit_key).is_none(),
             "unseeded extra should not produce a bus entry"
         );
+    }
+
+    // ---------------------------------------------------------
+    // UX-VENUE-2 — per-venue regime classifier
+    // ---------------------------------------------------------
+
+    /// Two venue L1 streams with diverging mid behaviour
+    /// produce two regime entries on the bus keyed by
+    /// `(venue, symbol, product)`. The classifier bootstraps
+    /// entries from the bus and publishes a label per stream.
+    #[test]
+    fn classify_venue_regimes_publishes_one_label_per_venue_stream() {
+        let mock = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(mock as Arc<dyn ExchangeConnector>);
+        let dash = mm_dashboard::state::DashboardState::new();
+        let mut engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            AppConfig::default(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            Some(dash.clone()),
+            None,
+        );
+
+        let binance_key = (
+            "binance".to_string(),
+            "BTCUSDT".to_string(),
+            mm_common::config::ProductType::Spot,
+        );
+        let bybit_key = (
+            "bybit".to_string(),
+            "BTCUSDT".to_string(),
+            mm_common::config::ProductType::Spot,
+        );
+
+        // Seed two distinct streams on the bus.
+        let bus = dash.data_bus();
+        for (i, mid) in [dec!(50_000), dec!(50_010), dec!(50_020)].iter().enumerate() {
+            bus.publish_l1(
+                binance_key.clone(),
+                mm_dashboard::data_bus::BookL1Snapshot {
+                    bid_px: Some(*mid - dec!(1)),
+                    ask_px: Some(*mid + dec!(1)),
+                    mid: Some(*mid),
+                    spread_bps: Some(dec!(0.4)),
+                    ts: Some(chrono::Utc::now()),
+                },
+            );
+            bus.publish_l1(
+                bybit_key.clone(),
+                mm_dashboard::data_bus::BookL1Snapshot {
+                    bid_px: Some(*mid - dec!(2)),
+                    ask_px: Some(*mid + dec!(2)),
+                    mid: Some(*mid + Decimal::from(i as u64)),
+                    spread_bps: Some(dec!(0.8)),
+                    ts: Some(chrono::Utc::now()),
+                },
+            );
+            engine.classify_venue_regimes_tick();
+        }
+
+        let binance_reg = bus.get_regime(&binance_key).expect("binance regime");
+        let bybit_reg = bus.get_regime(&bybit_key).expect("bybit regime");
+        // Default RegimeDetector returns `Quiet` until the
+        // window is half-full; that's fine — we only assert
+        // that both streams got a label and the snapshot
+        // timestamp is stamped.
+        assert!(!binance_reg.label.is_empty());
+        assert!(!bybit_reg.label.is_empty());
+        assert!(binance_reg.ts.is_some());
+        assert!(bybit_reg.ts.is_some());
+
+        // A stream for a DIFFERENT symbol must not be
+        // classified by this engine (multi-engine scoping).
+        let other_key = (
+            "binance".to_string(),
+            "ETHUSDT".to_string(),
+            mm_common::config::ProductType::Spot,
+        );
+        bus.publish_l1(
+            other_key.clone(),
+            mm_dashboard::data_bus::BookL1Snapshot {
+                bid_px: Some(dec!(3_000)),
+                ask_px: Some(dec!(3_001)),
+                mid: Some(dec!(3_000.5)),
+                spread_bps: Some(dec!(1)),
+                ts: Some(chrono::Utc::now()),
+            },
+        );
+        engine.classify_venue_regimes_tick();
+        assert!(
+            bus.get_regime(&other_key).is_none(),
+            "a stream for a different symbol must not be classified by this engine"
+        );
+    }
+
+    /// Feeding identical mids between ticks must not advance
+    /// the detector — otherwise a venue whose feed has stalled
+    /// (extras polled every 5 s, classifier ticking every 2 s)
+    /// would be biased toward Quiet by a stream of zero returns.
+    #[test]
+    fn classify_venue_regimes_ignores_unchanged_mid() {
+        let mock = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        let bundle = ConnectorBundle::single(mock as Arc<dyn ExchangeConnector>);
+        let dash = mm_dashboard::state::DashboardState::new();
+        let mut engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            AppConfig::default(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            Some(dash.clone()),
+            None,
+        );
+
+        let key = (
+            "binance".to_string(),
+            "BTCUSDT".to_string(),
+            mm_common::config::ProductType::Spot,
+        );
+        let snap = mm_dashboard::data_bus::BookL1Snapshot {
+            bid_px: Some(dec!(49_999)),
+            ask_px: Some(dec!(50_001)),
+            mid: Some(dec!(50_000)),
+            spread_bps: Some(dec!(0.4)),
+            ts: Some(chrono::Utc::now()),
+        };
+        for _ in 0..5 {
+            dash.data_bus().publish_l1(key.clone(), snap.clone());
+            engine.classify_venue_regimes_tick();
+        }
+
+        // No return samples fed into the detector because the
+        // mid never changed → per-key `last_mid` is set but the
+        // detector's internal returns ring stayed empty. We
+        // can't peek into the detector, but we *can* check the
+        // classifier cached the last mid once (the entry exists).
+        assert_eq!(engine.venue_regime_classifiers.len(), 1);
+        let slot = engine.venue_regime_classifiers.get(&key).unwrap();
+        assert_eq!(slot.1, Some(dec!(50_000)));
     }
 
     // ---------------------------------------------------------

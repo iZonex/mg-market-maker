@@ -1419,6 +1419,18 @@ pub struct MarketMakerConfig {
     #[serde(default = "default_sor_extra_l1_poll_secs")]
     pub sor_extra_l1_poll_secs: u64,
 
+    /// UX-VENUE-2 — how often the engine samples its own
+    /// `(venue, symbol, product)` L1 streams off the data bus,
+    /// feeds returns into a per-venue `RegimeDetector`, and
+    /// republishes the label so the Overview per-venue strip
+    /// can render a regime chip next to each row. Default 2 s
+    /// — matches the strip's UI poll cadence so a new regime
+    /// shows up within one render tick. Set to 0 to disable
+    /// the per-venue classifier entirely (the autotuner's
+    /// primary regime detector is unaffected).
+    #[serde(default = "default_venue_regime_classify_secs")]
+    pub venue_regime_classify_secs: u64,
+
     /// S1.2 — per-strategy capital budget cap in quote-asset
     /// units. Keys are `Strategy::name()` tags (e.g.
     /// `"avellaneda"`, `"funding_arb"`, `"basis"`, `"grid"`).
@@ -1783,6 +1795,10 @@ fn default_sor_queue_refresh_secs() -> u64 {
 
 fn default_sor_extra_l1_poll_secs() -> u64 {
     5
+}
+
+fn default_venue_regime_classify_secs() -> u64 {
+    2
 }
 
 /// Qty-source policy for the auto-dispatch SOR tick (Epic A
@@ -2688,6 +2704,7 @@ impl Default for AppConfig {
                 sor_trade_rate_window_secs: default_sor_trade_rate_window_secs(),
                 sor_queue_refresh_secs: default_sor_queue_refresh_secs(),
                 sor_extra_l1_poll_secs: default_sor_extra_l1_poll_secs(),
+                venue_regime_classify_secs: default_venue_regime_classify_secs(),
                 strategy_capital_budget: std::collections::HashMap::new(),
             symbol_circulating_supply: std::collections::HashMap::new(),
                 cross_exchange_min_profit_bps: dec!(5),

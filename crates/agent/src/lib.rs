@@ -18,6 +18,7 @@ pub mod catalog;
 pub mod connector_factory;
 pub mod engine_runner;
 pub mod fail_ladder_walker;
+pub mod graph_replay;
 pub mod market_maker_runner;
 pub mod reconnect;
 pub mod registry;
@@ -798,73 +799,19 @@ impl<T: Transport> LeaseClient<T> {
                                             }),
                                             Ok(mut replay_ev) => {
                                                 let store = mm_dashboard::details_store::global();
-                                                // Oldest→newest to
-                                                // preserve tick ordering
-                                                // in the divergence list.
+                                                // Oldest→newest so the
+                                                // divergence list preserves
+                                                // tick ordering.
                                                 let original: Vec<_> = store
                                                     .graph_traces(&symbol, Some(ticks))
                                                     .into_iter()
                                                     .rev()
                                                     .collect();
-                                                let ctx = mm_strategy_graph::EvalCtx::default();
-                                                let mut divergences: Vec<serde_json::Value> =
-                                                    Vec::new();
-                                                for t in &original {
-                                                    let kind_values = t.source_kind_values();
-                                                    let src =
-                                                        mm_strategy_graph::evaluator::replay_source_inputs(
-                                                            &replay_ev,
-                                                            &kind_values,
-                                                        );
-                                                    let replay_sinks = replay_ev
-                                                        .tick(&ctx, &src)
-                                                        .unwrap_or_default();
-                                                    let replay_set: std::collections::BTreeSet<String> =
-                                                        replay_sinks
-                                                            .iter()
-                                                            .filter_map(|a| {
-                                                                serde_json::to_string(a).ok()
-                                                            })
-                                                            .collect();
-                                                    let original_set: std::collections::BTreeSet<String> =
-                                                        t.sinks_fired
-                                                            .iter()
-                                                            .filter_map(|a| {
-                                                                serde_json::to_string(a).ok()
-                                                            })
-                                                            .collect();
-                                                    if replay_set != original_set {
-                                                        divergences.push(serde_json::json!({
-                                                            "tick_num": t.tick_num,
-                                                            "tick_ms": t.tick_ms,
-                                                            "original_sinks": t.sinks_fired,
-                                                            "replay_sinks": replay_sinks,
-                                                        }));
-                                                    }
-                                                }
-                                                let summary = if original.is_empty() {
-                                                    format!(
-                                                        "no traces for {symbol} — deployment may not have ticked yet"
-                                                    )
-                                                } else if divergences.is_empty() {
-                                                    format!(
-                                                        "{} tick(s) replayed · candidate matches deployed behaviour",
-                                                        original.len()
-                                                    )
-                                                } else {
-                                                    format!(
-                                                        "{} tick(s) replayed · candidate diverges on {} tick(s)",
-                                                        original.len(),
-                                                        divergences.len()
-                                                    )
-                                                };
-                                                serde_json::json!({
-                                                    "summary": summary,
-                                                    "ticks_replayed": original.len(),
-                                                    "divergence_count": divergences.len(),
-                                                    "divergences": divergences,
-                                                    "candidate_issues": Vec::<String>::new(),
-                                                })
+                                                crate::graph_replay::compute_replay_payload(
+                                                    &symbol,
+                                                    &original,
+                                                    &mut replay_ev,
+                                                )
                                             }
                                         }
                                     }

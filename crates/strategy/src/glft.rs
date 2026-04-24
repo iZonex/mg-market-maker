@@ -550,8 +550,7 @@ mod tests {
             sor_inventory_threshold: rust_decimal::Decimal::ZERO,
             sor_trade_rate_window_secs: 60,
             sor_queue_refresh_secs: 2,
-            sor_extra_l1_poll_secs: 5,
-        };
+            sor_extra_l1_poll_secs: 5, venue_regime_classify_secs: 2, };
         let mut book = LocalOrderBook::new("BTCUSDT".into());
         book.apply_snapshot(
             vec![mm_common::PriceLevel {
@@ -650,8 +649,7 @@ mod tests {
             sor_inventory_threshold: rust_decimal::Decimal::ZERO,
             sor_trade_rate_window_secs: 60,
             sor_queue_refresh_secs: 2,
-            sor_extra_l1_poll_secs: 5,
-        };
+            sor_extra_l1_poll_secs: 5, venue_regime_classify_secs: 2, };
         let mut book = LocalOrderBook::new("BTCUSDT".into());
         book.apply_snapshot(
             vec![mm_common::PriceLevel {
@@ -813,8 +811,7 @@ mod tests {
             sor_inventory_threshold: rust_decimal::Decimal::ZERO,
             sor_trade_rate_window_secs: 60,
             sor_queue_refresh_secs: 2,
-            sor_extra_l1_poll_secs: 5,
-        };
+            sor_extra_l1_poll_secs: 5, venue_regime_classify_secs: 2, };
         let mut book = LocalOrderBook::new("BTCUSDT".into());
         book.apply_snapshot(
             vec![mm_common::PriceLevel {
@@ -1110,8 +1107,7 @@ mod tests {
             sor_inventory_threshold: rust_decimal::Decimal::ZERO,
             sor_trade_rate_window_secs: 60,
             sor_queue_refresh_secs: 2,
-            sor_extra_l1_poll_secs: 5,
-        }
+            sor_extra_l1_poll_secs: 5, venue_regime_classify_secs: 2, }
     }
 
     prop_compose! {

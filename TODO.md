@@ -585,13 +585,26 @@ Legend:
   WS subscription + `ExtraBookKeeper` — is still "correct" but
   deferred: the 5 s REST cadence is enough for the strip's 2 s
   UI poll and doesn't consume a WS handle budget on every extra.
-- [ ] **UX-VENUE-2** Per-venue regime classification. Today the
-  engine runs one `RegimeClassifier` on the primary mid stream
-  and the Overview's market-quality card labels its regime chip
-  `primary`. For cross-venue, operators want to see regime for
-  EACH active venue surface (spot `Quiet` vs perp `Volatile` is
-  a real signal). Depends on UX-VENUE-1 landing first so there's
-  per-venue mid data on the data bus to feed classifiers.
+- [x] **UX-VENUE-2** Per-venue regime classification — landed
+  2026-04-24. The engine now runs one `RegimeDetector` per
+  `(venue, symbol, product)` L1 stream it publishes to the
+  data bus, keyed on the same `StreamKey` shape UX-VENUE-1
+  uses. A new config knob
+  `market_maker.venue_regime_classify_secs` (default 2 s, set
+  to 0 to disable) drives a periodic
+  `classify_venue_regimes_tick` that: samples every L1 entry
+  whose symbol matches the engine, feeds a real return
+  (skipping unchanged mids so an extras-REST-poll stream
+  doesn't get biased toward `Quiet`), and republishes the
+  label onto a new `DataBus::venue_regimes` map. The
+  `/api/v1/venues/book_state` handler zips this map into its
+  existing rows so every `VenueBookStateRow` gets `regime` +
+  `regime_age_ms` fields, and `VenueMarketStrip.svelte`
+  renders a colour-coded chip (QUIET / TREND / VOL / MR)
+  between the `spread` and `age` columns with an opacity
+  drop when the classifier snapshot is older than 10 s.
+  Covered by two new engine tests + one new data-bus test —
+  full suite at 2238 passing.
 - [x] **UX-VENUE-3** Bybit hedge WS book stream is silent —
   `hedge_conn.subscribe(BTCUSDT)` on Bybit linear perp delivers
   only a `Connected` event; no subsequent `BookSnapshot` /
@@ -1953,11 +1966,30 @@ evaluator loop. No new per-tick persistence needed.
   API identical-graph → 0 divergences; invalid graph →
   candidate_issues populated; UI button opens modal with
   matching summary. Full e2e suite 17/17 green.
-- [ ] **GOBS-M5.2** (deferred) Side-by-side canvas — render
-  two miniature graphs scrubbed through the tick range with
-  diverging nodes glow-highlighted. Current v1 lists
-  divergences as JSON diff which is good enough for first
-  use; visual canvas diff is polish when operators ask.
+- [x] **GOBS-M5.2** Side-by-side canvas — landed 2026-04-24.
+  Agent-side `graph_replay` now extracts its payload builder
+  into `mm_agent::graph_replay::compute_replay_payload` and
+  uses `Evaluator::tick_with_full_trace` on the candidate so
+  it can diff node-kind outputs (aggregated per `(kind,
+  port)` with stable sort) against the deployed trace; each
+  divergence entry gets a new `diverging_kinds: [String]`
+  field alongside the existing sink JSON. Replay modal in
+  `StrategyPage.svelte` gained a prev/next + range scrubber,
+  per-tick kind chips, and two SVG mini-canvases (deployed
+  on the left, candidate on the right) rendered from each
+  graph's stored `pos` coords — nodes whose kind is in the
+  active `diverging_kinds` set get a warning-colour ring +
+  drop-shadow glow on both panes. `loadLiveGraph` now
+  caches `deployedGraphSnapshot` / `deployedGraphName` so
+  the modal has the deployed JSON without a second round-
+  trip; `runReplay` best-effort re-fetches via
+  `/api/v1/strategy/templates/{name}` when the cache is
+  empty (operator arrived in authoring directly). JSON
+  divergence stays in a collapsed `<details>` for deep
+  inspection. Covered by 3 new unit tests in
+  `crates/agent/src/graph_replay.rs` (empty-traces,
+  identical-zero-divergences, constant-diff-surfaces-kind),
+  full suite at 2241 passing.
 
 ### GOBS-SAVE — graph save-diff + versioning (landed)
 

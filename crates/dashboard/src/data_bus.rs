@@ -73,6 +73,17 @@ pub struct FundingRate {
     pub next_funding_ts: Option<DateTime<Utc>>,
 }
 
+/// UX-VENUE-2 — latest regime label classified off a venue's
+/// mid stream. `label` mirrors the `Debug` encoding used by
+/// the autotuner's primary regime detector ("Quiet", "Trending",
+/// "Volatile", "MeanReverting"), so the agent-side `regime_label`
+/// table and metrics encoder can stay shared.
+#[derive(Debug, Clone, Default)]
+pub struct VenueRegimeSnapshot {
+    pub label: String,
+    pub ts: Option<DateTime<Utc>>,
+}
+
 /// Wallet balance entry. `reserved` covers margin + open orders.
 #[derive(Debug, Clone, Default)]
 pub struct BalanceEntry {
@@ -95,6 +106,11 @@ pub struct DataBus {
     pub trades: Arc<RwLock<HashMap<StreamKey, VecDeque<TradeTick>>>>,
     pub funding: Arc<RwLock<HashMap<StreamKey, FundingRate>>>,
     pub balances: Arc<RwLock<HashMap<(String, String), BalanceEntry>>>,
+    /// UX-VENUE-2 — latest regime label per `(venue, symbol,
+    /// product)` stream. Populated by the engine's per-venue
+    /// classifier; consumed by `/api/v1/venues/book_state` so the
+    /// Overview strip can render one regime chip per venue row.
+    pub venue_regimes: Arc<RwLock<HashMap<StreamKey, VenueRegimeSnapshot>>>,
 }
 
 impl DataBus {
@@ -118,6 +134,13 @@ impl DataBus {
     pub fn publish_funding(&self, key: StreamKey, f: FundingRate) {
         if let Ok(mut map) = self.funding.write() {
             map.insert(key, f);
+        }
+    }
+
+    /// UX-VENUE-2 — upsert the regime label for a venue stream.
+    pub fn publish_regime(&self, key: StreamKey, snap: VenueRegimeSnapshot) {
+        if let Ok(mut map) = self.venue_regimes.write() {
+            map.insert(key, snap);
         }
     }
 
@@ -177,6 +200,24 @@ impl DataBus {
     /// divergence without per-key lookups.
     pub fn l1_entries(&self) -> Vec<(StreamKey, BookL1Snapshot)> {
         self.books_l1
+            .read()
+            .ok()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn get_regime(&self, key: &StreamKey) -> Option<VenueRegimeSnapshot> {
+        self.venue_regimes
+            .read()
+            .ok()
+            .and_then(|m| m.get(key).cloned())
+    }
+
+    /// UX-VENUE-2 — snapshot of every per-venue regime label so
+    /// `/api/v1/venues/book_state` can zip regimes into the rows
+    /// it already returns without a per-key lookup.
+    pub fn regime_entries(&self) -> Vec<(StreamKey, VenueRegimeSnapshot)> {
+        self.venue_regimes
             .read()
             .ok()
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -291,6 +332,33 @@ mod tests {
         let got = bus.get_balance("binance", "USDT").unwrap();
         assert_eq!(got.available, dec!(900));
         assert!(bus.get_balance("bybit", "USDT").is_none());
+    }
+
+    /// UX-VENUE-2 — regime publish/read/snapshot paths round-trip
+    /// through the bus and keep the newest writer wins.
+    #[test]
+    fn regime_roundtrip_and_overwrite() {
+        let bus = DataBus::new();
+        let k = key("binance", "BTCUSDT", ProductType::Spot);
+        bus.publish_regime(
+            k.clone(),
+            VenueRegimeSnapshot {
+                label: "Quiet".to_string(),
+                ts: Some(Utc::now()),
+            },
+        );
+        assert_eq!(bus.get_regime(&k).unwrap().label, "Quiet");
+        bus.publish_regime(
+            k.clone(),
+            VenueRegimeSnapshot {
+                label: "Volatile".to_string(),
+                ts: Some(Utc::now()),
+            },
+        );
+        assert_eq!(bus.get_regime(&k).unwrap().label, "Volatile");
+        let entries = bus.regime_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.label, "Volatile");
     }
 
     /// 23-UX-4 — funding_entries snapshot exposes every (venue,
