@@ -38,6 +38,7 @@
   import ActivePlans from '../components/ActivePlans.svelte'
   import GraphInspector from '../components/GraphInspector.svelte'
   import GraphTimeline from '../components/GraphTimeline.svelte'
+  import { computeGraphDiff } from '../graphDiff.js'
 
   // `liveAgent` / `liveDeployment` come from App.svelte when the URL
   // carries `?live=<agentId>/<deploymentId>` — operator opened this
@@ -354,6 +355,13 @@
   // ─── Export / Import ──────────────────────────────────────
 
   function exportGraph() {
+    // M-SAVE GOBS — stamp the filename with an ISO date so the
+    // operator can tell exports apart when cross-referencing
+    // against the template's version history on disk. Hash
+    // would be more precise but needs a validator roundtrip;
+    // date is good enough at human-scale.
+    const date = new Date().toISOString().slice(0, 10)
+    const stem = graphName || 'strategy-graph'
     const blob = new Blob(
       [JSON.stringify(toBackendGraph(), null, 2)],
       { type: 'application/json' },
@@ -361,7 +369,7 @@
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `${graphName || 'strategy-graph'}.json`
+    a.download = `${stem}.${date}.json`
     a.click()
     setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
@@ -387,6 +395,15 @@
         target: e.to.node, targetHandle: e.to.port,
       }))
       deployStatus = `imported ${nodes.length} nodes from ${file.name}`
+      // M-SAVE GOBS — if the imported name matches a known
+      // custom template, hint that saving will create a new
+      // version. The save dialog's diff preview does the actual
+      // version check at commit time; this is just a nudge so
+      // the operator doesn't assume a fresh template.
+      const existing = customTemplates.find((t) => t.name === graphName)
+      if (existing) {
+        deployStatus = `imported · matches existing '${graphName}' — save will create v${(existing.version_count ?? 0) + 2}`
+      }
     } catch (e) {
       deployStatus = `import failed: ${e}`
     } finally {
@@ -396,30 +413,139 @@
 
   // ─── Save as custom template ─────────────────────────────
 
+  // M-SAVE GOBS — the save flow now runs in two phases when
+  // the target name already has versions on disk:
+  //   phase 1: fetch existing latest graph + compute diff
+  //   phase 2: operator confirms → actually POST
+  // When the name is brand new we go straight to phase 2.
+  let saveDiffPreview = $state(null) // {existing, diff} when target already saved
+  let saveCheckBusy = $state(false)
+
   function openSaveDialog() {
     saveDialogName = graphName && graphName !== 'untitled' ? graphName : ''
     saveDialogDesc = ''
     saveDialogError = ''
+    saveDiffPreview = null
     saveDialogOpen = true
   }
 
-  async function confirmSaveTemplate() {
+  /**
+   * Click handler for the Save dialog's primary button. On first
+   * click, probe whether the name already exists — if it does,
+   * compute a diff and render it inline so the operator sees
+   * what's changing before the POST. On second click (with a
+   * diff already rendered), proceed to actually save.
+   */
+  async function onSaveClick() {
+    if (saveDiffPreview) {
+      // Second click → commit.
+      await commitSaveTemplate()
+      return
+    }
+    saveCheckBusy = true
+    saveDialogError = ''
+    try {
+      const name = saveDialogName.trim()
+      if (!name) {
+        saveDialogError = 'name is required'
+        return
+      }
+      let existing = null
+      try {
+        existing = await api.getJson(
+          `/api/v1/strategy/custom_templates/${encodeURIComponent(name)}`,
+        )
+      } catch {
+        // 404 is expected for a brand-new name — fall through
+        // to direct-save without a diff preview.
+      }
+      if (!existing?.graph) {
+        // New template: save immediately.
+        await commitSaveTemplate()
+        return
+      }
+      saveDiffPreview = {
+        existing,
+        diff: computeGraphDiff(existing.graph, toBackendGraph()),
+      }
+    } finally {
+      saveCheckBusy = false
+    }
+  }
+
+  async function commitSaveTemplate() {
     saveDialogBusy = true
     saveDialogError = ''
     try {
-      await api.postJson('/api/v1/strategy/custom_templates', {
+      const resp = await api.postJson('/api/v1/strategy/custom_templates', {
         name: saveDialogName.trim(),
         description: saveDialogDesc.trim(),
         graph: toBackendGraph(),
       })
       saveDialogOpen = false
+      saveDiffPreview = null
       await loadCustomTemplates()
-      deployStatus = `saved template '${saveDialogName.trim()}'`
+      const ver = resp?.version
+      deployStatus = ver
+        ? `saved '${saveDialogName.trim()}' (v${ver})`
+        : `saved template '${saveDialogName.trim()}'`
     } catch (e) {
       saveDialogError = String(e)
     } finally {
       saveDialogBusy = false
     }
+  }
+
+  function closeSaveDialog() {
+    saveDialogOpen = false
+    saveDiffPreview = null
+  }
+
+  // M-SAVE GOBS — version history UX for custom templates.
+  // Open via "Versions…" button in the toolbar. Lists every
+  // saved version newest-first; click any row to load that
+  // version's graph onto the canvas.
+  let versionsModal = $state(null) // {name, history}
+  let versionsBusy = $state(false)
+
+  const currentIsCustomTemplate = $derived.by(() =>
+    customTemplates.some((t) => t.name === graphName),
+  )
+
+  async function openVersionsModal() {
+    if (!currentIsCustomTemplate) return
+    versionsBusy = true
+    try {
+      const resp = await api.getJson(
+        `/api/v1/strategy/custom_templates/${encodeURIComponent(graphName)}`,
+      )
+      versionsModal = {
+        name: graphName,
+        history: resp?.history ?? [],
+      }
+    } catch (e) {
+      deployStatus = `history fetch failed: ${e}`
+    } finally {
+      versionsBusy = false
+    }
+  }
+
+  async function loadVersion(hash) {
+    if (!versionsModal) return
+    try {
+      const g = await api.getJson(
+        `/api/v1/strategy/custom_templates/${encodeURIComponent(versionsModal.name)}/versions/${encodeURIComponent(hash)}`,
+      )
+      applyLoadedGraph(g)
+      versionsModal = null
+      deployStatus = `loaded '${graphName}' @ ${hash.slice(0, 8)}`
+    } catch (e) {
+      deployStatus = `version load failed: ${e}`
+    }
+  }
+
+  function closeVersionsModal() {
+    versionsModal = null
   }
 
   async function loadCatalog() {
@@ -1069,6 +1195,18 @@
       <button type="button" class="btn ghost" onclick={openSaveDialog} disabled={nodes.length === 0} title="Save as reusable template">
         <Icon name="save" size={14} />
       </button>
+      {#if currentIsCustomTemplate}
+        <button
+          type="button"
+          class="btn ghost"
+          onclick={openVersionsModal}
+          disabled={versionsBusy}
+          title={`Browse saved versions of '${graphName}' and load any older revision.`}
+        >
+          <Icon name="history" size={14} />
+          <span>{versionsBusy ? '…' : 'Versions'}</span>
+        </button>
+      {/if}
       <button type="button" class="btn ghost" onclick={simulate} disabled={previewBusy || nodes.length === 0 || mode === 'live'} title="Evaluate graph without deploying">
         <Icon name="pulse" size={14} />
         <span>{previewBusy ? 'Simulating…' : 'Simulate'}</span>
@@ -1168,6 +1306,52 @@
     {/if}
   </div>
 
+  {#if versionsModal}
+    <div
+      class="modal-backdrop"
+      role="button"
+      tabindex="-1"
+      aria-label="Close versions"
+      onclick={closeVersionsModal}
+      onkeydown={(e) => { if (e.key === 'Escape') closeVersionsModal() }}
+    >
+      <div
+        class="modal versions-card"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Version history"
+        tabindex="-1"
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={(e) => e.stopPropagation()}
+      >
+        <h3>{versionsModal.name} — version history</h3>
+        {#if versionsModal.history.length === 0}
+          <div class="muted">no saved versions yet</div>
+        {:else}
+          <div class="versions-list">
+            {#each versionsModal.history as v, i (v.hash)}
+              <button
+                type="button"
+                class="version-row"
+                onclick={() => loadVersion(v.hash)}
+              >
+                <span class="v-ix">v{versionsModal.history.length - i}</span>
+                <code class="v-hash mono">{v.hash.slice(0, 12)}</code>
+                <span class="v-when mono">{new Date(v.saved_at).toLocaleString()}</span>
+                {#if v.saved_by}<span class="v-by">by <code>{v.saved_by}</code></span>{/if}
+                {#if v.description}<span class="v-desc">· {v.description}</span>{/if}
+                <span class="v-chev">›</span>
+              </button>
+            {/each}
+          </div>
+        {/if}
+        <div class="modal-actions">
+          <button type="button" class="btn ghost" onclick={closeVersionsModal}>Close</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
   {#if replayResult}
     <div
       class="modal-backdrop"
@@ -1233,11 +1417,11 @@
       role="button"
       tabindex="-1"
       aria-label="Close dialog"
-      onclick={() => (saveDialogOpen = false)}
-      onkeydown={(e) => { if (e.key === 'Escape') saveDialogOpen = false }}
+      onclick={closeSaveDialog}
+      onkeydown={(e) => { if (e.key === 'Escape') closeSaveDialog() }}
     >
       <div
-        class="modal"
+        class="modal save-modal"
         role="dialog"
         aria-modal="true"
         aria-label="Save as template"
@@ -1248,19 +1432,98 @@
         <h3>Save as template</h3>
         <label class="field stacked">
           <span class="field-label">Name</span>
-          <input type="text" bind:value={saveDialogName} placeholder="my-cool-setup" />
+          <input type="text" bind:value={saveDialogName} placeholder="my-cool-setup" disabled={saveDiffPreview !== null} />
         </label>
         <label class="field stacked">
           <span class="field-label">Description</span>
           <input type="text" bind:value={saveDialogDesc} placeholder="What does this do?" />
         </label>
+        {#if saveDiffPreview}
+          {@const d = saveDiffPreview.diff}
+          {@const unchanged = d.totalChanges === 0}
+          <div class="save-diff" class:clean={unchanged}>
+            <div class="save-diff-head">
+              {#if unchanged}
+                No graph changes — will save a new version with
+                just the updated description + timestamp.
+              {:else}
+                This name already has
+                {saveDiffPreview.existing.history?.length ?? 1} version(s).
+                Saving will append version #{(saveDiffPreview.existing.history?.length ?? 1) + 1}:
+              {/if}
+            </div>
+            {#if !unchanged}
+              <div class="save-diff-counts">
+                <span class="diff-chip add">+{d.addedNodes.length} nodes</span>
+                <span class="diff-chip rm">−{d.removedNodes.length} nodes</span>
+                <span class="diff-chip mod">~{d.modifiedNodes.length} nodes</span>
+                <span class="diff-chip add">+{d.addedEdges.length} edges</span>
+                <span class="diff-chip rm">−{d.removedEdges.length} edges</span>
+              </div>
+              <details class="save-diff-detail">
+                <summary>details</summary>
+                {#if d.addedNodes.length > 0}
+                  <div class="diff-section">
+                    <div class="diff-label">added nodes</div>
+                    {#each d.addedNodes as n}
+                      <code class="diff-line add">+ {n.kind} · {n.id.slice(0, 8)}</code>
+                    {/each}
+                  </div>
+                {/if}
+                {#if d.removedNodes.length > 0}
+                  <div class="diff-section">
+                    <div class="diff-label">removed nodes</div>
+                    {#each d.removedNodes as n}
+                      <code class="diff-line rm">− {n.kind} · {n.id.slice(0, 8)}</code>
+                    {/each}
+                  </div>
+                {/if}
+                {#if d.modifiedNodes.length > 0}
+                  <div class="diff-section">
+                    <div class="diff-label">modified nodes</div>
+                    {#each d.modifiedNodes as n}
+                      <code class="diff-line mod">
+                        ~ {n.kind} · {n.id.slice(0, 8)}
+                        {#if n.kindChanged}· kind {n.oldKind} → {n.kind}{/if}
+                        {#if n.configChanged}· config updated{/if}
+                      </code>
+                    {/each}
+                  </div>
+                {/if}
+                {#if d.addedEdges.length > 0}
+                  <div class="diff-section">
+                    <div class="diff-label">added edges</div>
+                    {#each d.addedEdges as e}
+                      <code class="diff-line add">+ {e.from.node.slice(0, 6)}:{e.from.port} → {e.to.node.slice(0, 6)}:{e.to.port}</code>
+                    {/each}
+                  </div>
+                {/if}
+                {#if d.removedEdges.length > 0}
+                  <div class="diff-section">
+                    <div class="diff-label">removed edges</div>
+                    {#each d.removedEdges as e}
+                      <code class="diff-line rm">− {e.from.node.slice(0, 6)}:{e.from.port} → {e.to.node.slice(0, 6)}:{e.to.port}</code>
+                    {/each}
+                  </div>
+                {/if}
+              </details>
+            {/if}
+          </div>
+        {/if}
         {#if saveDialogError}
           <div class="modal-err">{saveDialogError}</div>
         {/if}
         <div class="modal-actions">
-          <button type="button" class="btn ghost" onclick={() => (saveDialogOpen = false)}>Cancel</button>
-          <button type="button" class="btn" onclick={confirmSaveTemplate} disabled={saveDialogBusy || !saveDialogName.trim()}>
-            {saveDialogBusy ? 'Saving…' : 'Save'}
+          <button type="button" class="btn ghost" onclick={closeSaveDialog}>
+            Cancel
+          </button>
+          <button
+            type="button"
+            class="btn"
+            onclick={onSaveClick}
+            disabled={saveDialogBusy || saveCheckBusy || !saveDialogName.trim()}
+          >
+            {#if saveDialogBusy}Saving…{:else if saveCheckBusy}Checking…{:else if saveDiffPreview}Save new version{:else}Save{/if}
           </button>
         </div>
       </div>
@@ -1899,6 +2162,89 @@
   }
   .replay-diff-cols .col-old pre { border-left: 2px solid var(--fg-muted); }
   .replay-diff-cols .col-new pre { border-left: 2px solid var(--accent); }
+
+  /* M-SAVE GOBS — save-diff preview inside the save modal.
+     Sits between the input fields and the action buttons. */
+  .save-modal { min-width: 520px; max-width: 760px; }
+  .save-diff {
+    margin: var(--s-2) 0;
+    padding: var(--s-3);
+    background: color-mix(in srgb, var(--warn) 8%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent);
+    border-radius: var(--r-sm);
+    font-size: var(--fs-xs);
+  }
+  .save-diff.clean {
+    background: color-mix(in srgb, var(--ok) 8%, transparent);
+    border-color: color-mix(in srgb, var(--ok) 30%, transparent);
+  }
+  .save-diff-head { color: var(--fg-primary); margin-bottom: var(--s-2); }
+  .save-diff-counts {
+    display: flex; gap: 4px; flex-wrap: wrap;
+    margin-bottom: var(--s-2);
+  }
+  .diff-chip {
+    padding: 2px 6px;
+    border-radius: var(--r-sm);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    background: var(--bg-chip);
+    color: var(--fg-muted);
+  }
+  .diff-chip.add { color: var(--pos); background: color-mix(in srgb, var(--pos) 14%, transparent); }
+  .diff-chip.rm  { color: var(--neg); background: color-mix(in srgb, var(--neg) 14%, transparent); }
+  .diff-chip.mod { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
+  .save-diff-detail { margin-top: var(--s-2); }
+  .save-diff-detail summary {
+    cursor: pointer; font-size: 10px; color: var(--fg-muted);
+    letter-spacing: var(--tracking-label); text-transform: uppercase;
+  }
+  .diff-section { margin-top: 6px; }
+  .diff-label {
+    font-size: 9px; letter-spacing: var(--tracking-label);
+    text-transform: uppercase; color: var(--fg-muted); margin-bottom: 2px;
+  }
+  .diff-line {
+    display: block; padding: 1px 6px;
+    font-family: var(--font-mono); font-size: 10px;
+    border-radius: 2px; background: var(--bg-raised);
+    margin-bottom: 1px;
+  }
+  .diff-line.add { color: var(--pos); }
+  .diff-line.rm  { color: var(--neg); }
+  .diff-line.mod { color: var(--warn); }
+
+  /* M-SAVE GOBS — versions modal */
+  .versions-card { min-width: 520px; max-width: 720px; }
+  .versions-list {
+    display: flex; flex-direction: column; gap: 4px;
+    max-height: 60vh; overflow-y: auto;
+    margin: var(--s-2) 0;
+  }
+  .version-row {
+    display: flex; align-items: center; gap: var(--s-2);
+    padding: var(--s-2) var(--s-3);
+    background: var(--bg-raised);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--r-sm);
+    cursor: pointer; color: inherit; text-align: left;
+    font-size: var(--fs-xs);
+    transition: border-color var(--dur-fast), background var(--dur-fast);
+  }
+  .version-row:hover { border-color: var(--accent); background: var(--bg-chip); }
+  .v-ix {
+    display: inline-block; min-width: 38px;
+    padding: 1px 6px;
+    background: var(--bg-chip); color: var(--accent);
+    border-radius: var(--r-sm);
+    font-family: var(--font-mono); font-weight: 600; font-size: 10px;
+    text-align: center;
+  }
+  .v-hash { color: var(--fg-secondary); }
+  .v-when { color: var(--fg-muted); }
+  .v-by { color: var(--fg-muted); }
+  .v-desc { color: var(--fg-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .v-chev { margin-left: auto; color: var(--fg-muted); font-size: var(--fs-md); }
 
   .preview-bar {
     display: flex; align-items: center; flex-wrap: wrap; gap: var(--s-2);

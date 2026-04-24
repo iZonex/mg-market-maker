@@ -172,6 +172,10 @@ pub fn client_routes() -> Router<DashboardState> {
             get(get_custom_template)
                 .delete(delete_custom_template),
         )
+        .route(
+            "/api/v1/strategy/custom_templates/{name}/versions/{hash}",
+            get(get_custom_template_version),
+        )
         .route("/api/v1/loans", get(get_loans))
         .route("/api/v1/loans/{symbol}", get(get_loan_by_symbol))
         .route(
@@ -1467,8 +1471,57 @@ struct CustomTemplateSummary {
     description: String,
     saved_at: Option<chrono::DateTime<chrono::Utc>>,
     saved_by: Option<String>,
+    /// M-SAVE GOBS — latest graph content hash; helps the UI
+    /// distinguish identical rename from actual edit, and
+    /// prevents double-save of the same bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_hash: Option<String>,
+    /// How many versions sit behind the latest. `0` means just
+    /// the first save; useful for a "v{n+1}" label.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    version_count: usize,
 }
 
+fn is_zero_usize(v: &usize) -> bool { *v == 0 }
+
+/// M-SAVE GOBS — one line per version in `user_templates/<name>/history.jsonl`.
+/// The canonical graph JSON for each version lives in
+/// `<name>/<hash>.json`. Latest line of the jsonl is the
+/// "current" version; `graph` is ALWAYS read from the hash file.
+#[derive(Serialize, Deserialize, Clone)]
+struct CustomTemplateVersion {
+    hash: String,
+    saved_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    saved_by: Option<String>,
+    #[serde(default)]
+    description: String,
+}
+
+/// Full response for `GET /custom_templates/:name` — carries the
+/// flat graph that the canvas needs (latest version) plus the
+/// full history so the UI can render a version selector and
+/// fetch specific versions without a second round-trip listing.
+#[derive(Serialize)]
+struct CustomTemplateFull {
+    name: String,
+    description: String,
+    graph: mm_strategy_graph::Graph,
+    saved_at: Option<chrono::DateTime<chrono::Utc>>,
+    saved_by: Option<String>,
+    /// Newest-first — `history[0].hash` matches the `graph`
+    /// returned above. Legacy single-file templates surface as
+    /// a one-entry history so the UI can treat everything
+    /// uniformly.
+    history: Vec<CustomTemplateVersion>,
+}
+
+/// Walk `user_templates/` and return one summary per template
+/// name, honouring both layouts: the legacy flat-file
+/// `<name>.json` and the versioned `<name>/history.jsonl`
+/// directory. The newest version of each template feeds the
+/// summary; the flat-file form surfaces as a 1-version
+/// history so the UI never has to special-case it.
 async fn list_custom_templates(
     State(state): State<DashboardState>,
 ) -> Json<Vec<CustomTemplateSummary>> {
@@ -1478,22 +1531,70 @@ async fn list_custom_templates(
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Json(vec![]);
     };
-    let mut out: Vec<CustomTemplateSummary> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-        .filter_map(|e| {
-            let raw = std::fs::read_to_string(e.path()).ok()?;
-            let rec: CustomTemplateRecord = serde_json::from_str(&raw).ok()?;
-            Some(CustomTemplateSummary {
-                name: rec.name,
-                description: rec.description,
-                saved_at: rec.saved_at,
-                saved_by: rec.saved_by,
-            })
-        })
-        .collect();
+    let mut out: Vec<CustomTemplateSummary> = Vec::new();
+    for e in entries.filter_map(|x| x.ok()) {
+        let p = e.path();
+        if p.extension().is_some_and(|x| x == "json") {
+            // Legacy single-file template.
+            if let Some(rec) = read_legacy_record(&p) {
+                out.push(CustomTemplateSummary {
+                    name: rec.name,
+                    description: rec.description,
+                    saved_at: rec.saved_at,
+                    saved_by: rec.saved_by,
+                    latest_hash: Some(rec.graph.content_hash()),
+                    version_count: 0,
+                });
+            }
+            continue;
+        }
+        if p.is_dir() {
+            // Versioned layout: read history.jsonl, pick newest line.
+            let name = match p.file_name().and_then(|s| s.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            let versions = read_history(&p);
+            if let Some(latest) = versions.first() {
+                out.push(CustomTemplateSummary {
+                    name,
+                    description: latest.description.clone(),
+                    saved_at: Some(latest.saved_at),
+                    saved_by: latest.saved_by.clone(),
+                    latest_hash: Some(latest.hash.clone()),
+                    version_count: versions.len().saturating_sub(1),
+                });
+            }
+        }
+    }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Json(out)
+}
+
+/// Read `history.jsonl` for a template directory, newest-first.
+/// One line per save. Silently skips malformed lines — a
+/// corrupt middle line shouldn't brick the template's history.
+fn read_history(template_dir: &std::path::Path) -> Vec<CustomTemplateVersion> {
+    let hist_path = template_dir.join("history.jsonl");
+    let Ok(raw) = std::fs::read_to_string(&hist_path) else {
+        return Vec::new();
+    };
+    let mut versions: Vec<CustomTemplateVersion> = raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<CustomTemplateVersion>(l).ok())
+        .collect();
+    // Newest-first: history.jsonl is written append-only so
+    // the last line on disk is the latest save.
+    versions.reverse();
+    versions
+}
+
+/// Read a legacy flat-file template if present. Returns None
+/// when the file is absent, malformed, or missing fields.
+fn read_legacy_record(path: &std::path::Path) -> Option<CustomTemplateRecord> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<CustomTemplateRecord>(&raw).ok()
 }
 
 #[derive(Deserialize)]
@@ -1511,19 +1612,16 @@ async fn save_custom_template(
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
-    let Some(dir) = user_templates_dir(&state) else {
+    let Some(root) = user_templates_dir(&state) else {
         return (StatusCode::SERVICE_UNAVAILABLE, "strategy graphs not configured")
             .into_response();
     };
-    // Reject path-traversal by restricting the name to the same
-    // ASCII subset the built-in graph store accepts.
     if !req.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         return (StatusCode::BAD_REQUEST, "name must be [A-Za-z0-9_-]+").into_response();
     }
     if req.name.is_empty() {
         return (StatusCode::BAD_REQUEST, "name is required").into_response();
     }
-    // Compile-check so a user can't "save" an invalid draft.
     if let Err(e) = mm_strategy_graph::Evaluator::build(&req.graph) {
         return (
             StatusCode::BAD_REQUEST,
@@ -1531,29 +1629,93 @@ async fn save_custom_template(
         )
             .into_response();
     }
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+
+    let template_dir = root.join(&req.name);
+    let legacy_path = root.join(format!("{}.json", req.name));
+    if let Err(e) = std::fs::create_dir_all(&template_dir) {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("mkdir: {e}")).into_response();
     }
+
+    // Lazy legacy migration: if the old flat file exists and the
+    // versioned history hasn't been started yet, seed the history
+    // with the legacy record as version 1. Keeps operator-saved
+    // templates from silently losing their first version when the
+    // new write path takes over.
+    let history_path = template_dir.join("history.jsonl");
+    if legacy_path.exists() && !history_path.exists() {
+        if let Some(legacy) = read_legacy_record(&legacy_path) {
+            let legacy_hash = legacy.graph.content_hash();
+            let legacy_entry = CustomTemplateVersion {
+                hash: legacy_hash.clone(),
+                saved_at: legacy.saved_at.unwrap_or_else(chrono::Utc::now),
+                saved_by: legacy.saved_by.clone(),
+                description: legacy.description.clone(),
+            };
+            // Write the legacy graph under its hash + append the
+            // history line, then drop the flat file to avoid a
+            // double-read on next list.
+            let legacy_graph_body =
+                serde_json::to_string_pretty(&legacy.graph).unwrap_or_default();
+            let _ = std::fs::write(
+                template_dir.join(format!("{legacy_hash}.json")),
+                legacy_graph_body,
+            );
+            if let Ok(line) = serde_json::to_string(&legacy_entry) {
+                let _ = append_line(&history_path, &line);
+            }
+            let _ = std::fs::remove_file(&legacy_path);
+        }
+    }
+
     let saved_by = headers
         .get("X-MM-User")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let record = CustomTemplateRecord {
-        name: req.name.clone(),
-        description: req.description,
-        graph: req.graph,
-        saved_at: Some(chrono::Utc::now()),
+    let hash = req.graph.content_hash();
+    let graph_path = template_dir.join(format!("{hash}.json"));
+    // Dedup: if this exact graph hash was saved before, skip
+    // rewriting the graph file but still append a history entry
+    // (description / saved_by may have changed).
+    if !graph_path.exists() {
+        let body = match serde_json::to_string_pretty(&req.graph) {
+            Ok(b) => b,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        if let Err(e) = std::fs::write(&graph_path, body) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("write graph: {e}")).into_response();
+        }
+    }
+    let entry = CustomTemplateVersion {
+        hash: hash.clone(),
+        saved_at: chrono::Utc::now(),
         saved_by,
+        description: req.description,
     };
-    let path = dir.join(format!("{}.json", req.name));
-    let body = match serde_json::to_string_pretty(&record) {
-        Ok(b) => b,
+    let line = match serde_json::to_string(&entry) {
+        Ok(l) => l,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    if let Err(e) = std::fs::write(&path, body) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")).into_response();
+    if let Err(e) = append_line(&history_path, &line) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("append: {e}")).into_response();
     }
-    (StatusCode::OK, Json(serde_json::json!({ "status": "saved" }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "saved",
+            "hash": hash,
+            "version": read_history(&template_dir).len(),
+        })),
+    )
+        .into_response()
+}
+
+fn append_line(path: &std::path::Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(f, "{line}")
 }
 
 async fn get_custom_template(
@@ -1565,18 +1727,109 @@ async fn get_custom_template(
     if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         return (StatusCode::BAD_REQUEST, "bad name").into_response();
     }
-    let Some(dir) = user_templates_dir(&state) else {
+    let Some(root) = user_templates_dir(&state) else {
         return (StatusCode::SERVICE_UNAVAILABLE, "strategy graphs not configured")
             .into_response();
     };
-    let path = dir.join(format!("{name}.json"));
-    match std::fs::read_to_string(&path) {
+    let template_dir = root.join(&name);
+    let legacy_path = root.join(format!("{name}.json"));
+
+    // Prefer the versioned layout; fall back to legacy flat file
+    // so pre-M-SAVE installations still serve their templates
+    // without a forced migration.
+    if template_dir.is_dir() {
+        let history = read_history(&template_dir);
+        let Some(latest) = history.first().cloned() else {
+            return (StatusCode::NOT_FOUND, "no versions recorded").into_response();
+        };
+        let graph_path = template_dir.join(format!("{}.json", latest.hash));
+        let graph: mm_strategy_graph::Graph = match std::fs::read_to_string(&graph_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+        {
+            Some(g) => g,
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("latest version {} missing on disk", latest.hash),
+                )
+                    .into_response()
+            }
+        };
+        return (
+            StatusCode::OK,
+            Json(CustomTemplateFull {
+                name,
+                description: latest.description.clone(),
+                graph,
+                saved_at: Some(latest.saved_at),
+                saved_by: latest.saved_by.clone(),
+                history,
+            }),
+        )
+            .into_response();
+    }
+
+    match std::fs::read_to_string(&legacy_path) {
         Ok(raw) => match serde_json::from_str::<CustomTemplateRecord>(&raw) {
-            Ok(rec) => (StatusCode::OK, Json(rec)).into_response(),
+            Ok(rec) => {
+                let hash = rec.graph.content_hash();
+                let entry = CustomTemplateVersion {
+                    hash: hash.clone(),
+                    saved_at: rec.saved_at.unwrap_or_else(chrono::Utc::now),
+                    saved_by: rec.saved_by.clone(),
+                    description: rec.description.clone(),
+                };
+                (
+                    StatusCode::OK,
+                    Json(CustomTemplateFull {
+                        name: rec.name,
+                        description: rec.description,
+                        graph: rec.graph,
+                        saved_at: rec.saved_at,
+                        saved_by: rec.saved_by,
+                        history: vec![entry],
+                    }),
+                )
+                    .into_response()
+            }
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             (StatusCode::NOT_FOUND, "not found").into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// M-SAVE GOBS — fetch a specific historical version by hash.
+/// Returns just the graph JSON (no history wrapper). Used by
+/// the version selector in StrategyPage to roll back to an
+/// older template revision without affecting other templates.
+async fn get_custom_template_version(
+    State(state): State<DashboardState>,
+    Path((name, hash)): Path<(String, String)>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return (StatusCode::BAD_REQUEST, "bad name").into_response();
+    }
+    if !hash.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return (StatusCode::BAD_REQUEST, "bad hash").into_response();
+    }
+    let Some(root) = user_templates_dir(&state) else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "strategy graphs not configured")
+            .into_response();
+    };
+    let path = root.join(&name).join(format!("{hash}.json"));
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => match serde_json::from_str::<mm_strategy_graph::Graph>(&raw) {
+            Ok(g) => (StatusCode::OK, Json(g)).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (StatusCode::NOT_FOUND, "version not found").into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -1591,17 +1844,30 @@ async fn delete_custom_template(
     if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         return (StatusCode::BAD_REQUEST, "bad name").into_response();
     }
-    let Some(dir) = user_templates_dir(&state) else {
+    let Some(root) = user_templates_dir(&state) else {
         return (StatusCode::SERVICE_UNAVAILABLE, "strategy graphs not configured")
             .into_response();
     };
-    let path = dir.join(format!("{name}.json"));
-    match std::fs::remove_file(&path) {
-        Ok(_) => (StatusCode::OK, "deleted").into_response(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            (StatusCode::NOT_FOUND, "not found").into_response()
+    let template_dir = root.join(&name);
+    let legacy_path = root.join(format!("{name}.json"));
+    // Delete the whole versioned directory if present + the
+    // legacy flat file if it lingers.
+    let mut removed = false;
+    if template_dir.is_dir() {
+        if let Err(e) = std::fs::remove_dir_all(&template_dir) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("rmdir: {e}"))
+                .into_response();
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        removed = true;
+    }
+    if legacy_path.exists() {
+        let _ = std::fs::remove_file(&legacy_path);
+        removed = true;
+    }
+    if removed {
+        (StatusCode::OK, "deleted").into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "not found").into_response()
     }
 }
 

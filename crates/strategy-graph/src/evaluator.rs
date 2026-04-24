@@ -122,12 +122,36 @@ pub fn replay_source_inputs(
     kind_values: &HashMap<(String, String), Value>,
 ) -> HashMap<(NodeId, String), Value> {
     let mut out: HashMap<(NodeId, String), Value> = HashMap::new();
+    // M5-GOBS — count candidate source nodes per kind. A kind
+    // that appears more than once means we can't deterministically
+    // dispatch trace values by kind alone (e.g. two `Math.Const`
+    // literals with different `config.value`s would collapse onto
+    // whichever sat last in the original trace). Skip those and
+    // let the candidate's own `evaluate()` supply its per-node
+    // default, which for literal-style sources is read from config.
+    let mut kind_counts: HashMap<&str, usize> = HashMap::new();
+    for id in &candidate.order {
+        let Some(order) = candidate.input_order.get(id) else { continue };
+        if !order.is_empty() {
+            continue;
+        }
+        if let Some(kind) = candidate.kinds.get(id) {
+            *kind_counts.entry(kind.as_str()).or_insert(0) += 1;
+        }
+    }
+
     for id in &candidate.order {
         let Some(order) = candidate.input_order.get(id) else { continue };
         if !order.is_empty() {
             continue;
         }
         let Some(kind) = candidate.kinds.get(id).cloned() else { continue };
+        // Ambiguous dispatch — two source nodes share this kind;
+        // we can't tell them apart from a kind-keyed trace. Fall
+        // back to `evaluate()` so each literal uses its own config.
+        if kind_counts.get(kind.as_str()).copied().unwrap_or(0) > 1 {
+            continue;
+        }
         let Some(node) = candidate.nodes.get(id) else { continue };
         for p in node.output_ports() {
             if let Some(v) = kind_values.get(&(kind.clone(), p.name.clone())) {

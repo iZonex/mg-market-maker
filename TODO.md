@@ -254,26 +254,26 @@ report" flow. Four waves below, **execute in order**.
 Operator today can't answer "what graph is running on agent X?"
 and has to save + pick + swap in two pages. Fix that first.
 
-- [ ] **A1** Agent echoes `graph_hash: Option<String>` +
+- [x] **A1** Agent echoes `graph_hash: Option<String>` +
   `template: Option<String>` in `DeploymentStateRow`. Populated
   on engine start from the resolved template/graph; updated on
   `StrategyGraphSwap` override. Fleet readback shows it.
-- [ ] **A2** Add `GET /api/v1/agents/{id}/deployments/{dep}/variables`
+- [x] **A2** Add `GET /api/v1/agents/{id}/deployments/{dep}/variables`
   returning the currently-applied variables map (agent serves
   from its own DesiredStrategy state). Mirror of the existing
   PATCH — no introspection today.
-- [ ] **A3** `StrategyPage` gains a single "Deploy" action that
+- [x] **A3** `StrategyPage` gains a single "Deploy" action that
   combines save-graph + pick-agent + dispatch into one modal.
   Current three-step flow (save → open picker → swap) becomes
   one confirmation dialog with fleet selector + variable form.
-- [ ] **A4** `DeployDialog` gains a "Custom graph" tab next to
+- [x] **A4** `DeployDialog` gains a "Custom graph" tab next to
   "Template". Same modal, two modes. Graph mode imports from
   StrategyPage draft or file.
-- [ ] **A5** `StrategyPage` rollback surface: list graph history
+- [x] **A5** `StrategyPage` rollback surface: list graph history
   (`/api/v1/strategy/graphs/{name}/history`) + one-click
   "rollback to hash X on deployment Y". `rollbackFrom` state
   already exists (line 50) — just needs the button.
-- [ ] **A6** Graph preview: wire `POST /api/v1/strategy/preview`
+- [x] **A6** Graph preview: wire `POST /api/v1/strategy/preview`
   to StrategyPage — dry-run the evaluator with sample inputs,
   show emitted quotes without touching the fleet.
 
@@ -298,7 +298,7 @@ fleet-aware, via the `AuditRangeFetcher` pattern landed
   already tracks these, just needs the topic registration):
   `pnl_snapshot`, `positions_snapshot`, `sla_snapshot`,
   `reconciliation_snapshot`.
-- [ ] **B4** Per-client drilldown page:
+- [x] **B4** Per-client drilldown page:
   `frontend/src/lib/pages/ClientPage.svelte`. Joins fleet rows
   by `profile.client_id` → shows positions per venue, PnL
   attribution per strategy, SLA certificate, open fills,
@@ -316,19 +316,19 @@ reconciliation drift, can't pause the whole fleet at once, can
 revoke an agent that still has live deployments, can't rotate
 credentials.
 
-- [ ] **C1** ReconciliationPage — new details topic
+- [x] **C1** ReconciliationPage — new details topic
   `reconciliation_snapshot` (phantom orders, orphaned orders,
   balance drift). Controller endpoint
   `GET /api/v1/reconciliation/fleet` fans out + aggregates.
   Frontend page with three tables + "resolve" actions per row.
-- [ ] **C2** Global pause: `POST /api/v1/ops/pause_fleet` fans
+- [x] **C2** Global pause: `POST /api/v1/ops/pause_fleet` fans
   out `ops/pause` to every accepted agent's active deployments.
   Button at fleet-level on FleetPage. Same for `resume_fleet`.
-- [ ] **C3** Multi-agent batch deploy: `FleetPage` adds
+- [x] **C3** Multi-agent batch deploy: `FleetPage` adds
   checkbox selection → "Deploy to selected". `DeployDialog`
   accepts an array of agent_ids → serial fan-out with
   per-agent result report.
-- [ ] **C4** Revoke-flow safety: when operator clicks "Revoke"
+- [x] **C4** Revoke-flow safety: when operator clicks "Revoke"
   on an agent with live deployments, show warning modal listing
   them + option to "stop all deployments then revoke" vs "cancel".
 - [ ] **C5** Credential rotation UI: VaultPage edit mode that
@@ -336,14 +336,14 @@ credentials.
   `credential_rotated_at` timestamp. Per-credential fetch audit
   (which agent fetched + when) via controller-side tap on
   `resolve_for`.
-- [ ] **C6** Credential expiry warnings: optional
+- [x] **C6** Credential expiry warnings: optional
   `expires_at: Option<DateTime>` on `VaultEntry`. VaultPage
   renders red chip for <7 days remaining; Platform dashboard
   has a rollup counter.
 - [ ] **C7** Fleet-level aggregate card on FleetPage: per-agent
   "running N deployments · M live orders · total PnL $X · last
   tick Y ms ago" summary row above the agent-card list.
-- [ ] **C8** Deployment-level flatten preview: before dispatch,
+- [x] **C8** Deployment-level flatten preview: before dispatch,
   `GET .../ops/flatten/preview` returns qty/side/expected
   slippage; confirmation modal shows it.
 
@@ -411,11 +411,11 @@ Outstanding follow-ups surfaced by the 2026-04-21 smoke run:
   deployment). Add a "lockout-safe" self-unlock via a signed
   out-of-band token, or document "always enroll TOTP before
   flipping the flag" in SECURITY.md + warn at server boot.
-- [ ] **TEST-1** `pentest_templates_e2e` flakes when run
+- [x] **TEST-1** `pentest_templates_e2e` flakes when run
   concurrently (2/6 fail → 6/6 pass in isolation). Shared
   global state (metrics registry? audit singleton?) needs a
   per-test isolate or a serial-only `#[serial_test::serial]`.
-- [ ] **AUDIT-1** Controller auth-event fsync added
+- [x] **AUDIT-1** Controller auth-event fsync added
   (2026-04-21) — LoginSucceeded/Failed/Logout + PasswordReset
   Issued/Completed now critical. Agents emit their own event
   classes; audit their critical list independently.
@@ -427,11 +427,11 @@ Outstanding follow-ups surfaced by the 2026-04-21 smoke run:
 Surface-level polish for the compliance/audit flow. Lower
 urgency — current state already passes MiCA Article 17 export.
 
-- [ ] **D1** Hash-chain visual in AuditStream: highlight rows
+- [x] **D1** Hash-chain visual in AuditStream: highlight rows
   where chain is broken (prev_hash mismatch). Requires audit
   JSONL to carry both `hash` and `prev_hash` per row (already
   does per `crates/risk/src/audit.rs`).
-- [ ] **D2** Signed audit-range export endpoint:
+- [x] **D2** Signed audit-range export endpoint:
   `POST /api/v1/audit/export` with `from_ms/until_ms/client_id`
   → returns tamper-proof bundle (same HMAC-SHA256 manifest
   shape as monthly bundle, arbitrary range). Button on
@@ -445,7 +445,7 @@ urgency — current state already passes MiCA Article 17 export.
   `TelemetryPayload::Alert` envelope → controller dedups by
   `(severity, message_hash)` with 60s window → single Telegram
   send. Keeps per-agent AlertManager as emitter only.
-- [ ] **D5** Compliance violations panel: per-client watch list
+- [x] **D5** Compliance violations panel: per-client watch list
   (daily loss > threshold, position limit breach, SLA uptime
   drop, halt participation). Rolls up across the fleet with
   direct links to relevant drilldown.
@@ -1947,6 +1947,47 @@ evaluator loop. No new per-tick persistence needed.
   diverging nodes glow-highlighted. Current v1 lists
   divergences as JSON diff which is good enough for first
   use; visual canvas diff is polish when operators ask.
+
+### GOBS-SAVE — graph save-diff + versioning (landed)
+
+- [x] **SAVE-1** Versioned storage. `user_templates/<name>/`
+  holds one `<hash>.json` per unique graph + append-only
+  `history.jsonl`. Legacy flat `<name>.json` lazy-migrates on
+  next save (seed as version 1, remove after). Dedup: re-
+  saving the same bytes appends history but doesn't rewrite
+  the graph file.
+- [x] **SAVE-2** Frontend `graphDiff.js` — pure fn returns
+  added/removed/modified nodes + added/removed edges, stable-
+  stringify config compare, edge matching by
+  `(from.node,port) -> (to.node,port)` tuple.
+- [x] **SAVE-3** Save dialog runs in two phases: first click
+  probes `/custom_templates/:name`; if an existing version is
+  found, renders a diff preview with +/-/~ chips + expandable
+  details; second click (button flips to "Save new version")
+  commits via POST.
+- [x] **SAVE-4** `Versions` button in toolbar (visible when
+  current `graphName` matches a custom template). Opens a
+  modal listing every version newest-first; click any row →
+  GET `/custom_templates/:name/versions/:hash` → apply to
+  canvas.
+- [x] **SAVE-5** Export filename stamped with ISO date so
+  cross-referencing with on-disk history is trivial. Import
+  detects name collision + hints "matches existing 'X' — save
+  will create v{N+2}".
+- [x] **SAVE-6** `DashboardState::set_strategy_graph_store`
+  wired in `server/src/main.rs` so distributed-mode boots no
+  longer 503 the save endpoint. Root: `data/strategy_graphs`.
+- [x] **SAVE-7** M5 replay bugfix found along the way:
+  `replay_source_inputs` kind-keyed lookup collapsed multiple
+  `Math.Const` literals with distinct `config.value`s onto
+  whichever appeared last in the trace. Now counts candidate
+  source-node kinds; skips ambiguous ones (>= 2 of same kind)
+  so each literal's own `evaluate()` default supplies its
+  config value.
+- [x] **SAVE-8** Playwright `graph-save-versioning.spec.ts` —
+  API round-trip (v1→v2 history + per-version read + dedup)
+  + UI (seeded template → save dialog → same name flips diff
+  preview → commit). Suite 27/27 green.
 
 ### GOBS-PRE — pre-human-testing hardening (landed)
 

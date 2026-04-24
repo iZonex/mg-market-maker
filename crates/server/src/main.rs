@@ -151,6 +151,22 @@ async fn main() -> Result<()> {
     // Dashboard state + auth + WS broadcast. State starts empty;
     // the adapter task below fills it from fleet telemetry.
     let dashboard_state = DashboardState::new();
+    // M-SAVE GOBS — attach a GraphStore so `/api/v1/strategy/custom_templates`
+    // has a root to write under. Distributed mode doesn't run an
+    // engine locally, but the custom-template persistence lives
+    // on the controller box so operators can save graphs from
+    // any browser and the library persists across restarts.
+    match mm_strategy_graph::GraphStore::new("data/strategy_graphs") {
+        Ok(store) => {
+            dashboard_state.set_strategy_graph_store(std::sync::Arc::new(store));
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "strategy graph store init failed — custom-template saves will 503",
+            );
+        }
+    }
     let ws_broadcast = Arc::new(WsBroadcast::new(1024));
 
     // JWT signing secret. Must be stable across restarts or
