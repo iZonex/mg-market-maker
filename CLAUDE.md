@@ -4,7 +4,7 @@ Production-grade market maker for the custom exchange at `../exchange/` with mul
 
 ## Stats
 
-**18 crates, ~180 files, ~83K lines Rust, 1431 tests**
+**25 crates, ~200 files, ~157K lines Rust, 2241 tests**
 
 ## Architecture
 

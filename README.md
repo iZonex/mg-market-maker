@@ -14,16 +14,16 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/language-Rust-orange?logo=rust" alt="Rust">
-  <img src="https://img.shields.io/badge/tests-1431_passing-brightgreen" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-2241_passing-brightgreen" alt="Tests">
   <img src="https://img.shields.io/badge/clippy-zero_warnings-brightgreen" alt="Clippy">
-  <img src="https://img.shields.io/badge/crates-18-blue" alt="Crates">
-  <img src="https://img.shields.io/badge/lines-83K-blue" alt="LoC">
+  <img src="https://img.shields.io/badge/crates-25-blue" alt="Crates">
+  <img src="https://img.shields.io/badge/lines-157K-blue" alt="LoC">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
 
 ---
 
-High-performance, multi-venue market making engine with institutional-grade risk management, toxicity detection, and MiCA compliance. `Decimal` arithmetic everywhere — never `f64` for money. 18 crates, 83K lines, 1431 tests.
+High-performance, multi-venue market making engine with institutional-grade risk management, toxicity detection, and MiCA compliance. `Decimal` arithmetic everywhere — never `f64` for money. 25 crates, 157K lines, 2241 tests.
 
 ## Why MG?
 
@@ -394,18 +394,45 @@ cargo bench -p mm-strategy                    # strategy benchmarks
 
 ## Documentation
 
+### Getting started
 | Guide | Audience | Topics |
 |-------|----------|--------|
 | **[Quick Start](docs/guides/quickstart.md)** | New users | Build, configure, smoke test, paper, live |
-| **[Strategy Catalog](docs/guides/strategy-catalog.md)** | Everyone | Every strategy + signal + modulator — formulas, params, gotchas, selection matrix, per-PairClass recipes |
-| **[Writing Strategies](docs/guides/writing-strategies.md)** | Strategy devs | Trait, context, alpha signals, testing |
-| **[Architecture](docs/guides/architecture.md)** | System devs | Crate graph, data flow, persistence |
-| **[Operations](docs/guides/operations.md)** | Operators | Modes, troubleshooting, daily checklist, auth surface |
-| **[Adding Exchanges](docs/guides/adding-exchange.md)** | Connector devs | 8-step guide, auth, capabilities |
+| **[Architecture](docs/guides/architecture.md)** | System devs | Crate graph, multi-venue data bus, distributed agent/controller, persistence |
+| **[Deployment](docs/deployment.md)** | Ops | Docker, systemd, env vars, security checklist, venue fixtures |
 | **[Config Reference](docs/guides/configuration-reference.md)** | Everyone | Every TOML field + env vars |
+
+### Using the system
+| Guide | Audience | Topics |
+|-------|----------|--------|
+| **[Dashboard UI](docs/guides/dashboard-ui.md)** | Operators | Overview, Fleet, Strategy, Incidents, Surveillance — per-page walkthrough |
+| **[Graph Authoring](docs/guides/graph-authoring.md)** | Strategy authors | Palette, node kinds, validation, save + version, deploy, live observability, replay |
+| **[Operations](docs/guides/operations.md)** | Operators | Modes, kill switch, checkpoint, hot-reload, common issues |
+| **[Alerts & Webhooks](docs/guides/alerts-and-webhooks.md)** | Operators | Telegram bot, 3-level severity, webhook dispatch, alert rules |
+| **[Metrics Glossary](docs/guides/metrics-glossary.md)** | Operators | Every `mm_*` Prometheus gauge with semantics + alert thresholds |
+| **[Security Model](docs/guides/security-model.md)** | Operators + clients | JWT + RBAC, per-client scoping, vault, HMAC exports, audit chain |
+
+### Strategy authoring
+| Guide | Audience | Topics |
+|-------|----------|--------|
+| **[Strategy Catalog](docs/guides/strategy-catalog.md)** | Everyone | Every strategy + signal + modulator — formulas, params, gotchas, selection matrix |
+| **[Writing Strategies](docs/guides/writing-strategies.md)** | Strategy devs | Rust `Strategy` trait, context, alpha signals, testing |
 | **[Adaptive Calibration](docs/guides/adaptive-calibration.md)** | Strategy devs | PairClass templates, tuner feedback loop, hyperopt flow |
+| **[Pentest Guide](docs/guides/pentest.md)** | Pentest operators | 15 exploit patterns × detector pairing, `MM_ALLOW_RESTRICTED` gate |
+
+### Integrations
+| Guide | Audience | Topics |
+|-------|----------|--------|
+| **[Adding Exchanges](docs/guides/adding-exchange.md)** | Connector devs | 8-step guide, auth, capabilities |
+| **[Protocol Reference](docs/protocols/)** | Connector devs | Per-venue wire-format docs (Binance, Bybit, Hyperliquid, OKX, Deribit) |
 | **[Crash Recovery](docs/guides/crash-recovery.md)** | Operators | Checkpoint restore, fill replay from audit log |
-| **[Competitor Gap Analysis](docs/research/competitor-gap-analysis-apr17.md)** | Planning | What peers have we don't — STP, OCO, drop-copy, queue model |
+
+### Planning / research
+| Document | Topics |
+|----------|--------|
+| **[Competitor Gap Analysis](docs/research/competitor-gap-analysis-apr17.md)** | What peers have we don't — STP, OCO, drop-copy, queue model |
+| **[Production MM State of the Art](docs/research/production-mm-state-of-the-art.md)** | SOTA survey + gap matrix |
+| **[ROADMAP](docs/roadmap-v2-production-mm.md)** | Active epics + deferred work |
 
 ## Contributing
 
@@ -413,8 +440,10 @@ cargo bench -p mm-strategy                    # strategy benchmarks
 2. Create a feature branch (`git checkout -b feat/my-feature`)
 3. Add tests for new functionality
 4. Ensure `cargo clippy --all-targets -- -D warnings` passes
-5. Ensure `cargo test` passes (1431+ tests)
+5. Ensure `cargo test` passes (2241+ tests)
 6. Open a PR with a clear description
+
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** for coding style, commit conventions, and review checklist.
 
 ## License
 
