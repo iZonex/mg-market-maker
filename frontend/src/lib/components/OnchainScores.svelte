@@ -188,6 +188,4 @@
   .sym { color: var(--fg-primary); font-weight: 600; }
   .chain { color: var(--fg-secondary); text-transform: lowercase; font-size: 10px; }
   .val { text-align: right; font-variant-numeric: tabular-nums; }
-  .val small { color: var(--fg-muted); margin-left: 4px; }
-  .mono { font-family: var(--font-mono); }
-</style>
+  .val small { color: var(--fg-muted); margin-left: 4px; }</style>

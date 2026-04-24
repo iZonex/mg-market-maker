@@ -218,15 +218,7 @@
     font-size: var(--fs-2xs);
     color: var(--fg-secondary);
   }
-  .row-right { display: flex; align-items: center; gap: var(--s-2); }
-
-  .chip {
-    font-family: var(--font-mono); font-size: 10px;
-    text-transform: uppercase; letter-spacing: var(--tracking-label);
-    font-weight: 600; padding: 2px 6px; border-radius: var(--r-sm);
-    border: 1px solid currentColor;
-  }
-  .chip-pos { color: var(--pos); }
+  .row-right { display: flex; align-items: center; gap: var(--s-2); }  .chip-pos { color: var(--pos); }
   .chip-muted { color: var(--fg-muted); }
 
   .switch {

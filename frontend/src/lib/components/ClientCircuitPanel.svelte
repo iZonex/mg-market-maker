@@ -116,7 +116,4 @@
   tr.tripped {
     background: rgba(239, 68, 68, 0.06);
   }
-  tr.tripped td.cid { color: var(--neg); }
-  .pos { color: var(--pos); }
-  .neg { color: var(--neg); }
-</style>
+  tr.tripped td.cid { color: var(--neg); }</style>

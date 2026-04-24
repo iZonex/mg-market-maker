@@ -291,6 +291,4 @@
   .error {
     padding: var(--s-3); background: var(--danger-bg);
     border-radius: var(--r-md); color: var(--danger); font-size: var(--fs-sm);
-  }
-  .muted { color: var(--fg-muted); font-size: var(--fs-sm); padding: var(--s-2) 0; }
-</style>
+  }</style>

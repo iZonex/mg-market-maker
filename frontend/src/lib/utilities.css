@@ -1,0 +1,120 @@
+/*
+ * Utility classes — the shared CSS sibling to the `primitives/` Svelte
+ * components. Use these when you can't use a primitive (e.g. a
+ * `<span>`/`<label>`/`<summary>` playing the role of a chip or when
+ * templating demands a plain string class name).
+ *
+ * Rule: the styling here MUST match the corresponding primitive so
+ * a forked brand that edits `tokens.css` sees identical re-colouring
+ * on both the `<Chip>` component and `class="chip"` spans.
+ *
+ * CI contract: no file in `src/lib/**` (outside this one + tokens.css)
+ * should define its own `.chip`, `.tone-*`, `.pill`, `.badge` CSS
+ * rules. If you need a bespoke chip with different semantics, pick a
+ * different class name (e.g. `.rank-chip`, `.venue-kill`).
+ */
+
+/* ── Chip — compact status / category marker ────────────────── */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  background: var(--bg-chip);
+  color: var(--fg-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+/* ── Tone colour modifiers ─────────────────────────────────── */
+/*   Applied as `.tone-X` both on `.chip` spans AND on bare
+ *   inline elements ("just make this text the right colour"). */
+.tone-neutral  { background: var(--bg-chip);  color: var(--fg-secondary); }
+.tone-muted    { background: var(--bg-chip);  color: var(--fg-muted); }
+.tone-accent   { background: var(--accent-dim); color: var(--accent); }
+.tone-ok,
+.tone-positive { background: var(--pos-bg);   color: var(--pos); }
+.tone-warn     { background: var(--warn-bg);  color: var(--warn); }
+.tone-bad,
+.tone-danger   { background: var(--danger-bg); color: var(--danger); }
+.tone-info     { background: var(--info-bg);  color: var(--info); }
+
+/* Product tones — shown on venue strips / deployment rows. */
+.tone-spot     { background: var(--info-bg);  color: var(--info); }
+.tone-perp     { background: var(--pos-bg);   color: var(--pos); }
+.tone-invperp  { background: var(--warn-bg);  color: var(--warn); }
+
+/* Legacy chip-X namespace for compatibility with older templates.
+ * New code should use `class="chip tone-X"` instead. */
+.chip.chip-pos,
+.chip.chip-ok       { background: var(--pos-bg);    color: var(--pos); }
+.chip.chip-warn     { background: var(--warn-bg);   color: var(--warn); }
+.chip.chip-danger   { background: var(--danger-bg); color: var(--danger); }
+.chip.chip-info     { background: var(--info-bg);   color: var(--info); }
+.chip.chip-muted    { background: var(--bg-chip);   color: var(--fg-muted); }
+
+/* Role badges — consistent with Chip primitive's role tones. */
+.chip.role-admin,
+.tone-admin    { background: var(--role-admin-bg,    color-mix(in srgb, var(--critical) 14%, transparent)); color: var(--role-admin,    var(--critical)); }
+.chip.role-operator,
+.tone-operator { background: var(--role-operator-bg, color-mix(in srgb, var(--warn) 14%, transparent));     color: var(--role-operator, var(--warn)); }
+.chip.role-viewer,
+.tone-viewer   { background: var(--bg-chip); color: var(--fg-secondary); }
+.chip.role-client_reader,
+.chip.role-client,
+.tone-client   { background: var(--info-bg); color: var(--info); }
+
+/* ── Pill — StatusPill primitive counterpart ────────────────── */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: var(--r-pill);
+  background: var(--bg-chip);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  letter-spacing: var(--tracking-label);
+  text-transform: uppercase;
+  color: var(--fg-secondary);
+  line-height: 1;
+}
+.pill .dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--fg-muted);
+  flex: none;
+}
+.pill.sev-ok     .dot { background: var(--pos); }
+.pill.sev-ok          { color: var(--pos); }
+.pill.sev-info   .dot { background: var(--info); }
+.pill.sev-info        { color: var(--info); }
+.pill.sev-warn   .dot { background: var(--warn); }
+.pill.sev-warn        { color: var(--warn); }
+.pill.sev-danger .dot { background: var(--danger); }
+.pill.sev-danger      { color: var(--danger); font-weight: 600; }
+
+/* ── `.mono` text utility — tabular numbers ─────────────────── */
+.mono,
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── `.muted` / `.faint` text utilities ─────────────────────── */
+.muted { color: var(--fg-muted); }
+.faint { color: var(--fg-faint); }
+
+/* ── Semantic inline text colours ──────────────────────────── */
+.text-ok,
+.pos      { color: var(--pos); }
+.text-warn { color: var(--warn); }
+.text-danger,
+.neg      { color: var(--danger); }
+.text-info { color: var(--info); }
+.text-muted { color: var(--fg-muted); }

@@ -297,6 +297,4 @@
   }
   .venue { font-family: var(--font-mono); color: var(--fg-secondary); }
   .sym { font-family: var(--font-mono); color: var(--fg-muted); font-size: 10px; }
-  .leg-val { font-family: var(--font-mono); font-variant-numeric: tabular-nums; text-align: right; }
-  .mono { font-family: var(--font-mono); }
-</style>
+  .leg-val { font-family: var(--font-mono); font-variant-numeric: tabular-nums; text-align: right; }</style>

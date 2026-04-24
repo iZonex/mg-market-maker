@@ -769,9 +769,7 @@
     padding: 4px var(--s-2); border-bottom: 1px solid var(--border-subtle); text-align: left;
   }
   .lvl-table th { color: var(--fg-muted); text-transform: uppercase; font-size: 10px; letter-spacing: var(--tracking-label); }
-  .lvl-table .num { text-align: right; }
-  .muted { color: var(--fg-muted); }
-  .panel {
+  .lvl-table .num { text-align: right; }  .panel {
     position: fixed; top: 0; right: 0; bottom: 0;
     width: min(860px, 95vw);
     z-index: 41;
@@ -811,18 +809,6 @@
   .meta-item.stale { margin-left: auto; color: var(--fg-muted); }
   .k { color: var(--fg-muted); text-transform: uppercase; letter-spacing: var(--tracking-label); font-size: 10px; }
   .v { color: var(--fg-primary); }
-  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-
-  .chip {
-    font-family: var(--font-mono); font-size: 10px;
-    text-transform: uppercase; letter-spacing: var(--tracking-label);
-    font-weight: 600; padding: 2px 6px; border-radius: var(--r-sm);
-    border: 1px solid currentColor;
-  }
-  .tone-ok { color: var(--pos); }
-  .tone-danger { color: var(--neg); }
-  .tone-muted { color: var(--fg-muted); }
-
   .banner {
     display: flex; align-items: center; gap: var(--s-2);
     margin: var(--s-2) var(--s-4);

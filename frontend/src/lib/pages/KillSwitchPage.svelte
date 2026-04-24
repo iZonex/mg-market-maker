@@ -112,10 +112,7 @@
     line-height: 1.5;
   }
   .empty strong { color: var(--ok); display: block; margin-bottom: 4px; }
-  .empty-actions { margin-top: var(--s-2); }
-  .muted { color: var(--fg-muted); font-size: var(--fs-xs); line-height: 1.55; margin-top: var(--s-2); }
-  .muted.small { font-size: 10px; }
-  .links { display: flex; flex-direction: column; gap: var(--s-2); }
+  .empty-actions { margin-top: var(--s-2); }  .links { display: flex; flex-direction: column; gap: var(--s-2); }
   .links a {
     padding: var(--s-2) var(--s-3);
     color: var(--fg-secondary);

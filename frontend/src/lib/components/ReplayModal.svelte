@@ -351,7 +351,4 @@
     font-size: 10px; line-height: 1.3; overflow: auto; max-height: 160px;
   }
   .replay-diff-cols .col-old pre { border-left: 2px solid var(--fg-muted); }
-  .replay-diff-cols .col-new pre { border-left: 2px solid var(--accent); }
-  .muted { color: var(--fg-muted); }
-  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-</style>
+  .replay-diff-cols .col-new pre { border-left: 2px solid var(--accent); }</style>

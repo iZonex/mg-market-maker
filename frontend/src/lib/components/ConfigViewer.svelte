@@ -146,8 +146,6 @@
   .row-value.muted { color: var(--fg-muted); }
   .row-value.str { color: var(--fg-primary); }
   .row-value.num { color: var(--accent); }
-  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-
   .section { display: flex; flex-direction: column; gap: 4px; }
   .section-title {
     font-size: 10px; font-weight: 600; color: var(--fg-muted);
@@ -165,8 +163,6 @@
     border-radius: var(--r-sm);
     font-size: var(--fs-2xs);
   }
-  .faint { color: var(--fg-muted); }
-
   .raw {
     max-height: 320px; overflow: auto;
     padding: var(--s-2) var(--s-3);

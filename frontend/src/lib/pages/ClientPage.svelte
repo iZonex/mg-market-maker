@@ -495,9 +495,7 @@
     gap: var(--s-3);
   }
   .grid.onboard-only { margin-top: var(--s-3); }
-  .error { color: var(--neg); font-size: var(--fs-sm); }
-  .muted { color: var(--fg-muted); font-size: var(--fs-xs); }
-  .empty {
+  .error { color: var(--neg); font-size: var(--fs-sm); }  .empty {
     padding: var(--s-3); color: var(--fg-muted);
     font-size: var(--fs-sm); text-align: center;
   }
@@ -545,19 +543,6 @@
     font-size: 10px;
   }
   .num { text-align: right; }
-  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-  .tone-ok   { color: var(--pos); }
-  .tone-warn { color: var(--warn); }
-  .tone-bad  { color: var(--neg); }
-
-  .chip {
-    padding: 2px 8px; font-size: 10px; font-family: var(--font-mono);
-    border-radius: var(--r-sm); background: var(--bg-raised);
-  }
-  .chip.tone-ok    { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
-  .chip.tone-bad   { background: color-mix(in srgb, var(--danger) 18%, transparent); color: var(--danger); }
-  .chip.tone-muted { background: var(--bg-raised); color: var(--fg-muted); }
-
   .cert-line {
     margin-top: var(--s-2); font-size: var(--fs-xs);
     color: var(--fg-secondary);
@@ -586,6 +571,4 @@
     background: var(--bg-chip); border-radius: var(--r-sm);
     max-width: 520px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .invite-exp { font-size: 10px; }
-  .muted.small { font-size: 10px; color: var(--fg-muted); margin-top: 4px; }
-</style>
+  .invite-exp { font-size: 10px; }</style>

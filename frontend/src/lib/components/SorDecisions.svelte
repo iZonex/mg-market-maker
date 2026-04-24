@@ -188,6 +188,4 @@
   .venue { text-transform: uppercase; }
   .lqty { text-align: right; }
   .mode { font-size: 9px; text-transform: uppercase; letter-spacing: var(--tracking-label); }
-  .cost { text-align: right; font-variant-numeric: tabular-nums; }
-  .mono { font-family: var(--font-mono); }
-</style>
+  .cost { text-align: right; font-variant-numeric: tabular-nums; }</style>

@@ -211,9 +211,7 @@
   .page { padding: var(--s-6); height: calc(100vh - 57px); overflow-y: auto; }
   .container { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: var(--s-4); }
   .page-header h1 { margin: 0 0 6px; font-size: var(--fs-xl); font-weight: 600; color: var(--fg-primary); letter-spacing: var(--tracking-tight); }
-  .page-sub { margin: 0; color: var(--fg-muted); font-size: var(--fs-sm); line-height: 1.5; max-width: 620px; }
-  .muted { color: var(--fg-muted); font-size: var(--fs-sm); }
-  code { font-family: var(--font-mono); background: var(--bg-chip); padding: 1px 6px; border-radius: 3px; color: var(--fg-primary); font-size: 11px; }
+  .page-sub { margin: 0; color: var(--fg-muted); font-size: var(--fs-sm); line-height: 1.5; max-width: 620px; }  code { font-family: var(--font-mono); background: var(--bg-chip); padding: 1px 6px; border-radius: 3px; color: var(--fg-primary); font-size: 11px; }
 
   .form { display: flex; flex-direction: column; gap: var(--s-4); }
   .fields { display: flex; flex-direction: column; gap: var(--s-4); }

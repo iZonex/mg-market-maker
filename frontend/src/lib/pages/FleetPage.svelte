@@ -1256,19 +1256,6 @@
     background: color-mix(in srgb, var(--warn) 18%, transparent);
     color: var(--warn); border-radius: var(--r-sm);
   }
-  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-
-  .chip {
-    font-family: var(--font-mono); font-size: 10px;
-    text-transform: uppercase; letter-spacing: var(--tracking-label);
-    font-weight: 600; padding: 2px 6px; border-radius: var(--r-sm);
-    border: 1px solid currentColor;
-  }
-  .tone-ok { color: var(--accent); }
-  .tone-warn { color: var(--warn); }
-  .tone-danger { color: var(--danger); }
-  .tone-muted { color: var(--fg-muted); }
-
   /* `.btn*` CSS moved to primitives/Button.svelte — design system v1. */
 
   .cred-list {

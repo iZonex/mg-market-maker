@@ -188,6 +188,4 @@
   .count.danger { color: var(--danger); }
   .count.danger b { color: var(--danger); }
   .uc { color: var(--danger); margin-left: 4px; font-size: 9px; }
-  .reason { color: var(--fg-secondary); font-size: var(--fs-2xs); }
-  .mono { font-family: var(--font-mono); }
-</style>
+  .reason { color: var(--fg-secondary); font-size: var(--fs-2xs); }</style>

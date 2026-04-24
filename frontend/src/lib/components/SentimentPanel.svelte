@@ -222,9 +222,6 @@
   .btn:hover:not(:disabled) { background: var(--bg-raised); }
 
   .error { padding: var(--s-3); background: var(--danger-bg); color: var(--danger); border-radius: var(--r-md); font-size: var(--fs-sm); }
-  .muted { color: var(--fg-muted); font-size: var(--fs-sm); }
-  .muted code { font-family: var(--font-mono); background: var(--bg-chip); padding: 1px 4px; border-radius: var(--r-sm); }
-
   table.rows { width: 100%; border-collapse: collapse; }
   table.rows th { text-align: left; font-size: var(--fs-xs); color: var(--fg-muted); font-weight: 500; padding: var(--s-2) var(--s-3); border-bottom: 1px solid var(--border-subtle); text-transform: uppercase; letter-spacing: var(--tracking-label); }
   table.rows th.right { text-align: right; }

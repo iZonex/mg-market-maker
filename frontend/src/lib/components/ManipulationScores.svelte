@@ -172,6 +172,4 @@
   .row.data.danger { background: var(--danger-dim, rgba(255, 80, 80, 0.08)); }
   .sym { color: var(--fg-primary); font-weight: 600; }
   .val { text-align: right; font-variant-numeric: tabular-nums; }
-  .combined-col { font-weight: 700; }
-  .mono { font-family: var(--font-mono); }
-</style>
+  .combined-col { font-weight: 700; }</style>

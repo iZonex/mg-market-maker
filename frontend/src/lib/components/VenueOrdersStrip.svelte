@@ -109,18 +109,7 @@
     flex-wrap: wrap;
     gap: var(--s-2);
     flex: 1;
-  }
-  .chip {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--s-1);
-    padding: 3px var(--s-2);
-    background: var(--bg-chip);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--r-sm);
-    font-family: var(--font-mono);
-  }
-  .dot {
+  }  .dot {
     width: 6px;
     height: 6px;
     border-radius: 50%;

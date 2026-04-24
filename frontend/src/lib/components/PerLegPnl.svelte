@@ -122,20 +122,7 @@
   }
   td.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
   .venue { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--accent); }
-  .sym { font-size: var(--fs-xs); }
-  .chip {
-    display: inline-block;
-    padding: 2px var(--s-2);
-    border-radius: var(--r-sm);
-    font-size: var(--fs-2xs);
-    background: var(--bg-chip);
-    color: var(--fg-secondary);
-    text-transform: uppercase;
-    letter-spacing: var(--tracking-label);
-  }
-  .pos { color: var(--pos); }
-  .neg { color: var(--neg); }
-  .alert-bar {
+  .sym { font-size: var(--fs-xs); }  .alert-bar {
     display: flex;
     align-items: center;
     gap: var(--s-2);

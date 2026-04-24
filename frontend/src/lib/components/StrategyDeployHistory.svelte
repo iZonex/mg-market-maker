@@ -299,20 +299,10 @@
   .panel { padding: var(--s-3) var(--s-4); display: flex; flex-direction: column; gap: var(--s-3); max-height: 280px; overflow-y: auto; }
   .section { display: flex; flex-direction: column; gap: var(--s-2); }
   .section-title { font-size: var(--fs-2xs); color: var(--fg-muted); text-transform: uppercase; letter-spacing: var(--tracking-label); }
-  .chips { display: flex; flex-wrap: wrap; gap: var(--s-2); }
-  .chip {
-    padding: var(--s-2) var(--s-3);
-    background: var(--bg-chip); border: 1px solid var(--border-subtle);
-    border-radius: var(--r-pill); color: var(--fg-primary);
-    font-family: var(--font-mono); font-size: var(--fs-2xs); cursor: pointer;
-  }
-  .chip:hover { border-color: var(--accent); color: var(--accent); }
-  table { width: 100%; border-collapse: collapse; }
+  .chips { display: flex; flex-wrap: wrap; gap: var(--s-2); }  table { width: 100%; border-collapse: collapse; }
   th, td { padding: var(--s-2); font-size: var(--fs-xs); text-align: left; border-bottom: 1px solid var(--border-subtle); }
   th { color: var(--fg-muted); font-weight: 500; text-transform: uppercase; letter-spacing: var(--tracking-label); font-size: var(--fs-2xs); }
-  .num, .small { font-family: var(--font-mono); font-size: var(--fs-2xs); }
-  .muted { color: var(--fg-muted); font-size: var(--fs-xs); }
-  .error { color: var(--neg); font-size: var(--fs-xs); }
+  .num, .small { font-family: var(--font-mono); font-size: var(--fs-2xs); }  .error { color: var(--neg); font-size: var(--fs-xs); }
   .rb-btn {
     padding: 2px var(--s-2);
     background: var(--bg-chip); border: 1px solid var(--border-subtle);

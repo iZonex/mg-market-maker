@@ -144,19 +144,7 @@
     display: flex;
     flex-wrap: wrap;
     gap: var(--s-1);
-  }
-  .pill {
-    display: inline-flex;
-    gap: 4px;
-    padding: 2px var(--s-2);
-    background: var(--bg-chip);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--r-sm);
-    font-family: var(--font-mono);
-    font-size: 10px;
-    align-items: baseline;
-  }
-  .sym { font-weight: 700; color: var(--fg-primary); }
+  }  .sym { font-weight: 700; color: var(--fg-primary); }
   .metric { color: var(--fg-secondary); font-variant-numeric: tabular-nums; }
   .sep { color: var(--fg-faint); }
   .drill {

@@ -586,8 +586,6 @@
     display: flex; flex-direction: column; gap: var(--s-5);
     padding-top: var(--s-3);
   }
-  .muted { color: var(--fg-muted); font-size: var(--fs-sm); }
-
   .section { display: flex; flex-direction: column; gap: var(--s-3); }
   .section-head {
     display: flex; align-items: baseline; gap: var(--s-2);

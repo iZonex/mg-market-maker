@@ -216,11 +216,7 @@
     font-size: var(--fs-2xs);
     color: var(--fg-muted);
     margin-top: 1px;
-  }
-
-  .pos  { color: var(--pos); }
-  .neg  { color: var(--neg); }
-  .warn { color: var(--warn); }
+  }  .warn { color: var(--warn); }
 
   .ticker-up   { color: var(--pos); }
   .ticker-down { color: var(--neg); }

@@ -171,6 +171,4 @@
   .rows { display: flex; flex-direction: column; }
   .row.data + .row.data { border-top: 1px solid var(--border-subtle); }
   .sym { color: var(--fg-primary); font-weight: 600; }
-  .bps, .pbid, .pask { text-align: right; font-variant-numeric: tabular-nums; }
-  .mono { font-family: var(--font-mono); }
-</style>
+  .bps, .pbid, .pask { text-align: right; font-variant-numeric: tabular-nums; }</style>

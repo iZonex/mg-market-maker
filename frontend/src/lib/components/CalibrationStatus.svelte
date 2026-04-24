@@ -143,6 +143,4 @@
   .row.data + .row.data { border-top: 1px solid var(--border-subtle); }
   .sym { color: var(--fg-primary); font-weight: 600; }
   .strat { color: var(--fg-secondary); text-transform: uppercase; font-size: 10px; }
-  .val, .samp, .ago { text-align: right; font-variant-numeric: tabular-nums; }
-  .mono { font-family: var(--font-mono); }
-</style>
+  .val, .samp, .ago { text-align: right; font-variant-numeric: tabular-nums; }</style>

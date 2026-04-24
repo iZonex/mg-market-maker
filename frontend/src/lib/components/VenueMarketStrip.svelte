@@ -209,20 +209,7 @@
   .age[data-sev='ok']   { background: var(--pos-bg, rgba(16, 185, 129, 0.10)); color: var(--pos); }
   .age[data-sev='info'] { background: var(--bg-chip); color: var(--fg-secondary); }
   .age[data-sev='warn'] { background: var(--warn-bg); color: var(--warn); font-weight: 600; }
-  .age[data-sev='bad']  { background: var(--danger-bg, rgba(239, 68, 68, 0.12)); color: var(--danger); font-weight: 600; }
-  .chip {
-    padding: 1px 8px;
-    border-radius: var(--r-pill);
-    font-family: var(--font-mono);
-    font-size: 10px;
-    letter-spacing: var(--tracking-label);
-    text-transform: uppercase;
-    background: var(--bg-chip);
-    color: var(--fg-secondary);
-    text-align: center;
-  }
-  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-  .regime {
+  .age[data-sev='bad']  { background: var(--danger-bg, rgba(239, 68, 68, 0.12)); color: var(--danger); font-weight: 600; }  .regime {
     font-family: var(--font-mono);
     font-size: 10px;
     padding: 1px 6px;

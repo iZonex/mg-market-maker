@@ -145,25 +145,10 @@
   }
   td.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
   .venue { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--accent); }
-  .sym { font-size: var(--fs-xs); }
-  .chip {
-    display: inline-block;
-    padding: 1px var(--s-2);
-    border-radius: var(--r-sm);
-    font-size: var(--fs-2xs);
-    background: var(--bg-chip);
-    color: var(--fg-secondary);
-    text-transform: uppercase;
-    letter-spacing: var(--tracking-label);
-  }
-  [data-sev='warn'] { color: var(--warn); font-weight: 600; }
+  .sym { font-size: var(--fs-xs); }  [data-sev='warn'] { color: var(--warn); font-weight: 600; }
   [data-sev='neg']  { color: var(--neg); font-weight: 600; }
   [data-sev='info'] { color: var(--info); }
-  [data-sev='muted']{ color: var(--fg-muted); }
-  .pos { color: var(--pos); }
-  .neg { color: var(--neg); }
-  .muted { color: var(--fg-muted); }
-  .small { font-size: var(--fs-2xs); }
+  [data-sev='muted']{ color: var(--fg-muted); }  .small { font-size: var(--fs-2xs); }
   .foot { text-align: right; padding: 0 var(--s-2); }
   .alert-bar {
     display: flex;

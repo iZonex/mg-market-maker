@@ -254,9 +254,7 @@
 
 <style>
   .page { padding: var(--s-4); }
-  .scroll { overflow-y: auto; }
-  .muted { color: var(--fg-muted); font-size: var(--fs-sm); padding: var(--s-3); }
-  .empty {
+  .scroll { overflow-y: auto; }  .empty {
     display: flex; align-items: center; gap: var(--s-2);
     padding: var(--s-3);
     background: color-mix(in srgb, var(--ok) 10%, transparent);

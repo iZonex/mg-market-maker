@@ -216,11 +216,7 @@
   }
   .lbl { color: var(--fg-muted); }
   .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; color: var(--fg-primary); }
-  .num.small { font-size: var(--fs-xs); }
-  .muted { color: var(--fg-muted); }
-  .pos { color: var(--pos); }
-  .neg { color: var(--neg); }
-  .pnl-grid {
+  .num.small { font-size: var(--fs-xs); }  .pnl-grid {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
     gap: var(--s-2);

@@ -259,21 +259,7 @@
     text-transform: uppercase;
     letter-spacing: var(--tracking-tight);
     color: var(--fg-primary);
-  }
-  .chip {
-    font-family: var(--font-mono);
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: var(--tracking-label);
-    font-weight: 600;
-  }
-  .chips { display: flex; gap: var(--s-1); align-items: baseline; }
-  .chip.venue-kill {
-    border: 1px solid currentColor;
-    padding: 0 var(--s-1);
-    border-radius: var(--r-sm);
-  }
-  .venue-controls {
+  }  .chips { display: flex; gap: var(--s-1); align-items: baseline; }  .venue-controls {
     display: flex; gap: var(--s-1); align-items: center;
     margin-top: var(--s-1); margin-bottom: var(--s-2);
     font-size: 10px;
@@ -294,7 +280,5 @@
   }
   .stat { display: flex; justify-content: space-between; }
   .k { color: var(--fg-muted); letter-spacing: var(--tracking-label); text-transform: uppercase; font-size: 10px; }
-  .v { color: var(--fg-primary); }
-  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-  .v.danger { color: var(--danger); font-weight: 700; }
+  .v { color: var(--fg-primary); }  .v.danger { color: var(--danger); font-weight: 700; }
 </style>

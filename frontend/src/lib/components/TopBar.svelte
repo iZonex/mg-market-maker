@@ -319,9 +319,7 @@
     font-weight: 600;
     font-size: var(--fs-sm);
     color: var(--fg-primary);
-  }
-  .muted { color: var(--fg-muted); }
-  .small { font-size: var(--fs-2xs); }
+  }  .small { font-size: var(--fs-2xs); }
   .symbol-btn {
     padding: 0 var(--s-3);
   }

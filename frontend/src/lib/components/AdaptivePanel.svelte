@@ -150,24 +150,7 @@
     font-weight: 600;
     color: var(--fg-primary);
     font-family: var(--font-mono); font-variant-numeric: tabular-nums;
-  }
-  .pos { color: var(--pos); }
-  .neg { color: var(--neg); }
-  .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-
-  .chip {
-    font-family: var(--font-mono); font-size: 10px;
-    text-transform: uppercase; letter-spacing: var(--tracking-label);
-    font-weight: 600; padding: 2px 6px; border-radius: var(--r-sm);
-    border: 1px solid currentColor;
-  }
-  .tone-pos { color: var(--pos); }
-  .tone-neg { color: var(--neg); }
-  .tone-danger { color: var(--neg); }
-  .tone-warn { color: var(--warn); }
-  .tone-info { color: var(--accent); }
-  .tone-muted { color: var(--fg-muted); }
-
+  }  .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
   .gamma-block {
     display: flex; flex-direction: column; gap: 4px;
     margin-top: var(--s-1);

@@ -256,25 +256,6 @@
   }
   .v.alert { color: var(--danger); }
   .v.warn { color: var(--warn); }
-  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-
-  .chip {
-    display: inline-block;
-    padding: 1px 6px;
-    font-size: 10px;
-    font-family: var(--font-mono);
-    border-radius: var(--r-sm);
-    background: var(--bg-chip);
-  }
-  .chip.tone-ok { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
-  .chip.tone-bad { background: color-mix(in srgb, var(--danger) 18%, transparent); color: var(--danger); }
-  .chip.tone-info { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); }
-  .chip.tone-muted { color: var(--fg-muted); }
-  .chip.bad {
-    background: color-mix(in srgb, var(--danger) 18%, transparent);
-    color: var(--danger);
-  }
-
   .err {
     padding: var(--s-2);
     font-size: var(--fs-xs);
@@ -308,8 +289,6 @@
     color: var(--fg-primary);
   }
   .summary-hint { line-height: 1.4; }
-  .foot { margin-top: var(--s-2); }
-  .muted { color: var(--fg-muted); }
-  .small { font-size: 10px; }
+  .foot { margin-top: var(--s-2); }  .small { font-size: 10px; }
 
 </style>

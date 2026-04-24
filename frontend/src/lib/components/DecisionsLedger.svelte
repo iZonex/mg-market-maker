@@ -212,9 +212,7 @@
   thead { position: sticky; top: 0; background: var(--bg-raised); z-index: 1; }
   th, td { padding: var(--s-1) var(--s-2); text-align: left; white-space: nowrap; border-bottom: 1px solid var(--border-subtle); }
   th { color: var(--fg-muted); font-weight: 500; letter-spacing: var(--tracking-label); text-transform: uppercase; font-size: 10px; }
-  .r { text-align: right; }
-  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-  tr.unresolved td { opacity: 0.6; }
+  .r { text-align: right; }  tr.unresolved td { opacity: 0.6; }
   .truncated {
     padding: var(--s-1) var(--s-2);
     font-size: 10px;

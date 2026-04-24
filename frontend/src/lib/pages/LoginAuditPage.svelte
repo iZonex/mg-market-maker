@@ -220,10 +220,7 @@
     font-size: var(--fs-xs);
     color: var(--neg);
     margin-bottom: var(--s-3);
-  }
-
-  .mono { font-family: var(--font-mono); font-size: var(--fs-2xs); color: var(--fg-secondary); }
-  .detail { word-break: break-all; }
+  }  .detail { word-break: break-all; }
 
   .spinner {
     width: 12px; height: 12px;

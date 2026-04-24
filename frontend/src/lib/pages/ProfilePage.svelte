@@ -435,8 +435,6 @@
     color: var(--danger);
     font-size: var(--fs-sm);
   }
-  .muted { color: var(--fg-muted); font-size: var(--fs-sm); }
-
   /* ── Identity ──────────────────────────────── */
   .identity {
     display: grid;
@@ -539,24 +537,6 @@
   }
   .inline-msg.ok  { color: var(--accent); background: rgba(0, 209, 178, 0.10); border: 1px solid rgba(0, 209, 178, 0.25); }
   .inline-msg.err { color: var(--danger); background: rgba(239, 68, 68, 0.08);  border: 1px solid rgba(239, 68, 68, 0.25); }
-
-  .chip {
-    display: inline-flex; align-items: center; gap: 4px;
-    font-family: var(--font-sans);
-    font-size: 10px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: var(--tracking-label);
-    padding: 3px 8px;
-    border-radius: var(--r-sm);
-    border: 1px solid currentColor;
-  }
-  .chip.tone-ok    { color: var(--accent); }
-  .chip.tone-muted { color: var(--fg-muted); }
-  .chip.role-admin    { color: var(--critical, #dc2626); }
-  .chip.role-operator { color: var(--warn); }
-  .chip.role-viewer   { color: var(--pos, #22c55e); }
-
   /* ── 2FA enabled panel ─────────────────────── */
   .totp-enabled { display: flex; flex-direction: column; gap: var(--s-3); }
   .enabled-panel {

@@ -442,8 +442,6 @@
     font-size: 10px;
   }
   .vio-table tr.sev-high td { background: color-mix(in srgb, var(--danger) 8%, transparent); }
-  .mono { font-family: var(--font-mono); }
-
   .actions-col, .actions-cell { text-align: right; }
   .actions-cell {
     display: flex; gap: 4px; justify-content: flex-end;
@@ -471,6 +469,4 @@
     font-size: 10px; font-family: var(--font-mono);
     padding: 2px 6px; border-radius: var(--r-sm);
     background: var(--bg-raised); color: var(--fg-muted);
-  }
-  .muted { color: var(--fg-muted); }
-</style>
+  }</style>

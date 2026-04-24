@@ -166,10 +166,7 @@
     font-size: var(--fs-sm);
     font-weight: 500;
     color: var(--fg-primary);
-  }
-  .pos { color: var(--pos); }
-  .neg { color: var(--neg); }
-  .warn { color: var(--warn); }
+  }  .warn { color: var(--warn); }
 
   .kl-mini {
     display: inline-flex;

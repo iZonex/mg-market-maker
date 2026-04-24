@@ -247,9 +247,7 @@
   .page { padding: var(--s-4); }
   .scroll { overflow-y: auto; }
   .grid { display: grid; grid-template-columns: 1fr; gap: var(--s-3); }
-  .error { color: var(--neg); font-size: var(--fs-sm); margin-bottom: var(--s-2); }
-  .muted { color: var(--fg-muted); font-size: var(--fs-xs); }
-  .empty {
+  .error { color: var(--neg); font-size: var(--fs-sm); margin-bottom: var(--s-2); }  .empty {
     padding: var(--s-3); color: var(--fg-muted);
     font-size: var(--fs-sm); text-align: center;
     background: color-mix(in srgb, var(--ok) 8%, transparent);
@@ -289,16 +287,6 @@
   }
   .rec-table tr.warn { background: color-mix(in srgb, var(--warn) 6%, transparent); }
   .num { text-align: right; }
-  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-
-  .chip {
-    display: inline-block;
-    padding: 1px 6px; font-size: 10px; font-family: var(--font-mono);
-    border-radius: var(--r-sm); background: var(--bg-chip);
-  }
-  .chip.tone-danger { background: color-mix(in srgb, var(--danger) 18%, transparent); color: var(--danger); }
-  .chip.tone-warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
-
   .header-row {
     display: flex; align-items: center; justify-content: space-between;
     margin-bottom: var(--s-2);

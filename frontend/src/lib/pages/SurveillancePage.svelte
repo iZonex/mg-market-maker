@@ -268,18 +268,6 @@
     font-size: var(--fs-sm);
     font-weight: 600;
   }
-  .chip {
-    font-family: var(--font-mono); font-size: 10px;
-    padding: 2px 6px; border-radius: var(--r-sm);
-    border: 1px solid currentColor;
-    text-transform: uppercase;
-    letter-spacing: var(--tracking-label);
-    font-weight: 600;
-  }
-  .chip.tone-danger { color: var(--danger); }
-  .chip.tone-warn { color: var(--warn); }
-  .chip.tone-muted { color: var(--fg-muted); }
-
   .empty {
     padding: var(--s-4);
     color: var(--fg-muted);
@@ -335,7 +323,4 @@
     font-size: 10px;
     min-width: 40px;
     text-align: right;
-  }
-  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-  .faint { color: var(--fg-muted); }
-</style>
+  }</style>

@@ -198,8 +198,4 @@
     font-size: var(--fs-xs);
     font-weight: 600;
     line-height: 1;
-  }
-
-  .pos { color: var(--pos); }
-  .neg { color: var(--neg); }
-</style>
+  }</style>

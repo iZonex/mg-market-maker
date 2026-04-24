@@ -389,14 +389,7 @@
   }
   .head-left { display: flex; align-items: center; gap: var(--s-2); }
 
-  .name { color: var(--fg-primary); font-weight: 500; }
-  .muted { color: var(--fg-muted); }
-  .mono {
-    font-family: var(--font-mono);
-    font-size: var(--fs-2xs);
-    color: var(--fg-secondary);
-  }
-  .actions-col { width: 1%; white-space: nowrap; }
+  .name { color: var(--fg-primary); font-weight: 500; }  .actions-col { width: 1%; white-space: nowrap; }
   .actions-cell { text-align: right; }
 
   .form {

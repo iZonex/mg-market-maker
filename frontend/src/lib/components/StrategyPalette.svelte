@@ -234,11 +234,7 @@ ${e.kind} · ${e.inputs.length} in · ${e.outputs.length} out${e.restricted ? ' 
     border-radius: var(--r-sm); color: var(--fg-primary);
     cursor: grab; user-select: none; text-align: left;
     transition: background 0.08s, border-color 0.08s;
-  }
-  .chip:hover { background: var(--bg-base); border-color: var(--accent); }
-  .chip:active { cursor: grabbing; }
-  .chip.restricted { border-color: var(--neg); }
-  /* M3-GOBS — dormant source (not referenced by current graph). */
+  }  /* M3-GOBS — dormant source (not referenced by current graph). */
   .chip.dormant {
     opacity: 0.48;
     background:
@@ -249,9 +245,7 @@ ${e.kind} · ${e.inputs.length} in · ${e.outputs.length} out${e.restricted ? ' 
         var(--bg-raised) 5px,
         var(--bg-raised) 10px
       );
-  }
-  .chip.dormant:hover { opacity: 0.85; }
-  /* M6-4 GOBS — text badge doubles down on the diagonal-stripe
+  }  /* M6-4 GOBS — text badge doubles down on the diagonal-stripe
      hint. Operators who didn't spot the fade see the word. */
   .chip-dormant-badge {
     flex-shrink: 0;

@@ -268,6 +268,4 @@
   .qty { color: var(--fg-secondary); text-align: right; font-variant-numeric: tabular-nums; }
   .route { color: var(--fg-primary); text-transform: uppercase; text-align: right; }
   .arrow { color: var(--accent); font-weight: 700; }
-  .reason { color: var(--fg-muted); font-size: var(--fs-2xs); }
-  .mono { font-family: var(--font-mono); }
-</style>
+  .reason { color: var(--fg-muted); font-size: var(--fs-2xs); }</style>

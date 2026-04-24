@@ -138,8 +138,6 @@
   }
   .meta { color: var(--fg-muted); font-size: 10px; }
   .meta.muted { color: var(--fg-muted); }
-  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-
   .tl-live-pill {
     margin-left: auto;
     display: inline-flex;

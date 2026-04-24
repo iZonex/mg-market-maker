@@ -382,8 +382,6 @@
   .title { font-size: var(--fs-lg); font-weight: 600; color: var(--fg-primary); }
   .sub { font-size: var(--fs-xs); color: var(--fg-muted); margin-left: var(--s-3); }
   .error { color: var(--neg); font-size: var(--fs-sm); }
-  .muted { color: var(--fg-muted); font-size: var(--fs-sm); padding: var(--s-3); text-align: center; }
-
   .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s-3); }
 
   .kv-row {
@@ -412,18 +410,6 @@
     font-size: 10px;
   }
   .num { text-align: right; }
-  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-  .tone-ok { color: var(--pos); }
-  .tone-warn { color: var(--warn); }
-  .tone-bad { color: var(--neg); }
-
-  .chip {
-    padding: 2px 8px; font-size: 10px; font-family: var(--font-mono);
-    border-radius: var(--r-sm); background: var(--bg-raised);
-  }
-  .chip.tone-ok { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
-  .chip.tone-bad { background: color-mix(in srgb, var(--danger) 18%, transparent); color: var(--danger); }
-
   .cert-hint { font-size: 10px; color: var(--fg-muted); margin-top: 4px; }
 
   .wh-preview {

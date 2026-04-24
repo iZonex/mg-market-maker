@@ -274,15 +274,7 @@
     cursor: pointer; user-select: none;
   }
   .toggle:hover { color: var(--fg-primary); }
-  .toggle.pending { color: var(--warn); }
-
-  .chip {
-    font-family: var(--font-mono); font-size: 10px;
-    text-transform: uppercase; letter-spacing: var(--tracking-label);
-    font-weight: 600; padding: 2px 6px; border-radius: var(--r-sm);
-    border: 1px solid currentColor;
-  }
-  .chip-warn { color: var(--warn); }
+  .toggle.pending { color: var(--warn); }  .chip-warn { color: var(--warn); }
 
   .actions { display: flex; gap: var(--s-2); }
 
@@ -305,7 +297,4 @@
     font-size: var(--fs-2xs);
     color: var(--fg-secondary);
     word-break: break-word;
-  }
-
-  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-</style>
+  }</style>

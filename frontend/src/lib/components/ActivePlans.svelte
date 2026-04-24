@@ -147,9 +147,7 @@
     height: 8px; background: var(--bg-raised); border-radius: var(--r-pill); overflow: hidden;
   }
   .bar-fill { height: 100%; border-radius: var(--r-pill); transition: width var(--dur-base) var(--ease-out); }
-  .values { display: flex; gap: var(--s-2); font-size: 10px; color: var(--fg-muted); align-items: center; }
-  .mono { font-family: var(--font-mono); }
-  .tag.abort {
+  .values { display: flex; gap: var(--s-2); font-size: 10px; color: var(--fg-muted); align-items: center; }  .tag.abort {
     color: var(--danger);
     font-weight: 600;
     letter-spacing: var(--tracking-label);

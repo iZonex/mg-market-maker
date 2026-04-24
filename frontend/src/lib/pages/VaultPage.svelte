@@ -614,9 +614,7 @@
   .container { max-width: 880px; margin: 0 auto; display: flex; flex-direction: column; gap: var(--s-4); }
   .page-header { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--s-4); margin-bottom: var(--s-2); }
   .page-header h1 { margin: 0 0 6px; font-size: var(--fs-xl); font-weight: 600; color: var(--fg-primary); letter-spacing: var(--tracking-tight); }
-  .page-sub { margin: 0; color: var(--fg-muted); font-size: var(--fs-sm); line-height: 1.5; max-width: 620px; }
-  .muted { color: var(--fg-muted); font-size: var(--fs-sm); }
-  code {
+  .page-sub { margin: 0; color: var(--fg-muted); font-size: var(--fs-sm); line-height: 1.5; max-width: 620px; }  code {
     font-family: var(--font-mono); font-size: 11px;
     background: var(--bg-chip); color: var(--fg-primary);
     padding: 1px 6px; border-radius: 3px;

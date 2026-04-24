@@ -192,6 +192,4 @@
   .px { color: var(--fg-secondary); font-size: 11px; }
   .ack { font-size: 10px; text-align: right; color: var(--fg-muted); }
   .leg.acked .ack { color: var(--accent); font-weight: 600; }
-  .missing { grid-column: 2 / -1; color: var(--fg-muted); font-style: italic; font-size: 11px; }
-  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-</style>
+  .missing { grid-column: 2 / -1; color: var(--fg-muted); font-style: italic; font-size: 11px; }</style>

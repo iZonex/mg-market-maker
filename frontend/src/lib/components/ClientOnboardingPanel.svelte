@@ -221,11 +221,7 @@
   textarea { resize: vertical; min-height: 40px; }
   .btn:hover:not(:disabled) { background: var(--accent); color: var(--bg-base); }
   .error { color: var(--danger); font-size: var(--fs-xs); }
-  .success { color: var(--pos, #10b981); font-size: var(--fs-xs); }
-  .muted { color: var(--fg-muted); }
-  .small { font-size: var(--fs-xs); }
+  .success { color: var(--pos, #10b981); font-size: var(--fs-xs); }  .small { font-size: var(--fs-xs); }
   .rules { width: 100%; border-collapse: collapse; }
   .rules th, .rules td { padding: 4px var(--s-2); font-size: var(--fs-2xs); text-align: left; border-bottom: 1px solid var(--border-subtle); }
-  .rules th { color: var(--fg-muted); text-transform: uppercase; letter-spacing: var(--tracking-label); }
-  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-</style>
+  .rules th { color: var(--fg-muted); text-transform: uppercase; letter-spacing: var(--tracking-label); }</style>

@@ -167,6 +167,4 @@
     padding: 1px 6px; border-radius: var(--r-sm);
     background: color-mix(in srgb, var(--accent) 15%, transparent);
     color: var(--accent);
-  }
-  .mono { font-family: var(--font-mono); }
-</style>
+  }</style>
