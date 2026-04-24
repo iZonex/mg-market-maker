@@ -1,6 +1,7 @@
 <script>
   import BrandMark from './BrandMark.svelte'
   import Icon from './Icon.svelte'
+  import { BRAND } from '../branding.js'
 
   let { route = $bindable('overview'), auth, connected = false, mode = 'paper' } = $props()
 
@@ -92,7 +93,7 @@
 <aside class="sidebar" class:connected>
   <div class="brand">
     <BrandMark size={22} />
-    <span class="brand-name">Market Maker</span>
+    <span class="brand-name">{BRAND.productName.replace(new RegExp('^' + BRAND.shortName + '\\s*'), '')}</span>
   </div>
 
   <nav class="nav">

@@ -49,6 +49,15 @@
   --critical:    #dc2626;
   --critical-bg: rgba(220, 38, 38, 0.14);
 
+  /* ── Semantic aliases — keep grep'able under both names ── */
+  /*   `--danger` is an alias for `--neg` used widely in               */
+  /*   component code (122 refs). Defined here so that forks that      */
+  /*   re-skin by editing `--neg` get `--danger` for free.             */
+  --danger:      var(--neg);
+  --danger-bg:   var(--neg-bg);
+  --ok:          var(--pos);
+  --ok-bg:       var(--pos-bg);
+
   /* ── Role badges ──────────────────────────────────────── */
   --role-admin:    var(--critical);
   --role-operator: var(--warn);

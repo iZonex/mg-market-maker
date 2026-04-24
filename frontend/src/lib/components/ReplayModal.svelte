@@ -1,14 +1,14 @@
 <script>
   /*
-   * GOBS-M5 + M5.2 — "Replay vs deployed" modal, extracted out of
-   * `StrategyPage.svelte` as part of the Wave 6 modal-decomposition
-   * refactor. Takes a pre-computed `result` payload (the
-   * `graph_replay` details-topic response) and two graph snapshots
-   * (deployed + candidate) that feed the side-by-side SVG mini-
-   * canvas. The divergence scrubber is local state — there is no
-   * reason the parent should care which tick the operator is
-   * currently staring at.
+   * GOBS-M5 + M5.2 — "Replay vs deployed" modal. Chrome comes from
+   * `<Modal>` primitive (backdrop + focus trap + Escape dismiss),
+   * we only own the replay-specific content (scrubber + dual SVG
+   * mini-canvas + sink JSON diff). The divergence cursor is local
+   * state — no reason the parent should care which tick the
+   * operator is currently staring at.
    */
+
+  import { Modal, Button } from '../primitives/index.js'
 
   let {
     /** @type {any | null} — replay payload from the agent. `null` hides the modal. */
@@ -97,78 +97,67 @@
   const miniCandidate = $derived(projectGraphForMiniCanvas(candidateGraph))
 </script>
 
-{#if result}
-  <div
-    class="modal-backdrop"
-    role="button"
-    tabindex="-1"
-    aria-label="Close replay"
-    onclick={onClose}
-    onkeydown={(e) => { if (e.key === 'Escape') onClose() }}
-  >
-    <div
-      class="modal replay-card"
-      role="dialog"
-      aria-modal="true"
-      aria-label="Replay vs deployed"
-      tabindex="-1"
-      onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => e.stopPropagation()}
-    >
-      <h3>Replay vs deployed</h3>
-      <div class="replay-summary" class:bad={result.divergence_count > 0}>
-        <div class="replay-summary-line">{result.summary}</div>
-        {#if result.candidate_issues?.length}
-          <div class="replay-issues">
-            {#each result.candidate_issues as iss}
-              <code class="v-issue">{iss}</code>
-            {/each}
-          </div>
-        {/if}
+<Modal
+  open={!!result}
+  ariaLabel="Replay vs deployed"
+  maxWidth="900px"
+  {onClose}
+>
+  {#snippet children()}
+    <h3>Replay vs deployed</h3>
+    <div class="replay-summary" class:bad={result?.divergence_count > 0}>
+      <div class="replay-summary-line">{result?.summary}</div>
+      {#if result?.candidate_issues?.length}
+        <div class="replay-issues">
+          {#each result.candidate_issues as iss}
+            <code class="v-issue">{iss}</code>
+          {/each}
+        </div>
+      {/if}
+    </div>
+
+    {#if activeDivergence}
+      {@const divList = result.divergences}
+      <div class="replay-scrubber">
+        <Button
+          variant="ghost"
+          size="xs"
+          disabled={divergenceIdx <= 0}
+          onclick={() => (divergenceIdx = Math.max(0, divergenceIdx - 1))}
+          aria-label="Previous divergent tick"
+        >{#snippet children()}‹{/snippet}</Button>
+        <span class="replay-scrubber-meta">
+          <code>tick #{activeDivergence.tick_num}</code>
+          <span class="muted">
+            ({divergenceIdx + 1}/{divList.length}) ·
+            {new Date(activeDivergence.tick_ms).toLocaleTimeString()}
+          </span>
+          {#if activeDivergence.diverging_kinds?.length}
+            <span class="replay-kinds">
+              kinds:
+              {#each activeDivergence.diverging_kinds as k}
+                <code class="replay-kind-chip">{k}</code>
+              {/each}
+            </span>
+          {/if}
+        </span>
+        <input
+          type="range"
+          min="0"
+          max={Math.max(0, divList.length - 1)}
+          bind:value={divergenceIdx}
+          aria-label="Divergence cursor"
+        />
+        <Button
+          variant="ghost"
+          size="xs"
+          disabled={divergenceIdx >= divList.length - 1}
+          onclick={() => (divergenceIdx = Math.min(divList.length - 1, divergenceIdx + 1))}
+          aria-label="Next divergent tick"
+        >{#snippet children()}›{/snippet}</Button>
       </div>
 
-      {#if activeDivergence}
-        {@const divList = result.divergences}
-        <div class="replay-scrubber">
-          <button
-            type="button"
-            class="btn ghost sm"
-            disabled={divergenceIdx <= 0}
-            onclick={() => (divergenceIdx = Math.max(0, divergenceIdx - 1))}
-            aria-label="Previous divergent tick"
-          >‹</button>
-          <span class="replay-scrubber-meta">
-            <code>tick #{activeDivergence.tick_num}</code>
-            <span class="muted">
-              ({divergenceIdx + 1}/{divList.length}) ·
-              {new Date(activeDivergence.tick_ms).toLocaleTimeString()}
-            </span>
-            {#if activeDivergence.diverging_kinds?.length}
-              <span class="replay-kinds">
-                kinds:
-                {#each activeDivergence.diverging_kinds as k}
-                  <code class="replay-kind-chip">{k}</code>
-                {/each}
-              </span>
-            {/if}
-          </span>
-          <input
-            type="range"
-            min="0"
-            max={Math.max(0, divList.length - 1)}
-            bind:value={divergenceIdx}
-            aria-label="Divergence cursor"
-          />
-          <button
-            type="button"
-            class="btn ghost sm"
-            disabled={divergenceIdx >= divList.length - 1}
-            onclick={() => (divergenceIdx = Math.min(divList.length - 1, divergenceIdx + 1))}
-            aria-label="Next divergent tick"
-          >›</button>
-        </div>
-
-        <div class="replay-canvas-pair">
+      <div class="replay-canvas-pair">
           <div class="replay-mini-col">
             <span class="col-label">
               deployed{deployedGraphName ? ` · ${deployedGraphName}` : ''}
@@ -239,34 +228,15 @@
           </div>
         </details>
       {/if}
+  {/snippet}
 
-      <div class="modal-actions">
-        <button type="button" class="btn ghost" onclick={onClose}>Close</button>
-      </div>
-    </div>
-  </div>
-{/if}
+  {#snippet actions()}
+    <Button variant="ghost" onclick={onClose}>{#snippet children()}Close{/snippet}</Button>
+  {/snippet}
+</Modal>
 
 <style>
-  .modal-backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.55);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 40;
-  }
-  .modal {
-    background: var(--bg-elev-1, var(--bg-base));
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--r-md);
-    padding: var(--s-3);
-    display: flex;
-    flex-direction: column;
-    gap: var(--s-2);
-  }
-  .replay-card { min-width: 640px; max-width: 900px; max-height: 80vh; display: flex; flex-direction: column; }
+  h3 { margin: 0 0 var(--s-3) 0; font-size: var(--fs-lg); font-weight: 600; }
   .replay-summary {
     padding: var(--s-3);
     background: color-mix(in srgb, var(--ok) 8%, transparent);
@@ -382,27 +352,6 @@
   }
   .replay-diff-cols .col-old pre { border-left: 2px solid var(--fg-muted); }
   .replay-diff-cols .col-new pre { border-left: 2px solid var(--accent); }
-  .modal-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: var(--s-2);
-    margin-top: var(--s-2);
-  }
-  .btn {
-    padding: 6px 12px;
-    border-radius: var(--r-sm);
-    font-size: var(--fs-sm);
-    cursor: pointer;
-    background: var(--accent);
-    color: var(--fg-on-accent, #fff);
-    border: none;
-  }
-  .btn.ghost {
-    background: transparent;
-    color: var(--fg-primary);
-    border: 1px solid var(--border-subtle);
-  }
-  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .muted { color: var(--fg-muted); }
   .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 </style>

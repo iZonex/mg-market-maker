@@ -427,6 +427,12 @@ cargo bench -p mm-strategy                    # strategy benchmarks
 | **[Protocol Reference](docs/protocols/)** | Connector devs | Per-venue wire-format docs (Binance, Bybit, Hyperliquid, OKX, Deribit) |
 | **[Crash Recovery](docs/guides/crash-recovery.md)** | Operators | Checkpoint restore, fill replay from audit log |
 
+### Frontend / white-label
+| Guide | Audience | Topics |
+|-------|----------|--------|
+| **[Frontend Style Guide](docs/guides/frontend-style-guide.md)** | Frontend devs | `tokens.css` + `primitives/` discipline, available components, anti-patterns |
+| **[Rebranding](docs/guides/rebranding.md)** | Forkers | 3-file rebrand surface (branding.js + tokens.css + logo.svg) |
+
 ### Planning / research
 | Document | Topics |
 |----------|--------|

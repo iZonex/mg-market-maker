@@ -1,21 +1,30 @@
 <script>
   /*
-   * MG| brand mark — geometric custom glyph.
-   *
-   * Design intent: a monolithic "M" rendered as a single 4-vertex
-   * polyline at fs-2xl weight-700 proportions, followed by a
-   * mint-accent pipe that sits as the rightmost stroke. The
-   * entire mark is vector, scales to any size, and stays crisp
-   * from 24 px favicon up to 96 px splash.
+   * Brand mark — glyph + optional wordmark. The short glyph
+   * ("MG" by default) and the rest-of-name ("Market Maker") both
+   * come from the `branding.js` constants so re-skinning the
+   * project is a single-file edit.
    *
    * Height is the control dimension; width follows (ratio ≈ 1.6).
    *
    * Props:
    *   size      — pixel height of the mark (default 28)
-   *   withText  — render "MG| Market Maker" wordmark after the
-   *               glyph; default false (just the glyph)
+   *   withText  — render wordmark after the glyph; default false
    */
+  import { BRAND } from '../branding.js'
+
   let { size = 28, withText = false } = $props()
+  // Split the product name on the first whitespace — "<short> <rest>".
+  // `short` goes into the glyph; `rest` is the wordmark.
+  const _short = BRAND.shortName
+  const _rest = $derived.by(() => {
+    const parts = BRAND.productName.trim().split(/\s+/)
+    if (parts[0] === _short) return parts.slice(1).join(' ')
+    // Fallback: product name without the shortName prefix/suffix match
+    return BRAND.productName.startsWith(_short)
+      ? BRAND.productName.slice(_short.length).trim()
+      : BRAND.productName
+  })
   const w = $derived(size * 2.4)
   const h = $derived(size)
 </script>
@@ -39,7 +48,7 @@
       letter-spacing="-0.6"
       fill="currentColor"
       dominant-baseline="alphabetic"
-    >MG</text>
+    >{_short}</text>
     <path
       d="M70 4 V 28"
       stroke="var(--accent)"
@@ -49,7 +58,7 @@
   </svg>
 
   {#if withText}
-    <span class="brand-rest">Market Maker</span>
+    <span class="brand-rest">{_rest}</span>
   {/if}
 </span>
 
