@@ -26,51 +26,69 @@ Graphs compose existing sources + computation + sinks. If the behaviour you want
 
 ## The canvas
 
-**Palette** (left) — drag nodes onto the canvas. Palette groups:
+**Palette** (left) — drag nodes onto the canvas. Palette groups (from `catalog.rs`'s `NodeMeta`):
 
 | Group | Examples |
 |-------|----------|
-| **Sources** | `Book.L1`, `Book.L2`, `Trade.Tape`, `Trade.OwnFill`, `Funding`, `Balance`, `Portfolio.NetDelta`, `Volatility.Realised`, `Toxicity.VPIN`, `Toxicity.KyleLambda`, `Momentum.OFIZ`, `Risk.MarginRatio`, `Risk.OTR`, `Sentiment.Score`, ~40 more |
+| **Sources** | `Book.L1`, `Book.L2`, `Trade.Tape`, `Trade.OwnFill`, `Funding`, `Balance`, `Portfolio.NetDelta`, `Volatility.Realised`, `Toxicity.VPIN`, `Toxicity.KyleLambda`, `Momentum.OFIZ`, `Risk.MarginRatio`, `Risk.OTR`, `Sentiment.Score`, many more |
 | **Math** | `Math.Add`, `Math.Mul`, `Math.Const` |
-| **Stats** | `Stats.EWMA` |
-| **Cast** | `Cast.ToBool`, `Cast.StrategyEq`, `Cast.PairClassEq` |
-| **Logic** | `Logic.And`, `Logic.Mux` |
+| **Logic** | `Logic.And`, `Logic.Mux`, `Cast.ToBool`, `Cast.StrategyEq`, `Cast.PairClassEq` |
 | **Indicators** | `Indicator.SMA`, `Indicator.EMA`, `Indicator.HMA`, `Indicator.RSI`, `Indicator.ATR`, `Indicator.Bollinger` |
-| **Signals** | `Signal.ImbalanceDepth`, `Signal.TradeFlow`, `Signal.Microprice`, `Signal.FillDepth` |
-| **Strategies** (node-pool) | `Strategy.Avellaneda`, `Strategy.GLFT`, `Strategy.Grid`, `Strategy.Basis`, `Strategy.CrossExchange`, plus pentest variants |
-| **Exec / Plan** | exec-algorithm composites (TWAP, VWAP, POV, Iceberg) and plan nodes |
-| **Risk sources** | `Risk.CircuitBreaker`, `Risk.ToxicityWiden`, `Risk.InventoryUrgency`, `Risk.NewsRetreatState`, `Risk.LeadLagMultiplier` |
-| **Surveillance** ⚠️ | `Surveillance.ManipulationScore`, `Surveillance.SpoofingScore`, `Surveillance.LayeringScore`, etc. — paired with detector-only graphs on the defence side |
-| **Onchain** | `Onchain.HolderConcentration`, `Onchain.SuspectInflowRate` |
+| **Signals** | `Signal.ImbalanceDepth`, `Signal.TradeFlow`, `Signal.Microprice`, `Signal.OpenInterest`, `Signal.LongShortRatio` |
+| **Risk** | `Risk.CircuitBreaker`, `Risk.ToxicityWiden`, `Risk.InventoryUrgency`, `Risk.NewsRetreatState`, `Risk.LeadLagMultiplier` |
+| **Surveillance** ⚠️ | `Surveillance.ManipulationScore` / `SpoofingScore` / `LayeringScore` / etc. — detector scores |
+| **Strategies** | `Strategy.Active` (source), `Strategy.Avellaneda`, `Strategy.GLFT`, `Strategy.Grid`, `Strategy.Basis`, `Strategy.CrossExchange`, `Strategy.BasisArb` |
+| **Exploit** ⚠️ | `Strategy.Spoof`, `Strategy.Wash`, `Strategy.Ignite`, etc. — pentest-only (restricted gate) |
+| **Quotes** | Quote-composition nodes |
+| **Exec** | Execution-algorithm composites (TWAP / VWAP / POV / Iceberg variants) |
+| **Plans** | Multi-step plan nodes |
 | **Sinks** | `Out.SpreadMult`, `Out.SizeMult`, `Out.KillEscalate`, `Out.Quotes`, `Out.AtomicBundle` |
+| **Misc** | Utility nodes not fitting other buckets |
 
 Drag a node → it drops onto the canvas → click it → Config panel opens on the right.
 
-**Edges** — hover an output port (right side of a node) until it highlights, drag to an input port on another node. Port colors indicate type:
-- **Number** — green. Most common (Decimal-valued).
-- **Bool** — orange. For gating (`Logic.And`, `Logic.Mux` selector).
-- **StrategyKind** — blue. Emitted by `Strategy.Active`, consumed by `Cast.StrategyEq`.
-- **PairClass** — purple. Emitted by `PairClass.Current`, consumed by `Cast.PairClassEq`.
-- **Unit** — grey. Marker ports; every sink output is `Unit` ("the action fired this tick").
-- **QuoteBundle** — for `Out.Quotes` and exec-algo sinks.
+**Edges** — hover an output port (right side of a node) until it highlights, drag to an input port on another node. Port types (from `PortType` enum in `crates/strategy-graph/src/types.rs`) and their UI colors (from `StrategyNode.svelte::typeClass`):
 
-The canvas enforces type compatibility on connect — mismatched port types reject the edge with a tooltip.
+| Port type | UI color | Used by |
+|-----------|----------|---------|
+| `Number` | blue (`#60a5fa`) | Default — every Decimal-valued signal |
+| `Bool` | emerald (`#34d399`) | Gating inputs (`Logic.And`, `Logic.Mux` selector) |
+| `Unit` | grey (`#9ca3af`) | Marker ports; every sink output is `Unit` |
+| `String` | purple (`#c084fc`) | Labels / audit tags |
+| `KillLevel` | red (`#f87171`) | `Out.KillEscalate` + risk-level inputs |
+| `StrategyKind` | amber (`#fbbf24`) | `Strategy.Active` → `Cast.StrategyEq` |
+| `PairClass` | rose (`#fb7185`) | `PairClass.Current` → `Cast.PairClassEq` |
+| `Quotes` | (inherits default) | `Out.Quotes` and graph-authored quote bundles |
+
+The canvas enforces type compatibility on connect — mismatched port types raise a `PortTypeMismatch` validation error on the next evaluation pass.
 
 ---
 
 ## Validation strip
 
-Below the toolbar, live server-side validation tells you whether the graph is deployable:
+Below the toolbar, live server-side validation tells you whether the graph is deployable. The authoritative variants live in `crates/strategy-graph/src/graph.rs::ValidationError`:
 
+| Variant | Meaning |
+|---------|---------|
+| `UnsupportedVersion` | Graph schema version not supported by this build |
+| `DuplicateNodeId` | Two nodes share the same NodeId UUID |
+| `UnknownKind` | Node kind not in the catalog |
+| `RestrictedNotAllowed` | Graph references a restricted (pentest) node but `MM_ALLOW_RESTRICTED=yes-pentest-mode` is not set |
+| `MultipleInputs` | Same (node, port) receives more than one edge |
+| `DanglingEdge` | Edge references a non-existent node or port |
+| `PortTypeMismatch` | Source port type ≠ destination port type |
+| `Cycle` | DAG rule broken — a cycle was detected |
+| `DepthExceeded` | Graph exceeds `MAX_GRAPH_DEPTH` |
+| `NoSpreadMultSink` | No `Out.SpreadMult` sink — every graph needs at least one |
+| `UnknownVenue` | A venue/symbol config on a parameterised source references an unknown venue |
+| `UnknownConfigField` | Node config contains a field not in its schema |
+
+States:
 - **empty** — no nodes yet, drag from the palette
-- **ready** (green) — `Evaluator::build` succeeded, no dangling edges, every sink is reachable, no cycles
-- **invalid** (red) — lists every blocker. Common issues:
-  - `missing required source kind: Book.L1` — a strategy node needs live book data
-  - `dangling edge: Math.Mul.a → Out.SpreadMult.mult expects Number, got Missing` — an upstream input is unset
-  - `cycle detected: A → B → A` — DAG rule broken
-  - `unconsumed sink output` — you added a sink but nothing references its `action` output (usually harmless, just warning)
+- **ready** (green) — `Evaluator::build` succeeded
+- **invalid** (red) — lists the first error from the list above
 
-The Deploy button is enabled only on **ready**.
+The Deploy button is enabled only on **ready**. Non-fatal warnings (dead nodes, unconsumed outputs) come from the `GraphAnalysis` struct, viewable in Live mode's Inspector — they don't block deploy.
 
 ---
 

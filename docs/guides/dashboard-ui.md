@@ -10,27 +10,57 @@ Operator walkthrough of the MG Market Maker dashboard. Covers every page in the 
 
 ## Navigation overview
 
-| Route | Role | Primary use |
-|-------|------|-------------|
-| `/` (Overview) | viewer+ | Single-symbol snapshot: mid, spread, PnL, inventory, kill level, SLA chip, regime chip, per-venue market strip |
-| Fleet | viewer+ | All deployments across agents — search, filter, drilldown |
-| Strategy | operator+ | Graph authoring canvas + live-mode observability |
-| Rules | operator+ | Alert rules for webhook / Telegram routing |
-| Venues | operator+ | Per-venue connector status, capability flags |
-| Orderbook | viewer+ | Top-20 L2 view of the primary symbol |
-| History | viewer+ | Historical charts + daily report browser |
-| Calibration | viewer+ | Hyperopt trial history + pending calibration recommendations |
-| Reconciliation | operator+ | Order + balance reconciliation vs venue |
-| Incidents | operator+ | Open / triage / resolve deployment incidents |
-| Compliance | viewer+ | MiCA report export, SLA certificates, audit-chain verify |
-| Surveillance | admin | Raw manipulation-score roster (drilldown preferred path) |
-| Kill Switch | admin | 5-level kill-switch state + manual reset |
-| Vault | admin | Credential entries per (client, venue) with rotation UI |
+Role gates come from `Sidebar.svelte`'s declared `roles: [...]` per entry:
+
+### Live
+| Route | Roles | Primary use |
+|-------|-------|-------------|
+| Overview | admin / operator / viewer | Single-symbol snapshot: mid, spread, PnL, inventory, kill level, SLA chip, regime chip, per-venue market strip |
+| Orderbook | admin / operator / viewer | Top-20 L2 view of the primary symbol |
+| History | admin / operator / viewer | Historical charts + daily report browser |
+
+### Operations
+| Route | Roles | Primary use |
+|-------|-------|-------------|
+| Fleet | admin / operator / viewer | All deployments across agents — search, filter, drilldown |
+| Clients | admin / operator / viewer | Client list + scope browser |
+| Reconciliation | admin / operator / viewer | Order + balance reconciliation vs venue |
+| Incidents | admin / operator | Open / triage / resolve deployment incidents |
+
+### Venues & Execution
+| Route | Roles | Primary use |
+|-------|-------|-------------|
+| Venues | admin / operator | Per-venue connector status, capability flags |
+| Calibration | admin / operator | Hyperopt trial history + pending calibration recommendations |
+
+### Compliance
+| Route | Roles | Primary use |
+|-------|-------|-------------|
+| Compliance | admin / operator / viewer | MiCA report export, SLA certificates, audit-chain verify |
+
+### Configure
+| Route | Roles | Primary use |
+|-------|-------|-------------|
+| Strategy | admin / operator | Graph authoring canvas + live-mode observability |
+| Rules | admin / operator | Alert rules for webhook / Telegram routing |
+
+### Admin
+| Route | Roles | Primary use |
+|-------|-------|-------------|
+| Kill switch | admin | 5-level kill-switch state + manual reset |
 | Platform | admin | Cluster-wide config — feature flags, loans, sentiment headlines |
+| Vault | admin | Credential entries with rotation UI |
 | Users | admin | User CRUD, role assignment |
-| Login Audit | admin | Login attempt log for compliance audit |
-| Client Portal | client-reader | Per-client read-only: PnL, positions, fills, reports |
-| Profile | any | Password rotation, 2FA setup |
+| Auth audit | admin | Login attempt log for compliance audit |
+| Surveillance | admin | Raw manipulation-score roster (drilldown preferred path) |
+
+### Client-scoped (separate auth flow)
+A user logging in with a `ClientReader` token sees a tenant-scoped Client Portal view (per-client PnL, positions, fills, reports) instead of the operator sidebar. This is a distinct UX that shares the HTTP API surface but not the navigation.
+
+### Account (all roles)
+| Route | Primary use |
+|-------|-------------|
+| My account | Password rotation, 2FA setup |
 
 ---
 

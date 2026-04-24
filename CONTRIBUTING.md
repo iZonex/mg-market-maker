@@ -31,7 +31,7 @@ cd frontend && npm run build    # must build without errors
 - **Edition 2021** — use `let … else`, `if let`-chains, `async fn` in traits
 - **`rust_decimal::Decimal`** for all money/price/quantity — never `f64`
 - **Meaningful names** — `inventory_manager` not `im`, `mid_price` not `mp`
-- **Tests alongside code** — `#[cfg(test)] mod tests;` in sibling file under `<module>/tests.rs`
+- **Tests alongside code** — inline `#[cfg(test)] mod tests { ... }` is the default. For large test modules (>200 LOC or more than ~10 tests), extract to a sibling file at `<module>/tests.rs` with a bare `#[cfg(test)] mod tests;` declaration — keeps the production file readable.
 - **Tracing for logging** — `info!`, `warn!`, `error!` from the `tracing` crate; never `println!`
 - **No `unwrap()` on Results that represent externalities** — propagate `?` or handle the error explicitly
 - **No backward-compat shims** — when the shape of something changes, change every call site. We don't maintain deprecated APIs internally.
@@ -96,7 +96,7 @@ The preferred way to add strategy logic is as a graph node — users compose the
 1. Create `crates/exchange/<venue>/`
 2. Implement `ExchangeConnector` trait (see `crates/exchange/core/src/connector.rs`)
 3. Handle authentication (HMAC / EIP-712 / FIX logon), WebSocket reconnect, REST rate-limit backoff, 429 handling
-4. Set `VenueCapabilities` flags — only enable `supports_ws_trading` / `supports_fix` / `supports_amend` / `supports_batch` when the code path is actually wired
+4. Set `VenueCapabilities` flags — only flip `supports_ws_trading` / `supports_fix` / `supports_amend` / `supports_funding_rate` true when the code path is actually wired; set `max_batch_size` / `max_order_rate` to the venue's real limits
 5. Reuse shared protocol layers in `crates/protocols/` when applicable (`ws_rpc` for id-correlated WS, `fix` for FIX 4.4)
 6. Add to workspace in root `Cargo.toml`
 7. Add a capability-audit test (each exchange crate has one) — ensures capability flags match reality

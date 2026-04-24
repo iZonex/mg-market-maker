@@ -154,7 +154,7 @@ One implementation per venue × product. Handles:
 - Product spec (tick / lot / fees)
 - Health check
 - Rate limiting (429 backoff)
-- `VenueCapabilities` flags — advertises `supports_ws_trading`, `supports_fix`, `supports_amend`, `supports_batch` (only set when wired; CI enforces)
+- `VenueCapabilities` flags — advertises `supports_ws_trading`, `supports_fix`, `supports_amend`, `supports_funding_rate`, plus numeric `max_batch_size` / `max_order_rate` (flags only set when actually wired; CI enforces via each exchange crate's capability-audit test)
 
 Implementations: `CustomConnector`, `BinanceConnector` (spot), `BinanceFuturesConnector`, `BybitConnector`, `HyperLiquidConnector`.
 
@@ -261,17 +261,21 @@ strategy.compute_quotes()
 ### Persistence
 ```
 data/
-├── audit/{symbol}.jsonl          # MiCA SHA-256-chained audit trail
+├── audit/                        # MiCA SHA-256-chained audit trail
+│   ├── {symbol}.jsonl            #   live file
+│   └── {symbol}-YYYY-MM-DD.jsonl.gz   # rotated daily archive
 ├── fills.jsonl                   # fill history (dashboard ring)
-├── checkpoint.json               # engine state (inventory, PnL, autotuner) — atomic write
+├── checkpoint-{label}.json       # engine state (per symbol/mode tag)
 ├── recorded/{symbol}.jsonl       # market events (for backtest replay)
-├── loans.jsonl                   # loan agreements lifecycle
 ├── transfers.jsonl               # cross-venue transfer log (S6.4)
-├── user_templates/{name}/        # saved strategy graphs
-│   ├── <hash>.json               # content-addressed graph bodies
-│   └── history.jsonl             # version chain
-└── archive/                      # long-term audit archive (S3 or local)
+├── paper-smoke/                  # paper-mode smoke-run artefacts
+└── strategy_graphs/              # saved strategy graphs
+    └── user_templates/{name}/
+        ├── <hash>.json           # content-addressed graph bodies
+        └── history.jsonl         # version chain
 ```
+
+Loans, vault entries, approvals, and other controller-owned state live next to the controller binary, not in the engine's `data/` directory (paths configured via their respective env vars — see `docs/guides/configuration-reference.md`).
 
 ---
 
