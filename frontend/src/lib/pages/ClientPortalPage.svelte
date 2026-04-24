@@ -20,6 +20,7 @@
   import Card from '../components/Card.svelte'
   import Icon from '../components/Icon.svelte'
   import { createApiClient } from '../api.svelte.js'
+  import { Button } from '../primitives/index.js'
 
   let { auth } = $props()
   const api = $derived(createApiClient(auth))
@@ -225,10 +226,10 @@
             </div>
           </div>
           {#if cert?.signature}
-            <button type="button" class="btn ghost small" onclick={downloadCertificate}>
-              <Icon name="shield" size={12} />
-              Download signed certificate
-            </button>
+            <Button variant="ghost" size="sm" onclick={downloadCertificate}>
+          {#snippet children()}<Icon name="shield" size={12} />
+              Download signed certificate{/snippet}
+        </Button>
             <div class="cert-hint">
               HMAC-SHA256 signed · recompute with your shared secret to verify authenticity.
             </div>
@@ -281,20 +282,16 @@
             disabled={webhookBusy}
             onkeydown={(e) => { if (e.key === 'Enter') addWebhook() }}
           />
-          <button type="button" class="btn small" onclick={addWebhook} disabled={webhookBusy}>
-            <Icon name="check" size={12} />
-            <span>Add</span>
-          </button>
-          <button
-            type="button"
-            class="btn ghost small"
-            onclick={testWebhooks}
-            disabled={webhookBusy || webhookUrls.length === 0}
-            title={webhookUrls.length === 0 ? 'Add a URL first' : 'Fire a synthetic test event to every URL'}
-          >
-            <Icon name="shield" size={12} />
-            <span>Test-fire</span>
-          </button>
+          <Button variant="primary" size="sm" onclick={addWebhook} disabled={webhookBusy}>
+          {#snippet children()}<Icon name="check" size={12} />
+            <span>Add</span>{/snippet}
+        </Button>
+          <Button variant="ghost" size="sm" onclick={testWebhooks}
+ disabled={webhookBusy || webhookUrls.length === 0}
+ title={webhookUrls.length === 0 ? 'Add a URL first' : 'Fire a synthetic test event to every URL'}>
+          {#snippet children()}<Icon name="shield" size={12} />
+            <span>Test-fire</span>{/snippet}
+        </Button>
         </div>
         {#if webhookError}
           <div class="wh-err">{webhookError}</div>
@@ -310,16 +307,12 @@
             {#each webhookUrls as u (u)}
               <li class="wh-row">
                 <code class="mono" title={u}>{u}</code>
-                <button
-                  type="button"
-                  class="btn ghost xsmall"
-                  onclick={() => removeWebhook(u)}
-                  disabled={webhookBusy}
-                  aria-label="Remove webhook"
-                >
-                  <Icon name="close" size={10} />
-                  <span>Remove</span>
-                </button>
+                <Button variant="ghost" size="xs" onclick={() => removeWebhook(u)}
+ disabled={webhookBusy}
+ aria-label="Remove webhook">
+          {#snippet children()}<Icon name="close" size={10} />
+                  <span>Remove</span>{/snippet}
+        </Button>
               </li>
             {/each}
           </ul>
@@ -432,7 +425,6 @@
   .chip.tone-bad { background: color-mix(in srgb, var(--danger) 18%, transparent); color: var(--danger); }
 
   .cert-hint { font-size: 10px; color: var(--fg-muted); margin-top: 4px; }
-  .btn.small { margin-top: var(--s-2); }
 
   .wh-preview {
     display: flex; align-items: flex-start; gap: var(--s-2);
@@ -495,8 +487,4 @@
     gap: var(--s-2); font-size: var(--fs-xs);
   }
   .wh-result code { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .btn.xsmall {
-    padding: 2px 6px; font-size: 10px;
-    display: inline-flex; align-items: center; gap: 4px;
-  }
 </style>

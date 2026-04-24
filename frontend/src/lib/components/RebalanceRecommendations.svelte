@@ -9,6 +9,7 @@
    * balanced OR the [rebalancer] config section is absent.
    */
   import { createApiClient } from '../api.svelte.js'
+  import { Modal, Button } from '../primitives/index.js'
 
   let { auth } = $props()
   const api = $derived(createApiClient(auth))
@@ -133,24 +134,14 @@
     </div>
   {/if}
 
-  {#if pending}
-    <div
-      class="modal-backdrop"
-      role="button"
-      tabindex="-1"
-      aria-label="Close modal"
-      onclick={cancelExecute}
-      onkeydown={(e) => { if (e.key === 'Escape') cancelExecute() }}
-    >
-      <div
-        class="modal"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Confirm transfer"
-        tabindex="-1"
-        onclick={(e) => e.stopPropagation()}
-        onkeydown={(e) => e.stopPropagation()}
-      >
+  <Modal
+    open={!!pending}
+    ariaLabel="Confirm transfer"
+    maxWidth="480px"
+    onClose={cancelExecute}
+  >
+    {#snippet children()}
+      {#if pending}
         <h3>Confirm transfer</h3>
         <div class="kv">
           <span class="k">Asset</span><span class="v mono">{pending.asset}</span>
@@ -176,19 +167,19 @@
             {/if}
           </div>
         {/if}
-        <div class="actions">
-          <button class="cancel" onclick={cancelExecute} disabled={submitting}>
-            {execResult ? 'Close' : 'Cancel'}
-          </button>
-          {#if !execResult}
-            <button class="confirm" onclick={confirmExecute} disabled={submitting}>
-              {submitting ? 'Submitting…' : 'Confirm'}
-            </button>
-          {/if}
-        </div>
-      </div>
-    </div>
-  {/if}
+      {/if}
+    {/snippet}
+    {#snippet actions()}
+      <Button variant="ghost" onclick={cancelExecute} disabled={submitting}>
+        {#snippet children()}{execResult ? 'Close' : 'Cancel'}{/snippet}
+      </Button>
+      {#if !execResult}
+        <Button variant="primary" onclick={confirmExecute} loading={submitting}>
+          {#snippet children()}Confirm{/snippet}
+        </Button>
+      {/if}
+    {/snippet}
+  </Modal>
 </div>
 
 <style>
@@ -244,22 +235,9 @@
   }
   .exec:hover { background: var(--accent); color: var(--bg-primary); }
 
-  .modal-backdrop {
-    position: fixed; inset: 0;
-    background: rgba(0, 0, 0, 0.6);
-    display: flex; align-items: center; justify-content: center;
-    z-index: 1000;
-  }
-  .modal {
-    background: var(--bg-chip);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--r-md);
-    padding: var(--s-4);
-    max-width: 440px;
-    width: 90%;
-    display: flex; flex-direction: column; gap: var(--s-3);
-  }
-  .modal h3 { margin: 0; color: var(--fg-primary); font-size: var(--fs-md); }
+  /* `.modal-backdrop` + `.modal` moved to primitives/Modal.svelte —
+     design system v1. */
+  h3 { margin: 0; color: var(--fg-primary); font-size: var(--fs-md); }
   .kv {
     display: grid;
     grid-template-columns: 70px 1fr;
@@ -285,22 +263,7 @@
   .result.err { background: var(--danger-dim, rgba(255,80,80,0.1)); color: var(--danger); }
   .status { font-weight: 700; text-transform: uppercase; letter-spacing: var(--tracking-label); }
   .tx, .err-text { font-size: 10px; }
-  .actions {
-    display: flex; justify-content: flex-end; gap: var(--s-2);
-  }
-  .actions button {
-    padding: 6px 14px;
-    font-size: var(--fs-xs);
-    border-radius: var(--r-md);
-    cursor: pointer;
-    border: 1px solid var(--border-subtle);
-  }
-  .actions .cancel { background: transparent; color: var(--fg-secondary); }
-  .actions .confirm {
-    background: var(--accent); color: var(--bg-primary);
-    border-color: var(--accent);
-  }
-  .actions button:disabled { opacity: 0.5; cursor: not-allowed; }
+  /* `.actions` button styling moved to primitives/Button.svelte. */
   .asset { color: var(--fg-primary); font-weight: 600; text-transform: uppercase; }
   .qty { color: var(--fg-secondary); text-align: right; font-variant-numeric: tabular-nums; }
   .route { color: var(--fg-primary); text-transform: uppercase; text-align: right; }

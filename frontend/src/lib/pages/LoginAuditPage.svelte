@@ -12,6 +12,7 @@
   import Card from '../components/Card.svelte'
   import Icon from '../components/Icon.svelte'
   import { createApiClient } from '../api.svelte.js'
+  import { Button } from '../primitives/index.js'
 
   let { auth } = $props()
   const api = $derived(createApiClient(auth))
@@ -115,9 +116,9 @@
             bind:value={contains}
             onkeydown={(e) => { if (e.key === 'Enter') refresh() }}
           />
-          <button type="button" class="btn btn-sm btn-ghost" onclick={refresh} disabled={loading}>
-            {#if loading}<span class="spinner"></span>Refreshing…{:else}<Icon name="check" size={12} />Refresh{/if}
-          </button>
+          <Button variant="primary" onclick={refresh} disabled={loading}>
+          {#snippet children()}{#if loading}<span class="spinner"></span>Refreshing…{:else}<Icon name="check" size={12} />Refresh{/if}{/snippet}
+        </Button>
         </div>
 
         <div class="summary">

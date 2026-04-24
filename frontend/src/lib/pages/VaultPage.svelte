@@ -22,6 +22,7 @@
   import Card from '../components/Card.svelte'
   import Icon from '../components/Icon.svelte'
   import { createApiClient } from '../api.svelte.js'
+  import { Button } from '../primitives/index.js'
 
   let { auth } = $props()
   const api = $derived(createApiClient(auth))
@@ -357,10 +358,10 @@
         </p>
       </div>
       {#if mode === 'idle'}
-        <button type="button" class="btn primary" onclick={startPickKind}>
-          <Icon name="check" size={12} />
-          <span>Add entry</span>
-        </button>
+        <Button variant="primary" onclick={startPickKind}>
+          {#snippet children()}<Icon name="check" size={12} />
+          <span>Add entry</span>{/snippet}
+        </Button>
       {/if}
     </header>
 
@@ -393,7 +394,9 @@
             {/each}
           </div>
           <div class="actions">
-            <button type="button" class="btn ghost" onclick={cancelForm}>Cancel</button>
+            <Button variant="ghost" onclick={cancelForm}>
+          {#snippet children()}Cancel{/snippet}
+        </Button>
           </div>
         {/snippet}
       </Card>
@@ -501,11 +504,13 @@
               </div>
             {/if}
             <div class="actions">
-              <button type="button" class="btn ghost" onclick={cancelForm} disabled={formBusy}>Cancel</button>
-              <button type="submit" class="btn primary" disabled={formBusy}>
-                {#if formBusy}<span class="spinner"></span>{/if}
-                <span>{formBusy ? 'Saving…' : (mode === 'rotate' ? 'Save rotation' : 'Save entry')}</span>
-              </button>
+              <Button variant="ghost" onclick={cancelForm} disabled={formBusy}>
+          {#snippet children()}Cancel{/snippet}
+        </Button>
+              <Button variant="primary" type="submit" disabled={formBusy}>
+          {#snippet children()}{#if formBusy}<span class="spinner"></span>{/if}
+                <span>{formBusy ? 'Saving…' : (mode === 'rotate' ? 'Save rotation' : 'Save entry')}</span>{/snippet}
+        </Button>
             </div>
           </form>
         {/snippet}
@@ -575,19 +580,21 @@
                       <div class="row-actions">
                         {#if confirmDeleteName === r.name}
                           <span class="confirm-text">Delete <code>{r.name}</code>?</span>
-                          <button type="button" class="btn danger small" disabled={busyName[r.name]} onclick={() => deleteRow(r.name)}>
-                            {busyName[r.name] ? 'Deleting…' : 'Yes, delete'}
-                          </button>
-                          <button type="button" class="btn ghost small" onclick={() => (confirmDeleteName = null)}>Cancel</button>
+                          <Button variant="danger" size="sm" disabled={busyName[r.name]} onclick={() => deleteRow(r.name)}>
+          {#snippet children()}{busyName[r.name] ? 'Deleting…' : 'Yes, delete'}{/snippet}
+        </Button>
+                          <Button variant="ghost" size="sm" onclick={() => (confirmDeleteName = null)}>
+          {#snippet children()}Cancel{/snippet}
+        </Button>
                         {:else}
-                          <button type="button" class="btn ghost small" onclick={() => startRotate(r)}>
-                            <Icon name="refresh" size={12} />
-                            <span>Rotate</span>
-                          </button>
-                          <button type="button" class="btn ghost small" onclick={() => (confirmDeleteName = r.name)}>
-                            <Icon name="close" size={12} />
-                            <span>Delete</span>
-                          </button>
+                          <Button variant="ghost" size="sm" onclick={() => startRotate(r)}>
+          {#snippet children()}<Icon name="refresh" size={12} />
+                            <span>Rotate</span>{/snippet}
+        </Button>
+                          <Button variant="ghost" size="sm" onclick={() => (confirmDeleteName = r.name)}>
+          {#snippet children()}<Icon name="close" size={12} />
+                            <span>Delete</span>{/snippet}
+        </Button>
                         {/if}
                       </div>
                     </div>
@@ -694,25 +701,9 @@
 
   .actions { display: flex; gap: var(--s-2); justify-content: flex-end; }
 
-  .btn {
-    display: inline-flex; align-items: center; gap: 6px;
-    padding: 9px 16px;
-    border: 1px solid;
-    border-radius: var(--r-md);
-    font-size: var(--fs-sm);
-    font-weight: 600;
-    background: transparent;
-    cursor: pointer;
-    font-family: var(--font-sans);
-  }
-  .btn.small { padding: 5px 10px; font-size: 11px; }
-  .btn.primary { background: var(--accent); color: #001510; border-color: var(--accent); }
   .btn.primary:hover:not(:disabled) { filter: brightness(1.1); }
-  .btn.ghost { color: var(--fg-secondary); border-color: var(--border-default); }
   .btn.ghost:hover:not(:disabled) { background: var(--bg-chip); color: var(--fg-primary); }
-  .btn.danger { color: var(--danger); border-color: var(--danger); }
   .btn.danger:hover:not(:disabled) { background: rgba(239,68,68,0.1); }
-  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
   .spinner {
     width: 12px; height: 12px;

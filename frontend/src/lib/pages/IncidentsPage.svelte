@@ -17,6 +17,7 @@
   import Card from '../components/Card.svelte'
   import Icon from '../components/Icon.svelte'
   import { createApiClient } from '../api.svelte.js'
+  import { Button } from '../primitives/index.js'
 
   let { auth, onOpenGraphLive = null } = $props()
   const api = $derived(createApiClient(auth))
@@ -183,24 +184,20 @@
 
                   {#if inc.graph_agent_id && inc.graph_deployment_id && onOpenGraphLive}
                     <div class="graph-link">
-                      <button
-                        type="button"
-                        class="btn ghost small"
-                        onclick={() => onOpenGraphLive(
-                          inc.graph_agent_id,
-                          inc.graph_deployment_id,
-                          inc.graph_tick_num ?? null,
-                        )}
-                        title="Open the strategy graph at the tick this incident was filed against"
-                      >
-                        <Icon name="graph" size={12} />
+                      <Button variant="ghost" size="sm" onclick={() => onOpenGraphLive(
+ inc.graph_agent_id,
+ inc.graph_deployment_id,
+ inc.graph_tick_num ?? null,
+ )}
+ title="Open the strategy graph at the tick this incident was filed against">
+          {#snippet children()}<Icon name="graph" size={12} />
                         <span>
                           Open graph at incident
                           {#if inc.graph_tick_num != null}
                             · tick #{inc.graph_tick_num}
                           {/if}
-                        </span>
-                      </button>
+                        </span>{/snippet}
+        </Button>
                     </div>
                   {/if}
 
@@ -217,10 +214,12 @@
                   {:else}
                     <div class="inc-actions">
                       {#if inc.state === 'open'}
-                        <button class="btn ghost small" disabled={busyId[inc.id]} onclick={() => ack(inc.id)}>Acknowledge</button>
+                        <Button variant="ghost" size="sm" disabled={busyId[inc.id]} onclick={() => ack(inc.id)}>
+          {#snippet children()}Acknowledge{/snippet}
+        </Button>
                       {/if}
                       <details class="resolve-details">
-                        <summary class="btn ok small">Resolve…</summary>
+                        <summary class="resolve-summary">Resolve…</summary>
                         <div class="resolve-form">
                           <label>
                             <span>Root cause <span class="req">*</span></span>
@@ -235,9 +234,9 @@
                             <textarea rows="2" bind:value={resolveForm.preventive} placeholder="How do we stop this from happening again?"></textarea>
                           </label>
                           <div class="resolve-actions">
-                            <button class="btn ok" disabled={busyId[inc.id]} onclick={() => resolve(inc.id)}>
-                              {busyId[inc.id] ? 'Resolving…' : 'Confirm resolve'}
-                            </button>
+                            <Button variant="ok" disabled={busyId[inc.id]} onclick={() => resolve(inc.id)}>
+          {#snippet children()}{busyId[inc.id] ? 'Resolving…' : 'Confirm resolve'}{/snippet}
+        </Button>
                           </div>
                         </div>
                       </details>
@@ -317,6 +316,18 @@
 
   .resolve-details summary { list-style: none; cursor: pointer; }
   .resolve-details summary::-webkit-details-marker { display: none; }
+  /* `<summary>` acting as a button — can't be <Button> (needs to live
+     inside <details>). Styled like a ghost-ok button. */
+  .resolve-summary {
+    display: inline-flex; align-items: center;
+    padding: 2px 8px;
+    font-size: 10px;
+    border-radius: var(--r-sm);
+    border: 1px solid var(--pos);
+    color: var(--pos);
+    background: transparent;
+  }
+  .resolve-summary:hover { background: color-mix(in srgb, var(--pos) 14%, transparent); }
   .resolve-form {
     display: flex; flex-direction: column; gap: var(--s-2);
     padding: var(--s-3);

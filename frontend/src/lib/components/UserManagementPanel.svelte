@@ -14,6 +14,7 @@
 
   import { createApiClient } from '../api.svelte.js'
   import Icon from './Icon.svelte'
+  import { Button } from '../primitives/index.js'
 
   let { auth } = $props()
   const api = $derived(createApiClient(auth))
@@ -192,15 +193,11 @@
         <span class="chip">{users.length}</span>
       </div>
       {#if canControl}
-        <button
-          type="button"
-          class="btn btn-sm btn-primary"
-          onclick={openForm}
-          disabled={showForm || formBusy}
-        >
-          <Icon name="check" size={12} />
-          <span>New user</span>
-        </button>
+        <Button variant="primary" onclick={openForm}
+ disabled={showForm || formBusy}>
+          {#snippet children()}<Icon name="check" size={12} />
+          <span>New user</span>{/snippet}
+        </Button>
       {/if}
     </header>
 
@@ -239,21 +236,17 @@
               <td class="mono">{u.api_key_hint}</td>
               {#if canControl}
                 <td class="actions-cell">
-                  <button
-                    type="button"
-                    class="btn btn-sm btn-ghost"
-                    onclick={() => startReset(u)}
-                    disabled={resetBusyFor === u.id}
-                    title="Generate a one-shot password-reset URL for this user"
-                  >
-                    {#if resetBusyFor === u.id}
+                  <Button variant="primary" onclick={() => startReset(u)}
+ disabled={resetBusyFor === u.id}
+ title="Generate a one-shot password-reset URL for this user">
+          {#snippet children()}{#if resetBusyFor === u.id}
                       <span class="spinner"></span>
                       <span>Issuing…</span>
                     {:else}
                       <Icon name="shield" size={12} />
                       <span>Reset password</span>
-                    {/if}
-                  </button>
+                    {/if}{/snippet}
+        </Button>
                 </td>
               {/if}
             </tr>
@@ -267,14 +260,10 @@
     <form class="form" onsubmit={(e) => { e.preventDefault(); submitForm() }}>
       <div class="form-head">
         <span class="label">Create user</span>
-        <button
-          type="button"
-          class="btn btn-icon btn-sm btn-ghost"
-          onclick={() => { showForm = false }}
-          aria-label="Close"
-        >
-          <Icon name="close" size={12} />
-        </button>
+        <Button variant="primary" onclick={() => { showForm = false }}
+ aria-label="Close">
+          {#snippet children()}<Icon name="close" size={12} />{/snippet}
+        </Button>
       </div>
       <div class="form-row">
         <label class="f-label" for="nu-name">Name</label>
@@ -307,18 +296,18 @@
         />
       </div>
       <div class="actions">
-        <button type="submit" class="btn btn-primary" disabled={formBusy}>
-          {#if formBusy}
+        <Button variant="primary" type="submit" disabled={formBusy}>
+          {#snippet children()}{#if formBusy}
             <span class="spinner"></span>
             <span>Creating…</span>
           {:else}
             <Icon name="check" size={14} />
             <span>Create</span>
-          {/if}
-        </button>
-        <button type="button" class="btn btn-ghost" onclick={() => (showForm = false)} disabled={formBusy}>
-          Cancel
-        </button>
+          {/if}{/snippet}
+        </Button>
+        <Button variant="primary" onclick={() => (showForm = false)} disabled={formBusy}>
+          {#snippet children()}Cancel{/snippet}
+        </Button>
       </div>
       {#if formError}
         <div class="error-line">
@@ -349,15 +338,15 @@
       </p>
       <div class="issued-key">
         <code>{absoluteUrl(resetUrl)}</code>
-        <button type="button" class="btn btn-sm btn-ghost" onclick={copyResetLink}>
-          <Icon name="check" size={12} />
-          <span>Copy</span>
-        </button>
+        <Button variant="primary" onclick={copyResetLink}>
+          {#snippet children()}<Icon name="check" size={12} />
+          <span>Copy</span>{/snippet}
+        </Button>
       </div>
       <div class="actions">
-        <button type="button" class="btn btn-ghost btn-sm" onclick={dismissReset}>
-          Done
-        </button>
+        <Button variant="primary" onclick={dismissReset}>
+          {#snippet children()}Done{/snippet}
+        </Button>
       </div>
     </div>
   {/if}
@@ -375,15 +364,15 @@
       </p>
       <div class="issued-key">
         <code>{justIssuedKey}</code>
-        <button type="button" class="btn btn-sm btn-ghost" onclick={copyKey}>
-          <Icon name="check" size={12} />
-          <span>Copy</span>
-        </button>
+        <Button variant="primary" onclick={copyKey}>
+          {#snippet children()}<Icon name="check" size={12} />
+          <span>Copy</span>{/snippet}
+        </Button>
       </div>
       <div class="actions">
-        <button type="button" class="btn btn-ghost btn-sm" onclick={dismissKey}>
-          Done
-        </button>
+        <Button variant="primary" onclick={dismissKey}>
+          {#snippet children()}Done{/snippet}
+        </Button>
       </div>
     </div>
   {/if}

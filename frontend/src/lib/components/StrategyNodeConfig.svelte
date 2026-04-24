@@ -1,4 +1,6 @@
 <script>
+  import { Button } from '../primitives/index.js'
+
   /*
    * Epic H — right-pane node config panel.
    *
@@ -98,9 +100,9 @@
     {/if}
 
     <div class="actions">
-      <button type="button" class="btn danger" onclick={onDelete}>
-        Delete node
-      </button>
+      <Button variant="danger" onclick={onDelete}>
+          {#snippet children()}Delete node{/snippet}
+        </Button>
     </div>
   {/if}
 </div>
@@ -159,12 +161,4 @@
   }
 
   .actions { display: flex; justify-content: flex-end; margin-top: var(--s-2); }
-  .btn {
-    padding: var(--s-2) var(--s-3);
-    background: var(--bg-chip); border: 1px solid var(--border-subtle);
-    border-radius: var(--r-sm); color: var(--fg-primary);
-    font-size: var(--fs-xs); cursor: pointer;
-  }
-  .btn.danger { border-color: var(--neg); color: var(--neg); }
-  .btn.danger:hover { background: var(--neg); color: var(--bg-base); }
 </style>

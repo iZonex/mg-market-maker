@@ -25,6 +25,7 @@
    */
   import { createApiClient } from '../api.svelte.js'
   import Icon from './Icon.svelte'
+  import { Button } from '../primitives/index.js'
 
   let { auth } = $props()
   const api = $derived(createApiClient(auth))
@@ -143,10 +144,10 @@
       {#if lastRefresh}
         <span class="refresh-at">updated {fmtRelative(lastRefresh)}</span>
       {/if}
-      <button type="button" class="btn ghost" onclick={refresh} disabled={loading}>
-        <Icon name="refresh" size={14} />
-        <span>{loading ? 'Loading…' : 'Reload'}</span>
-      </button>
+      <Button variant="ghost" onclick={refresh} disabled={loading}>
+          {#snippet children()}<Icon name="refresh" size={14} />
+        <span>{loading ? 'Loading…' : 'Reload'}</span>{/snippet}
+        </Button>
     </div>
   </div>
 
@@ -218,17 +219,7 @@
   .hint { font-size: var(--fs-xs); color: var(--fg-muted); }
   .actions { display: flex; align-items: center; gap: var(--s-3); }
   .refresh-at { font-size: var(--fs-xs); color: var(--fg-muted); }
-  .btn {
-    display: inline-flex; align-items: center; gap: var(--s-2);
-    padding: var(--s-2) var(--s-3);
-    background: var(--bg-chip); border: 1px solid var(--border-subtle);
-    border-radius: var(--r-md); color: var(--fg-primary);
-    font-size: var(--fs-xs); cursor: pointer;
-    transition: background var(--dur-fast) var(--ease-out);
-  }
-  .btn.ghost { background: transparent; }
   .btn:hover:not(:disabled) { background: var(--bg-raised); }
-  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
   .error { padding: var(--s-3); background: var(--danger-bg); color: var(--danger); border-radius: var(--r-md); font-size: var(--fs-sm); }
   .muted { color: var(--fg-muted); font-size: var(--fs-sm); }

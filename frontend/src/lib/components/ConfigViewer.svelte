@@ -17,6 +17,8 @@
 
   import Icon from './Icon.svelte'
 
+  import { Button } from '../primitives/index.js'
+
   let { row } = $props()
 
   const variables = $derived(row?.variables || {})
@@ -55,13 +57,9 @@
     <span class="meta">
       {scalarEntries.length} scalar · {nestedKeys.length} nested
     </span>
-    <button
-      type="button"
-      class="btn ghost"
-      onclick={() => (expanded = !expanded)}
-    >
-      <span>{expanded ? 'Hide raw JSON' : 'Show raw JSON'}</span>
-    </button>
+    <Button variant="ghost" onclick={() => (expanded = !expanded)}>
+          {#snippet children()}<span>{expanded ? 'Hide raw JSON' : 'Show raw JSON'}</span>{/snippet}
+        </Button>
   </div>
 
   {#if scalarEntries.length === 0 && nestedKeys.length === 0}
@@ -114,14 +112,6 @@
   }
   .meta { font-size: var(--fs-2xs); color: var(--fg-muted); }
 
-  .btn {
-    display: inline-flex; align-items: center; gap: var(--s-2);
-    padding: 2px 8px;
-    background: transparent; border: 1px solid var(--border-subtle);
-    border-radius: var(--r-sm); color: var(--fg-secondary);
-    font-size: var(--fs-2xs); cursor: pointer;
-  }
-  .btn:hover { background: var(--bg-base); color: var(--fg-primary); }
 
   .empty {
     display: flex; align-items: center; gap: var(--s-2);

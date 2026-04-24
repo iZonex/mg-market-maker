@@ -1,6 +1,7 @@
 <script>
   import BrandMark from './BrandMark.svelte'
   import Icon from './Icon.svelte'
+  import { Button } from '../primitives/index.js'
 
   let { auth } = $props()
 
@@ -184,20 +185,17 @@
           </div>
         {/if}
 
-        <button
-          type="submit"
-          class="btn btn-primary btn-lg"
-          disabled={loading
-            || (mode === 'totp' ? totpCode.length !== 6 : (!name.trim() || !password))}
-        >
-          {#if loading}
+        <Button variant="primary" type="submit"
+ disabled={loading
+ || (mode === 'totp' ? totpCode.length !== 6 : (!name.trim() || !password))}>
+          {#snippet children()}{#if loading}
             <span class="spinner"></span>
             <span>{mode === 'bootstrap' ? 'Creating admin…' : mode === 'totp' ? 'Verifying…' : 'Authenticating…'}</span>
           {:else}
             <span>{mode === 'bootstrap' ? 'Create admin account' : mode === 'totp' ? 'Verify & sign in' : 'Sign in'}</span>
             <Icon name="chevronR" size={16} />
-          {/if}
-        </button>
+          {/if}{/snippet}
+        </Button>
       </form>
     {/if}
 

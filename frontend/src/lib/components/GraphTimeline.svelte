@@ -1,4 +1,6 @@
 <script>
+  import { Button } from '../primitives/index.js'
+
   /*
    * M4-GOBS — timeline / time-travel scrubber for live graph.
    *
@@ -67,10 +69,10 @@
       <span class="meta muted">waiting for first tick…</span>
     {/if}
     {#if pinnedTickNum != null}
-      <button type="button" class="btn-live" onclick={onUnpin} title="Release pin, resume live">
-        <span class="live-dot"></span>
-        <span>Back to live</span>
-      </button>
+      <Button variant="primary" onclick={onUnpin} title="Release pin, resume live">
+          {#snippet children()}<span class="live-dot"></span>
+        <span>Back to live</span>{/snippet}
+        </Button>
     {:else}
       <span class="tl-live-pill">
         <span class="live-dot pulsing"></span>

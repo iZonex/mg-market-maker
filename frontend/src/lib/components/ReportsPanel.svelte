@@ -17,6 +17,7 @@
 
   import { createApiClient } from '../api.svelte.js'
   import Icon from './Icon.svelte'
+  import { Button } from '../primitives/index.js'
 
   let { auth } = $props()
   const api = $derived(createApiClient(auth))
@@ -137,10 +138,10 @@
       <span class="label">Reports</span>
       <span class="hint">daily JSON / CSV, historical archive</span>
     </div>
-    <button type="button" class="btn ghost" onclick={loadHistory} disabled={loading}>
-      <Icon name="refresh" size={14} />
-      <span>{loading ? 'Loading…' : 'Reload'}</span>
-    </button>
+    <Button variant="ghost" onclick={loadHistory} disabled={loading}>
+          {#snippet children()}<Icon name="refresh" size={14} />
+      <span>{loading ? 'Loading…' : 'Reload'}</span>{/snippet}
+        </Button>
   </div>
 
   {#if error}
@@ -150,14 +151,14 @@
   <div class="section">
     <div class="section-title">Today</div>
     <div class="actions">
-      <button type="button" class="btn" onclick={() => download('/api/v1/report/daily/csv', `daily-${today()}.csv`)} disabled={busy}>
-        <Icon name="external" size={14} />
-        <span>Download CSV</span>
-      </button>
-      <button type="button" class="btn" onclick={() => download('/api/v1/report/daily', `daily-${today()}.json`)} disabled={busy}>
-        <Icon name="external" size={14} />
-        <span>Download JSON</span>
-      </button>
+      <Button variant="primary" onclick={() => download('/api/v1/report/daily/csv', `daily-${today()}.csv`)} disabled={busy}>
+          {#snippet children()}<Icon name="external" size={14} />
+        <span>Download CSV</span>{/snippet}
+        </Button>
+      <Button variant="primary" onclick={() => download('/api/v1/report/daily', `daily-${today()}.json`)} disabled={busy}>
+          {#snippet children()}<Icon name="external" size={14} />
+        <span>Download JSON</span>{/snippet}
+        </Button>
     </div>
   </div>
 
@@ -178,21 +179,21 @@
       </label>
     </div>
     <div class="actions">
-      <button type="button" class="btn" onclick={() => download(monthlyUrl('csv'), monthlyName('csv'))} disabled={busy}>
-        <Icon name="external" size={14} /> <span>CSV</span>
-      </button>
-      <button type="button" class="btn" onclick={() => download(monthlyUrl('xlsx'), monthlyName('xlsx'))} disabled={busy}>
-        <Icon name="external" size={14} /> <span>XLSX</span>
-      </button>
-      <button type="button" class="btn" onclick={() => download(monthlyUrl('pdf'), monthlyName('pdf'))} disabled={busy}>
-        <Icon name="external" size={14} /> <span>PDF</span>
-      </button>
-      <button type="button" class="btn ghost" onclick={() => download(monthlyUrl('json'), monthlyName('json'))} disabled={busy}>
-        <span>JSON</span>
-      </button>
-      <button type="button" class="btn ghost" onclick={() => download(monthlyUrl('manifest'), monthlyName('manifest.json'))} disabled={busy}>
-        <span>Manifest (HMAC)</span>
-      </button>
+      <Button variant="primary" onclick={() => download(monthlyUrl('csv'), monthlyName('csv'))} disabled={busy}>
+          {#snippet children()}<Icon name="external" size={14} /> <span>CSV</span>{/snippet}
+        </Button>
+      <Button variant="primary" onclick={() => download(monthlyUrl('xlsx'), monthlyName('xlsx'))} disabled={busy}>
+          {#snippet children()}<Icon name="external" size={14} /> <span>XLSX</span>{/snippet}
+        </Button>
+      <Button variant="primary" onclick={() => download(monthlyUrl('pdf'), monthlyName('pdf'))} disabled={busy}>
+          {#snippet children()}<Icon name="external" size={14} /> <span>PDF</span>{/snippet}
+        </Button>
+      <Button variant="ghost" onclick={() => download(monthlyUrl('json'), monthlyName('json'))} disabled={busy}>
+          {#snippet children()}<span>JSON</span>{/snippet}
+        </Button>
+      <Button variant="ghost" onclick={() => download(monthlyUrl('manifest'), monthlyName('manifest.json'))} disabled={busy}>
+          {#snippet children()}<span>Manifest (HMAC)</span>{/snippet}
+        </Button>
     </div>
   </div>
 
@@ -204,9 +205,9 @@
       HMAC-SHA256 manifest over the events array.
     </div>
     <div class="actions">
-      <button type="button" class="btn" onclick={downloadSignedAudit} disabled={busy}>
-        <Icon name="shield" size={14} /> <span>Download signed audit</span>
-      </button>
+      <Button variant="primary" onclick={downloadSignedAudit} disabled={busy}>
+          {#snippet children()}<Icon name="shield" size={14} /> <span>Download signed audit</span>{/snippet}
+        </Button>
     </div>
   </div>
 
@@ -216,9 +217,9 @@
       ZIP with summary (JSON+CSV+XLSX+PDF), fills.jsonl, audit.jsonl, HMAC-signed manifest + README. Same period + client selector as above.
     </div>
     <div class="actions">
-      <button type="button" class="btn" onclick={() => download(`/api/v1/export/bundle?${new URLSearchParams({ from: mFrom, to: mTo, ...(mClientId.trim() ? { client_id: mClientId.trim() } : {}) }).toString()}`, `bundle-${mClientId.trim() || 'all'}-${mFrom}-to-${mTo}.zip`)} disabled={busy}>
-        <Icon name="external" size={14} /> <span>Download bundle</span>
-      </button>
+      <Button variant="primary" onclick={() => download(`/api/v1/export/bundle?${new URLSearchParams({ from: mFrom, to: mTo, ...(mClientId.trim() ? { client_id: mClientId.trim() } : {}) }).toString()}`, `bundle-${mClientId.trim() || 'all'}-${mFrom}-to-${mTo}.zip`)} disabled={busy}>
+          {#snippet children()}<Icon name="external" size={14} /> <span>Download bundle</span>{/snippet}
+        </Button>
     </div>
   </div>
 
@@ -261,17 +262,7 @@
     letter-spacing: var(--tracking-label); text-transform: uppercase;
   }
   .actions { display: flex; gap: var(--s-2); flex-wrap: wrap; }
-  .btn {
-    display: inline-flex; align-items: center; gap: var(--s-2);
-    padding: var(--s-2) var(--s-3);
-    background: var(--bg-chip); border: 1px solid var(--border-subtle);
-    border-radius: var(--r-md); color: var(--fg-primary);
-    font-size: var(--fs-xs); cursor: pointer;
-    transition: background var(--dur-fast) var(--ease-out);
-  }
   .btn:hover:not(:disabled) { background: var(--bg-raised); }
-  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-  .btn.ghost { background: transparent; }
 
   .form { display: flex; gap: var(--s-3); flex-wrap: wrap; }
   .form label { display: flex; flex-direction: column; gap: 2px; font-size: var(--fs-xs); color: var(--fg-secondary); }

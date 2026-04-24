@@ -12,6 +12,7 @@
    */
   import Icon from './Icon.svelte'
   import { createApiClient } from '../api.svelte.js'
+  import { Button } from '../primitives/index.js'
 
   let { auth, onNavigate = () => {} } = $props()
   const api = $derived(createApiClient(auth))
@@ -197,7 +198,9 @@
 
     {#if allDone}
       <div class="wiz-done-actions">
-        <button type="button" class="btn ghost small" onclick={dismiss}>Hide now</button>
+        <Button variant="ghost" size="sm" onclick={dismiss}>
+          {#snippet children()}Hide now{/snippet}
+        </Button>
       </div>
     {/if}
   </div>

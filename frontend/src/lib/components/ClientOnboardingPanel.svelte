@@ -18,6 +18,7 @@
    * banner so operators know.
    */
   import { createApiClient } from '../api.svelte.js'
+  import { Button } from '../primitives/index.js'
 
   let { auth } = $props()
   const api = $derived(createApiClient(auth))
@@ -154,9 +155,9 @@
       </label>
     </div>
     <div class="row">
-      <button type="button" class="btn" onclick={createClient} disabled={busy}>
-        {busy ? 'Registering…' : 'Register client'}
-      </button>
+      <Button variant="primary" onclick={createClient} disabled={busy}>
+          {#snippet children()}{busy ? 'Registering…' : 'Register client'}{/snippet}
+        </Button>
     </div>
     {#if formError}<div class="error">{formError}</div>{/if}
     {#if success}<div class="success">{success}</div>{/if}
@@ -218,14 +219,7 @@
     font-family: inherit;
   }
   textarea { resize: vertical; min-height: 40px; }
-  .btn {
-    height: 28px; padding: 0 var(--s-3);
-    background: var(--accent-dim); color: var(--accent);
-    border: 1px solid var(--accent); border-radius: var(--r-sm);
-    cursor: pointer; font-size: var(--fs-xs);
-  }
   .btn:hover:not(:disabled) { background: var(--accent); color: var(--bg-base); }
-  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .error { color: var(--danger); font-size: var(--fs-xs); }
   .success { color: var(--pos, #10b981); font-size: var(--fs-xs); }
   .muted { color: var(--fg-muted); }

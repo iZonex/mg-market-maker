@@ -16,6 +16,7 @@
   import Card from '../components/Card.svelte'
   import Icon from '../components/Icon.svelte'
   import { createApiClient } from '../api.svelte.js'
+  import { Button } from '../primitives/index.js'
 
   let { auth } = $props()
   const api = $derived(createApiClient(auth))
@@ -192,13 +193,13 @@
             </div>
           {/if}
           <div class="actions">
-            <button type="button" class="btn ghost" disabled={busy || !dirty} onclick={discard}>
-              Discard
-            </button>
-            <button type="submit" class="btn primary" disabled={busy || !dirty}>
-              {#if busy}<span class="spinner"></span>{/if}
-              <span>{busy ? 'Saving…' : dirty ? 'Save changes' : 'Nothing to save'}</span>
-            </button>
+            <Button variant="ghost" disabled={busy || !dirty} onclick={discard}>
+          {#snippet children()}Discard{/snippet}
+        </Button>
+            <Button variant="primary" type="submit" disabled={busy || !dirty}>
+          {#snippet children()}{#if busy}<span class="spinner"></span>{/if}
+              <span>{busy ? 'Saving…' : dirty ? 'Save changes' : 'Nothing to save'}</span>{/snippet}
+        </Button>
           </div>
         </div>
       </form>
@@ -268,21 +269,8 @@
   }
   .actions { display: flex; gap: var(--s-2); justify-content: flex-end; }
 
-  .btn {
-    display: inline-flex; align-items: center; gap: 6px;
-    padding: 9px 18px;
-    border: 1px solid;
-    border-radius: var(--r-md);
-    font-size: var(--fs-sm); font-weight: 600;
-    background: transparent;
-    cursor: pointer;
-    font-family: var(--font-sans);
-  }
-  .btn.primary { background: var(--accent); color: #001510; border-color: var(--accent); }
   .btn.primary:hover:not(:disabled) { filter: brightness(1.1); }
-  .btn.ghost { color: var(--fg-secondary); border-color: var(--border-default); }
   .btn.ghost:hover:not(:disabled) { background: var(--bg-chip); color: var(--fg-primary); }
-  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
   .spinner {
     width: 12px; height: 12px;

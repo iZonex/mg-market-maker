@@ -20,6 +20,7 @@
   import EmptyStateGuide from '../components/EmptyStateGuide.svelte'
   import ClientOnboardingPanel from '../components/ClientOnboardingPanel.svelte'
   import { createApiClient } from '../api.svelte.js'
+  import { Button } from '../primitives/index.js'
 
   let { auth, onNavigate = () => {} } = $props()
   const api = $derived(createApiClient(auth))
@@ -368,18 +369,16 @@
       <Card title="Portal invite" subtitle="generate a one-time signup URL for this client" span={3}>
         {#snippet children()}
           <div class="invite-row">
-            <button
-              type="button"
-              class="btn ok small"
-              disabled={inviteBusy}
-              onclick={generateInvite}
-            >
-              {inviteBusy ? 'Generating…' : invite ? 'Regenerate invite URL' : 'Generate invite URL'}
-            </button>
+            <Button variant="ok" size="sm" disabled={inviteBusy}
+ onclick={generateInvite}>
+          {#snippet children()}{inviteBusy ? 'Generating…' : invite ? 'Regenerate invite URL' : 'Generate invite URL'}{/snippet}
+        </Button>
             {#if invite}
               <div class="invite-detail">
                 <code class="invite-url mono">{invite.url}</code>
-                <button type="button" class="btn ghost small" onclick={copyInvite}>Copy</button>
+                <Button variant="ghost" size="sm" onclick={copyInvite}>
+          {#snippet children()}Copy{/snippet}
+        </Button>
                 <span class="invite-exp muted">expires {new Date(invite.expires_at).toLocaleString()}</span>
               </div>
             {/if}
@@ -395,14 +394,10 @@
       <Card title="Webhook deliveries" subtitle="last 50 · fires on SLA breaches, fills, kill events" span={3}>
         {#snippet children()}
           <div class="wh-actions">
-            <button
-              type="button"
-              class="btn ok small"
-              disabled={webhookTestBusy}
-              onclick={testWebhooks}
-            >
-              {webhookTestBusy ? 'Testing…' : 'Send test payload'}
-            </button>
+            <Button variant="ok" size="sm" disabled={webhookTestBusy}
+ onclick={testWebhooks}>
+          {#snippet children()}{webhookTestBusy ? 'Testing…' : 'Send test payload'}{/snippet}
+        </Button>
             {#if webhookTestStatus}
               <span class="wh-status {webhookTestStatus.phase}">{webhookTestStatus.text}</span>
             {/if}

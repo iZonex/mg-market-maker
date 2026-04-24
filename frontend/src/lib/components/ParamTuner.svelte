@@ -19,6 +19,8 @@
 
   import Icon from './Icon.svelte'
 
+  import { Button } from '../primitives/index.js'
+
   let { row, onPatch, canControl = false } = $props()
 
   const variables = $derived(row?.variables || {})
@@ -152,16 +154,14 @@
           disabled={!canControl}
           oninput={(e) => onSlide(f, e.currentTarget.value)}
         />
-        <button
-          type="button"
-          class="btn btn-icon btn-ghost"
-          class:revert-visible={pendingThis}
-          onclick={() => revert(f.key)}
-          title="Revert"
-          disabled={!pendingThis}
-        >
-          <Icon name="clock" size={12} />
-        </button>
+        <span class:revert-visible={pendingThis}>
+          <Button variant="ghost" size="sm" iconOnly
+            onclick={() => revert(f.key)}
+            title="Revert"
+            disabled={!pendingThis}>
+            {#snippet children()}<Icon name="clock" size={12} />{/snippet}
+          </Button>
+        </span>
       </div>
     {/each}
   </div>
@@ -184,29 +184,21 @@
   </div>
 
   <div class="actions">
-    <button
-      type="button"
-      class="btn btn-primary"
-      onclick={applyAll}
-      disabled={busy || !canControl || pendingCount === 0}
-    >
-      {#if busy}
+    <Button variant="primary" onclick={applyAll}
+ disabled={busy || !canControl || pendingCount === 0}>
+          {#snippet children()}{#if busy}
         <span class="spinner"></span>
         <span>Applying…</span>
       {:else}
         <Icon name="check" size={14} />
         <span>Apply {pendingCount} override{pendingCount === 1 ? '' : 's'}</span>
-      {/if}
-    </button>
+      {/if}{/snippet}
+        </Button>
     {#if pendingCount > 0}
-      <button
-        type="button"
-        class="btn btn-ghost"
-        onclick={() => (pending = {})}
-        disabled={busy}
-      >
-        Discard
-      </button>
+      <Button variant="primary" onclick={() => (pending = {})}
+ disabled={busy}>
+          {#snippet children()}Discard{/snippet}
+        </Button>
     {/if}
   </div>
 
@@ -258,14 +250,6 @@
     width: 90px;
   }
 
-  .btn {
-    display: inline-flex; align-items: center; gap: var(--s-2);
-    padding: 4px 10px;
-    border-radius: var(--r-sm);
-    border: 1px solid;
-    font-size: var(--fs-xs); font-weight: 600; cursor: pointer;
-    background: transparent;
-  }
   .btn-icon { padding: 4px; width: 24px; height: 24px; justify-content: center; }
   .btn-primary {
     color: var(--bg-base);
@@ -275,7 +259,6 @@
   .btn-primary:hover:not(:disabled) { opacity: 0.92; }
   .btn-ghost { color: var(--fg-muted); border-color: var(--border-subtle); }
   .btn-ghost:hover:not(:disabled) { color: var(--fg-primary); background: var(--bg-base); }
-  .btn:disabled { opacity: 0; pointer-events: none; }
   .revert-visible { opacity: 1 !important; pointer-events: auto !important; }
 
   .toggles {

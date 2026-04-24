@@ -1,4 +1,6 @@
 <script>
+  import { Button } from '../primitives/index.js'
+
   /*
    * Wave H1 — password reset via signed admin-issued URL.
    *
@@ -63,9 +65,9 @@
         Your password has been updated. The reset link is no
         longer valid. Log in with your new password.
       </p>
-      <button type="button" class="btn primary" onclick={goToLogin}>
-        Go to login
-      </button>
+      <Button variant="primary" onclick={goToLogin}>
+          {#snippet children()}Go to login{/snippet}
+        </Button>
     {:else}
       <p class="lead">
         An administrator generated this reset link for you. Pick
@@ -96,9 +98,9 @@
         <div class="error">{error}</div>
       {/if}
 
-      <button type="submit" class="btn primary" disabled={busy}>
-        {busy ? 'Updating…' : 'Set new password'}
-      </button>
+      <Button variant="primary" type="submit" disabled={busy}>
+          {#snippet children()}{busy ? 'Updating…' : 'Set new password'}{/snippet}
+        </Button>
 
       <p class="hint">
         If this link is expired or already used, ask your admin
@@ -141,13 +143,5 @@
     background: color-mix(in srgb, var(--danger) 15%, transparent);
     color: var(--danger); font-size: var(--fs-xs);
   }
-  .btn.primary {
-    padding: var(--s-2) var(--s-4);
-    background: var(--accent); color: var(--bg-base);
-    border: 0; border-radius: var(--r-sm);
-    font-size: var(--fs-sm); font-weight: 600;
-    cursor: pointer;
-  }
-  .btn.primary:disabled { opacity: 0.5; cursor: not-allowed; }
   .hint { margin: 0; font-size: 10px; color: var(--fg-muted); text-align: center; }
 </style>

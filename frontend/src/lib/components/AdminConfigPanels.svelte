@@ -9,6 +9,7 @@
    * operator can touch these from the UI.
    */
   import { createApiClient } from '../api.svelte.js'
+  import { Button } from '../primitives/index.js'
 
   let { auth } = $props()
   const api = $derived(createApiClient(auth))
@@ -170,9 +171,9 @@
           bind:value={webhookUrl}
           disabled={webhookBusy}
         />
-        <button type="button" class="btn" onclick={addWebhook} disabled={webhookBusy || !webhookUrl}>
-          Add
-        </button>
+        <Button variant="primary" onclick={addWebhook} disabled={webhookBusy || !webhookUrl}>
+          {#snippet children()}Add{/snippet}
+        </Button>
       </div>
       {#if webhookError}<div class="error">{webhookError}</div>{/if}
       {#if webhooks.url_count === 0}
@@ -206,9 +207,9 @@
           <span class="k">threshold</span>
           <input type="number" bind:value={alertThreshold} disabled={alertBusy} step="0.01" />
         </label>
-        <button type="button" class="btn" onclick={addAlert} disabled={alertBusy || !alertSymbol}>
-          Add
-        </button>
+        <Button variant="primary" onclick={addAlert} disabled={alertBusy || !alertSymbol}>
+          {#snippet children()}Add{/snippet}
+        </Button>
       </div>
       {#if alertError}<div class="error">{alertError}</div>{/if}
       {#if alerts.length}
@@ -248,9 +249,9 @@
         <label class="field"><span class="k">counterparty</span><input type="text" bind:value={loanCounterparty} disabled={loanBusy} /></label>
         <label class="field"><span class="k">start</span><input type="date" bind:value={loanStart} disabled={loanBusy} /></label>
         <label class="field"><span class="k">end</span><input type="date" bind:value={loanEnd} disabled={loanBusy} /></label>
-        <button type="button" class="btn" onclick={addLoan} disabled={loanBusy || !loanSymbol}>
-          Create
-        </button>
+        <Button variant="primary" onclick={addLoan} disabled={loanBusy || !loanSymbol}>
+          {#snippet children()}Create{/snippet}
+        </Button>
       </div>
       {#if loanError}<div class="error">{loanError}</div>{/if}
       {#if loans.length}
@@ -293,9 +294,9 @@
           bind:value={sentimentHeadline}
           disabled={sentimentBusy}
         />
-        <button type="button" class="btn" onclick={pushHeadline} disabled={sentimentBusy || !sentimentHeadline.trim()}>
-          Push
-        </button>
+        <Button variant="primary" onclick={pushHeadline} disabled={sentimentBusy || !sentimentHeadline.trim()}>
+          {#snippet children()}Push{/snippet}
+        </Button>
       </div>
       {#if sentimentError}<div class="error">{sentimentError}</div>{/if}
       {#if sentimentStatus}<div class="muted small">{sentimentStatus}</div>{/if}
@@ -334,14 +335,7 @@
   input[type=url], input[type=text]:not(.field input), .row > input:first-child {
     flex: 1 1 auto;
   }
-  .btn {
-    height: 28px; padding: 0 var(--s-3);
-    background: var(--accent-dim); color: var(--accent);
-    border: 1px solid var(--accent); border-radius: var(--r-sm);
-    cursor: pointer; font-size: var(--fs-xs);
-  }
   .btn:hover:not(:disabled) { background: var(--accent); color: var(--bg-base); }
-  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .error { color: var(--danger); font-size: var(--fs-xs); }
   .muted { color: var(--fg-muted); }
   .small { font-size: var(--fs-xs); }

@@ -16,6 +16,7 @@
   import { createApiClient } from '../api.svelte.js'
   import { fmtPnl, fmtPrice, fmtBps, fmtRelative, fmtFixed } from '../format.js'
   import Icon from './Icon.svelte'
+  import { Modal, Button } from '../primitives/index.js'
 
   let {
     open = false,
@@ -84,24 +85,22 @@
   }
 </script>
 
-{#if open}
-  <button
-    type="button"
-    class="backdrop"
-    onclick={onClose}
-    aria-label="Close leg details"
-  ></button>
-
-  <div class="modal card-glass" role="dialog" aria-modal="true">
+<Modal
+  {open}
+  ariaLabel="Leg details"
+  maxWidth="720px"
+  {onClose}
+>
+  {#snippet children()}
     <div class="head">
       <div class="head-meta">
         <span class="venue">{venue}</span>
         <span class="sep">/</span>
         <span class="symbol num">{symbol}</span>
       </div>
-      <button type="button" class="close" onclick={onClose} aria-label="Close">
-        <Icon name="close" size={14} />
-      </button>
+      <Button variant="ghost" size="sm" iconOnly onclick={onClose} aria-label="Close">
+        {#snippet children()}<Icon name="close" size={14} />{/snippet}
+      </Button>
     </div>
 
     <div class="grid">
@@ -168,32 +167,12 @@
         </section>
       {/if}
     </div>
-  </div>
-{/if}
+  {/snippet}
+</Modal>
 
 <style>
-  .backdrop {
-    position: fixed;
-    inset: 0;
-    background: rgba(0,0,0,0.5);
-    z-index: var(--z-modal-backdrop);
-    border: none;
-    cursor: pointer;
-  }
-  .modal {
-    position: fixed;
-    top: 50%; left: 50%;
-    transform: translate(-50%, -50%);
-    min-width: 560px;
-    max-width: 90vw;
-    max-height: 85vh;
-    padding: var(--s-4);
-    z-index: var(--z-modal);
-    display: flex;
-    flex-direction: column;
-    gap: var(--s-3);
-    overflow-y: auto;
-  }
+  /* `.backdrop` + `.modal` moved to primitives/Modal.svelte —
+     design system v1. */
   .head {
     display: flex; align-items: center; justify-content: space-between;
     padding-bottom: var(--s-2);
@@ -203,16 +182,7 @@
   .venue { color: var(--accent); font-family: var(--font-mono); font-weight: 600; }
   .sep { color: var(--fg-faint); }
   .symbol { font-family: var(--font-mono); font-weight: 600; font-size: var(--fs-md); }
-  .close {
-    background: var(--bg-chip);
-    border: 1px solid var(--border-subtle);
-    border-radius: 50%;
-    width: 24px; height: 24px;
-    display: flex; align-items: center; justify-content: center;
-    cursor: pointer;
-    color: var(--fg-muted);
-  }
-  .close:hover { color: var(--fg-primary); }
+  /* `.close` button styling moved to Button primitive (variant=ghost size=sm iconOnly). */
   .grid {
     display: grid;
     grid-template-columns: 1fr 1fr;

@@ -12,6 +12,7 @@
   import Card from '../components/Card.svelte'
   import Icon from '../components/Icon.svelte'
   import { createApiClient } from '../api.svelte.js'
+  import { Button } from '../primitives/index.js'
 
   let { auth } = $props()
   const api = $derived(createApiClient(auth))
@@ -248,10 +249,10 @@
             </div>
           {/if}
           <div class="actions">
-            <button type="submit" class="btn primary" disabled={pwBusy || !pwOld || !pwNew}>
-              {#if pwBusy}<span class="spinner"></span>{/if}
-              <span>{pwBusy ? 'Changing…' : 'Change password'}</span>
-            </button>
+            <Button variant="primary" type="submit" disabled={pwBusy || !pwOld || !pwNew}>
+          {#snippet children()}{#if pwBusy}<span class="spinner"></span>{/if}
+              <span>{pwBusy ? 'Changing…' : 'Change password'}</span>{/snippet}
+        </Button>
           </div>
         </form>
       {/snippet}
@@ -286,10 +287,10 @@
                   <span class="secret-label">Can't scan? Enter this secret manually</span>
                   <div class="secret-row">
                     <code class="secret">{enrollment.secret_base32}</code>
-                    <button type="button" class="btn ghost small" onclick={copySecret}>
-                      <Icon name={secretCopied ? 'check' : 'link'} size={12} />
-                      <span>{secretCopied ? 'Copied' : 'Copy'}</span>
-                    </button>
+                    <Button variant="ghost" size="sm" onclick={copySecret}>
+          {#snippet children()}<Icon name={secretCopied ? 'check' : 'link'} size={12} />
+                      <span>{secretCopied ? 'Copied' : 'Copy'}</span>{/snippet}
+        </Button>
                   </div>
                 </div>
                 <form class="stacked-form" onsubmit={verifyEnroll}>
@@ -315,11 +316,13 @@
                     </div>
                   {/if}
                   <div class="actions">
-                    <button type="button" class="btn ghost" onclick={cancelEnroll} disabled={totpBusy}>Cancel</button>
-                    <button type="submit" class="btn primary" disabled={totpBusy || totpCode.length !== 6}>
-                      {#if totpBusy}<span class="spinner"></span>{/if}
-                      <span>{totpBusy ? 'Verifying…' : 'Verify & enable'}</span>
-                    </button>
+                    <Button variant="ghost" onclick={cancelEnroll} disabled={totpBusy}>
+          {#snippet children()}Cancel{/snippet}
+        </Button>
+                    <Button variant="primary" type="submit" disabled={totpBusy || totpCode.length !== 6}>
+          {#snippet children()}{#if totpBusy}<span class="spinner"></span>{/if}
+                      <span>{totpBusy ? 'Verifying…' : 'Verify & enable'}</span>{/snippet}
+        </Button>
                   </div>
                 </form>
               </div>
@@ -337,7 +340,9 @@
                 <div class="enabled-sub">You'll enter a 6-digit code on every sign-in.</div>
               </div>
               {#if !showDisable}
-                <button type="button" class="btn ghost" onclick={() => (showDisable = true)}>Disable…</button>
+                <Button variant="ghost" onclick={() => (showDisable = true)}>
+          {#snippet children()}Disable…{/snippet}
+        </Button>
               {/if}
             </div>
 
@@ -359,11 +364,13 @@
                   <input id="dis-pw" type="password" autocomplete="current-password" bind:value={disablePw} disabled={disableBusy} />
                 </div>
                 <div class="actions">
-                  <button type="button" class="btn ghost" onclick={() => { showDisable = false; disablePw = '' }} disabled={disableBusy}>Cancel</button>
-                  <button type="submit" class="btn danger" disabled={disableBusy || !disablePw}>
-                    {#if disableBusy}<span class="spinner"></span>{/if}
-                    <span>{disableBusy ? 'Disabling…' : 'Disable 2FA'}</span>
-                  </button>
+                  <Button variant="ghost" onclick={() => { showDisable = false; disablePw = '' }} disabled={disableBusy}>
+          {#snippet children()}Cancel{/snippet}
+        </Button>
+                  <Button variant="danger" type="submit" disabled={disableBusy || !disablePw}>
+          {#snippet children()}{#if disableBusy}<span class="spinner"></span>{/if}
+                    <span>{disableBusy ? 'Disabling…' : 'Disable 2FA'}</span>{/snippet}
+        </Button>
                 </div>
               </form>
             {/if}
@@ -384,10 +391,10 @@
                 <span>{totpMsg.text}</span>
               </div>
             {/if}
-            <button type="button" class="btn primary large" disabled={totpBusy} onclick={startEnroll}>
-              {#if totpBusy}<span class="spinner"></span>{/if}
-              <span>{totpBusy ? 'Starting…' : 'Enable 2FA'}</span>
-            </button>
+            <Button variant="primary" disabled={totpBusy} onclick={startEnroll}>
+          {#snippet children()}{#if totpBusy}<span class="spinner"></span>{/if}
+              <span>{totpBusy ? 'Starting…' : 'Enable 2FA'}</span>{/snippet}
+        </Button>
           </div>
         {/if}
       {/snippet}
@@ -510,40 +517,9 @@
 
   .actions { display: flex; gap: var(--s-2); justify-content: flex-end; margin-top: var(--s-1); }
 
-  .btn {
-    display: inline-flex; align-items: center; gap: var(--s-2);
-    padding: 9px 18px;
-    border: 1px solid;
-    border-radius: var(--r-md);
-    font-size: var(--fs-sm);
-    font-weight: 600;
-    background: transparent;
-    color: inherit;
-    cursor: pointer;
-    font-family: var(--font-sans);
-    transition: background var(--dur-fast) var(--ease-out),
-                border-color var(--dur-fast) var(--ease-out),
-                color var(--dur-fast) var(--ease-out);
-  }
-  .btn.small { padding: 5px 10px; font-size: var(--fs-xs); }
-  .btn.large { padding: 11px 22px; font-size: var(--fs-md); }
-  .btn.primary {
-    background: var(--accent);
-    color: #001510;
-    border-color: var(--accent);
-  }
   .btn.primary:hover:not(:disabled) { filter: brightness(1.1); }
-  .btn.ghost {
-    color: var(--fg-secondary);
-    border-color: var(--border-default);
-  }
   .btn.ghost:hover:not(:disabled) { background: var(--bg-chip); color: var(--fg-primary); }
-  .btn.danger {
-    color: var(--danger);
-    border-color: var(--danger);
-  }
   .btn.danger:hover:not(:disabled) { background: rgba(239, 68, 68, 0.1); }
-  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
   .spinner {
     width: 12px; height: 12px;

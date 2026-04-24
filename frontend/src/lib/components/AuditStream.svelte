@@ -1,6 +1,7 @@
 <script>
   import { createApiClient } from '../api.svelte.js'
   import Icon from './Icon.svelte'
+  import { Button } from '../primitives/index.js'
 
   let { auth } = $props()
   const api = $derived(createApiClient(auth))
@@ -188,30 +189,22 @@
       {/if}
     </div>
     <div class="head-actions">
-      <button
-        type="button"
-        class="btn btn-ghost btn-sm"
-        onclick={runVerify}
-        disabled={verifyBusy}
-        title="Run real SHA-256 hash-chain verify across every deployment's audit file"
-      >
-        <Icon name="shield" size={12} />
-        <span>{verifyBusy ? 'Verifying…' : 'Verify chain'}</span>
-      </button>
-      <button
-        type="button"
-        class="btn btn-ghost btn-sm"
-        onclick={() => (pausePoll = !pausePoll)}
-        aria-label={pausePoll ? 'Resume' : 'Pause'}
-      >
-        {#if pausePoll}
+      <Button variant="primary" onclick={runVerify}
+ disabled={verifyBusy}
+ title="Run real SHA-256 hash-chain verify across every deployment's audit file">
+          {#snippet children()}<Icon name="shield" size={12} />
+        <span>{verifyBusy ? 'Verifying…' : 'Verify chain'}</span>{/snippet}
+        </Button>
+      <Button variant="primary" onclick={() => (pausePoll = !pausePoll)}
+ aria-label={pausePoll ? 'Resume' : 'Pause'}>
+          {#snippet children()}{#if pausePoll}
           <Icon name="pulse" size={12} />
           <span>Resume</span>
         {:else}
           <Icon name="clock" size={12} />
           <span>Pause</span>
-        {/if}
-      </button>
+        {/if}{/snippet}
+        </Button>
     </div>
   </header>
 
@@ -251,9 +244,9 @@
       bind:value={filter}
     />
     {#if filter}
-      <button type="button" class="btn btn-icon btn-ghost btn-sm" onclick={() => (filter = '')} aria-label="clear">
-        <Icon name="close" size={12} />
-      </button>
+      <Button variant="primary" onclick={() => (filter = '')} aria-label="clear">
+          {#snippet children()}<Icon name="close" size={12} />{/snippet}
+        </Button>
     {/if}
   </div>
 

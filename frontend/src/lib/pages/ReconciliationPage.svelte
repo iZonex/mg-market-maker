@@ -15,6 +15,7 @@
    */
   import Card from '../components/Card.svelte'
   import { createApiClient } from '../api.svelte.js'
+  import { Button } from '../primitives/index.js'
 
   let { auth } = $props()
   const api = $derived(createApiClient(auth))
@@ -202,13 +203,15 @@
         {#if cleanRows.length === 0}
           <div class="muted">no clean rows</div>
         {:else if !cleanExpanded}
-          <button type="button" class="btn ghost" onclick={() => (showClean = true)}>
-            Show {cleanRows.length} clean row(s)
-          </button>
+          <Button variant="ghost" onclick={() => (showClean = true)}>
+          {#snippet children()}Show {cleanRows.length} clean row(s){/snippet}
+        </Button>
         {:else}
           <div class="header-row">
             <span class="muted">{cleanRows.length} deployment(s) reconciled clean</span>
-            <button type="button" class="btn ghost small" onclick={() => (showClean = false)}>Hide</button>
+            <Button variant="ghost" size="sm" onclick={() => (showClean = false)}>
+          {#snippet children()}Hide{/snippet}
+        </Button>
           </div>
           <table class="rec-table">
             <thead>
@@ -300,5 +303,4 @@
     display: flex; align-items: center; justify-content: space-between;
     margin-bottom: var(--s-2);
   }
-  .btn.small { padding: 2px 8px; font-size: var(--fs-xs); }
 </style>

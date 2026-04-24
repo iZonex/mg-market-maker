@@ -17,6 +17,8 @@
 
   import { formatValue } from '../graphLiveStore.svelte.js'
 
+  import { Button } from '../primitives/index.js'
+
   let {
     node = null,
     stats = null, // nodeStats Map — see graphLiveStore.nodeStatsFromTraces
@@ -92,9 +94,9 @@
 <div class="inspector">
   <header class="insp-head">
     <span class="insp-title">Live inspector</span>
-    <button type="button" class="btn ghost small" onclick={onReturnToAuthoring}>
-      Back to authoring
-    </button>
+    <Button variant="ghost" size="sm" onclick={onReturnToAuthoring}>
+          {#snippet children()}Back to authoring{/snippet}
+        </Button>
   </header>
 
   {#if error}
@@ -310,5 +312,4 @@
   .muted { color: var(--fg-muted); }
   .small { font-size: 10px; }
 
-  .btn.small { padding: 2px 8px; font-size: 10px; }
 </style>

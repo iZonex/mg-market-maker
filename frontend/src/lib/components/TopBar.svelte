@@ -6,6 +6,7 @@
   // (which symbol am I looking at, how fresh is the data, what
   // mode are we in) never scrolls off-screen.
   import { createApiClient } from '../api.svelte.js'
+  import { Button } from '../primitives/index.js'
 
   let {
     symbols = [],
@@ -142,11 +143,11 @@
          useless "all clients" dropdown. -->
     {#if clients.length > 0}
       <div class="client-picker">
-        <button class="btn btn-ghost btn-sm symbol-btn" onclick={() => (clientMenuOpen = !clientMenuOpen)} aria-haspopup="listbox" aria-expanded={clientMenuOpen} title="Client scope">
-          <span class="client-tag">client:</span>
+        <Button variant="primary" onclick={() => (clientMenuOpen = !clientMenuOpen)} aria-haspopup="listbox" aria-expanded={clientMenuOpen} title="Client scope">
+          {#snippet children()}<span class="client-tag">client:</span>
           <span class="client-name num">{clientLabel}</span>
-          <Icon name="chevronDown" size={14} />
-        </button>
+          <Icon name="chevronDown" size={14} />{/snippet}
+        </Button>
         {#if clientMenuOpen}
           <div class="symbol-menu card-glass scroll">
             <button class="sym-opt" class:active={activeClient === ''} onclick={() => pickClient('')}>
@@ -166,10 +167,10 @@
     {/if}
 
     <div class="symbol-picker">
-      <button class="btn btn-ghost btn-sm symbol-btn" onclick={() => (symbolMenuOpen = !symbolMenuOpen)} aria-haspopup="listbox" aria-expanded={symbolMenuOpen}>
-        <span class="sym-ticker num">{activeSymbol || '—'}</span>
-        <Icon name="chevronDown" size={14} />
-      </button>
+      <Button variant="primary" onclick={() => (symbolMenuOpen = !symbolMenuOpen)} aria-haspopup="listbox" aria-expanded={symbolMenuOpen}>
+          {#snippet children()}<span class="sym-ticker num">{activeSymbol || '—'}</span>
+        <Icon name="chevronDown" size={14} />{/snippet}
+        </Button>
       {#if symbolMenuOpen && symbols.length > 0}
         <div class="symbol-menu card-glass scroll">
           {#each symbols as s}

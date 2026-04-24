@@ -16,6 +16,7 @@
    */
   import Icon from './Icon.svelte'
   import { createApiClient } from '../api.svelte.js'
+  import { Button, Modal } from '../primitives/index.js'
 
   let { auth, agent, agents = null, onClose = () => {}, onDeployed = () => {} } = $props()
   const api = $derived(createApiClient(auth))
@@ -311,8 +312,13 @@
   })
 </script>
 
-<div class="backdrop" role="dialog" aria-modal="true" tabindex="-1" onmousedown={handleBackdrop}>
-  <div class="modal">
+<Modal
+  open={true}
+  ariaLabel="Deploy strategy"
+  maxWidth="720px"
+  {onClose}
+>
+  {#snippet children()}
     <header class="modal-head">
       <div class="head-text">
         <div class="title">
@@ -330,9 +336,9 @@
           <div class="sub">on agent <code class="mono">{primaryAgent.agent_id}</code> · fingerprint <code class="mono">{primaryAgent.fingerprint}</code></div>
         {/if}
       </div>
-      <button type="button" class="close" onclick={onClose} aria-label="Close">
-        <Icon name="close" size={14} />
-      </button>
+      <Button variant="ghost" size="sm" iconOnly onclick={onClose} aria-label="Close">
+        {#snippet children()}<Icon name="close" size={14} />{/snippet}
+      </Button>
     </header>
 
     <div class="body">
@@ -420,7 +426,7 @@
               <span class="hint">paste a graph JSON or load from file — applied via <code>variables.strategy_graph</code></span>
             </div>
             <div class="graph-actions">
-              <label class="btn ghost file-btn">
+              <label class="file-btn">
                 <input type="file" accept=".json,application/json" onchange={loadGraphFromFile} disabled={submitting} />
                 Load JSON file…
               </label>
@@ -549,39 +555,23 @@
       {/if}
     </div>
 
-    <footer class="foot">
-      <button type="button" class="btn ghost" onclick={onClose} disabled={submitting}>Cancel</button>
-      <button type="button" class="btn primary" onclick={deploy} disabled={loading || submitting || !!tenantBlock}>
-        {#if submitting}<span class="spinner"></span>{/if}
-        <span>{submitting ? 'Deploying…' : 'Deploy strategy'}</span>
-      </button>
-    </footer>
-  </div>
-</div>
+  {/snippet}
+  {#snippet actions()}
+    <Button variant="ghost" onclick={onClose} disabled={submitting}>
+      {#snippet children()}Cancel{/snippet}
+    </Button>
+    <Button variant="primary" onclick={deploy} loading={submitting} disabled={loading || !!tenantBlock}>
+      {#snippet children()}Deploy strategy{/snippet}
+    </Button>
+  {/snippet}
+</Modal>
 
 <style>
-  .backdrop {
-    position: fixed; inset: 0;
-    background: rgba(0, 0, 0, 0.55);
-    backdrop-filter: blur(2px);
-    display: flex; align-items: center; justify-content: center;
-    z-index: var(--z-modal, 1000);
-    padding: var(--s-6);
-  }
-  .modal {
-    width: 720px;
-    max-width: 100%;
-    max-height: 92vh;
-    display: flex; flex-direction: column;
-    background: var(--bg-raised);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--r-lg);
-    box-shadow: var(--shadow-lg);
-    overflow: hidden;
-  }
+  /* `.backdrop`, `.modal`, `.close` moved to primitives/Modal.svelte
+     + Button.svelte — design system v1. */
   .modal-head {
     display: flex; align-items: flex-start; justify-content: space-between;
-    padding: var(--s-4) var(--s-5);
+    padding-bottom: var(--s-3);
     border-bottom: 1px solid var(--border-subtle);
   }
   .head-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
@@ -591,19 +581,10 @@
     letter-spacing: var(--tracking-tight);
   }
   .sub { font-size: var(--fs-xs); color: var(--fg-muted); }
-  .close {
-    background: transparent; border: 1px solid var(--border-subtle);
-    color: var(--fg-muted); padding: 6px;
-    border-radius: var(--r-sm); cursor: pointer;
-    display: flex; align-items: center; justify-content: center;
-  }
-  .close:hover { color: var(--fg-primary); background: var(--bg-chip); }
 
   .body {
-    flex: 1; min-height: 0;
-    padding: var(--s-4) var(--s-5);
-    overflow-y: auto;
     display: flex; flex-direction: column; gap: var(--s-5);
+    padding-top: var(--s-3);
   }
   .muted { color: var(--fg-muted); font-size: var(--fs-sm); }
 
@@ -662,7 +643,21 @@
   .mode-tab:disabled { opacity: 0.5; cursor: not-allowed; }
 
   .graph-actions { display: flex; align-items: center; gap: var(--s-3); margin-bottom: var(--s-2); }
-  .file-btn { position: relative; overflow: hidden; cursor: pointer; }
+  /* Ghost-button-styled file picker. We don't use <Button> here
+     because file-input needs a `<label>` parent for accessibility. */
+  .file-btn {
+    display: inline-flex; align-items: center; gap: var(--s-2);
+    padding: 4px 10px;
+    font-size: var(--fs-xs);
+    border-radius: var(--r-sm);
+    border: 1px solid var(--border-subtle);
+    color: var(--fg-primary);
+    background: transparent;
+    cursor: pointer;
+    position: relative;
+    overflow: hidden;
+  }
+  .file-btn:hover { background: var(--bg-chip-hover); border-color: var(--border-default); }
   .file-btn input[type="file"] {
     position: absolute; inset: 0; opacity: 0; cursor: pointer;
   }
@@ -815,37 +810,8 @@
     font-size: var(--fs-xs);
   }
 
-  .foot {
-    display: flex; justify-content: flex-end; gap: var(--s-2);
-    padding: var(--s-3) var(--s-5);
-    border-top: 1px solid var(--border-subtle);
-    background: var(--bg-base, var(--bg-raised));
-  }
-  .btn {
-    display: inline-flex; align-items: center; gap: 6px;
-    padding: 9px 18px;
-    border: 1px solid;
-    border-radius: var(--r-md);
-    font-size: var(--fs-sm);
-    font-weight: 600;
-    background: transparent;
-    cursor: pointer;
-    font-family: var(--font-sans);
-  }
-  .btn.primary { background: var(--accent); color: #001510; border-color: var(--accent); }
-  .btn.primary:hover:not(:disabled) { filter: brightness(1.1); }
-  .btn.ghost { color: var(--fg-secondary); border-color: var(--border-default); }
-  .btn.ghost:hover:not(:disabled) { background: var(--bg-chip); color: var(--fg-primary); }
-  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-
-  .spinner {
-    width: 12px; height: 12px;
-    border: 2px solid rgba(0,0,0,0.25);
-    border-top-color: currentColor;
-    border-radius: 50%;
-    animation: spin 0.75s linear infinite;
-  }
-  @keyframes spin { to { transform: rotate(360deg); } }
+  /* `.foot`, `.btn*`, `.spinner` moved to primitives/Modal.svelte +
+     Button.svelte (built-in loading spinner) — design system v1. */
 
   code.mono { font-family: var(--font-mono); font-size: 11px; background: var(--bg-chip); padding: 0 4px; border-radius: 3px; color: var(--fg-primary); }
 </style>

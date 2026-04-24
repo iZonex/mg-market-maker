@@ -10,6 +10,7 @@
    * portal immediately.
    */
   import { createApiClient } from '../api.svelte.js'
+  import { Button } from '../primitives/index.js'
 
   let { auth, inviteToken } = $props()
   const api = $derived(createApiClient(auth))
@@ -99,9 +100,9 @@
       <div class="error">{error}</div>
     {/if}
 
-    <button type="submit" class="btn primary" disabled={busy}>
-      {busy ? 'Creating account…' : 'Create account'}
-    </button>
+    <Button variant="primary" type="submit" disabled={busy}>
+          {#snippet children()}{busy ? 'Creating account…' : 'Create account'}{/snippet}
+        </Button>
 
     <p class="hint">
       This invite is valid for 24 hours from when your admin
@@ -143,13 +144,5 @@
     background: color-mix(in srgb, var(--danger) 15%, transparent);
     color: var(--danger); font-size: var(--fs-xs);
   }
-  .btn.primary {
-    padding: var(--s-2) var(--s-4);
-    background: var(--accent); color: var(--bg-base);
-    border: 0; border-radius: var(--r-sm);
-    font-size: var(--fs-sm); font-weight: 600;
-    cursor: pointer;
-  }
-  .btn.primary:disabled { opacity: 0.5; cursor: not-allowed; }
   .hint { margin: 0; font-size: 10px; color: var(--fg-muted); text-align: center; }
 </style>

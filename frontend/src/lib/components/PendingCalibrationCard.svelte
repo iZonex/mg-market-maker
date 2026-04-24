@@ -25,6 +25,7 @@
 
   import { createApiClient } from '../api.svelte.js'
   import Icon from './Icon.svelte'
+  import { Button } from '../primitives/index.js'
 
   let { data, auth } = $props()
   const api = $derived(createApiClient(auth))
@@ -217,10 +218,10 @@
         a suggestion for review.
       </span>
       {#if !showTrigger}
-        <button type="button" class="btn btn-primary" onclick={openTriggerForm}>
-          <Icon name="bolt" size={14} />
-          <span>Run calibration</span>
-        </button>
+        <Button variant="primary" onclick={openTriggerForm}>
+          {#snippet children()}<Icon name="bolt" size={14} />
+          <span>Run calibration</span>{/snippet}
+        </Button>
       {/if}
     </div>
   {:else}
@@ -229,10 +230,10 @@
         <span class="label">Pending</span>
         <span class="chip chip-warn">{pending.length}</span>
       </div>
-      <button type="button" class="btn btn-sm btn-ghost" onclick={openTriggerForm} disabled={showTrigger}>
-        <Icon name="bolt" size={12} />
-        <span>New run</span>
-      </button>
+      <Button variant="primary" onclick={openTriggerForm} disabled={showTrigger}>
+          {#snippet children()}<Icon name="bolt" size={12} />
+        <span>New run</span>{/snippet}
+        </Button>
     </header>
 
     <div class="list">
@@ -281,29 +282,21 @@
           </table>
 
           <div class="actions">
-            <button
-              type="button"
-              class="btn btn-primary"
-              onclick={() => apply(p.symbol)}
-              disabled={busy !== ''}
-            >
-              {#if busy === p.symbol}
+            <Button variant="primary" onclick={() => apply(p.symbol)}
+ disabled={busy !== ''}>
+          {#snippet children()}{#if busy === p.symbol}
                 <span class="spinner"></span>
                 <span>Applying…</span>
               {:else}
                 <Icon name="check" size={14} />
                 <span>Apply</span>
-              {/if}
-            </button>
-            <button
-              type="button"
-              class="btn btn-ghost"
-              onclick={() => discard(p.symbol)}
-              disabled={busy !== ''}
-            >
-              <Icon name="close" size={14} />
-              <span>Discard</span>
-            </button>
+              {/if}{/snippet}
+        </Button>
+            <Button variant="primary" onclick={() => discard(p.symbol)}
+ disabled={busy !== ''}>
+          {#snippet children()}<Icon name="close" size={14} />
+              <span>Discard</span>{/snippet}
+        </Button>
           </div>
         </article>
       {/each}
@@ -314,9 +307,9 @@
     <form class="trigger" onsubmit={(e) => { e.preventDefault(); submitTrigger() }}>
       <div class="trigger-head">
         <span class="label">Run hyperopt</span>
-        <button type="button" class="btn btn-icon btn-sm btn-ghost" onclick={() => { showTrigger = false }} aria-label="Close trigger form">
-          <Icon name="close" size={12} />
-        </button>
+        <Button variant="primary" onclick={() => { showTrigger = false }} aria-label="Close trigger form">
+          {#snippet children()}<Icon name="close" size={12} />{/snippet}
+        </Button>
       </div>
       <div class="trigger-row">
         <label class="f-label" for="tr-sym">Symbol</label>
@@ -363,18 +356,18 @@
         </select>
       </div>
       <div class="actions">
-        <button type="submit" class="btn btn-primary" disabled={triggerBusy || !triggerSym || !triggerPath}>
-          {#if triggerBusy}
+        <Button variant="primary" type="submit" disabled={triggerBusy || !triggerSym || !triggerPath}>
+          {#snippet children()}{#if triggerBusy}
             <span class="spinner"></span>
             <span>Queueing…</span>
           {:else}
             <Icon name="bolt" size={14} />
             <span>Queue run</span>
-          {/if}
-        </button>
-        <button type="button" class="btn btn-ghost" onclick={() => { showTrigger = false }} disabled={triggerBusy}>
-          Cancel
-        </button>
+          {/if}{/snippet}
+        </Button>
+        <Button variant="primary" onclick={() => { showTrigger = false }} disabled={triggerBusy}>
+          {#snippet children()}Cancel{/snippet}
+        </Button>
       </div>
     </form>
   {/if}

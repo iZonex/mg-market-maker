@@ -1,6 +1,7 @@
 <script>
   import { createApiClient } from '../api.svelte.js'
   import Icon from './Icon.svelte'
+  import { Button } from '../primitives/index.js'
 
   let { auth } = $props()
   const api = $derived(createApiClient(auth))
@@ -94,10 +95,10 @@
           </td>
           <td class="right">
             {#if r.tripped}
-              <button type="button" class="btn btn-sm btn-ghost" onclick={() => resetClient(r.client_id)} disabled={busy}>
-                <Icon name="check" size={12} />
-                <span>Reset</span>
-              </button>
+              <Button variant="primary" onclick={() => resetClient(r.client_id)} disabled={busy}>
+          {#snippet children()}<Icon name="check" size={12} />
+                <span>Reset</span>{/snippet}
+        </Button>
             {/if}
           </td>
         </tr>
