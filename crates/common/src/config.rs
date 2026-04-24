@@ -1407,6 +1407,18 @@ pub struct MarketMakerConfig {
     #[serde(default = "default_sor_queue_refresh_secs")]
     pub sor_queue_refresh_secs: u64,
 
+    /// UX-VENUE-1 gap close — how often the engine polls each
+    /// `sor_extra_venues` connector for its L1 top-of-book and
+    /// republishes it onto `DataBus::books_l1` so the
+    /// Overview's per-venue market strip renders extras
+    /// alongside primary + hedge. Default 5 s: fast enough for
+    /// the 2 s UI poll to get a fresh sample every other tick,
+    /// slow enough that a REST `get_orderbook(depth=1)` per
+    /// extra venue doesn't chew rate-limit budget. Set to 0 to
+    /// disable the poll entirely.
+    #[serde(default = "default_sor_extra_l1_poll_secs")]
+    pub sor_extra_l1_poll_secs: u64,
+
     /// S1.2 — per-strategy capital budget cap in quote-asset
     /// units. Keys are `Strategy::name()` tags (e.g.
     /// `"avellaneda"`, `"funding_arb"`, `"basis"`, `"grid"`).
@@ -1767,6 +1779,10 @@ fn default_sor_trade_rate_window_secs() -> u64 {
 
 fn default_sor_queue_refresh_secs() -> u64 {
     2
+}
+
+fn default_sor_extra_l1_poll_secs() -> u64 {
+    5
 }
 
 /// Qty-source policy for the auto-dispatch SOR tick (Epic A
@@ -2671,6 +2687,7 @@ impl Default for AppConfig {
                 sor_inventory_threshold: dec!(0),
                 sor_trade_rate_window_secs: default_sor_trade_rate_window_secs(),
                 sor_queue_refresh_secs: default_sor_queue_refresh_secs(),
+                sor_extra_l1_poll_secs: default_sor_extra_l1_poll_secs(),
                 strategy_capital_budget: std::collections::HashMap::new(),
             symbol_circulating_supply: std::collections::HashMap::new(),
                 cross_exchange_min_profit_bps: dec!(5),

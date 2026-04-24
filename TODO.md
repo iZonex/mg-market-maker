@@ -570,15 +570,21 @@ Legend:
 - [x] **UX-VENUE-1** Per-venue market strip on Overview is live
   (`/api/v1/venues/book_state` → `VenueMarketStrip.svelte`) and
   publishes `primary_engine.book` + `hedge_book` to the data bus.
-  **Gap**: SOR-extra venues (e.g. Binance linear perp in
-  `cross-exchange-paper.toml`) are not WS-subscribed — they only
-  serve on-demand REST queries inside `VenueStateAggregator.collect`.
-  Result: the strip currently renders only primary (+ hedge when
-  cross-exchange). Two fixes possible: (a) subscribe extras to WS
-  + stream their books through a lightweight `ExtraBookKeeper`
-  in the engine; (b) periodic `get_orderbook(depth=1)` poll per
-  extra on a new tokio interval that publishes L1 to the data
-  bus. Option (b) is simpler but lossy; (a) is correct.
+  Gap closed 2026-04-24 by option (b) — new engine interval
+  `sor_extra_l1_poll_secs` (default 5 s, set to 0 to disable)
+  iterates `ConnectorBundle.extra`, maps each connector back to
+  its seeded `(venue, product, symbol)` slot on the
+  `VenueStateAggregator`, calls `get_orderbook(depth=1)`, and
+  republishes the top-of-book onto `DataBus::books_l1` under the
+  same `(venue, symbol, product)` key the strip reads. Errors per
+  extra are skipped (not fatal); unseeded extras are skipped
+  instead of inventing a symbol. Covered by two unit tests in
+  `crates/engine/src/market_maker.rs`
+  (`extra_venue_l1_poll_publishes_to_data_bus`,
+  `extra_venue_l1_poll_skips_unseeded_extras`). Option (a) — full
+  WS subscription + `ExtraBookKeeper` — is still "correct" but
+  deferred: the 5 s REST cadence is enough for the strip's 2 s
+  UI poll and doesn't consume a WS handle budget on every extra.
 - [ ] **UX-VENUE-2** Per-venue regime classification. Today the
   engine runs one `RegimeClassifier` on the primary mid stream
   and the Overview's market-quality card labels its regime chip

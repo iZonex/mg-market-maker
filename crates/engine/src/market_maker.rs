@@ -1958,6 +1958,101 @@ impl MarketMakerEngine {
         }
     }
 
+    /// UX-VENUE-1 gap close — poll every `sor_extra_venues`
+    /// connector for its L1 top-of-book over REST and republish
+    /// onto `DataBus::books_l1` so the Overview's per-venue
+    /// market strip renders extras alongside primary + hedge.
+    ///
+    /// Primary + hedge are already event-driven via their WS
+    /// feeds; extras don't get their own WS subscription (they
+    /// exist mainly as advisory SOR targets), so this tick is
+    /// how the UI discovers they are alive at all. A venue that
+    /// fails to respond is skipped for this tick — no partial
+    /// snapshot is published, and the data-bus entry goes stale
+    /// naturally (age_ms climbs on the endpoint).
+    async fn poll_extra_venues_for_data_bus(&self) {
+        use mm_exchange_core::connector::VenueProduct;
+
+        let Some(dash) = self.dashboard.as_ref() else { return };
+        if self.connectors.extra.is_empty() { return; }
+
+        let slots = self.sor_aggregator.venue_slots();
+        for conn in &self.connectors.extra {
+            let venue = conn.venue_id();
+            let product = conn.product();
+            let Some(symbol) = slots
+                .iter()
+                .find(|(v, p, _)| *v == venue && *p == product)
+                .map(|(_, _, s)| s.clone())
+            else {
+                // Extra venue not seeded — should not happen when
+                // the engine is built via the config loader, but a
+                // manual `with_sor_venue` misuse would land here.
+                // Skip rather than invent a symbol.
+                continue;
+            };
+
+            let (bids, asks) = match conn.get_orderbook(&symbol, 1).await {
+                Ok((bids, asks, _seq)) => (bids, asks),
+                Err(e) => {
+                    tracing::warn!(
+                        venue = ?venue,
+                        product = ?product,
+                        symbol = %symbol,
+                        error = %e,
+                        "sor_extra L1 poll failed — skipping tick"
+                    );
+                    continue;
+                }
+            };
+
+            let Some(best_bid) = bids.first().map(|l| l.price) else { continue };
+            let Some(best_ask) = asks.first().map(|l| l.price) else { continue };
+            if best_bid <= Decimal::ZERO || best_ask <= Decimal::ZERO {
+                continue;
+            }
+
+            let mid = (best_bid + best_ask) / Decimal::from(2);
+            let spread_bps = if mid > Decimal::ZERO {
+                ((best_ask - best_bid) / mid) * Decimal::from(10_000u32)
+            } else {
+                Decimal::ZERO
+            };
+
+            // VenueProduct covers dated futures + options that the
+            // config's `ProductType` does not — map to the nearest
+            // streamable kind so extras on those venues still
+            // publish (the data bus is display-only here, not a
+            // wallet/margin decision).
+            let stream_product = match product {
+                VenueProduct::Spot => mm_common::config::ProductType::Spot,
+                VenueProduct::LinearPerp | VenueProduct::UsdMarginedFuture => {
+                    mm_common::config::ProductType::LinearPerp
+                }
+                VenueProduct::InversePerp | VenueProduct::CoinMarginedFuture => {
+                    mm_common::config::ProductType::InversePerp
+                }
+                VenueProduct::Option => mm_common::config::ProductType::LinearPerp,
+            };
+
+            let key = (
+                format!("{:?}", venue).to_lowercase(),
+                symbol,
+                stream_product,
+            );
+            dash.data_bus().publish_l1(
+                key,
+                mm_dashboard::data_bus::BookL1Snapshot {
+                    bid_px: Some(best_bid),
+                    ask_px: Some(best_ask),
+                    mid: Some(mid),
+                    spread_bps: Some(spread_bps),
+                    ts: Some(chrono::Utc::now()),
+                },
+            );
+        }
+    }
+
     /// Epic A stage-2 #1 — automatic inline SOR dispatch
     /// tick. Computes a target `(side, qty, urgency)` from the
     /// configured [`mm_common::config::SorTargetSource`], fires
@@ -6014,6 +6109,21 @@ impl MarketMakerEngine {
             tokio::time::interval(tokio::time::Duration::from_secs(sor_queue_secs));
         sor_queue_refresh_interval.tick().await;
 
+        // UX-VENUE-1 gap close — periodic L1 poll for every
+        // `sor_extra_venues` connector so the Overview strip
+        // sees extras next to primary + hedge. `0` disables the
+        // interval entirely; non-zero values are clamped to at
+        // least 1 s so the interval is well-formed.
+        let sor_extra_l1_secs = self.config.market_maker.sor_extra_l1_poll_secs;
+        let sor_extra_l1_enabled =
+            sor_extra_l1_secs > 0 && !self.connectors.extra.is_empty();
+        let mut sor_extra_l1_interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(sor_extra_l1_secs.max(1)));
+        // Skip the first immediate tick so a fresh process doesn't
+        // race the primary book fetch by firing before any
+        // handshake has landed.
+        sor_extra_l1_interval.tick().await;
+
         self.cycle_start = Instant::now();
 
         loop {
@@ -6186,6 +6296,9 @@ impl MarketMakerEngine {
                 }
                 _ = sor_queue_refresh_interval.tick() => {
                     self.refresh_sor_queue_wait();
+                }
+                _ = sor_extra_l1_interval.tick(), if sor_extra_l1_enabled => {
+                    self.poll_extra_venues_for_data_bus().await;
                 }
                 _ = funding_arb_interval.tick(),
                     if self.funding_arb_driver.is_some() =>
@@ -15263,6 +15376,102 @@ mod stage2_track1_integration {
         // last_hedge_basket starts empty by default.
         engine.run_sor_dispatch_tick().await;
         assert_eq!(mock.place_single_calls(), 0);
+    }
+
+    // ---------------------------------------------------------
+    // UX-VENUE-1 gap close — periodic L1 poll for SOR extras
+    // ---------------------------------------------------------
+
+    /// A seeded extra-venue connector with a synthetic mid gets
+    /// its top-of-book republished onto `DataBus::books_l1`
+    /// under the `(venue, symbol, product)` key the
+    /// `/api/v1/venues/book_state` endpoint reads.
+    #[tokio::test]
+    async fn extra_venue_l1_poll_publishes_to_data_bus() {
+        // Primary: Binance spot BTCUSDT (auto-seeded by `new()`).
+        let binance = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        binance.set_mid(dec!(50_000));
+        // Extra: Bybit spot BTCUSDT with a distinct mid so we can
+        // tell them apart in the data bus snapshot.
+        let bybit = Arc::new(MockConnector::new(VenueId::Bybit, VenueProduct::Spot));
+        bybit.set_mid(dec!(50_020));
+        let bundle = ConnectorBundle {
+            primary: binance.clone() as Arc<dyn ExchangeConnector>,
+            hedge: None,
+            pair: None,
+            extra: vec![bybit.clone() as Arc<dyn ExchangeConnector>],
+        };
+        // Engine with a live dashboard so `publish_l1` actually
+        // writes into the bus we read afterwards.
+        let dash = mm_dashboard::state::DashboardState::new();
+        let mut engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            AppConfig::default(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            Some(dash.clone()),
+            None,
+        );
+        // Seed the aggregator for the extra so the poll can map
+        // `(venue, product) → symbol` back to the right book.
+        let seed = VenueSeed::new("BTCUSDT", sample_product("BTCUSDT"), dec!(1));
+        engine = engine.with_sor_venue(VenueId::Bybit, seed);
+
+        engine.poll_extra_venues_for_data_bus().await;
+
+        let key = (
+            "bybit".to_string(),
+            "BTCUSDT".to_string(),
+            mm_common::config::ProductType::Spot,
+        );
+        let snap = dash
+            .data_bus()
+            .get_l1(&key)
+            .expect("extra venue L1 should be on the bus after poll");
+        assert_eq!(snap.bid_px, Some(dec!(50_019)));
+        assert_eq!(snap.ask_px, Some(dec!(50_021)));
+        assert_eq!(snap.mid, Some(dec!(50_020)));
+        assert!(snap.ts.is_some(), "timestamp should be stamped");
+    }
+
+    /// A venue that's in `ConnectorBundle.extra` but NOT seeded
+    /// on the aggregator is skipped rather than inventing a
+    /// symbol from thin air.
+    #[tokio::test]
+    async fn extra_venue_l1_poll_skips_unseeded_extras() {
+        let binance = Arc::new(MockConnector::new(VenueId::Binance, VenueProduct::Spot));
+        binance.set_mid(dec!(50_000));
+        let bybit = Arc::new(MockConnector::new(VenueId::Bybit, VenueProduct::Spot));
+        bybit.set_mid(dec!(50_020));
+        let bundle = ConnectorBundle {
+            primary: binance as Arc<dyn ExchangeConnector>,
+            hedge: None,
+            pair: None,
+            extra: vec![bybit as Arc<dyn ExchangeConnector>],
+        };
+        let dash = mm_dashboard::state::DashboardState::new();
+        let engine = MarketMakerEngine::new(
+            "BTCUSDT".to_string(),
+            AppConfig::default(),
+            sample_product("BTCUSDT"),
+            Box::new(AvellanedaStoikov),
+            bundle,
+            Some(dash.clone()),
+            None,
+        );
+        // Deliberately do NOT call `with_sor_venue(VenueId::Bybit, …)`.
+        engine.poll_extra_venues_for_data_bus().await;
+
+        let bybit_key = (
+            "bybit".to_string(),
+            "BTCUSDT".to_string(),
+            mm_common::config::ProductType::Spot,
+        );
+        assert!(
+            dash.data_bus().get_l1(&bybit_key).is_none(),
+            "unseeded extra should not produce a bus entry"
+        );
     }
 
     // ---------------------------------------------------------

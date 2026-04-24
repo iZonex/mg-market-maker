@@ -98,6 +98,7 @@ fn make_config() -> MarketMakerConfig {
         sor_inventory_threshold: rust_decimal::Decimal::ZERO,
         sor_trade_rate_window_secs: 60,
         sor_queue_refresh_secs: 2,
+        sor_extra_l1_poll_secs: 5,
     }
 }
 
