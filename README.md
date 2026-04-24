@@ -21,9 +21,15 @@
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
 
+<p align="center">
+  <img src="docs/screenshot.png" alt="MG Market Maker dashboard — Overview page" width="820">
+</p>
+
 ---
 
 High-performance, multi-venue market making engine with institutional-grade risk management, toxicity detection, and MiCA compliance. `Decimal` arithmetic everywhere — never `f64` for money. 25 crates, 157K lines, 2241 tests.
+
+Runs as a **server + agent split**: one `mm-server` (controller + dashboard + vault) central, one or more `mm-agent` processes (trading engine) per colo / venue region. Single-machine dev = both on one host. Agents connect over mTLS-capable WebSocket, lease-gated, admission-controlled by the controller.
 
 ## Why MG?
 
@@ -63,6 +69,8 @@ Alpha pipeline: book imbalance, trade flow, microprice, OFI (Cont-Kukanov-Stoiko
 Regime detection: Quiet / Trending / Volatile / MeanReverting with per-regime auto-tuning. Pair-class templates: MajorSpot / AltSpot / MemeSpot / MajorPerp / AltPerp / StableStable with adaptive γ feedback loop.
 
 **[Writing custom strategies](docs/guides/writing-strategies.md)** — implement one trait, get order management, risk, PnL for free.
+
+Or skip the Rust entirely: the dashboard ships a **visual graph builder** (`StrategyPage`) — drag sources (book, trades, sentiment, onchain, risk metrics), wire math/stats/logic nodes, pick an `Out.*` sink, deploy to any agent. Live mode overlays per-tick values on the canvas; history lets you diff + rollback any prior deploy. See **[Graph Authoring](docs/guides/graph-authoring.md)**.
 </details>
 
 <details>
@@ -111,18 +119,20 @@ hyperliquid_spot + hyperliquid_perp` side-by-side).
 </details>
 
 <details>
-<summary><b>Dashboard & Auth</b> — Svelte 5, role-gated, audited, WCAG AA</summary>
+<summary><b>Dashboard & Auth</b> — Svelte 5, role-gated, audited, WCAG AA, fork-to-rebrand</summary>
 
 - **Svelte 5 runes** — modern reactivity (`$state`, `$derived`, `$effect`, `$props`)
-- **Role-based auth** — Admin / Operator / Viewer with HMAC-signed 24 h Bearer tokens + X-API-Key header
+- **Design system** — `tokens.css` (108 CSS variables) + `primitives/` (Button, Modal, Chip, StatusPill, FormField, DataGrid, EmptyState, StatTile). Every component is tokens-only — a design-system linter gates 8 invariants on every PR (no hex in primitives, no utility-class leaks, no product-name hardcodes)
+- **Fork-to-rebrand** — swap `branding.js` + `tokens.css` + `public/logo.svg` and you have a white-label dashboard. See [Rebranding guide](docs/guides/rebranding.md)
+- **Visual strategy builder** — drag-and-drop graph authoring with live-mode value overlay, replay vs deployed, version history + diff. `StrategyPage`, powered by `svelte-flow` + `strategy-graph` crate
+- **Fleet page** — every connected agent with approval state, lease TTL, deployments, retire + revoke flows, batch deploy
+- **Per-deployment drilldown** — adaptive state, kill ladder ops, feature flags, live tuning, funding-arb driver events, flatten preview with book-depth cover check
+- **Role-based auth** — Admin / Operator / Viewer / ClientReader; HMAC-signed 24h Bearer + X-API-Key header
 - **Login / logout audited** — `LoginSucceeded` / `LoginFailed` / `LogoutSucceeded` rows in MiCA trail with source IP + user_id / key prefix
-- **IP rate-limit on login** — 20/min per source IP to blunt credential stuffing
-- **Timing-equalization** on login failure — no trivial oracle on key membership
-- **Typed-echo kill confirmation** — operator must type `{symbol} {action}` (e.g. `BTCUSDT FLATTEN`) for L3/L4 destructive ops; 3-second cooldown with countdown before fire button arms
-- **Stale-data indicators** — every WS payload stamped with `_rx_ms`; `StaleBadge` component shows fresh (≤2s green) / stale (≤5s amber) / frozen (>5s red pulse)
-- **Symbol switcher** — header pills drive `activeSymbol` flowing to every panel
-- **Design tokens + WCAG AA** — centralised `tokens.css` for background, foreground, semantic, pair-class colours, 4pt spacing grid, typography scale; muted text passes AA contrast; `prefers-reduced-motion` handler; `:focus-visible` default ring on every interactive
-- **Adaptive panel** — live γ / pair class / feedback state per symbol
+- **IP rate-limit on login** — 20/min per source IP; timing-equalised response to deny key-membership oracle
+- **Typed-echo kill confirmation** — operator must type `{symbol} {action}` for L3/L4 destructive ops
+- **Stale-data indicators** — every WS payload stamped with `_rx_ms`; freshness pill shows fresh (≤2s green) / stale (≤5s amber) / frozen (>5s red pulse)
+- **WCAG AA** — muted text passes AA contrast; `prefers-reduced-motion` handler; `:focus-visible` default ring
 - **Preflight** — clock-skew (±500 ms / ±2000 ms budgets), rate-limit budget, venue server time, exchange info, balance sanity — fails live startup on hard errors
 </details>
 
@@ -156,8 +166,8 @@ hyperliquid_spot + hyperliquid_perp` side-by-side).
 ### 1. Build
 
 ```bash
-git clone https://github.com/mgmarket/market-maker.git
-cd market-maker
+git clone https://github.com/iZonex/mg-market-maker.git
+cd mg-market-maker
 cargo build --release
 ```
 
@@ -207,9 +217,11 @@ Pre-flight checks run automatically. If any fail in live mode, the system exits.
 
 ```bash
 docker compose up -d
-# Dashboard: http://localhost:9090/api/status
-# Prometheus: http://localhost:9091
-# Grafana: http://localhost:3000
+# Dashboard UI:     http://localhost:9090
+# Dashboard status: http://localhost:9090/api/v1/status
+# mm-agent WS:      ws://localhost:9091   (controller-facing only)
+# Prometheus:       http://localhost:9093
+# Grafana:          http://localhost:3000
 ```
 
 ## API Endpoints
@@ -276,28 +288,38 @@ Destructive operator endpoints (`/api/v1/ops/widen|stop|cancel-all|flatten|disco
 ## Architecture
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌────────────────┐
-│   Config     │────>│    Server     │────>│  Engine (xN)   │
-│  (TOML+env)  │     │  preflight   │     │  per symbol    │
-└─────────────┘     │  smoke test  │     │                │
-                    └──────┬───────┘     │  Book Keeper   │
-                           │             │  -> Strategy   │
-                    ┌──────v───────┐     │  -> Risk       │
-                    │  Dashboard   │     │  -> Orders     │
-                    │  HTTP + WS   │<────│  -> PnL/SLA    │
-                    │  Prometheus  │     │  -> Audit      │
-                    │  Telegram    │     └───────┬────────┘
-                    └──────────────┘             │
-                                         ┌──────v────────┐
-                                         │  Connectors   │
-                                         │  Binance      │
-                                         │  Bybit        │
-                                         │  HyperLiquid  │
-                                         │  Custom       │
-                                         └───────────────┘
+     Operator browser
+            │
+            ▼  HTTP + WS (token-auth, role-gated)
+┌─────────────────────────────────────┐
+│             mm-server                │
+│  ┌────────────┐  ┌────────────────┐  │
+│  │ Controller │  │   Dashboard    │  │
+│  │  • fleet    │  │  • UI + state  │  │
+│  │  • vault    │  │  • /api/v1/*   │  │
+│  │  • approvals│  │  • Prometheus  │  │
+│  │  • tunables │  │  • Telegram    │  │
+│  └─────┬──────┘  └────────────────┘  │
+│        │ agent WS (lease, admission) │
+└────────┼─────────────────────────────┘
+         │
+    ┌────┴──────┬──────────┬───────────┐
+    ▼           ▼          ▼           ▼
+┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+│mm-agent│ │mm-agent│ │mm-agent│ │mm-agent│
+│  eu-01 │ │  us-01 │ │  ap-01 │ │ smoke  │
+│  engine│ │  engine│ │  engine│ │  engine│
+└───┬────┘ └───┬────┘ └───┬────┘ └───┬────┘
+    │          │          │          │
+    ▼          ▼          ▼          ▼
+   Binance   Bybit    HyperLiquid   Custom
 ```
 
-**[Full architecture guide](docs/guides/architecture.md)** — data flow, crate graph, persistence layout.
+- **mm-server** — controller + dashboard. Serves UI, holds vault, manages agent lifecycle (admission → lease → deploy → revoke), owns the auth surface. No engine.
+- **mm-agent** — trading engine. Pulls credentials + strategy graph from controller, keeps its own book + risk + audit, publishes telemetry back. One agent per colo / venue region / tenant.
+- **Single-machine dev** = one `mm-server` + one `mm-agent` on the same host. **Distributed** = central server, many agents.
+
+**[Full architecture guide](docs/guides/architecture.md)** — data flow, crate graph, persistence layout, distributed mode details.
 
 ## Write Your Own Strategy
 
@@ -352,24 +374,40 @@ daily_loss_limit = 1000
 
 ```
 crates/
-  server/          Entry point, preflight, smoke test, config validation
-  engine/          Main event loop, order manager, book keeper, rebalancer, health
-  strategy/        6 strategies + A/B split + autotune + momentum + indicators
-  risk/            Kill switch, VPIN, VaR, portfolio risk, audit, SLA, PnL, reconciliation
+  server/          mm-server binary — controller + dashboard composition
+  controller/      Agent admission, vault, lease, approvals, deploy dispatch
+  agent/           mm-agent binary — engine runner, credential pull, telemetry push
+  control/         Shared WS envelope, identity, lease, messages (server↔agent)
+  engine/          Main event loop, order manager, book keeper, SOR, reconciliation
+  strategy/        Avellaneda/GLFT/Grid/Basis/XEMM/FundingArb/StatArb/PairedUnwind
+  strategy-graph/  Visual graph builder runtime — nodes, evaluator, templates
+  risk/            Kill switch, VPIN, VaR, portfolio risk, audit, SLA, PnL, surveillance
   exchange/
     core/          ExchangeConnector trait, SOR, rate limiter
-    binance/       Binance spot + futures
-    bybit/         Bybit V5
-    hyperliquid/   HyperLiquid (EIP-712)
+    binance/       Binance spot + USDM futures
+    bybit/         Bybit V5 spot + linear + inverse
+    hyperliquid/   HyperLiquid (EIP-712 / k256)
     client/        Custom exchange
   dashboard/       HTTP API, Prometheus, Telegram, webhooks, MiCA reports
-  portfolio/       Multi-currency position + PnL aggregation
-  persistence/     Checkpoint, fill replay, loan store, transfer log
-  backtester/      Simulator, fill models, event recorder, demo data, hyperopt
+  portfolio/       Multi-currency position + PnL aggregation, cross-venue
+  persistence/     Checkpoint, fill replay, loan store, transfer log, funding
+  backtester/      Simulator, fill models, event recorder, demo data, stress
   protocols/       WS-RPC, FIX 4.4 (shared transport layers)
   indicators/      SMA, EMA, HMA, RSI, ATR, Bollinger, candles
+  sentiment/       News feeds, LLM classifiers, per-ticker sentiment ticks
+  onchain/         Alchemy / Etherscan / Moralis holder + flow trackers
   hyperopt/        Random search, differential evolution, calibration
+frontend/
+  src/lib/
+    primitives/    Design-system primitives (Button, Modal, Chip, …)
+    tokens.css     108 CSS variables — fork-and-edit to rebrand
+    components/    Feature components grouped by page surface
+    pages/         Route-level pages (Fleet, Strategy, Vault, …)
 ```
+
+The dashboard is a **fork-to-rebrand Svelte 5 app**: `tokens.css` +
+`branding.js` + `public/logo.svg` are the three files to swap. See
+**[Rebranding](docs/guides/rebranding.md)**.
 
 ## Benchmarks
 
@@ -387,9 +425,13 @@ cargo bench -p mm-strategy
 ## Testing
 
 ```bash
-cargo test                                    # 1431 tests
+cargo test --all                              # 2241 tests
 cargo clippy --all-targets -- -D warnings     # zero warnings
+cargo fmt --all -- --check                    # style clean
 cargo bench -p mm-strategy                    # strategy benchmarks
+cargo build -p mm-server --features otel      # OTel feature build
+scripts/distributed-smoke.sh                  # 3-min server+agent smoke
+scripts/lint-design-system.sh                 # 8 frontend invariants
 ```
 
 ## Documentation
@@ -446,7 +488,7 @@ cargo bench -p mm-strategy                    # strategy benchmarks
 2. Create a feature branch (`git checkout -b feat/my-feature`)
 3. Add tests for new functionality
 4. Ensure `cargo clippy --all-targets -- -D warnings` passes
-5. Ensure `cargo test` passes (2241+ tests)
+5. Ensure `cargo test --all` passes (2241 tests)
 6. Open a PR with a clear description
 
 See **[CONTRIBUTING.md](CONTRIBUTING.md)** for coding style, commit conventions, and review checklist.
