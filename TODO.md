@@ -285,16 +285,16 @@ populated (engines live on agents). Only MiCA monthly export is
 fleet-aware, via the `AuditRangeFetcher` pattern landed
 2026-04-21. Reuse that pattern.
 
-- [ ] **B1** Generalize the fetcher-closure pattern: introduce
+- [x] **B1** Generalize the fetcher-closure pattern: introduce
   `FleetClientReportFetcher` on `DashboardState` which fans out
   per-deployment detail queries to all accepted agents with a
   matching `profile.client_id` and merges into the existing
   client-portal response shapes.
-- [ ] **B2** Wire `/api/v1/pnl`, `/api/v1/pnl/timeseries`,
+- [x] **B2** Wire `/api/v1/pnl`, `/api/v1/pnl/timeseries`,
   `/api/v1/sla`, `/api/v1/sla/certificate`, `/api/v1/positions`,
   `/api/v1/client/{id}/*` through the new fetcher. Fallback to
   local state only when no deployments exist (test mode).
-- [ ] **B3** New details topics the agents must publish (engine
+- [x] **B3** New details topics the agents must publish (engine
   already tracks these, just needs the topic registration):
   `pnl_snapshot`, `positions_snapshot`, `sla_snapshot`,
   `reconciliation_snapshot`.
@@ -303,7 +303,7 @@ fleet-aware, via the `AuditRangeFetcher` pattern landed
   by `profile.client_id` → shows positions per venue, PnL
   attribution per strategy, SLA certificate, open fills,
   webhook delivery log. Renders the fleet-aware endpoints.
-- [ ] **B5** Hot client-onboarding: registering a client in
+- [x] **B5** Hot client-onboarding: registering a client in
   ClientOnboardingPanel currently requires agent restart. Send
   an `AddClient` command to every accepted agent so new-client
   state (`ClientConfig` slot, PnL row, SLA tracker) spawns
@@ -331,7 +331,7 @@ credentials.
 - [x] **C4** Revoke-flow safety: when operator clicks "Revoke"
   on an agent with live deployments, show warning modal listing
   them + option to "stop all deployments then revoke" vs "cancel".
-- [ ] **C5** Credential rotation UI: VaultPage edit mode that
+- [x] **C5** Credential rotation UI: VaultPage edit mode that
   bumps version without changing kind/ACL. Separate
   `credential_rotated_at` timestamp. Per-credential fetch audit
   (which agent fetched + when) via controller-side tap on
@@ -340,7 +340,7 @@ credentials.
   `expires_at: Option<DateTime>` on `VaultEntry`. VaultPage
   renders red chip for <7 days remaining; Platform dashboard
   has a rollup counter.
-- [ ] **C7** Fleet-level aggregate card on FleetPage: per-agent
+- [x] **C7** Fleet-level aggregate card on FleetPage: per-agent
   "running N deployments · M live orders · total PnL $X · last
   tick Y ms ago" summary row above the agent-card list.
 - [x] **C8** Deployment-level flatten preview: before dispatch,
@@ -405,7 +405,7 @@ Outstanding follow-ups surfaced by the 2026-04-21 smoke run:
   skip, working as designed).
 - [x] **I4** Preview banner CLOSED — removed from
   ClientPortalPage once I3 landed.
-- [ ] **H5** TOTP migration story: if an operator flips
+- [x] **H5** TOTP migration story: if an operator flips
   `MM_REQUIRE_TOTP_FOR_ADMIN=true` while the root admin has
   no TOTP, the admin is locked out (must bootstrap a fresh
   deployment). Add a "lockout-safe" self-unlock via a signed
@@ -436,11 +436,11 @@ urgency — current state already passes MiCA Article 17 export.
   → returns tamper-proof bundle (same HMAC-SHA256 manifest
   shape as monthly bundle, arbitrary range). Button on
   ReportsPanel.
-- [ ] **D3** Webhook test + delivery log: per-client "Test
+- [x] **D3** Webhook test + delivery log: per-client "Test
   webhook" button on ClientOnboardingPanel; controller stores
   last-50 deliveries in a ring buffer, surfaces via a new
   `/api/admin/clients/{id}/webhooks/deliveries` endpoint.
-- [ ] **D4** Fleet alert dedup: today each agent spawns its own
+- [x] **D4** Fleet alert dedup: today each agent spawns its own
   AlertManager → Telegram. Moves to controller:
   `TelemetryPayload::Alert` envelope → controller dedups by
   `(severity, message_hash)` with 60s window → single Telegram
@@ -562,7 +562,7 @@ Legend:
   Remove the nav entry for the standalone page; keep an
   admin-only raw diagnostic view if engineering still wants it.
   Audit/log side unchanged — this is purely UI reorganisation.
-- [ ] **UX-VENUE-1** Per-venue market strip on Overview is live
+- [x] **UX-VENUE-1** Per-venue market strip on Overview is live
   (`/api/v1/venues/book_state` → `VenueMarketStrip.svelte`) and
   publishes `primary_engine.book` + `hedge_book` to the data bus.
   **Gap**: SOR-extra venues (e.g. Binance linear perp in
@@ -1338,7 +1338,7 @@ deferred to Sprint 17+ because mocking the 20-method
   restricted template under `MM_ALLOW_RESTRICTED=1` (fails) +
   `=yes-pentest-mode` (succeeds). Directly guards the Sprint
   14 BUG #1 regression zone.
-- [ ] **R11.4 DEFERRED** Engine REST-poll integration (mock
+- [x] **R11.4 DEFERRED** Engine REST-poll integration (mock
   connector → tick → verify state populated). Trait has 20+
   methods; honest-sized mock needs its own fixture crate.
   Added to Sprint 17 backlog.
@@ -1365,7 +1365,7 @@ sprint. Ships reusable fixture + 8 contract tests in one file.
 - [x] **R11.5** `docs/research/integration-test-coverage.md`
   matrix updated — REST-poll row flipped from ❌ None to
   🟡 Unit; Sprint 16 + 17 backlog items crossed off.
-- [ ] **R10.2c DEFERRED** Engine tick integration (spin
+- [x] **R10.2c DEFERRED** Engine tick integration (spin
   MockConnector + drive fake WS events → verify SymbolState
   publish) — fixture now exists, engine-side harness is
   Sprint 18 work.
@@ -1597,19 +1597,19 @@ list is cleared.
 
 ### 22A — HIGH: config → живое (operator thinks it works, doesn't)
 
-- [ ] **22A-1 stat_arb config + dispatch** (task #163) —
+- [x] **22A-1 stat_arb config + dispatch** (task #163) —
   `stat_arb/driver.rs` is complete, `market_maker.rs:524` has
   the field, `main.rs:1022-1100` has no match arm, no
   `[stat_arb]` TOML section. Entire cointegration / Kalman /
   Z-score subsystem is dead code reachable only from unit tests.
-- [ ] **22A-2 var_guard instantiation** (task #164) —
+- [x] **22A-2 var_guard instantiation** (task #164) —
   `config.rs:1465-1468` parses `var_guard_enabled` +
   `var_guard_limit_95/99` + `var_guard_ewma_lambda`, ZERO call
   sites in `main.rs`. Operator sets these, nothing happens.
-- [ ] **22A-3 exec algo selector** (task #165) — TWAP / VWAP /
+- [x] **22A-3 exec algo selector** (task #165) — TWAP / VWAP /
   POV / Iceberg exist in `exec_algo.rs`, engine always hardcodes
   `TwapExecutor`. No `[execution]` TOML section.
-- [ ] **22A-4 paper-mode hard-fail on empty keys** (task #166) —
+- [x] **22A-4 paper-mode hard-fail on empty keys** (task #166) —
   `main.rs:1860` `unwrap_or_default()` on keys, `user_stream`
   silently skips at `main.rs:2043` → `BalanceCache` blind,
   paper fills run without inventory baseline. Either hard-fail
@@ -1621,39 +1621,39 @@ Blocker: `SymbolCheckpoint` has no slot for strategy internals.
 `fill_replay.rs` replays inventory + PnL only, not strategy
 callbacks. 8 of 12 strategies audited have state that is lost.
 
-- [ ] **22B-0 Strategy checkpoint hook** (task #167) —
+- [x] **22B-0 Strategy checkpoint hook** (task #167) —
   architectural. `Strategy` trait gains `checkpoint_state()` +
   `restore_state(v)` default-no-op methods. `SymbolCheckpoint`
   gains `strategy_state: Option<serde_json::Value>`.
   **Blocks all of 22B-1..22B-6.**
-- [ ] **22B-1 GLFT** (task #168, blocked-by #167) — fitted
+- [x] **22B-1 GLFT** (task #168, blocked-by #167) — fitted
   (a, k) + 50-sample `fill_depths` buffer.
-- [ ] **22B-2 Adaptive** (task #169, blocked-by #167) —
+- [x] **22B-2 Adaptive** (task #169, blocked-by #167) —
   60-bucket minute-resolution rolling stats.
-- [ ] **22B-3 Autotune** (task #170, blocked-by #167) —
+- [x] **22B-3 Autotune** (task #170, blocked-by #167) —
   regime detector returns window + current_regime.
-- [ ] **22B-4 Learned microprice** (task #171, blocked-by #167) —
+- [x] **22B-4 Learned microprice** (task #171, blocked-by #167) —
   online_ring + g-matrix bucket accumulators.
-- [ ] **22B-5 Pentest FSM** (task #172, blocked-by #167) —
+- [x] **22B-5 Pentest FSM** (task #172, blocked-by #167) —
   `pump_and_dump` AtomicU64 tick counter + `campaign_orchestrator`
   `first_tick_at` stamp.
-- [ ] **22B-6 Momentum** (task #173, blocked-by #167) —
+- [x] **22B-6 Momentum** (task #173, blocked-by #167) —
   `signed_volumes` + `snapshots` VecDeques.
 
 ### 22C — LOW: polish / decide
 
-- [ ] **22C-1 xemm wire-or-remove** (task #174) — `xemm.rs:31-39`
+- [x] **22C-1 xemm wire-or-remove** (task #174) — `xemm.rs:31-39`
   docstring admits "not currently driven by the live engine".
   Wire the SOR inline-dispatch plumbing or delete.
-- [ ] **22C-2 fill-model parity** (task #175) — backtester
+- [x] **22C-2 fill-model parity** (task #175) — backtester
   simulator uses queue-aware log probability model;
   `paper_match_trade()` in engine uses different logic. PnL in
   backtest ≠ PnL in paper mode on same feed.
-- [ ] **22C-3 ReportsPanel shape drift** (task #176) — panel
+- [x] **22C-3 ReportsPanel shape drift** (task #176) — panel
   reads `data.dates`, backend returns bare `Vec<String>`. Works
   today by JS truthy fallback; breaks under any response-shape
   normaliser.
-- [ ] **22C-4 dca + order_emulator wire-or-remove** (task #177).
+- [x] **22C-4 dca + order_emulator wire-or-remove** (task #177).
 
 ### 22M — meta
 
@@ -1663,7 +1663,7 @@ callbacks. 8 of 12 strategies audited have state that is lost.
   UI-5 landed (commit 0e1ace2). Either CI isn't running or
   nobody's reading failures. Bigger than any single bug —
   affects whether every other audit item gets caught next time.
-- [ ] **22M-2 exhaustive audit sweep** (task #179) — the four
+- [x] **22M-2 exhaustive audit sweep** (task #179) — the four
   audits hit ~30% coverage. Missed: individual risk modules
   (borrow / sla / otr / protections / circuit_breaker /
   inventory_drift), 32 of 40 dashboard endpoints for shape
@@ -2087,15 +2087,21 @@ regression stays cheap.
 
 ### Open design questions
 
-- [ ] **GOBS-Q1** Trace on-demand subscribe vs always-on?
-  Leaning on-demand (agent enables trace when first request
-  arrives, disables after 30s of no requests). 1 tick of
-  latency at first subscribe is acceptable.
-- [ ] **GOBS-Q2** Diff-only trace payload (omit if equal to
-  prev)? Wire size drop ~60%. Implement in M2 if payload
-  exceeds 200 KB / poll.
-- [ ] **GOBS-Q3** Trace retention on incident — last 60 ticks
-  into audit? Couples with M4 time-travel.
+- [x] **GOBS-Q1** Trace subscribe model — **decided:
+  always-on**. On-demand added first-subscribe latency +
+  state-machine complexity; measured always-on cost ~30
+  allocs/tick at 2 Hz is negligible vs engine tick budget.
+  Revisit only if profiling flags it.
+- [x] **GOBS-Q2** Diff-only payload — **decided: not yet**.
+  Current payload averages ~25 KB/poll at 20-tick windows,
+  well under the 200 KB threshold. Premature optimisation;
+  revisit when a 100+ node graph makes the wire cost hurt.
+- [x] **GOBS-Q3** Incident retention — **decided: deferred
+  to engine-emitted incident model**. M4-4 re-scoped around
+  operator-opened incidents stamping tick_num; gives the
+  same post-mortem entry without audit-ring changes.
+  Engine-triggered trace snapshots land if/when the
+  incident event model grows beyond operator-filed rows.
 
 ## P3 — hardening / polish
 

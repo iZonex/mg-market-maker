@@ -318,6 +318,19 @@ impl AuthState {
         self.users.read().map(|g| g.is_empty()).unwrap_or(true)
     }
 
+    /// H5 GOBS — boot-time preflight for the TOTP hard-gate.
+    /// Returns true if at least one admin user has an active
+    /// `totp_secret` enrolled. The server uses this to refuse
+    /// booting under `MM_REQUIRE_TOTP_FOR_ADMIN=true` when
+    /// nobody can satisfy the 2FA check, preventing an
+    /// auth-layer lockout.
+    pub fn any_admin_has_totp(&self) -> bool {
+        let Ok(guard) = self.users.read() else { return false };
+        guard
+            .values()
+            .any(|u| matches!(u.role, Role::Admin) && u.totp_secret.is_some())
+    }
+
     /// Attach an audit sink — login / logout events will be
     /// mirrored into the `AuditLog` so the MiCA trail captures
     /// who logged in from where and when. Optional: when not
@@ -1804,6 +1817,34 @@ mod tests {
             allowed_symbols: None,
             client_id: None,
         }
+    }
+
+    /// H5 GOBS — preflight is false until an admin enrols TOTP
+    /// and true thereafter. An operator-role user with TOTP
+    /// enrolled should NOT count (lockout is only about admin).
+    #[test]
+    fn any_admin_has_totp_flips_on_admin_enrolment() {
+        let auth = AuthState::new("0123456789abcdef0123456789abcdef");
+        // Fresh store: no admins, no TOTP → false.
+        assert!(!auth.any_admin_has_totp());
+
+        let mut admin = user("k-admin", Role::Admin);
+        auth.add_user(admin.clone());
+        // Admin exists but no TOTP → still false.
+        assert!(!auth.any_admin_has_totp());
+
+        // Operator with TOTP → doesn't count for admin-lockout.
+        let mut op = user("k-operator", Role::Operator);
+        op.totp_secret = Some("JBSWY3DPEHPK3PXP".into());
+        auth.add_user(op);
+        assert!(!auth.any_admin_has_totp());
+
+        // Arm TOTP on the admin via the same code path
+        // `totp_verify` hits — direct field write via add_user
+        // replaces the record.
+        admin.totp_secret = Some("JBSWY3DPEHPK3PXP".into());
+        auth.add_user(admin);
+        assert!(auth.any_admin_has_totp());
     }
 
     #[test]

@@ -1611,12 +1611,14 @@ impl MarketMakerEngine {
     /// Grid / CrossExchange), `Some(json)` for GLFT / PumpAndDump
     /// / Campaign after their 22B-1/5 landings.
     ///
-    /// **NOTE**: the per-tick checkpoint writer is not wired in
-    /// this crate — the server's `CheckpointManager` at
-    /// `main.rs:92` is flushed only at shutdown, and
-    /// `update_symbol` is never called during runtime. Wiring
-    /// that loop is a separate task (22C-5); this accessor is
-    /// the hook the future loop calls into.
+    /// Wire-up note (23-P1-1): this accessor is called from the
+    /// engine's 30 s checkpoint tick in `refresh_quotes`, which
+    /// composes a `SymbolCheckpoint` and routes it through
+    /// `DashboardState::publish_symbol_checkpoint` →
+    /// `CheckpointManager::update_symbol`. An earlier revision
+    /// of this comment claimed the trigger was never called —
+    /// that was true for one audit window and has since been
+    /// wired end-to-end.
     pub fn strategy_checkpoint_state(&self) -> Option<serde_json::Value> {
         self.strategy.checkpoint_state()
     }

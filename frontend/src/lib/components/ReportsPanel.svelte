@@ -46,8 +46,13 @@
     loading = true
     error = ''
     try {
+      // Backend returns a bare `Vec<String>` (date strings). The
+      // previous `(data.dates || data || [])` chain worked by JS
+      // truthy-fallback but would break under any upstream shape
+      // normaliser that returns `{dates: []}` for empty lists.
+      // Shape-contract fix: trust the array, guard against null.
       const data = await api.getJson('/api/v1/report/history')
-      history = (data.dates || data || []).slice(0, 30)
+      history = (Array.isArray(data) ? data : []).slice(0, 30)
     } catch (e) {
       error = e?.message || String(e)
     } finally {

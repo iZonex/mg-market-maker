@@ -27,18 +27,20 @@
 //!
 //! ## Integration status
 //!
-//! `XemmExecutor` is library-complete and re-exported from
-//! `mm_strategy` for SDK consumers. It is **not** currently driven
-//! by the live engine because the shipping `CrossExchangeStrategy`
-//! (which *does* run end-to-end once wired via
-//! `StrategyType::CrossExchange`) does not yet observe hedge-leg
-//! fills through the engine's event loop — the dual-connector
-//! fill router threads primary fills into the `OrderManager` but
-//! a hedge dispatch on a separate connector requires the SOR
-//! inline dispatch plumbing from Epic A stage-2 (see
-//! `docs/research/production-mm-state-of-the-art.md`).
+//! `XemmExecutor` is driven by the engine's fill hot-path —
+//! `market_maker.rs` around line 7926 calls `on_maker_fill` on
+//! every primary-venue fill when both `hedge_book` and a
+//! `hedge` connector are attached (`[xemm].enabled = true` +
+//! dual-venue credentials). The `XemmDecision` is dispatched
+//! fire-and-forget on a spawned task because the fill handler
+//! itself is synchronous.
 //!
-//! When that stage-2 lands, the wire-up becomes:
+//! The legacy text here claimed "not currently driven" — that
+//! was true during the Epic A stage-2 gap but superseded when
+//! SOR inline dispatch landed. Library is the same shape; the
+//! only change was the plumbing on the engine side.
+//!
+//! The reference wire-up for SDK consumers remains:
 //!
 //! 1. On `MarketEvent::Fill` from the primary connector, call
 //!    `executor.on_maker_fill(fill)`.

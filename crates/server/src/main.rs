@@ -243,6 +243,35 @@ async fn main() -> Result<()> {
         .unwrap_or(false);
     if require_totp_admin {
         info!("admin login hardened: TOTP required (MM_REQUIRE_TOTP_FOR_ADMIN)");
+        // H5 GOBS — lockout-safe preflight. When the hard-gate
+        // is armed but NO admin user has a TOTP secret enrolled,
+        // every admin login will fail the 2FA check and nobody
+        // can reach the dashboard to enrol. We refuse to start
+        // in that state — the operator's only options are (a)
+        // roll back the env flag, (b) run the binary once with
+        // MM_REQUIRE_TOTP_ADMIN_BYPASS=yes-i-understand so they
+        // can log in, enrol TOTP, log out, then remove the
+        // bypass + restart. Fail-stop at boot is strictly
+        // safer than bricking the auth surface mid-session.
+        let bypass = std::env::var("MM_REQUIRE_TOTP_ADMIN_BYPASS")
+            .ok()
+            .map(|v| v.trim() == "yes-i-understand")
+            .unwrap_or(false);
+        let any_admin_has_totp = auth_state.any_admin_has_totp();
+        if !any_admin_has_totp && !auth_state.needs_bootstrap() && !bypass {
+            return Err(anyhow::anyhow!(
+                "MM_REQUIRE_TOTP_FOR_ADMIN is set but no admin user has TOTP enrolled. \
+                 Starting would lock every admin out. Fix by:\n  \
+                 1. unset MM_REQUIRE_TOTP_FOR_ADMIN, restart, log in, enrol TOTP, restart with the flag; OR\n  \
+                 2. set MM_REQUIRE_TOTP_ADMIN_BYPASS=yes-i-understand for a single recovery run, enrol TOTP, then remove the bypass.",
+            ));
+        }
+        if bypass {
+            warn!(
+                "MM_REQUIRE_TOTP_ADMIN_BYPASS active — TOTP gate is soft for this boot; \
+                 enrol TOTP on the admin user, log out, remove the bypass env, restart.",
+            );
+        }
     }
     auth_state = auth_state.with_require_totp_for_admin(require_totp_admin);
     if auth_state.needs_bootstrap() {
