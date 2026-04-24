@@ -227,6 +227,13 @@ jobs:
             # real credentials.
             tmp=$(mktemp -d)
             envsubst < deploy/alertmanager/alertmanager.yml > "$tmp/alertmanager.yml"
+            # The prom/alertmanager image runs as UID 65534
+            # (nobody). `mktemp -d` creates 0700 by default so the
+            # in-container user can't stat the mount — widen perms
+            # before the docker run rather than `--user 0:0`
+            # (amtool checks file ownership inside the container).
+            chmod 0755 "$tmp"
+            chmod 0644 "$tmp/alertmanager.yml"
             docker run --rm -v "$tmp:/cfg" prom/alertmanager:latest \
               --config.file=/cfg/alertmanager.yml --help >/dev/null 2>&1 || true
             # Use amtool for actual config validation.
