@@ -8,14 +8,15 @@
    *     snapshot (features / variables / regime / kill_level / γ …)
    *   - the `onPatch` adaptor that hits
    *     `PATCH /api/v1/agents/{agent_id}/deployments/{deployment_id}/variables`
-   *     and optimistically merges the patch into the local row so
-   *     the UI doesn't flicker while the next telemetry sample
-   *     catches up.
+   *     and optimistically merges the patch into the local row
+   *     so the UI doesn't flicker while the next telemetry
+   *     sample catches up.
+   *   - flatten-preview (L4) and file-incident side modals.
    *
-   * The drilldown itself is just the container. The four panels
-   * (FeatureStatusPanel, AdaptivePanel, ConfigViewer, ParamTuner)
-   * each take a thin `{ row, onPatch, canControl }` contract and
-   * render a slice of the row.
+   * The actual panels (FeatureStatusPanel, AdaptivePanel,
+   * ConfigViewer, ParamTuner) take a `{ row, onPatch, canControl }`
+   * contract; the ops ladder, funding-arb section, and flatten
+   * modal live in ./drilldown/*.
    */
 
   import { untrack } from 'svelte'
@@ -26,6 +27,9 @@
   import ParamTuner from './ParamTuner.svelte'
   import Icon from './Icon.svelte'
   import { Button } from '../primitives/index.js'
+  import OpsLadder from './drilldown/OpsLadder.svelte'
+  import FundingArbPanel from './drilldown/FundingArbPanel.svelte'
+  import FlattenPreviewModal from './drilldown/FlattenPreviewModal.svelte'
 
   let {
     auth,
@@ -39,17 +43,11 @@
 
   const POLL_MS = 2_000
 
-  // `deployment` is the initial snapshot passed in when the
-  // drilldown opens; the modal owns `row` from there, with
-  // refresh() merging in fresh telemetry.
   let row = $state(untrack(() => deployment))
   let error = $state(null)
   let lastFetch = $state(null)
   let patchStatus = $state(null)
 
-  // Funding-arb recent-event ring buffer, fetched on-demand
-  // from the controller's details endpoint when the
-  // funding-arb section is visible.
   let fundingEvents = $state([])
   let fundingEventsError = $state(null)
   let fundingEventsLoading = $state(false)
@@ -60,19 +58,17 @@
     try {
       const fleetData = await api.getJson('/api/v1/fleet')
       const agentRow = Array.isArray(fleetData)
-        ? fleetData.find(a => a.agent_id === agent.agent_id)
+        ? fleetData.find((a) => a.agent_id === agent.agent_id)
         : null
       const depRow = agentRow?.deployments?.find(
-        d => d.deployment_id === deployment.deployment_id
+        (d) => d.deployment_id === deployment.deployment_id,
       )
       if (depRow) {
         row = depRow
         error = null
       } else {
-        // The deployment vanished on the agent side (stopped /
-        // reconcile dropped it). Keep last snapshot visible but
-        // surface the divergence so the operator knows the
-        // drilldown is stale.
+        // Deployment vanished (stopped / reconcile dropped it).
+        // Keep last snapshot visible but surface the divergence.
         error = 'deployment no longer in fleet snapshot'
       }
       lastFetch = new Date()
@@ -111,8 +107,6 @@
 
   // Auto-load the funding-arb events drawer once any driver
   // counter is non-zero OR the driver is currently engaged.
-  // Cheaper than polling — operator can click refresh to pull
-  // a fresher page.
   let fundingEventsEverLoaded = $state(false)
   $effect(() => {
     const hasActivity = (row?.funding_arb_active)
@@ -126,15 +120,6 @@
     }
   })
 
-  /**
-   * Fire an operational command at this specific deployment.
-   * `op` is the path segment of the canonical per-deployment
-   * ops endpoint (widen / stop / cancel-all / flatten /
-   * disconnect / reset / pause / resume / emulator-register /
-   * emulator-cancel / dca-start / dca-cancel / graph-swap).
-   * `body` carries optional `{reason, spec, id, graph}`. We
-   * surface the result in the same status banner as PATCH.
-   */
   async function onOp(op, body = {}) {
     patchStatus = { phase: 'sending', keys: [op] }
     try {
@@ -149,8 +134,6 @@
         throw new Error(`${r.status} ${text}`)
       }
       patchStatus = { phase: 'ok', applied: [op] }
-      // Kick a refresh so the new state (e.g. kill_level) shows
-      // up immediately rather than waiting for the next poll.
       refresh()
     } catch (e) {
       patchStatus = { phase: 'err', error: e?.message || String(e) }
@@ -173,8 +156,6 @@
     await onOp(op, { reason })
   }
 
-  // Wave C8 — flatten-preview modal state. `phase` drives
-  // render; `data` is the parsed details reply.
   let flattenPreview = $state(null)
 
   async function openFlattenPreview() {
@@ -185,7 +166,7 @@
       const r = await api.getJson(path)
       flattenPreview = { phase: 'confirm', data: r?.payload || null, reason: 'operator flatten (L4)' }
     } catch (e) {
-      flattenPreview = { phase: 'err', data: null, error: e?.message || String(e) }
+      flattenPreview = { phase: 'err', data: null, error: e?.message || String(e), reason: '' }
     }
   }
 
@@ -197,15 +178,14 @@
     flattenPreview = null
   }
 
-  function closeFlattenPreview() {
-    flattenPreview = null
+  function closeFlattenPreview() { flattenPreview = null }
+  function updateFlattenReason(v) {
+    if (flattenPreview) flattenPreview = { ...flattenPreview, reason: v }
   }
 
   // M4-4 GOBS — file an incident stamped with the deployment's
   // latest graph tick. Reads `graph_trace_recent?limit=1` so the
-  // incident row later opens the live canvas at the exact frame
-  // the operator filed against. No form: category + detail
-  // autogenerate from kill_level / graph hash / symbol.
+  // incident row later opens the live canvas at the exact frame.
   let incidentBusy = $state(false)
   async function fileIncident() {
     if (incidentBusy) return
@@ -249,13 +229,12 @@
 
   /**
    * Ship a patch map (`{ gamma: "0.02", momentum_enabled: false }`)
-   * at the agent. The controller validates admission + forwards
-   * to the agent; the agent's registry merges into the variables
-   * snapshot and — when the deployment supports hot-reload —
-   * translates recognised keys into ConfigOverride variants.
+   * at the agent. The controller validates + forwards; the agent's
+   * registry merges into the variables snapshot and — when the
+   * deployment supports hot-reload — translates recognised keys
+   * into ConfigOverride variants.
    *
-   * Optimistically merges into the local `row.variables` so the
-   * UI reflects the change before the next telemetry tick.
+   * Optimistically merges into the local `row.variables`.
    */
   async function onPatch(patch) {
     if (!patch || Object.keys(patch).length === 0) return
@@ -272,18 +251,10 @@
         throw new Error(`${r.status} ${text}`)
       }
       const body = await r.json().catch(() => ({}))
-      // Optimistic merge — next `refresh()` will overwrite with
-      // the authoritative agent snapshot if translation landed.
       if (row) {
-        row = {
-          ...row,
-          variables: { ...(row.variables || {}), ...patch },
-        }
+        row = { ...row, variables: { ...(row.variables || {}), ...patch } }
       }
-      patchStatus = {
-        phase: 'ok',
-        applied: body.patched_fields ?? Object.keys(patch),
-      }
+      patchStatus = { phase: 'ok', applied: body.patched_fields ?? Object.keys(patch) }
     } catch (e) {
       patchStatus = { phase: 'err', error: e?.message || String(e) }
     }
@@ -295,12 +266,20 @@
   }
 
   const title = $derived(
-    `${row?.template || 'deployment'} · ${row?.symbol || deployment.symbol}`
+    `${row?.template || 'deployment'} · ${row?.symbol || deployment.symbol}`,
   )
   const subtitle = $derived(
-    [row?.venue, row?.product, row?.mode]
-      .filter(Boolean)
-      .join(' · ') || deployment.deployment_id
+    [row?.venue, row?.product, row?.mode].filter(Boolean).join(' · ')
+      || deployment.deployment_id,
+  )
+
+  const showFundingArb = $derived(
+    row?.funding_arb_active
+      || row?.funding_arb_entered
+      || row?.funding_arb_exited
+      || row?.funding_arb_taker_rejected
+      || row?.funding_arb_pair_break
+      || row?.funding_arb_pair_break_uncompensated,
   )
 </script>
 
@@ -316,22 +295,22 @@
     <div class="head-actions">
       {#if onOpenGraphLive && row?.active_graph?.name}
         <Button variant="ghost" size="sm" onclick={() => onOpenGraphLive(agent.agent_id, deployment.deployment_id)}
- title="Open this deployment's strategy graph in Live mode">
+          title="Open this deployment's strategy graph in Live mode">
           {#snippet children()}<Icon name="pulse" size={12} />
           <span>Open graph (live)</span>{/snippet}
         </Button>
       {/if}
       {#if row?.active_graph?.name}
         <Button variant="ghost" size="sm" onclick={fileIncident}
- disabled={incidentBusy}
- title="File an incident stamped with this deployment's latest tick so a post-mortem can jump straight to the live graph at that frame">
+          disabled={incidentBusy}
+          title="File an incident stamped with this deployment's latest tick so a post-mortem can jump straight to the live graph at that frame">
           {#snippet children()}<Icon name="alert" size={12} />
           <span>{incidentBusy ? 'Filing…' : 'File incident'}</span>{/snippet}
         </Button>
       {/if}
-      <button type="button" class="close" onclick={onClose} aria-label="Close drilldown">
-        <Icon name="close" size={16} />
-      </button>
+      <Button variant="ghost" size="sm" iconOnly onclick={onClose} aria-label="Close drilldown">
+        {#snippet children()}<Icon name="close" size={16} />{/snippet}
+      </Button>
     </div>
   </header>
 
@@ -402,57 +381,7 @@
 
     <section class="section span-2">
       <h3 class="section-title">Ops · kill ladder + control</h3>
-      <div class="ops-row">
-        <button type="button" class="op-btn kl-L1" disabled={!canControl}
-          onclick={() => onKillOp('widen', 'WIDEN')}>
-          <span class="kl-tag">L1</span><span>Widen</span>
-        </button>
-        <button type="button" class="op-btn kl-L2" disabled={!canControl}
-          onclick={() => onKillOp('stop', 'STOP NEW')}>
-          <span class="kl-tag">L2</span><span>Stop</span>
-        </button>
-        <button type="button" class="op-btn kl-L3" disabled={!canControl}
-          onclick={() => onKillOp('cancel-all', 'CANCEL ALL')}>
-          <span class="kl-tag">L3</span><span>Cancel</span>
-        </button>
-        <button type="button" class="op-btn kl-L4" disabled={!canControl}
-          onclick={() => onKillOp('flatten', 'FLATTEN')}>
-          <span class="kl-tag">L4</span><span>Flatten</span>
-        </button>
-        <button type="button" class="op-btn kl-L5" disabled={!canControl}
-          onclick={() => onKillOp('disconnect', 'DISCONNECT')}>
-          <span class="kl-tag">L5</span><span>Disconnect</span>
-        </button>
-      </div>
-      <div class="ops-row ops-row-aux">
-        <button type="button" class="op-btn aux" disabled={!canControl}
-          onclick={() => onKillOp('reset', 'RESET')}>
-          Reset kill switch
-        </button>
-        <button type="button" class="op-btn aux" disabled={!canControl}
-          onclick={() => onOp('pause')}>
-          Pause quoting
-        </button>
-        <button type="button" class="op-btn aux" disabled={!canControl}
-          onclick={() => onOp('resume')}>
-          Resume quoting
-        </button>
-        <button type="button" class="op-btn aux" disabled={!canControl}
-          onclick={() => onOp('dca-cancel')}>
-          Cancel DCA
-        </button>
-      </div>
-      {#if !canControl}
-        <p class="ops-hint">
-          Read-only — operator role required.
-        </p>
-      {:else}
-        <p class="ops-hint">
-          Ladder actions prompt for a reason; reset clears the
-          manual escalation recorded in the audit trail.
-          Pause/Resume flip the `paused` variable live.
-        </p>
-      {/if}
+      <OpsLadder {canControl} {onKillOp} {onOp} />
     </section>
 
     <section class="section">
@@ -532,79 +461,16 @@
       {/if}
     </section>
 
-    {#if row?.funding_arb_active || row?.funding_arb_entered || row?.funding_arb_exited || row?.funding_arb_taker_rejected || row?.funding_arb_pair_break || row?.funding_arb_pair_break_uncompensated}
+    {#if showFundingArb}
       <section class="section span-2">
         <h3 class="section-title">Funding-arb driver</h3>
-        <div class="exec-grid">
-          <div class="exec-cell">
-            <span class="exec-k">State</span>
-            {#if row.funding_arb_active}
-              <span class="exec-v mono" style="color: var(--pos)">ENGAGED</span>
-            {:else}
-              <span class="exec-v mono">IDLE</span>
-            {/if}
-          </div>
-          <div class="exec-cell">
-            <span class="exec-k">Entered</span>
-            <span class="exec-v mono">{row.funding_arb_entered ?? 0}</span>
-          </div>
-          <div class="exec-cell">
-            <span class="exec-k">Exited</span>
-            <span class="exec-v mono">{row.funding_arb_exited ?? 0}</span>
-          </div>
-          <div class="exec-cell">
-            <span class="exec-k">Taker rejected</span>
-            <span class="exec-v mono">{row.funding_arb_taker_rejected ?? 0}</span>
-          </div>
-          <div class="exec-cell">
-            <span class="exec-k">Pair break</span>
-            <span class="exec-v mono">{row.funding_arb_pair_break ?? 0}</span>
-          </div>
-          <div class="exec-cell">
-            <span class="exec-k">Pair break (uncomp.)</span>
-            {#if (row.funding_arb_pair_break_uncompensated ?? 0) > 0}
-              <span class="exec-v mono" style="color: var(--neg)">{row.funding_arb_pair_break_uncompensated}</span>
-            {:else}
-              <span class="exec-v mono">0</span>
-            {/if}
-          </div>
-        </div>
-
-        <div class="events-head">
-          <span class="events-title">Recent events</span>
-          <button
-            type="button"
-            class="events-refresh"
-            disabled={fundingEventsLoading}
-            onclick={loadFundingEvents}
-          >
-            {fundingEventsLoading ? 'Loading…' : 'Refresh'}
-          </button>
-        </div>
-        {#if fundingEventsError}
-          <p class="exec-hint err">Details fetch failed: {fundingEventsError}</p>
-        {:else if fundingEvents.length === 0 && !fundingEventsLoading}
-          <p class="exec-hint">No recent events in the agent's ring buffer yet.</p>
-        {:else}
-          <table class="events-table">
-            <thead>
-              <tr>
-                <th>when</th>
-                <th>outcome</th>
-                <th>reason</th>
-              </tr>
-            </thead>
-            <tbody>
-              {#each fundingEvents as ev, i (i)}
-                <tr>
-                  <td class="mono">{new Date(ev.at_ms).toLocaleTimeString()}</td>
-                  <td class="mono">{ev.outcome}</td>
-                  <td class="mono">{ev.reason || '—'}</td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        {/if}
+        <FundingArbPanel
+          {row}
+          events={fundingEvents}
+          loading={fundingEventsLoading}
+          error={fundingEventsError}
+          onRefresh={loadFundingEvents}
+        />
       </section>
     {/if}
 
@@ -626,150 +492,21 @@
 </div>
 
 {#if flattenPreview}
-  <div
-    class="flatten-backdrop"
-    role="button"
-    tabindex="-1"
-    aria-label="Close preview"
-    onclick={closeFlattenPreview}
-    onkeydown={(e) => { if (e.key === 'Escape') closeFlattenPreview() }}
-  >
-    <div
-      class="flatten-card"
-      role="dialog"
-      aria-modal="true"
-      aria-label="Flatten preview"
-      tabindex="-1"
-      onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => e.stopPropagation()}
-    >
-      <div class="flatten-title">Flatten preview · L4 kill</div>
-      {#if flattenPreview.phase === 'loading'}
-        <div class="flatten-body muted">fetching current position + book…</div>
-      {:else if flattenPreview.phase === 'err'}
-        <div class="flatten-body">
-          <div class="banner err">
-            <Icon name="info" size={12} />
-            <span>Preview failed: {flattenPreview.error}</span>
-          </div>
-        </div>
-      {:else if !flattenPreview.data || flattenPreview.data.side === 'flat'}
-        <div class="flatten-body">
-          <div class="banner ok">Position is flat — nothing to unwind.</div>
-        </div>
-      {:else}
-        <div class="flatten-body">
-          <div class="flatten-kv">
-            <div class="fk-cell">
-              <span class="fk-k">side</span>
-              <span class="fk-v mono">{flattenPreview.data.side}</span>
-            </div>
-            <div class="fk-cell">
-              <span class="fk-k">quantity</span>
-              <span class="fk-v mono">{flattenPreview.data.quantity}</span>
-            </div>
-            <div class="fk-cell">
-              <span class="fk-k">mid</span>
-              <span class="fk-v mono">{flattenPreview.data.mid_price}</span>
-            </div>
-            <div class="fk-cell">
-              <span class="fk-k">notional</span>
-              <span class="fk-v mono">{flattenPreview.data.inventory_value_quote}</span>
-            </div>
-          </div>
-          {#if flattenPreview.data.book_depth_covers_position}
-            <div class="banner ok">
-              Book depth covers the position within
-              <code>{flattenPreview.data.estimated_slippage_pct ?? '—'}%</code>
-              from mid.
-            </div>
-          {:else}
-            <div class="banner err">
-              Book depth does NOT fully cover the position at the visible levels —
-              expect slippage beyond
-              <code>{flattenPreview.data.estimated_slippage_pct ?? '—'}%</code>
-              from mid. A market sweep may pause partway.
-            </div>
-          {/if}
-          {#if flattenPreview.data.book_levels?.length > 0}
-            <table class="lvl-table">
-              <thead>
-                <tr>
-                  <th>pct from mid</th>
-                  <th class="num">bid depth (quote)</th>
-                  <th class="num">ask depth (quote)</th>
-                </tr>
-              </thead>
-              <tbody>
-                {#each flattenPreview.data.book_levels as l (l.pct_from_mid)}
-                  <tr>
-                    <td class="mono">{l.pct_from_mid}</td>
-                    <td class="num mono">{l.bid_depth_quote}</td>
-                    <td class="num mono">{l.ask_depth_quote}</td>
-                  </tr>
-                {/each}
-              </tbody>
-            </table>
-          {/if}
-          <label class="flatten-reason">
-            <span class="fk-k">Reason</span>
-            <input type="text" bind:value={flattenPreview.reason} placeholder="operator flatten (L4)" />
-          </label>
-        </div>
-      {/if}
-      <div class="flatten-actions">
-        <Button variant="ghost" onclick={closeFlattenPreview}>
-          {#snippet children()}Cancel{/snippet}
-        </Button>
-        {#if flattenPreview.phase === 'confirm' && flattenPreview.data?.side !== 'flat'}
-          <Button variant="danger" onclick={confirmFlatten}>
-          {#snippet children()}Confirm flatten{/snippet}
-        </Button>
-        {/if}
-      </div>
-    </div>
-  </div>
+  <FlattenPreviewModal
+    state={flattenPreview}
+    onConfirm={confirmFlatten}
+    onClose={closeFlattenPreview}
+    onReasonChange={updateFlattenReason}
+  />
 {/if}
 
 <style>
   .backdrop {
     position: fixed; inset: 0;
-    background: rgba(0, 0, 0, 0.45);
+    background: var(--bg-overlay);
     z-index: 40;
   }
-  .flatten-backdrop {
-    position: fixed; inset: 0; z-index: 50;
-    background: rgba(0, 0, 0, 0.55);
-    display: flex; align-items: center; justify-content: center;
-    padding: var(--s-5);
-  }
-  .flatten-card {
-    width: 640px; max-width: 100%;
-    background: var(--bg-raised); border: 1px solid var(--border-strong);
-    border-radius: var(--r-lg); padding: var(--s-4);
-    display: flex; flex-direction: column; gap: var(--s-3);
-    max-height: 92vh; overflow-y: auto;
-  }
-  .flatten-title { font-size: var(--fs-lg); font-weight: 600; color: var(--fg-primary); }
-  .flatten-body { display: flex; flex-direction: column; gap: var(--s-2); }
-  .flatten-kv {
-    display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--s-2);
-  }
-  .fk-cell { display: flex; flex-direction: column; gap: 2px; padding: var(--s-2); background: var(--bg-chip); border-radius: var(--r-sm); }
-  .fk-k { font-size: 10px; color: var(--fg-muted); text-transform: uppercase; letter-spacing: var(--tracking-label); }
-  .fk-v { font-size: var(--fs-sm); color: var(--fg-primary); }
-  .flatten-reason { display: flex; flex-direction: column; gap: 4px; }
-  .flatten-reason input {
-    padding: var(--s-2); background: var(--bg-chip); border: 1px solid var(--border-subtle);
-    border-radius: var(--r-sm); color: var(--fg-primary); font-family: var(--font-mono); font-size: var(--fs-xs);
-  }
-  .flatten-actions { display: flex; gap: var(--s-2); justify-content: flex-end; }
-  .lvl-table { width: 100%; border-collapse: collapse; font-size: var(--fs-xs); }
-  .lvl-table th, .lvl-table td {
-    padding: 4px var(--s-2); border-bottom: 1px solid var(--border-subtle); text-align: left;
-  }
-  .lvl-table th { color: var(--fg-muted); text-transform: uppercase; font-size: 10px; letter-spacing: var(--tracking-label); }
-  .lvl-table .num { text-align: right; }  .panel {
+  .panel {
     position: fixed; top: 0; right: 0; bottom: 0;
     width: min(860px, 95vw);
     z-index: 41;
@@ -788,15 +525,7 @@
   .title { font-size: var(--fs-md); font-weight: 600; color: var(--fg-primary); }
   .subtitle { font-size: var(--fs-xs); color: var(--fg-secondary); }
   .subtitle.faint { color: var(--fg-muted); font-size: 10px; }
-  .close {
-    background: transparent; border: 1px solid var(--border-subtle);
-    border-radius: var(--r-sm); color: var(--fg-muted);
-    width: 28px; height: 28px; cursor: pointer;
-    display: inline-flex; align-items: center; justify-content: center;
-  }
-  .close:hover { color: var(--fg-primary); background: var(--bg-chip); }
   .head-actions { display: inline-flex; align-items: center; gap: var(--s-2); }
-  /* `.btn.small` moved to primitives/Button.svelte — design system v1. */
 
   .meta {
     display: flex; flex-wrap: wrap; gap: var(--s-3);
@@ -809,6 +538,7 @@
   .meta-item.stale { margin-left: auto; color: var(--fg-muted); }
   .k { color: var(--fg-muted); text-transform: uppercase; letter-spacing: var(--tracking-label); font-size: 10px; }
   .v { color: var(--fg-primary); }
+
   .banner {
     display: flex; align-items: center; gap: var(--s-2);
     margin: var(--s-2) var(--s-4);
@@ -816,8 +546,8 @@
     border-radius: var(--r-sm);
     font-size: var(--fs-xs);
   }
-  .banner.err { color: var(--neg); background: rgba(239, 68, 68, 0.08); }
-  .banner.ok  { color: var(--pos); background: rgba(16, 185, 129, 0.08); }
+  .banner.err { color: var(--neg); background: color-mix(in srgb, var(--neg) 8%, transparent); }
+  .banner.ok  { color: var(--pos); background: color-mix(in srgb, var(--pos) 8%, transparent); }
 
   .grid {
     flex: 1; overflow-y: auto;
@@ -843,11 +573,7 @@
     color: var(--fg-muted);
   }
 
-  .exec-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: var(--s-2);
-  }
+  .exec-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-2); }
   .exec-cell {
     display: flex; flex-direction: column; gap: 2px;
     padding: var(--s-2) var(--s-3);
@@ -861,108 +587,9 @@
     text-transform: uppercase;
     letter-spacing: var(--tracking-label);
   }
-  .exec-v {
-    font-size: var(--fs-sm);
-    color: var(--fg-primary);
-    font-weight: 600;
-  }
+  .exec-v { font-size: var(--fs-sm); color: var(--fg-primary); font-weight: 600; }
   .exec-hint {
     margin: 0;
-    font-size: var(--fs-2xs);
-    color: var(--fg-muted);
-    line-height: var(--lh-snug);
-  }
-  .exec-hint.err { color: var(--neg); }
-
-  .events-head {
-    display: flex; justify-content: space-between; align-items: center;
-    margin-top: var(--s-2);
-  }
-  .events-title {
-    font-size: 10px; color: var(--fg-muted);
-    text-transform: uppercase; letter-spacing: var(--tracking-label);
-    font-weight: 600;
-  }
-  .events-refresh {
-    padding: 2px 8px;
-    background: transparent;
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--r-sm);
-    color: var(--fg-secondary);
-    font-size: var(--fs-2xs);
-    cursor: pointer;
-  }
-  .events-refresh:disabled { opacity: 0.5; cursor: not-allowed; }
-  .events-refresh:hover:not(:disabled) {
-    color: var(--fg-primary); background: var(--bg-base);
-  }
-
-  .events-table {
-    width: 100%; border-collapse: collapse;
-    font-size: var(--fs-2xs);
-    margin-top: var(--s-1);
-  }
-  .events-table th, .events-table td {
-    padding: 4px var(--s-2);
-    text-align: left;
-    border-bottom: 1px solid var(--border-subtle);
-  }
-  .events-table th {
-    color: var(--fg-muted);
-    text-transform: uppercase;
-    letter-spacing: var(--tracking-label);
-    font-size: 10px;
-    font-weight: 600;
-  }
-  .events-table td.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; color: var(--fg-primary); }
-
-  .ops-row {
-    display: grid;
-    grid-template-columns: repeat(5, 1fr);
-    gap: var(--s-2);
-  }
-  .ops-row-aux {
-    grid-template-columns: repeat(4, 1fr);
-    margin-top: var(--s-2);
-  }
-  .op-btn {
-    display: inline-flex; align-items: center; justify-content: center;
-    gap: var(--s-2);
-    padding: var(--s-2) var(--s-3);
-    background: var(--bg-base);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--r-sm);
-    color: var(--fg-secondary);
-    font-family: var(--font-sans);
-    font-size: var(--fs-xs);
-    font-weight: 600;
-    cursor: pointer;
-    transition: border-color var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out);
-  }
-  .op-btn:hover:not(:disabled) {
-    border-color: var(--border-strong); color: var(--fg-primary);
-  }
-  .op-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-  .op-btn .kl-tag {
-    font-family: var(--font-mono);
-    font-size: 10px;
-    padding: 1px 5px;
-    border-radius: var(--r-sm);
-    font-weight: 700;
-  }
-  .op-btn.kl-L1 .kl-tag { background: color-mix(in srgb, var(--kl-L1) 22%, transparent); color: var(--kl-L1); }
-  .op-btn.kl-L1:hover:not(:disabled) { border-color: color-mix(in srgb, var(--kl-L1) 45%, transparent); }
-  .op-btn.kl-L2 .kl-tag { background: color-mix(in srgb, var(--kl-L2) 28%, transparent); color: var(--kl-L2); }
-  .op-btn.kl-L2:hover:not(:disabled) { border-color: color-mix(in srgb, var(--kl-L2) 55%, transparent); }
-  .op-btn.kl-L3 .kl-tag { background: color-mix(in srgb, var(--kl-L3) 20%, transparent); color: var(--kl-L3); }
-  .op-btn.kl-L3:hover:not(:disabled) { border-color: color-mix(in srgb, var(--kl-L3) 50%, transparent); }
-  .op-btn.kl-L4 .kl-tag { background: color-mix(in srgb, var(--kl-L4) 40%, transparent); color: var(--fg-primary); }
-  .op-btn.kl-L4:hover:not(:disabled) { border-color: color-mix(in srgb, var(--kl-L4) 75%, transparent); color: var(--kl-L4); }
-  .op-btn.kl-L5 .kl-tag { background: color-mix(in srgb, var(--kl-L5) 85%, transparent); color: var(--fg-primary); }
-  .op-btn.kl-L5:hover:not(:disabled) { border-color: color-mix(in srgb, var(--kl-L5) 90%, transparent); color: var(--kl-L5); }
-  .op-btn.aux { font-size: var(--fs-2xs); }
-  .ops-hint {
-    margin: var(--s-2) 0 0;
     font-size: var(--fs-2xs);
     color: var(--fg-muted);
     line-height: var(--lh-snug);
