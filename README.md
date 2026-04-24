@@ -51,71 +51,240 @@ Runs as a **server + agent split**: one `mm-server` (controller + dashboard + va
 ## Features
 
 <details>
-<summary><b>Strategies</b> — 9+ built-in, write your own in one file</summary>
+<summary><b>Quote strategies</b> — tick-synchronous quote producers (drop-in for any Strategy.* graph node)</summary>
 
-- **Avellaneda-Stoikov** — optimal spread with inventory skew (gamma/kappa/sigma)
-- **GLFT** — Guéant-Lehalle-Fernandez-Tapia with live order flow calibration
+- **Avellaneda-Stoikov** — optimal spread with inventory skew (γ / κ / σ)
+- **GLFT** — Guéant-Lehalle-Fernandez-Tapia with live order-flow calibration
 - **Grid** — symmetric grid quoting around mid
-- **Basis** — spot + reference price from hedge leg
-- **Cross-Venue** — make on venue A, hedge on venue B
-- **XEMM** — dedicated cross-exchange executor with slippage band
-- **Funding Arb** — atomic spot-perp funding rate arbitrage with compensating-reversal on break
-- **Stat Arb** — cointegrated pairs (Engle-Granger + Kalman + z-score driver)
-- **Paired Unwind** — L4 kill-switch flatten for paired basis/funding positions
-- **Exec Algos** — TWAP / VWAP / POV / Iceberg
+- **Basis** — spot + reference-price shift from a hedge leg
+- **Basis Arb** — paired spot-vs-futures spread entry/exit
+- **Cross-Exchange** — make on venue A, hedge on venue B
+- **XEMM** — cross-exchange executor with slippage band + inventory cap
+- **Inventory Skew** — quadratic skew + dynamic sizing + urgency unwinding
 
-Alpha pipeline: book imbalance, trade flow, microprice, OFI (Cont-Kukanov-Stoikov), HMA slope, learned microprice (Stoikov 2018), Cartea adverse-selection spread.
-
-Regime detection: Quiet / Trending / Volatile / MeanReverting with per-regime auto-tuning. Pair-class templates: MajorSpot / AltSpot / MemeSpot / MajorPerp / AltPerp / StableStable with adaptive γ feedback loop.
-
-**[Writing custom strategies](docs/guides/writing-strategies.md)** — implement one trait, get order management, risk, PnL for free.
-
-Or skip the Rust entirely: the dashboard ships a **visual graph builder** (`StrategyPage`) — drag sources (book, trades, sentiment, onchain, risk metrics), wire math/stats/logic nodes, pick an `Out.*` sink, deploy to any agent. Live mode overlays per-tick values on the canvas; history lets you diff + rollback any prior deploy. See **[Graph Authoring](docs/guides/graph-authoring.md)**.
 </details>
 
 <details>
-<summary><b>Risk Management</b> — 5-level kill switch, VPIN, VaR, portfolio limits</summary>
+<summary><b>Async drivers</b> — fire atomic multi-leg dispatches on their own tokio task</summary>
 
-- **5-Level Kill Switch** — Widen Spreads -> Stop New Orders -> Cancel All -> Flatten All (TWAP) -> Disconnect
-- **VPIN + Kyle's Lambda** — toxicity detection, auto spread widening
-- **Per-Strategy VaR Guard** — parametric Gaussian, EWMA, throttle to 0 on 99% breach
-- **Portfolio-Level Risk** — factor delta limits, cross-symbol VaR, correlation matrix
+- **Funding Arb Driver** — atomic spot-perp funding-rate arbitrage with compensating-reversal on pair break + uncompensated-break counter
+- **Stat Arb Driver** — cointegrated pairs: Engle-Granger + Johansen + Kalman + z-score, screener + signal + driver
+- **Campaign Orchestrator** — multi-leg campaign scheduler on top of the execution algos
+- **Paired Unwind** — L4 kill-switch flatten for paired basis / funding positions
+</details>
+
+<details>
+<summary><b>Execution algos</b> — plug into any Strategy as a sink-side executor</summary>
+
+- **TWAP** — time-weighted with slice count + duration config
+- **VWAP** — volume-weighted with duration config
+- **POV** — percent-of-volume target
+- **Iceberg** — display-qty chunking with hidden reserve
+- **Ignite** — burst executor (single-tick depth sweep)
+- **Mark / Layer** — laddered price-marker placement
+- **Foreign TWAP** — cross-venue slow liquidator for imbalanced inventory
+- **Order Emulator** — client-side OCO / GTD / trailing / stop-loss above venues that don't support them natively
+</details>
+
+<details>
+<summary><b>Alpha signals + modulators</b> — stack on any quote producer</summary>
+
+- **Book imbalance**, **trade flow**, **microprice**, **HMA slope**
+- **CKS OFI** — Cont-Kukanov-Stoikov L1 order-flow imbalance
+- **Learned microprice** — Stoikov 2018 G-function histogram fit
+- **Cartea adverse-selection spread** — closed-form with decimal-ln helper
+- **Market resilience** — event-driven shock detector + recovery score
+- **Volatility** — EWMA realised-vol estimator
+- **Autotune** — regime-conditional γ / size modulator (Quiet / Trending / Volatile / MeanReverting)
+- **Adaptive Tuner** — online rolling-fill-rate feedback controller, bounded γ factor
+- **Pair-class templates** — MajorSpot / AltSpot / MemeSpot / MajorPerp / AltPerp / StableStable with per-class defaults
+- **Mark price**, **AB Split** — time-based or symbol-based experiment routing
+</details>
+
+<details>
+<summary><b>Surveillance + pentest</b> — 15 manipulation patterns, detector + exploit pairs</summary>
+
+Each pattern ships **two halves**:
+
+- a **detector** that scores the live book/trade stream (surfaced on
+  DeploymentDrilldown and the fleet surveillance rollup),
+- an **exploit** that lives behind `MM_ALLOW_RESTRICTED=yes-pentest-mode`
+  + a typed-echo deploy-time acknowledgement.
+
+Current pairs: **Spoofing**, **Pump-and-Dump**, **Wash Trading**,
+**Thin-Book**, **Layering**, **Liquidation Cascade**, **Basket Push**,
+**Rug Detector**, **Rave Cycle** (+ full campaign), plus the catch-all
+`exploits.rs` pattern bank.
+
+6 pentest templates + 1 defender (`rug-detector-composite`) live under
+`crates/strategy-graph/templates/pentest/`. Deploys refuse unless the
+operator explicitly acknowledges the restricted-node list.
+
+See **[Pentest Guide](docs/guides/pentest.md)**.
+</details>
+
+<details>
+<summary><b>Strategy Graph</b> — visual builder with 100+ node kinds, live overlay, replay, versioning</summary>
+
+Drag from the palette, wire, deploy. No Rust required.
+
+- **Sources** — Book.L1 / Book.Depth / Trade.Tape, sentiment feeds
+  (news, social, on-chain holder flow), per-venue funding state,
+  portfolio inventory / balance, risk metrics (VPIN, Kyle λ, OTR)
+- **Math / Stats / Logic** — arithmetic, EWMA, constants, comparators,
+  cast-to-bool, pair-class / strategy-name equality
+- **Indicators** — SMA, EMA, HMA, RSI, ATR, Bollinger
+- **Risk nodes** — ToxicityWiden, InventoryUrgency, CircuitBreaker,
+  Cost.Sweep, Risk.UnrealizedIfFlatten
+- **Strategy blocks** — Avellaneda, GLFT, Grid, BasisCarry, BasketPush,
+  plus `-via-graph` carrier nodes
+- **Execution algos** — TwapConfig / VwapConfig / PovConfig / IcebergConfig
+- **Plan nodes** — Plan.Accumulate / Plan.Distribute
+- **Sinks** — `Out.SpreadMult`, `Out.QuoteOverride`, `Out.KillEscalate`
+
+14 bundled templates: `avellaneda-via-graph`, `glft-via-graph`,
+`grid-via-graph`, `basis-carry-spot-perp`, `cross-exchange-basic`,
+`xemm-reactive`, `funding-aware-quoter`, `cross-asset-regime`,
+`cost-gated-quoter`, `liquidity-burn-guard`, `meme-spot-guarded`,
+`major-spot-basic`, `rug-detector-composite`, plus 6 pentest patterns.
+
+**Live mode** overlays per-tick values on every edge, flags dead nodes,
+pulses active sinks, and tracks hit rate. Pin a tick for time-travel.
+**Replay vs deployed** runs your canvas against the last 20 ticks of
+a live deployment and counts divergences side-by-side.
+
+Custom graphs persist as versioned JSON (diff preview, rollback to any
+prior version) under `data/strategy_graphs/` on the controller.
+
+See **[Graph Authoring](docs/guides/graph-authoring.md)**.
+</details>
+
+<details>
+<summary><b>Risk management</b> — 5-level kill switch + ~35 risk modules</summary>
+
+**Kill ladder (per-deployment, escalates + auto-reset)**
+- L1 Widen Spreads → L2 Stop New → L3 Cancel All → L4 Flatten (TWAP) → L5 Disconnect
+- Typed-echo confirm for L3+ destructive ops
+- Flatten preview: book-depth cover check + slippage estimate
+
+**Real-time guards**
+- **VPIN** + **Kyle's Lambda** — toxicity, auto spread widening
 - **Circuit Breaker** — stale book, wide spread, max drawdown, max exposure
-- **Stale Book Watchdog** — auto-pause quoting when no data, auto-resume when fresh
-- **Balance Pre-Check** — reservation system prevents over-submitting
-- **Inventory Drift Reconciler** — detects tracker vs wallet divergence
+- **Stop-Loss Guard** / **Cooldown** / **Max Drawdown** / **Low-Profit Pairs** — from Freqtrade-style protections
+- **Lead-Lag Guard** — EWMA z-score on leader-venue mid → soft widen
+- **News Retreat** — 3-class headline state machine + cooldowns
+- **Social Risk** — FUD / FOMO ticks degrade aggressiveness
+- **Volume Limit**, **Market Impact** — per-window notional caps
+- **Margin Guard** — perp margin utilisation thresholds
+
+**Portfolio level**
+- Factor delta limits, cross-symbol VaR, correlation matrix
+- **Hedge Optimizer** — Markowitz mean-variance cross-asset hedge
+- **Per-Strategy VaR Guard** — parametric Gaussian, EWMA, 99% breach → throttle
+- **Per-Client Circuit** — tenant-scoped cut-off on breach
+- **Portfolio Balance** — cross-venue inventory aggregator + rebalancer
+- **Decision Ledger** — every quote/cancel decision stamped with the rule that fired
+
+**Accounting + reconciliation**
+- **Inventory Drift Reconciler** — tracker vs wallet divergence, 60s cycle
+- **Reconciliation** — fleet-wide order + balance match vs exchange, ghost / phantom / fetch-fail reporting
+- **PnL Attribution** — spread / inventory / rebates / fees
+- **OTR** — Order-to-Trade Ratio (MiCA surveillance metric)
+- **SLA** — per-minute presence buckets, spread compliance, two-sided obligation
+- **Session Calendar** — per-venue maintenance windows, auto-pause
+- **Loan Utilization** — token-lending cost amortisation
+- **DCA** — position-adjustment planner (flat / linear / accelerated)
+- **Liquidation Heatmap** — perp liquidation-level probe
+- **Borrow** — borrow-cost surcharge state machine
+- **Manipulation detectors** — per-symbol score surfaced on DeploymentDrilldown
+- **Performance** — rolling Sharpe / Sortino / Calmar / MaxDD telemetry
 </details>
 
 <details>
-<summary><b>Exchange Connectivity</b> — 4 venues, both spot + derivatives, WS order entry, FIX 4.4</summary>
+<summary><b>Exchange connectivity</b> — 5 venues, spot + derivatives, WS order entry, FIX 4.4</summary>
 
-Every CEX/DEX in the roster supports both spot and derivatives. Each
-product-type is a separate connector instance (so an engine can run
-`binance_spot + binance_futures + bybit_spot + bybit_linear +
-hyperliquid_spot + hyperliquid_perp` side-by-side).
+Every venue supports both spot and derivatives (where the venue
+itself does). Each product-type is a separate connector instance so
+an engine can run `binance_spot + binance_futures + bybit_spot +
+bybit_linear + hyperliquid_spot + hyperliquid_perp` side-by-side.
 
-- **Binance** — spot + USDM futures. WS API order entry, listen-key user data, batch orders. `LIMIT_MAKER` for post-only (no more `timeInForce=GTC` fallback bug). Clock-skew preflight catches `-1021` before startup.
+- **Binance** — spot + USDM futures. WS API order entry, listen-key user data, batch orders, `LIMIT_MAKER` for post-only. Clock-skew preflight catches `-1021` before startup.
 - **Bybit V5** — spot + linear (USDT-M) + inverse (coin-margined) perps. Unified category-parametrised API, batch 20, native amend, WS Trade.
-- **HyperLiquid** — spot + perps (two constructors: `new()` for perps, `spot()` for spot; asset index offset handled internally). EIP-712 signing (secp256k1), WS post. USDC-only collateral.
+- **HyperLiquid** — spot + perps. EIP-712 signing (secp256k1), WS post. USDC-only collateral.
+- **Coinbase Prime (FIX 4.4)** — institutional venue via the shared FIX session engine.
 - **Custom Exchange** — full REST + WS connector.
-- **FIX 4.4** — session engine + codec (for institutional venues).
-- **Shared Protocol Layer** — one WS-RPC abstraction, many adapters.
+- **Shared protocol layer** — one WS-RPC abstraction, many adapters. FIX 4.4 codec + session engine lives under `crates/protocols/fix`.
+- **Cross-venue SOR** — Smart Order Router with inline dispatch, trade-rate governor, per-venue state machine.
+- **Listing Sniper** — new-symbol discovery via `list_symbols` polling.
 
 **[Adding a new exchange](docs/guides/adding-exchange.md)** — implement one trait, 8 steps.
 </details>
 
 <details>
-<summary><b>Multi-Client & Compliance</b> — per-client isolation, MiCA audit, SLA tracking</summary>
+<summary><b>Vault + agent fleet</b> — encrypted multi-kind secret store, admission-gated agent control plane</summary>
 
-- **Multi-Client Isolation** — each client owns symbols with separate PnL, fills, webhooks, API auth
-- **MiCA Audit Trail** — append-only JSONL, microsecond timestamps, 5-year retention, **SHA-256 hash chain** (tamper-evident, restart-safe), HMAC-signed export
-- **fsync on critical events** — OrderFilled / KillSwitchEscalated / CircuitBreakerTripped durably land before returning
-- **MiCA HMAC Full-Body Signature** — reports sign the full UnsignedReport (period, strategy, OTR, risk controls, SLA, timestamp), not cherry-picked fields; constant-time verify
-- **SLA Tracking** — per-minute presence buckets, spread compliance, two-sided quoting obligations
-- **SLA Certificates** — HMAC-signed JSON for client reporting
-- **Article 17 Report** — algorithmic trading report template (strategy, OTR stats, risk controls)
-- **Token Lending** — loan agreements, utilization tracking, return schedules, PnL cost amortization
-- **Webhook Delivery** — per-client event routing (SLA breach, kill switch, large fill, reports)
+- **Vault** — AES-256-GCM encrypted-at-rest store for every secret type:
+  exchange credentials, Telegram tokens, Sentry DSNs, webhook URLs, SMTP
+  credentials, on-chain RPC keys, arbitrary generic values. Allowed-agents
+  whitelist per credential. "No reveal" rule — rotate = new value.
+- **Agent admission** — Pending → Accepted → (Revoked | Rejected) state
+  machine, persisted across controller restarts. Pre-approve flow lets
+  admin paste a fingerprint before the agent first connects.
+- **Tenant isolation** — `profile.client_id` on every agent; credentials
+  tagged for a tenant only resolve against matching agents. Cross-tenant
+  leak gated at deploy time.
+- **Lease-gated WS** — every agent session holds a refreshable lease;
+  controller restart replays persisted approvals so live agents don't
+  need re-approval.
+- **Fleet ops** — pause/resume fleet, batch deploy, retire individual
+  deployments, revoke agent with in-flight cancel-all.
+</details>
+
+<details>
+<summary><b>Multi-client + compliance</b> — per-client isolation, MiCA audit, SLA tracking, client portal</summary>
+
+- **Multi-client isolation** — each tenant owns symbols with separate
+  PnL, fills, webhooks, API auth. `ClientReader` role sees a dedicated
+  Client Portal: PnL, SLA, signed certificate download, self-service
+  webhook CRUD + test-fire, delivery log.
+- **MiCA audit trail** — append-only JSONL, microsecond timestamps, 5-year
+  retention, **SHA-256 hash chain** (tamper-evident, restart-safe),
+  HMAC-signed export. fsync on critical events (OrderFilled,
+  KillSwitchEscalated, CircuitBreakerTripped).
+- **MiCA HMAC full-body signature** — reports sign the full UnsignedReport
+  (period, strategy, OTR, risk controls, SLA, timestamp), constant-time
+  verify.
+- **SLA tracking** — per-minute presence buckets, spread compliance,
+  two-sided quoting obligation.
+- **SLA certificates** — HMAC-signed JSON, downloadable from client
+  portal.
+- **Article 17 report** — algorithmic trading report template.
+- **Monthly report job** — auto-generated PDF per tenant on a
+  `tokio-cron-scheduler` cadence, archived to S3.
+- **Token lending** — loan agreements, utilisation tracking, return
+  schedules, PnL cost amortisation, per-loan transfer log.
+- **Webhook delivery** — per-client event routing (SLA breach, kill
+  switch, large fill, reports). Fleet-wide delivery log with latency
+  percentiles, retry + delivery log.
+- **Violations panel** — unified watch list across SLA / kill / recon /
+  manipulation streams with hide / pause / widen / open-incident actions.
+- **Incidents** — persistent incident tracker (ack → resolve workflow,
+  post-mortem scaffold, graph-tick deep link from any fired violation).
+- **Archive pipeline** — S3 bundle shipper (`aws-sdk-s3` 1.x,
+  behavior-version-latest, default-https-client backend).
+</details>
+
+<details>
+<summary><b>Sentiment + on-chain signals</b> — feed into any Strategy node</summary>
+
+- **Sentiment orchestrator** — per-ticker tick bus for news + social +
+  keyword + LLM-classifier signals. RSS collector + Ollama classifier
+  shipped; plug in custom sources.
+- **On-chain tracker** — holder concentration, large transfer flow, via
+  Alchemy / Etherscan / Moralis / Goldrush adapters. Cached per-token so
+  graph nodes read cheaply.
+- **Headline state machine** — News.Retreat turns "Bad headline for TKR"
+  into a bounded quote-widen + optional pause window.
 </details>
 
 <details>
@@ -149,69 +318,94 @@ hyperliquid_spot + hyperliquid_perp` side-by-side).
 </details>
 
 <details>
-<summary><b>Operations & Monitoring</b> — Prometheus, Telegram, hot reload, smoke test</summary>
+<summary><b>Operations & monitoring</b> — Prometheus, Telegram, hot reload, distributed smoke harness, design-system linter</summary>
 
-- **45+ Prometheus Gauges** — PnL, spread, inventory, VPIN, SLA, VaR, fill slippage, portfolio
-- **Telegram** — two-way: alerts (3-level severity) + commands (/status, /stop, /pause, /force_exit)
-- **Hot Config Reload** — change gamma/spread/size via admin API without restart
-- **Pre-Flight Checks** — auto-validates venue, symbol, balance, fees, rate limits before trading
-- **Smoke Test Mode** — `MM_MODE=smoke` validates connector stack in 30 seconds
-- **Market Data Recording** — `record_market_data = true` for offline backtesting
-- **Graceful Shutdown** — Ctrl+C -> cancel all -> checkpoint flush -> exit
-- **Checkpoint Recovery** — restore inventory/PnL from last saved state
+- **Prometheus gauges** — 28+ `mm_*` metrics: PnL, spread, inventory, VPIN, Kyle λ, SLA, VaR, fill slippage, portfolio risk, per-deployment telemetry. See **[Metrics Glossary](docs/guides/metrics-glossary.md)**.
+- **Telegram** — two-way: alerts (3-level severity + dedup) + commands (`/status`, `/stop`, `/pause`, `/force_exit`).
+- **Alerting** — fleet-wide dedup across agents, webhook dispatch per client + severity routing.
+- **Hot config reload** — admin-only `/api/admin/strategy/graph/{name}/nodes/{node_id}/config`; live PATCH /variables on any deployment, optimistically merged locally.
+- **Pre-flight** — clock-skew (±500ms / ±2000ms budgets), rate-limit budget, venue server time, exchange info, balance sanity. Fails live startup on hard errors.
+- **Distributed smoke harness** — `scripts/distributed-smoke.sh` spins mm-server + mm-agent, walks the full handshake, deploys a graph, verifies 10+ downstream endpoints populate — 90s–5min runs.
+- **Design-system linter** — `scripts/lint-design-system.sh` gates 8 frontend invariants on every PR.
+- **Playwright e2e** — navigation smoke + role-gate checks against the running stand (CI job).
+- **Graceful shutdown** — Ctrl+C → cancel-all → final reports → checkpoint flush → exit.
+- **Crash recovery** — checkpoint restore (opt-in), fill-replay from audit log, orphaned-order cancel on restart.
+- **Health state machine** — Normal / Degraded / Critical, auto spread widening on venue errors.
+- **Market data recording** — `record_market_data = true` for offline backtesting.
+- **OpenTelemetry** — opt-in `--features otel` build: request/tick spans to OTLP gRPC collector. Sentry hook lands on panic.
 </details>
 
 ## Quick Start
 
-### 1. Build
+The system is a **server + agent split**. Exchange credentials live in
+the server's encrypted Vault (never in env vars). An agent dials the
+server, gets accepted by an admin, receives a lease, pulls credentials,
+and runs deployments authored by the operator on the dashboard.
+
+### 1. Build + boot the controller
 
 ```bash
 git clone https://github.com/iZonex/mg-market-maker.git
 cd mg-market-maker
 cargo build --release
-```
 
-### 2. Smoke Test (validate connectivity)
-
-Exchange keys are venue-scoped (no shared `MM_API_KEY` fallback). Auth
-secret protects the dashboard — 32+ random bytes in production.
-
-```bash
-# Pick the venues you care about — each pair is optional.
-export MM_BINANCE_API_KEY=...
-export MM_BINANCE_API_SECRET=...
-export MM_BYBIT_API_KEY=...
-export MM_BYBIT_API_SECRET=...
-export MM_HL_PRIVATE_KEY=...        # 0x-prefixed hex secp256k1
-
-# Dashboard auth secret (32+ bytes). Rotate to invalidate all tokens.
+# Server-side master key (AES-256-GCM for vault). Persisted to
+# ./master-key on first run; production backs this up out-of-band.
+export MM_MASTER_KEY="$(openssl rand -hex 32)"
+# Dashboard auth secret (HMAC-signed tokens).
 export MM_AUTH_SECRET="$(openssl rand -base64 48)"
 
-MM_MODE=smoke cargo run --release -p mm-server
+./target/release/mm-server
+# → UI:    http://127.0.0.1:9090   (log in with bootstrap admin on first run)
+# → agent: ws://127.0.0.1:9091     (mTLS-capable; dev = plain WS)
 ```
 
-### 3. Paper Trading (no real orders)
+### 2. Boot an agent
 
 ```bash
-MM_MODE=paper cargo run --release -p mm-server
+# On the same host for single-machine dev, or on a separate
+# box for distributed mode. First run generates
+# ./agent-identity.key (Ed25519). Log the fingerprint — admin
+# accepts it via Fleet page or pre-approves it before connect.
+export MM_BRAIN_WS_ADDR=ws://127.0.0.1:9091
+./target/release/mm-agent
 ```
 
-### 4. Record Data (for calibration)
+### 3. On the dashboard
 
-```toml
-# config/default.toml
-record_market_data = true
-```
+1. **Vault** — add exchange credential(s). Tag with `client_id` for
+   tenant isolation; tag `allowed_agents` to scope to a specific box.
+2. **Fleet** — accept the pending agent. Edit profile (region,
+   environment, purpose, client_id).
+3. **Strategy** — pick a bundled template, or drag your own graph.
+   Validate, simulate, then Deploy — the modal fans out the graph +
+   credential bind to every selected `(agent, deployment)` in parallel.
+4. **DeploymentDrilldown** — kill ladder, live tuning, funding-arb
+   events, flatten preview. Or flip into **Live graph** to watch
+   per-tick values overlayed on the canvas; pin a tick to time-travel.
 
-Let it run 7+ days, then backtest with the recorded data.
-
-### 5. Live Trading
+### Mode selector
 
 ```bash
-MM_MODE=live cargo run --release -p mm-server
+MM_MODE=smoke  cargo run --release -p mm-agent   # 30s connector-stack smoke
+MM_MODE=paper  cargo run --release -p mm-agent   # simulated fills, no venue side-effects
+MM_MODE=live   cargo run --release -p mm-agent   # real orders — preflight gates startup
 ```
 
-Pre-flight checks run automatically. If any fail in live mode, the system exits.
+Pre-flight checks (clock-skew, rate-limit budget, venue server time,
+exchange info, balance sanity) run automatically. Failures in live
+mode exit before the first order.
+
+### Distributed smoke
+
+```bash
+scripts/distributed-smoke.sh                     # 90s default
+SMOKE_WINDOW_SECS=300 scripts/distributed-smoke.sh  # 5 min
+```
+
+Spins server + agent in an isolated workdir, walks the full handshake
+(bootstrap admin → login → accept agent → push credential → deploy
+graph → wait 60s → assert 10+ endpoints populated → teardown).
 
 ### Docker
 
@@ -224,66 +418,28 @@ docker compose up -d
 # Grafana:          http://localhost:3000
 ```
 
-## API Endpoints
+## API Surface
 
-### Client API
+**111 routes** across four roots — `/api/auth/*`, `/api/v1/*`,
+`/api/v1/client/*`, `/api/admin/*`. Exhaustive tables live in the
+docs, not here.
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /api/v1/positions` | Current inventory per symbol |
-| `GET /api/v1/pnl` | PnL breakdown (spread/inventory/rebates/fees) |
-| `GET /api/v1/sla` | SLA compliance report |
-| `GET /api/v1/sla/certificate` | HMAC-signed compliance certificate |
-| `GET /api/v1/fills/recent` | Recent fills with NBBO capture |
-| `GET /api/v1/report/daily` | Daily performance report (JSON) |
-| `GET /api/v1/report/daily/csv` | Daily report (CSV) |
-| `GET /api/v1/portfolio` | Multi-currency portfolio snapshot |
-| `GET /api/v1/portfolio/risk` | Portfolio risk summary |
-| `GET /api/v1/portfolio/correlation` | Cross-symbol correlation matrix |
-| `GET /api/v1/loans` | Loan agreements |
-| `GET /api/v1/system/preflight` | System health check |
-| `GET /api/v1/audit/export?from=&to=` | Signed audit log export |
-| `GET /metrics` | Prometheus metrics |
+| Root | What's inside | Auth |
+|------|---------------|------|
+| **`/api/auth/*`** | login, logout, password reset, TOTP enrol/verify/disable, invite signup | `login` / `signup` open + IP rate-limited; rest Bearer |
+| **`/api/v1/*`** (read) | fleet, positions, pnl, sla, fills, portfolio, audit, reconciliation, surveillance, incidents, history, strategy catalog + templates, metrics, webhook deliveries | Bearer, role-derived |
+| **`/api/v1/agents/{id}/...`** | per-agent: credentials, deployments, deployment ops (widen/stop/cancel/flatten/disconnect/reset/pause/resume/dca/graph-swap), PATCH /variables, details topics, replay | Operator+ |
+| **`/api/v1/ops/*`** | fleet-wide pause / resume, per-venue kill, per-client reset, incident ack/resolve | Admin |
+| **`/api/v1/vault/*`** | vault CRUD, rotation | Admin |
+| **`/api/v1/approvals/*`** | agent admission: accept / reject / revoke / pre-approve | Admin |
+| **`/api/v1/strategy/*`** | graph catalog, templates, custom_templates + version history, validate, preview, save, history, rollback | Operator+ |
+| **`/api/v1/client/self/*`** | tenant-scoped: pnl, sla, sla/certificate, fills, webhook CRUD + test-fire, delivery log | ClientReader (scoped by token) |
+| **`/api/v1/client/{id}/*`** | admin view of the same | Admin |
+| **`/api/admin/*`** | clients, users, loans, optimize (hyperopt), strategy graph config hot-reload, sentiment headlines | Admin |
+| **`/metrics`** | Prometheus (28+ gauges) | Bearer, Admin/Operator |
+| **`/ws`** | live state broadcast | `?token=…` (browsers can't set headers on upgrade) |
 
-### Per-Client API
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /api/v1/client/{id}/sla` | Client SLA aggregate |
-| `GET /api/v1/client/{id}/sla/certificate` | Client compliance certificate |
-| `GET /api/v1/client/{id}/pnl` | Client PnL summary |
-| `GET /api/v1/client/{id}/fills` | Client fill history |
-
-### Admin API
-
-| Endpoint | Description |
-|----------|-------------|
-| `POST /api/admin/config/{symbol}` | Hot-reload config per symbol |
-| `POST /api/admin/config` | Broadcast config to all |
-| `POST /api/admin/config/bulk` | Bulk per-symbol config patch |
-| `POST /api/admin/symbols/{symbol}/pause` | Pause quoting |
-| `POST /api/admin/symbols/{symbol}/resume` | Resume quoting |
-| `POST /api/admin/clients` | Create client |
-| `POST /api/admin/loans` | Create loan agreement |
-| `POST /api/admin/optimize/trigger` | Kick off hyperopt random-search |
-| `GET /api/admin/optimize/status` | Hyperopt run status |
-| `GET /api/admin/optimize/results` | Completed jobs summary |
-| `GET /api/admin/optimize/pending` | Calibrations awaiting sign-off |
-| `POST /api/admin/optimize/apply` | Apply pending calibration to live config |
-| `POST /api/admin/optimize/discard` | Drop pending calibration |
-
-### Auth
-
-| Endpoint | Method | Auth | Role |
-|---|---|---|---|
-| `/api/auth/login` | POST | — | — (IP rate-limited 20/min) |
-| `/api/auth/logout` | POST | Bearer | any |
-| `/api/status`, `/api/v1/*` (read-only) | GET | Bearer | any |
-| `/metrics` | GET | Bearer | Admin / Operator |
-| `/api/v1/ops/*`, `/api/admin/*` | POST | Bearer | Admin only |
-| `/ws` | GET upgrade | `?token=…` | role-derived |
-
-Destructive operator endpoints (`/api/v1/ops/widen|stop|cancel-all|flatten|disconnect|reset`) are Admin-only and rate-limited. WebSocket accepts `?token=` only because browsers cannot set headers on the upgrade — this is not an HTTP path. See [docs/guides/operations.md](docs/guides/operations.md#dashboard-auth--network-exposure) for the full HTTPS / secret-rotation playbook.
+Destructive operator ops are **typed-echo confirmed** + rate-limited + audited. See **[Security Model](docs/guides/security-model.md)** for the full RBAC matrix and **[Operations](docs/guides/operations.md)** for the HTTPS / secret-rotation playbook.
 
 ## Architecture
 
