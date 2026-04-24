@@ -186,7 +186,7 @@
           <CalibrationPage {ws} {auth} />
         {:else if route === 'compliance'}
           <CompliancePage {ws} {auth} />
-        {:else if route === 'surveillance'}
+        {:else if route === 'surveillance' && auth.state.role === 'admin'}
           <SurveillancePage {auth} />
         {:else if route === 'strategy' && auth.canControl()}
           <StrategyPage

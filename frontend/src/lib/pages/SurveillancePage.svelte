@@ -1,6 +1,13 @@
 <script>
   /*
-   * Surveillance — fleet-wide detector board.
+   * Surveillance — admin-only fleet-wide detector roster.
+   *
+   * UX-SURV-1 demoted this from the Compliance group (where
+   * operators kept hitting a "no data" wall until a deployment
+   * quoted) to the Admin group. Operator-facing per-symbol
+   * scores now live in DeploymentDrilldown's "Manipulation
+   * detectors" section — this page is the raw roster for
+   * admins scanning the whole fleet at once.
    *
    * Reads GET /api/v1/surveillance/fleet every `REFRESH_MS` —
    * the controller joins every live DeploymentStateRow's
@@ -103,11 +110,14 @@
 <div class="page scroll">
   <div class="header">
     <div class="head-text">
-      <div class="title">Surveillance · fleet-wide</div>
+      <div class="title">Surveillance · fleet roster <span class="admin-pill">admin</span></div>
       <div class="subtitle">
-        Per-deployment manipulation detector scores, sorted by
-        combined risk. Scores above {WATCH_THRESHOLD} go amber,
-        above {ALERT_THRESHOLD} red.
+        Raw manipulation detector scores across every live
+        deployment, sorted by combined risk. Scores above
+        {WATCH_THRESHOLD} go amber, above {ALERT_THRESHOLD} red.
+        <strong>For contextual scores on a specific symbol</strong>,
+        open Fleet → deployment drilldown → “Manipulation detectors”
+        instead — this page is the all-fleet admin pulse.
       </div>
     </div>
     <div class="meta">
@@ -209,8 +219,17 @@
     margin-bottom: var(--s-4); gap: var(--s-3);
   }
   .head-text { display: flex; flex-direction: column; gap: 2px; max-width: 680px; }
-  .title { font-size: var(--fs-lg); font-weight: 600; color: var(--fg-primary); }
+  .title { font-size: var(--fs-lg); font-weight: 600; color: var(--fg-primary); display: inline-flex; align-items: center; gap: var(--s-2); }
+  .admin-pill {
+    font-family: var(--font-mono); font-size: 10px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: var(--tracking-label);
+    padding: 2px 6px; border-radius: var(--r-pill);
+    color: var(--warn);
+    background: color-mix(in srgb, var(--warn) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+  }
   .subtitle { font-size: var(--fs-xs); color: var(--fg-muted); line-height: 1.5; }
+  .subtitle strong { color: var(--fg-secondary); font-weight: 600; }
   .meta { font-size: var(--fs-xs); color: var(--fg-muted); display: flex; align-items: center; gap: var(--s-2); }
   .meta .error { color: var(--danger); }
   .spinner {

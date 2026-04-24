@@ -44,7 +44,6 @@
       label: 'Compliance',
       items: [
         { id: 'compliance',   label: 'Compliance',   icon: 'doc',   roles: ['admin','operator','viewer'] },
-        { id: 'surveillance', label: 'Surveillance', icon: 'alert', roles: ['admin','operator'] },
       ],
     },
     {
@@ -55,13 +54,18 @@
       ],
     },
     {
+      // UX-SURV-1 — standalone Surveillance demoted to admin-only
+      // raw-diagnostic view. Operator-facing per-deployment scores
+      // live in the drilldown's "Manipulation detectors" section,
+      // where they have symbol + kill-level context.
       label: 'Admin',
       items: [
-        { id: 'kill-switch', label: 'Kill switch', icon: 'alert',    roles: ['admin'] },
-        { id: 'platform',    label: 'Platform',    icon: 'settings', roles: ['admin'] },
-        { id: 'vault',       label: 'Vault',       icon: 'shield',   roles: ['admin'] },
-        { id: 'users',       label: 'Users',       icon: 'users',    roles: ['admin'] },
-        { id: 'login-audit', label: 'Auth audit',  icon: 'history',  roles: ['admin'] },
+        { id: 'kill-switch',  label: 'Kill switch',  icon: 'alert',    roles: ['admin'] },
+        { id: 'platform',     label: 'Platform',     icon: 'settings', roles: ['admin'] },
+        { id: 'vault',        label: 'Vault',        icon: 'shield',   roles: ['admin'] },
+        { id: 'users',        label: 'Users',        icon: 'users',    roles: ['admin'] },
+        { id: 'login-audit',  label: 'Auth audit',   icon: 'history',  roles: ['admin'] },
+        { id: 'surveillance', label: 'Surveillance', icon: 'alert',    roles: ['admin'] },
       ],
     },
     {

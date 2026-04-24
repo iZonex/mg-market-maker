@@ -552,16 +552,21 @@ Legend:
   7 tests in `crates/strategy-graph/src/nodes/plan.rs`.
 
 ### UI / UX
-- [ ] **UX-SURV-1** Surveillance detectors are currently a
-  standalone global page with 16 empty cards until a strategy
-  is quoting a symbol — operator-unfriendly "no data / no data /
-  no data" wall. Detectors only make sense in the
-  `(strategy, symbol)` context: move per-symbol scores onto
-  `OrderbookPage` alongside the book they describe, and into
-  `StrategyPage` drilldown as a toxicity/environment panel.
-  Remove the nav entry for the standalone page; keep an
-  admin-only raw diagnostic view if engineering still wants it.
-  Audit/log side unchanged — this is purely UI reorganisation.
+- [x] **UX-SURV-1** Landed 2026-04-24. Per-symbol detector scores
+  already live in `DeploymentDrilldown` → “Manipulation
+  detectors” (pump_dump / wash / thin_book / combined with
+  warming-up hint), which gives operators the `(strategy,
+  symbol)` context the standalone page lacked. The global
+  `SurveillancePage` is now demoted to an admin-only raw
+  diagnostic roster — moved from the Compliance sidebar group
+  into Admin with `roles: ['admin']`, `App.svelte` gains a
+  `auth.state.role === 'admin'` guard on the `'surveillance'`
+  route, and the page header is retitled “fleet roster” with
+  an `admin` pill + a “open Fleet → drilldown for contextual
+  scores” pointer. `OrderbookPage` is intentionally untouched
+  — it has no (agent, deployment, symbol) context today and
+  surfacing scores there would require plumbing a deployment
+  selector the page doesn't own. Audit/log side unchanged.
 - [x] **UX-VENUE-1** Per-venue market strip on Overview is live
   (`/api/v1/venues/book_state` → `VenueMarketStrip.svelte`) and
   publishes `primary_engine.book` + `hedge_book` to the data bus.
