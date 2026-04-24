@@ -7,6 +7,123 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-04-24
+
+Design-system + CI-drift release. No runtime behaviour changes — every
+commit is structural: 13 waves of frontend decomposition so future
+operator-facing work lands on stable primitives + tokens, plus a full
+Rust 1.94 fmt/clippy drift fix so CI can go green again.
+
+### Design system (Waves 1–13)
+
+Moved the dashboard from "pile of Svelte files" to "production design
+system with clone-to-rebrand path":
+
+- **Token layer** (`tokens.css` — 108 CSS variables): fg/bg/accent/
+  pos/neg/warn/danger, kill-level palette L1..L5, 10 chart series
+  colors, type scale, spacing, radii, motion. `--fg-on-accent` +
+  semantic aliases (`--danger: var(--neg)`, `--ok: var(--pos)`).
+- **Primitives** (`lib/primitives/`): Button (5 variants × 4 sizes +
+  iconOnly + loading), Modal (backdrop + dialog + actions snippet),
+  Chip (13 tones), StatusPill, FormField, DataGrid, EmptyState,
+  StatTile, SectionHeader. Zero hex literals.
+- **Utility layer** (`utilities.css`): globally-available `.chip`,
+  `.tone-*`, `.pill.sev-*`, `.mono`, `.muted`, `.pos`, `.neg` so
+  consumers don't re-declare.
+- **Chart theme bridge** (`chart-theme.js`): `readChartTheme()`,
+  `seriesColor(idx)`, `baseChartOptions()` pulling from CSS vars so
+  TradingView Lightweight Charts inherit the active brand palette.
+- **Rebrand surface**: fork + edit `branding.js` (product name +
+  logo + copyright) + `tokens.css` (hex values) + `public/logo.svg`.
+  Three-file swap.
+- **Design-system linter** (`scripts/lint-design-system.sh`): 8
+  invariants (no hex/rgba in primitives, no `.btn {}` outside
+  primitives, no inline class leaks, no product-name leaks, no
+  utility-class CSS outside utilities.css). Gates every PR.
+- **E2E navigation smoke** (`tests/e2e/navigation-smoke.spec.ts`):
+  click-through every sidebar entry for admin, verify role gates.
+
+### Heavy-file decompositions
+
+19 files split into 60+ focused subcomponents + 8 pure-JS helper
+modules. Parent files shrunk materially; every new subcomponent
+is tokens-only. Build stays green on every wave, linter stays 8/8.
+
+| File | Before | After | Drop |
+|---|---|---|---|
+| StrategyPage | 2192 | 1389 | −37% |
+| FleetPage | 1354 | 521 | −61% |
+| DeploymentDrilldown | 970 | 597 | −38% |
+| DeployDialog | 815 | 497 | −39% |
+| VaultPage | 769 | 192 | −75% |
+| ProfilePage | 668 | 309 | −54% |
+| TopBar | 558 | 266 | −52% |
+| ClientPage | 574 | 244 | −57% |
+| PendingCalibrationCard | 553 | 219 | −60% |
+| UserManagementPanel | 495 | 287 | −42% |
+| ClientPortalPage | 476 | 330 | −31% |
+| ViolationsPanel | 472 | 277 | −41% |
+| AuditStream | 439 | 339 | −23% |
+| StrategyDeployHistory | 376 | 233 | −38% |
+
+New sub-component directories:
+`components/{calibration,deploy,topbar,vault,drilldown,fleet,client,
+strategy,users,portal,violations,audit,deploy-history,profile}/`.
+
+### Format + lint + CI drift fix
+
+Rust 1.94 introduced new rustfmt + clippy defaults; pre-existing code
+drifted across both. This release brings the repo back green:
+
+- `cargo fmt --all` applied across 200 files (whitespace-only; nested
+  `mod`/`test` indentation policy changed between rustfmt versions).
+- `cargo clippy --fix --all-targets` applied where safe.
+- Manual clippy fixes: `should_implement_trait` allowlist on
+  `SettingsFile::from_str` (keeps call-site compat); `needless_range_loop`
+  → iterator; redundant `..Default::default()` drop in a fully-
+  initialised `KillSwitchConfig`; `large_enum_variant` allowlist with
+  why-comment on `TransportSelect` (boxing would add an alloc per
+  envelope on the hot receive path); `unnecessary_sort_by` →
+  `sort_by_key + Reverse`.
+- **Workspace-wide lint config** (`[workspace.lints.clippy]` in root
+  `Cargo.toml` + `[lints] workspace = true` opt-in on every crate):
+  allows `doc_lazy_continuation`, `field_reassign_with_default`,
+  `empty_line_after_doc_comments` — style-only 1.94 additions whose
+  churn isn't worth the diff.
+
+Verified green:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test --all` → **2241/2241** pass
+- `cargo build -p mm-server --features otel`
+- `frontend npm run build`
+- `scripts/lint-design-system.sh` (8/8)
+- `scripts/distributed-smoke.sh` (handshake + lease refresh +
+  controller-restart + live deploy telemetry all PASS)
+
+### Minor UX landed earlier in the release window
+
+- **UX-VENUE-2** — per-venue regime classification, passed through
+  the data bus (`VenueRegime` envelope added earlier in commit
+  `e3efaef`).
+- **GOBS-M5.2** — side-by-side canvas replay with divergence
+  scrubber + source-of-truth literal pass-through.
+- **UX-SURV-1** — demoted standalone SurveillancePage to admin-only;
+  per-symbol detector scores already live in DeploymentDrilldown.
+- **UX-VENUE-3** + **R10.2** + **GOBS-M6-4** — palette "unused"
+  badge, Bybit uppercase guard, integration audit rollup.
+
+### Still blocked on external resources
+
+- **PAPER-2** — two-venue paper smoke; needs Binance + Bybit
+  testnet API keys.
+- **OBS-1** — OTel + Sentry sanity; Sentry part needs a real DSN.
+  OTLP half can run against a local Jaeger (`docker run
+  jaegertracing/all-in-one`).
+- **HARD-3** — reconciliation real-exchange test; needs testnet
+  venue keys.
+
 ## [0.5.0] - 2026-04-17
 
 Production-hardening release. Closes the April 17 audit findings, lands

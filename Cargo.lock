@@ -2980,7 +2980,7 @@ dependencies = [
 
 [[package]]
 name = "mm-agent"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3013,7 +3013,7 @@ dependencies = [
 
 [[package]]
 name = "mm-backtester"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3039,7 +3039,7 @@ dependencies = [
 
 [[package]]
 name = "mm-common"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "proptest",
@@ -3054,7 +3054,7 @@ dependencies = [
 
 [[package]]
 name = "mm-control"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3078,7 +3078,7 @@ dependencies = [
 
 [[package]]
 name = "mm-controller"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3111,7 +3111,7 @@ dependencies = [
 
 [[package]]
 name = "mm-dashboard"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3159,7 +3159,7 @@ dependencies = [
 
 [[package]]
 name = "mm-engine"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3190,7 +3190,7 @@ dependencies = [
 
 [[package]]
 name = "mm-exchange-binance"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3217,7 +3217,7 @@ dependencies = [
 
 [[package]]
 name = "mm-exchange-bybit"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3243,7 +3243,7 @@ dependencies = [
 
 [[package]]
 name = "mm-exchange-client"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3265,7 +3265,7 @@ dependencies = [
 
 [[package]]
 name = "mm-exchange-coinbase-prime-fix"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3286,7 +3286,7 @@ dependencies = [
 
 [[package]]
 name = "mm-exchange-core"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3306,7 +3306,7 @@ dependencies = [
 
 [[package]]
 name = "mm-exchange-hyperliquid"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3333,7 +3333,7 @@ dependencies = [
 
 [[package]]
 name = "mm-hyperopt"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "rand 0.9.4",
@@ -3347,7 +3347,7 @@ dependencies = [
 
 [[package]]
 name = "mm-indicators"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "proptest",
  "rust_decimal",
@@ -3357,7 +3357,7 @@ dependencies = [
 
 [[package]]
 name = "mm-onchain"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3374,7 +3374,7 @@ dependencies = [
 
 [[package]]
 name = "mm-persistence"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3395,7 +3395,7 @@ dependencies = [
 
 [[package]]
 name = "mm-portfolio"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "mm-common",
@@ -3407,14 +3407,14 @@ dependencies = [
 
 [[package]]
 name = "mm-protocols-fix"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "mm-protocols-ws-rpc"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -3427,7 +3427,7 @@ dependencies = [
 
 [[package]]
 name = "mm-risk"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3452,7 +3452,7 @@ dependencies = [
 
 [[package]]
 name = "mm-sentiment"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3468,7 +3468,7 @@ dependencies = [
 
 [[package]]
 name = "mm-server"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
@@ -3519,7 +3519,7 @@ dependencies = [
 
 [[package]]
 name = "mm-strategy"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3543,7 +3543,7 @@ dependencies = [
 
 [[package]]
 name = "mm-strategy-graph"
-version = "0.4.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
