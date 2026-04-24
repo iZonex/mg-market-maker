@@ -2363,7 +2363,7 @@ impl DashboardState {
     pub fn onchain_snapshots(&self) -> Vec<OnchainSnapshot> {
         let g = self.inner.read().unwrap();
         let mut out: Vec<_> = g.onchain_snapshots.values().cloned().collect();
-        out.sort_by(|a, b| b.concentration_pct.cmp(&a.concentration_pct));
+        out.sort_by_key(|r| std::cmp::Reverse(r.concentration_pct));
         out
     }
 
@@ -2520,7 +2520,7 @@ impl DashboardState {
     pub fn list_incidents(&self) -> Vec<OpenIncident> {
         let g = self.inner.read().unwrap();
         let mut out: Vec<_> = g.open_incidents.values().cloned().collect();
-        out.sort_by(|a, b| b.opened_at_ms.cmp(&a.opened_at_ms));
+        out.sort_by_key(|r| std::cmp::Reverse(r.opened_at_ms));
         out
     }
 

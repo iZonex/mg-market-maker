@@ -2081,7 +2081,7 @@ async fn list_strategy_active(State(state): State<DashboardState>) -> axum::resp
             .or_insert(rec);
     }
     let mut out: Vec<_> = active.into_values().collect();
-    out.sort_by(|a, b| b.deployed_at.cmp(&a.deployed_at));
+    out.sort_by_key(|r| std::cmp::Reverse(r.deployed_at));
     (StatusCode::OK, Json(out)).into_response()
 }
 
@@ -2451,7 +2451,7 @@ async fn get_client_fills(
     if fills.is_empty() {
         fills = state.get_client_fills(&client_id, q.limit);
     }
-    fills.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    fills.sort_by_key(|f| std::cmp::Reverse(f.timestamp));
     fills.truncate(q.limit);
     Json(fills)
 }

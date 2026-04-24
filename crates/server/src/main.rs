@@ -738,7 +738,7 @@ async fn webhook_fanout_loop(state: mm_dashboard::state::DashboardState) {
                         }
                     }
                 }
-                out.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+                out.sort_by_key(|a| a.timestamp);
                 out
             } else {
                 Vec::new()

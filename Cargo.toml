@@ -30,7 +30,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-version = "0.6.1"
+version = "0.6.2"
 
 # Clippy lints we silence workspace-wide. Both are style-only
 # Rust 1.94 additions whose churn isn't worth the diff: doc
@@ -42,6 +42,17 @@ version = "0.6.1"
 doc_lazy_continuation = "allow"
 field_reassign_with_default = "allow"
 empty_line_after_doc_comments = "allow"
+
+# Rust 1.95 future-compat lint. Fires on `use super::*` inside a
+# nested `mod tests` when the parent scope has multiple paths to
+# the same trait (our `Strategy` is explicitly `use`d in each
+# strategy file AND re-exported from the crate root). The fix
+# upstream recommends is "import explicitly", but adding
+# `use crate::r#trait::Strategy` to every test module would mean
+# touching ~60 files for what is still a forward-compat warning
+# today. Revisit when 1.95 promotes this to a hard error.
+[workspace.lints.rust]
+ambiguous_glob_imported_traits = "allow"
 
 [workspace.dependencies]
 # Async runtime

@@ -471,7 +471,7 @@ impl Evaluator {
                 let defaults = node.evaluate(ctx, &input_vec, state)?;
                 node.output_ports()
                     .iter()
-                    .zip(defaults.into_iter())
+                    .zip(defaults)
                     .map(|(p, default)| {
                         source_inputs
                             .get(&(*id, p.name.clone()))

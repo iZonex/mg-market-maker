@@ -1831,7 +1831,7 @@ impl MarketMakerEngine {
                 }
             })
             .collect();
-        considered.sort_by(|a, b| a.cost_bps.cmp(&b.cost_bps));
+        considered.sort_by_key(|a| a.cost_bps);
 
         let record = mm_dashboard::state::SorDecisionRecord {
             ts_ms: chrono::Utc::now().timestamp_millis(),
@@ -5323,8 +5323,8 @@ impl MarketMakerEngine {
                         .collect();
                     // Deeper levels last: sort so level 0 is closest
                     // to mid on both sides (inner-first).
-                    bids.sort_by(|a, b| b.price.cmp(&a.price));
-                    asks.sort_by(|a, b| a.price.cmp(&b.price));
+                    bids.sort_by_key(|b| std::cmp::Reverse(b.price));
+                    asks.sort_by_key(|a| a.price);
                     let n = bids.len().max(asks.len());
                     let mut pairs = Vec::with_capacity(n);
                     for i in 0..n {
@@ -5420,8 +5420,8 @@ impl MarketMakerEngine {
                     }
                     // Pair bids + asks inner-first, same shape as the
                     // Quotes sink path.
-                    local_bids.sort_by(|a, b| b.price.cmp(&a.price));
-                    local_asks.sort_by(|a, b| a.price.cmp(&b.price));
+                    local_bids.sort_by_key(|b| std::cmp::Reverse(b.price));
+                    local_asks.sort_by_key(|a| a.price);
                     let n = local_bids.len().max(local_asks.len());
                     let mut pairs = Vec::with_capacity(n);
                     for i in 0..n {
@@ -10565,8 +10565,8 @@ impl MarketMakerEngine {
                                 Side::Sell => asks.push(q),
                             }
                         }
-                        bids.sort_by(|a, b| b.price.cmp(&a.price));
-                        asks.sort_by(|a, b| a.price.cmp(&b.price));
+                        bids.sort_by_key(|b| std::cmp::Reverse(b.price));
+                        asks.sort_by_key(|a| a.price);
                         let n = bids.len().max(asks.len());
                         let mut pairs = Vec::with_capacity(n);
                         for i in 0..n {

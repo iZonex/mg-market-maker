@@ -333,7 +333,9 @@ fn translate_variable_override(
             Decimal::from_str(s).ok()
         } else if let Some(f) = value.as_f64() {
             Decimal::try_from(f).ok()
-        } else { value.as_i64().map(Decimal::from) }
+        } else {
+            value.as_i64().map(Decimal::from)
+        }
     };
     let as_bool = || value.as_bool();
     let as_usize = || value.as_u64().map(|v| v as usize);

@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-04-24
+
+Rust 1.95 CI compatibility patch. 0.6.1 went out against Rust 1.94
+locally; GitHub Actions runs against current stable, which flipped
+to 1.95 on 2026-04-14 with new lints that flagged a handful of
+legacy patterns. No runtime behaviour changes.
+
+### Fixed
+
+- **`ambiguous_glob_imported_traits`** (new Rust 1.95 future-compat
+  lint) — 62 call sites in `mm-strategy` tests triggered by
+  `use super::*;` inside `mod tests` while the parent scope has
+  `Strategy` visible via both an explicit `use crate::r#trait::Strategy`
+  AND the crate-root `pub use`. The upstream advice is "import
+  explicitly", but that'd mean touching ~60 test modules for a
+  forward-compat lint. Allowed workspace-wide in `Cargo.toml` under
+  `[workspace.lints.rust]`; reassess when rustc promotes this to a
+  hard error.
+- **`unnecessary_sort_by`** (new Rust 1.95 clippy lint) — 8 call
+  sites in `mm-dashboard`, `mm-engine`, `mm-server` doing
+  `sort_by(|a, b| b.foo.cmp(&a.foo))` for descending order.
+  Rewritten as `sort_by_key(|r| std::cmp::Reverse(r.foo))`.
+- **`useless_conversion`** — one `defaults.into_iter()` in
+  `strategy-graph::evaluator` dropped.
+- **rustfmt 1.95** — one leading-blank-line normalisation in
+  `crates/agent/src/registry.rs`.
+
+### Verified (on Rust 1.95.0)
+
+- `cargo fmt --all -- --check` → clean
+- `RUSTFLAGS="-Dwarnings" cargo check --all-targets` → clean
+- `cargo clippy --all-targets -- -D warnings` → clean
+- `cargo test --all` → **2241/2241** pass
+- `cargo build -p mm-server --features otel` → clean
+- Frontend `npm run build` + design-system linter (8/8) → clean
+
 ## [0.6.1] - 2026-04-24
 
 Security patch. Closes the Dependabot findings flagged against 0.6.0.

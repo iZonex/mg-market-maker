@@ -81,7 +81,7 @@ fn collect_fills_merges_and_sorts_fleet_rows() {
         })
         .filter_map(|raw| serde_json::from_value::<FillRecord>(raw).ok())
         .collect();
-    out.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    out.sort_by_key(|f| std::cmp::Reverse(f.timestamp));
     assert_eq!(out.len(), 2);
     assert_eq!(out[0].side, "Sell", "newest first");
     assert_eq!(out[1].side, "Buy");
