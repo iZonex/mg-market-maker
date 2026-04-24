@@ -39,6 +39,7 @@
   import GraphInspector from '../components/GraphInspector.svelte'
   import GraphTimeline from '../components/GraphTimeline.svelte'
   import ReplayModal from '../components/ReplayModal.svelte'
+  import { Button, Modal } from '../primitives/index.js'
   import { computeGraphDiff } from '../graphDiff.js'
 
   // `liveAgent` / `liveDeployment` come from App.svelte when the URL
@@ -1224,51 +1225,47 @@
           </select>
         </label>
       {/if}
-      <button type="button" class="btn ghost" onclick={exportGraph} disabled={nodes.length === 0} title="Download graph as JSON">
-        <Icon name="download" size={14} />
-      </button>
-      <button type="button" class="btn ghost" onclick={() => fileInput?.click()} title="Import graph from JSON file">
-        <Icon name="upload" size={14} />
-      </button>
+      <Button variant="ghost" size="sm" iconOnly onclick={exportGraph} disabled={nodes.length === 0} title="Download graph as JSON">
+        {#snippet children()}<Icon name="download" size={14} />{/snippet}
+      </Button>
+      <Button variant="ghost" size="sm" iconOnly onclick={() => fileInput?.click()} title="Import graph from JSON file">
+        {#snippet children()}<Icon name="upload" size={14} />{/snippet}
+      </Button>
       <input
         type="file" accept="application/json" bind:this={fileInput}
         onchange={importGraph} style="display: none"
       />
-      <button type="button" class="btn ghost" onclick={openSaveDialog} disabled={nodes.length === 0} title="Save as reusable template">
-        <Icon name="save" size={14} />
-      </button>
+      <Button variant="ghost" size="sm" iconOnly onclick={openSaveDialog} disabled={nodes.length === 0} title="Save as reusable template">
+        {#snippet children()}<Icon name="save" size={14} />{/snippet}
+      </Button>
       {#if currentIsCustomTemplate}
-        <button
-          type="button"
-          class="btn ghost"
+        <Button
+          variant="ghost"
+          size="sm"
           onclick={openVersionsModal}
           disabled={versionsBusy}
           title={`Browse saved versions of '${graphName}' and load any older revision.`}
         >
-          <Icon name="history" size={14} />
-          <span>{versionsBusy ? '…' : 'Versions'}</span>
-        </button>
+          {#snippet children()}<Icon name="history" size={14} /><span>{versionsBusy ? '…' : 'Versions'}</span>{/snippet}
+        </Button>
       {/if}
-      <button type="button" class="btn ghost" onclick={simulate} disabled={previewBusy || nodes.length === 0 || mode === 'live'} title="Evaluate graph without deploying">
-        <Icon name="pulse" size={14} />
-        <span>{previewBusy ? 'Simulating…' : 'Simulate'}</span>
-      </button>
+      <Button variant="ghost" size="sm" onclick={simulate} disabled={previewBusy || nodes.length === 0 || mode === 'live'} title="Evaluate graph without deploying">
+        {#snippet children()}<Icon name="pulse" size={14} /><span>{previewBusy ? 'Simulating…' : 'Simulate'}</span>{/snippet}
+      </Button>
       {#if liveTarget && mode === 'authoring'}
-        <button
-          type="button"
-          class="btn ghost"
+        <Button
+          variant="ghost"
+          size="sm"
           onclick={runReplay}
           disabled={replayBusy || nodes.length === 0}
           title={`Replay this canvas against the last 20 ticks of ${liveTarget.agentId}/${liveTarget.deploymentId} and count where the sink actions diverge.`}
         >
-          <Icon name="history" size={14} />
-          <span>{replayBusy ? 'Replaying…' : 'Replay vs deployed'}</span>
-        </button>
+          {#snippet children()}<Icon name="history" size={14} /><span>{replayBusy ? 'Replaying…' : 'Replay vs deployed'}</span>{/snippet}
+        </Button>
       {/if}
-      <button type="button" class="btn" onclick={deploy} disabled={deployBusy || nodes.length === 0 || !validation.valid || mode === 'live'}>
-        <Icon name="bolt" size={14} />
-        <span>{deployBusy ? 'Deploying…' : 'Deploy'}</span>
-      </button>
+      <Button variant="primary" size="sm" onclick={deploy} disabled={deployBusy || nodes.length === 0 || !validation.valid || mode === 'live'}>
+        {#snippet children()}<Icon name="bolt" size={14} /><span>{deployBusy ? 'Deploying…' : 'Deploy'}</span>{/snippet}
+      </Button>
       <div class="mode-toggle" role="tablist" aria-label="Editor mode">
         <button
           type="button"
@@ -1348,51 +1345,39 @@
     {/if}
   </div>
 
-  {#if versionsModal}
-    <div
-      class="modal-backdrop"
-      role="button"
-      tabindex="-1"
-      aria-label="Close versions"
-      onclick={closeVersionsModal}
-      onkeydown={(e) => { if (e.key === 'Escape') closeVersionsModal() }}
-    >
-      <div
-        class="modal versions-card"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Version history"
-        tabindex="-1"
-        onclick={(e) => e.stopPropagation()}
-        onkeydown={(e) => e.stopPropagation()}
-      >
-        <h3>{versionsModal.name} — version history</h3>
-        {#if versionsModal.history.length === 0}
-          <div class="muted">no saved versions yet</div>
-        {:else}
-          <div class="versions-list">
-            {#each versionsModal.history as v, i (v.hash)}
-              <button
-                type="button"
-                class="version-row"
-                onclick={() => loadVersion(v.hash)}
-              >
-                <span class="v-ix">v{versionsModal.history.length - i}</span>
-                <code class="v-hash mono">{v.hash.slice(0, 12)}</code>
-                <span class="v-when mono">{new Date(v.saved_at).toLocaleString()}</span>
-                {#if v.saved_by}<span class="v-by">by <code>{v.saved_by}</code></span>{/if}
-                {#if v.description}<span class="v-desc">· {v.description}</span>{/if}
-                <span class="v-chev">›</span>
-              </button>
-            {/each}
-          </div>
-        {/if}
-        <div class="modal-actions">
-          <button type="button" class="btn ghost" onclick={closeVersionsModal}>Close</button>
+  <Modal
+    open={!!versionsModal}
+    ariaLabel="Version history"
+    maxWidth="720px"
+    onClose={closeVersionsModal}
+  >
+    {#snippet children()}
+      <h3>{versionsModal?.name} — version history</h3>
+      {#if versionsModal?.history?.length === 0}
+        <div class="muted">no saved versions yet</div>
+      {:else if versionsModal}
+        <div class="versions-list">
+          {#each versionsModal.history as v, i (v.hash)}
+            <button
+              type="button"
+              class="version-row"
+              onclick={() => loadVersion(v.hash)}
+            >
+              <span class="v-ix">v{versionsModal.history.length - i}</span>
+              <code class="v-hash mono">{v.hash.slice(0, 12)}</code>
+              <span class="v-when mono">{new Date(v.saved_at).toLocaleString()}</span>
+              {#if v.saved_by}<span class="v-by">by <code>{v.saved_by}</code></span>{/if}
+              {#if v.description}<span class="v-desc">· {v.description}</span>{/if}
+              <span class="v-chev">›</span>
+            </button>
+          {/each}
         </div>
-      </div>
-    </div>
-  {/if}
+      {/if}
+    {/snippet}
+    {#snippet actions()}
+      <Button variant="ghost" onclick={closeVersionsModal}>{#snippet children()}Close{/snippet}</Button>
+    {/snippet}
+  </Modal>
 
   <ReplayModal
     result={replayResult}
@@ -1401,33 +1386,22 @@
     candidateGraph={candidateGraphForReplay}
     onClose={closeReplay}
   />
-  {#if saveDialogOpen}
-    <div
-      class="modal-backdrop"
-      role="button"
-      tabindex="-1"
-      aria-label="Close dialog"
-      onclick={closeSaveDialog}
-      onkeydown={(e) => { if (e.key === 'Escape') closeSaveDialog() }}
-    >
-      <div
-        class="modal save-modal"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Save as template"
-        tabindex="-1"
-        onclick={(e) => e.stopPropagation()}
-        onkeydown={(e) => e.stopPropagation()}
-      >
-        <h3>Save as template</h3>
-        <label class="field stacked">
-          <span class="field-label">Name</span>
-          <input type="text" bind:value={saveDialogName} placeholder="my-cool-setup" disabled={saveDiffPreview !== null} />
-        </label>
-        <label class="field stacked">
-          <span class="field-label">Description</span>
-          <input type="text" bind:value={saveDialogDesc} placeholder="What does this do?" />
-        </label>
+  <Modal
+    open={saveDialogOpen}
+    ariaLabel="Save as template"
+    maxWidth="640px"
+    onClose={closeSaveDialog}
+  >
+    {#snippet children()}
+      <h3>Save as template</h3>
+      <label class="field stacked">
+        <span class="field-label">Name</span>
+        <input type="text" bind:value={saveDialogName} placeholder="my-cool-setup" disabled={saveDiffPreview !== null} />
+      </label>
+      <label class="field stacked">
+        <span class="field-label">Description</span>
+        <input type="text" bind:value={saveDialogDesc} placeholder="What does this do?" />
+      </label>
         {#if saveDiffPreview}
           {@const d = saveDiffPreview.diff}
           {@const unchanged = d.totalChanges === 0}
@@ -1500,25 +1474,20 @@
             {/if}
           </div>
         {/if}
-        {#if saveDialogError}
-          <div class="modal-err">{saveDialogError}</div>
-        {/if}
-        <div class="modal-actions">
-          <button type="button" class="btn ghost" onclick={closeSaveDialog}>
-            Cancel
-          </button>
-          <button
-            type="button"
-            class="btn"
-            onclick={onSaveClick}
-            disabled={saveDialogBusy || saveCheckBusy || !saveDialogName.trim()}
-          >
-            {#if saveDialogBusy}Saving…{:else if saveCheckBusy}Checking…{:else if saveDiffPreview}Save new version{:else}Save{/if}
-          </button>
-        </div>
-      </div>
-    </div>
-  {/if}
+      {#if saveDialogError}
+        <div class="modal-err">{saveDialogError}</div>
+      {/if}
+    {/snippet}
+    {#snippet actions()}
+      <Button variant="ghost" onclick={closeSaveDialog}>{#snippet children()}Cancel{/snippet}</Button>
+      <Button
+        variant="primary"
+        onclick={onSaveClick}
+        loading={saveDialogBusy || saveCheckBusy}
+        disabled={!saveDialogName.trim()}
+      >{#snippet children()}{#if saveDialogBusy}Saving…{:else if saveCheckBusy}Checking…{:else if saveDiffPreview}Save new version{:else}Save{/if}{/snippet}</Button>
+    {/snippet}
+  </Modal>
 
   {#if previewResult}
     <div class="preview-bar" class:has-error={previewResult.errors?.length > 0}>
@@ -1677,11 +1646,15 @@
     <ActivePlans {auth} />
   </div>
 
-  {#if deployTargetModal}
-    {@const targets = deployTargetModal.rows.filter(r => deployTargetModal.selected[r.key])}
-    {@const phase = deployTargetModal.phase}
-    <div class="ack-backdrop">
-      <div class="ack-card">
+  <Modal
+    open={!!deployTargetModal}
+    ariaLabel="Deploy graph — pick targets"
+    maxWidth="720px"
+    onClose={closeDeployTargetModal}
+  >
+    {#snippet children()}
+      {#if deployTargetModal}
+        {@const phase = deployTargetModal.phase}
         <div class="ack-title">
           {#if phase === 'select'}Deploy graph — pick target(s)
           {:else if phase === 'dispatching'}Dispatching graph…
@@ -1739,28 +1712,36 @@
             <div class="ack-hint">{deployTargetModal.status}</div>
           {/if}
         </div>
-        <div class="ack-actions">
-          <button type="button" class="btn ghost" onclick={closeDeployTargetModal}>
-            {phase === 'done' ? 'Close' : 'Cancel'}
-          </button>
-          {#if phase === 'select'}
-            <button
-              type="button"
-              class="btn ok"
-              disabled={targets.length === 0 || deployBusy}
-              onclick={() => confirmDeploy()}
-            >
-              Deploy to {targets.length} target{targets.length === 1 ? '' : 's'}
-            </button>
-          {/if}
-        </div>
-      </div>
-    </div>
-  {/if}
+      {/if}
+    {/snippet}
+    {#snippet actions()}
+      {#if deployTargetModal}
+        {@const targets = deployTargetModal.rows.filter(r => deployTargetModal.selected[r.key])}
+        {@const phase = deployTargetModal.phase}
+        <Button variant="ghost" onclick={closeDeployTargetModal}>
+          {#snippet children()}{phase === 'done' ? 'Close' : 'Cancel'}{/snippet}
+        </Button>
+        {#if phase === 'select'}
+          <Button
+            variant="ok"
+            disabled={targets.length === 0 || deployBusy}
+            onclick={() => confirmDeploy()}
+          >
+            {#snippet children()}Deploy to {targets.length} target{targets.length === 1 ? '' : 's'}{/snippet}
+          </Button>
+        {/if}
+      {/if}
+    {/snippet}
+  </Modal>
 
-  {#if restrictedAck}
-    <div class="ack-backdrop">
-      <div class="ack-card">
+  <Modal
+    open={!!restrictedAck}
+    ariaLabel="Restricted deploy acknowledgement"
+    maxWidth="560px"
+    onClose={() => { if (!restrictedAck?.busy) restrictedAck = null }}
+  >
+    {#snippet children()}
+      {#if restrictedAck}
         <div class="ack-title">⚠ Restricted deploy</div>
         <div class="ack-body">
           <p class="ack-lead">
@@ -1786,27 +1767,24 @@
             <div class="ack-error">{restrictedAck.error}</div>
           {/if}
         </div>
-        <div class="ack-actions">
-          <button
-            type="button"
-            class="btn ghost"
-            onclick={() => { restrictedAck = null }}
-            disabled={restrictedAck.busy}
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            class="btn"
-            onclick={confirmRestrictedDeploy}
-            disabled={!restrictedAck.acknowledged || restrictedAck.busy}
-          >
-            {restrictedAck.busy ? 'Deploying…' : 'Acknowledge & Deploy'}
-          </button>
-        </div>
-      </div>
-    </div>
-  {/if}
+      {/if}
+    {/snippet}
+    {#snippet actions()}
+      {#if restrictedAck}
+        <Button
+          variant="ghost"
+          onclick={() => { restrictedAck = null }}
+          disabled={restrictedAck.busy}
+        >{#snippet children()}Cancel{/snippet}</Button>
+        <Button
+          variant="danger"
+          onclick={confirmRestrictedDeploy}
+          loading={restrictedAck.busy}
+          disabled={!restrictedAck.acknowledged}
+        >{#snippet children()}Acknowledge & Deploy{/snippet}</Button>
+      {/if}
+    {/snippet}
+  </Modal>
 </div>
 
 <style>
@@ -1914,26 +1892,7 @@
     max-width: 260px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .btn {
-    display: inline-flex; align-items: center; justify-content: center;
-    gap: var(--s-2);
-    height: 30px;
-    padding: 0 var(--s-3);
-    background: var(--accent-dim); color: var(--accent);
-    border: 1px solid var(--accent);
-    border-radius: var(--r-sm); cursor: pointer;
-    font-family: var(--font-sans); font-size: 12px; font-weight: 500;
-    line-height: 1;
-  }
-  .btn.ghost {
-    background: transparent; color: var(--fg-secondary);
-    border-color: var(--border-strong);
-  }
-  .btn.ghost:hover:not(:disabled) {
-    color: var(--accent); border-color: var(--accent);
-  }
-  .btn:hover:not(:disabled) { background: var(--accent); color: var(--bg-base); }
-  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  /* `.btn` CSS moved to primitives/Button.svelte — design system v1. */
 
   /* Hide a top-bar field without removing it from the flex layout
    * so the bar keeps its width on scope toggles. */
@@ -2078,26 +2037,10 @@
     max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
 
-  /* Save-as-template modal. */
-  .modal-backdrop {
-    position: fixed; inset: 0; z-index: 50;
-    background: rgba(0, 0, 0, 0.55);
-    display: flex; align-items: center; justify-content: center;
-  }
-  .modal {
-    min-width: 360px; max-width: 480px;
-    padding: var(--s-4);
-    background: var(--bg-raised);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--r-md);
-    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
-    display: flex; flex-direction: column; gap: var(--s-3);
-  }
-  .modal h3 {
-    margin: 0; font-size: 14px; font-weight: 600;
-    color: var(--fg-primary);
-  }
-  .modal .field.stacked {
+  /* `.modal-*`, `.modal-actions`, `.modal-backdrop` CSS moved to
+     primitives/Modal.svelte — design system v1. */
+  h3 { margin: 0; font-size: 14px; font-weight: 600; color: var(--fg-primary); }
+  .field.stacked {
     display: flex; flex-direction: column; gap: 4px; height: auto;
   }
   .modal-err {
@@ -2106,14 +2049,9 @@
     border: 1px solid var(--neg); border-radius: var(--r-sm);
     color: var(--neg); font-family: var(--font-mono); font-size: 11px;
   }
-  .modal-actions { display: flex; justify-content: flex-end; gap: var(--s-2); }
-
-  /* Replay modal CSS moved to ReplayModal.svelte as part of the
-     Wave 6 modal-decomposition refactor. */
 
   /* M-SAVE GOBS — save-diff preview inside the save modal.
      Sits between the input fields and the action buttons. */
-  .save-modal { min-width: 520px; max-width: 760px; }
   .save-diff {
     margin: var(--s-2) 0;
     padding: var(--s-3);

@@ -22,6 +22,7 @@
   import DeployDialog from '../components/DeployDialog.svelte'
   import DeploymentDrilldown from '../components/DeploymentDrilldown.svelte'
   import EmptyStateGuide from '../components/EmptyStateGuide.svelte'
+  import { Button, Modal } from '../primitives/index.js'
   import { createApiClient } from '../api.svelte.js'
 
   let { auth, onNavigate = () => {}, onOpenGraphLive = () => {} } = $props()
@@ -527,23 +528,15 @@
                   </div>
                 </div>
                 <div class="actions">
-                  <button
-                    type="button"
-                    class="btn ok"
-                    disabled={busyFp[r.fingerprint]}
-                    onclick={() => accept(r.fingerprint)}
-                  >Accept</button>
-                  <button
-                    type="button"
-                    class="btn danger"
-                    disabled={busyFp[r.fingerprint]}
-                    onclick={() => reject(r.fingerprint)}
-                  >Reject</button>
-                  <button
-                    type="button"
-                    class="btn ghost"
-                    onclick={() => skip(r.fingerprint)}
-                  >Skip</button>
+                  <Button variant="ok" disabled={busyFp[r.fingerprint]} onclick={() => accept(r.fingerprint)}>
+          {#snippet children()}Accept{/snippet}
+        </Button>
+                  <Button variant="danger" disabled={busyFp[r.fingerprint]} onclick={() => reject(r.fingerprint)}>
+          {#snippet children()}Reject{/snippet}
+        </Button>
+                  <Button variant="ghost" onclick={() => skip(r.fingerprint)}>
+          {#snippet children()}Skip{/snippet}
+        </Button>
                 </div>
               </div>
             {/each}
@@ -628,39 +621,22 @@
               <span class="fleet-op-status {fleetOpStatus.phase}">{fleetOpStatus.text}</span>
             {/if}
             {#if batchCount > 0}
-              <button type="button" class="btn ok small" onclick={openBatchDeploy}>
-                Deploy to {batchCount} selected
-              </button>
-              <button type="button" class="btn ghost small" onclick={clearBatch}>
-                Clear selection
-              </button>
+              <Button variant="ok" size="sm" onclick={openBatchDeploy}>
+          {#snippet children()}Deploy to {batchCount} selected{/snippet}
+        </Button>
+              <Button variant="ghost" size="sm" onclick={clearBatch}>
+          {#snippet children()}Clear selection{/snippet}
+        </Button>
             {/if}
-            <button
-              type="button"
-              class="btn ghost small"
-              onclick={openPreApprove}
-              title="Pre-approve a fingerprint before the agent connects"
-            >
-              Pre-approve fingerprint
-            </button>
-            <button
-              type="button"
-              class="btn warn small"
-              disabled={fleetOpBusy}
-              onclick={() => fleetOp('pause', 'operator global pause')}
-              title="Flip paused = true on every running deployment across every accepted agent"
-            >
-              Pause fleet
-            </button>
-            <button
-              type="button"
-              class="btn ok small"
-              disabled={fleetOpBusy}
-              onclick={() => fleetOp('resume', 'operator global resume')}
-              title="Flip paused = false on every running deployment across every accepted agent"
-            >
-              Resume fleet
-            </button>
+            <Button variant="ghost" size="sm" onclick={openPreApprove} title="Pre-approve a fingerprint before the agent connects">
+          {#snippet children()}Pre-approve fingerprint{/snippet}
+        </Button>
+            <Button variant="warn" size="sm" disabled={fleetOpBusy} onclick={() => fleetOp('pause', 'operator global pause')} title="Flip paused = true on every running deployment across every accepted agent">
+          {#snippet children()}Pause fleet{/snippet}
+        </Button>
+            <Button variant="ok" size="sm" disabled={fleetOpBusy} onclick={() => fleetOp('resume', 'operator global resume')} title="Flip paused = false on every running deployment across every accepted agent">
+          {#snippet children()}Resume fleet{/snippet}
+        </Button>
           </div>
         </div>
 
@@ -721,17 +697,23 @@
                   </div>
                   <div class="head-right">
                     {#if r.state === 'accepted' && r.connected}
-                      <button type="button" class="btn ok small" onclick={() => (deployTarget = r)}>
-                        Deploy strategy
-                      </button>
+                      <Button variant="ok" size="sm" onclick={() => (deployTarget = r)}>
+          {#snippet children()}Deploy strategy{/snippet}
+        </Button>
                     {/if}
                     {#if r.state === 'accepted'}
-                      <button type="button" class="btn danger small" disabled={busyFp[r.fingerprint]} onclick={() => revoke(r.fingerprint)}>Revoke</button>
+                      <Button variant="danger" size="sm" disabled={busyFp[r.fingerprint]} onclick={() => revoke(r.fingerprint)}>
+          {#snippet children()}Revoke{/snippet}
+        </Button>
                     {:else if r.state === 'rejected' || r.state === 'revoked' || r.state === 'pending'}
-                      <button type="button" class="btn ok small" disabled={busyFp[r.fingerprint]} onclick={() => accept(r.fingerprint)}>Accept</button>
+                      <Button variant="ok" size="sm" disabled={busyFp[r.fingerprint]} onclick={() => accept(r.fingerprint)}>
+          {#snippet children()}Accept{/snippet}
+        </Button>
                     {/if}
                     {#if editingFp !== r.fingerprint}
-                      <button type="button" class="btn ghost small" onclick={() => startEdit(r)}>Edit</button>
+                      <Button variant="ghost" size="sm" onclick={() => startEdit(r)}>
+          {#snippet children()}Edit{/snippet}
+        </Button>
                     {/if}
                   </div>
                 </div>
@@ -772,8 +754,12 @@
                     <label>Labels<input type="text" bind:value={editForm.labels} placeholder="env=prod, role=hft" /></label>
                     <label class="notes-field">Notes<textarea rows="3" bind:value={editForm.notes} placeholder="Deployment gotchas, runbook links, known quirks"></textarea></label>
                     <div class="edit-actions">
-                      <button type="button" class="btn ok small" disabled={busyFp[editingFp]} onclick={saveProfile}>Save</button>
-                      <button type="button" class="btn ghost small" onclick={cancelEdit}>Cancel</button>
+                      <Button variant="ok" size="sm" disabled={busyFp[editingFp]} onclick={saveProfile}>
+          {#snippet children()}Save{/snippet}
+        </Button>
+                      <Button variant="ghost" size="sm" onclick={cancelEdit}>
+          {#snippet children()}Cancel{/snippet}
+        </Button>
                     </div>
                   </div>
                 {/if}
@@ -889,17 +875,9 @@
                           <td class="num mono">{fmtDecimal(d.inventory, 6)}</td>
                           <td class="num mono">{fmtDecimal(d.unrealized_pnl_quote, 4)}</td>
                           <td class="dep-actions">
-                            <button
-                              type="button"
-                              class="btn ghost xsmall"
-                              title="Retire deployment (remove from desired set)"
-                              onclick={(e) => {
-                                e.stopPropagation()
-                                retireDeployment(live.agent_id, d.deployment_id, d.symbol)
-                              }}
-                            >
-                              Retire
-                            </button>
+                            <Button variant="ghost" size="xs" title="Retire deployment (remove from desired set)" onclick={(e) => { e.stopPropagation(); retireDeployment(live.agent_id, d.deployment_id, d.symbol) }}>
+          {#snippet children()}Retire{/snippet}
+        </Button>
                           </td>
                           <td class="chev">›</td>
                         </tr>
@@ -958,24 +936,14 @@
   />
 {/if}
 
-{#if revokeModal}
-  <div
-    class="modal-backdrop"
-    role="button"
-    tabindex="-1"
-    aria-label="Close modal"
-    onclick={closeRevokeModal}
-    onkeydown={(e) => { if (e.key === 'Escape') closeRevokeModal() }}
-  >
-    <div
-      class="revoke-card"
-      role="dialog"
-      aria-modal="true"
-      aria-label="Revoke agent"
-      tabindex="-1"
-      onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => e.stopPropagation()}
-    >
+<Modal
+  open={!!revokeModal}
+  ariaLabel="Revoke agent"
+  maxWidth="560px"
+  onClose={closeRevokeModal}
+>
+  {#snippet children()}
+    {#if revokeModal}
       <div class="revoke-title">
         {#if revokeModal.phase === 'confirm'}Revoke agent with live deployments
         {:else if revokeModal.phase === 'stopping'}Cancelling orders…
@@ -1034,81 +1002,77 @@
           {/if}
         {/if}
       </div>
-      <div class="revoke-actions">
-        {#if revokeModal.phase === 'confirm'}
-          <button type="button" class="btn ghost" onclick={closeRevokeModal}>Cancel</button>
-          <button type="button" class="btn warn" onclick={revokeSkipStop}>
-            Revoke without cancelling
-          </button>
-          <button type="button" class="btn danger" onclick={revokeWithStop}>
-            Cancel orders + revoke
-          </button>
-        {:else if revokeModal.phase === 'done'}
-          <button type="button" class="btn ok" onclick={closeRevokeModal}>Close</button>
-        {/if}
-      </div>
-    </div>
-  </div>
-{/if}
+    {/if}
+  {/snippet}
+  {#snippet actions()}
+    {#if revokeModal}
+      {#if revokeModal.phase === 'confirm'}
+        <Button variant="ghost" onclick={closeRevokeModal}>
+          {#snippet children()}Cancel{/snippet}
+        </Button>
+        <Button variant="warn" onclick={revokeSkipStop}>
+          {#snippet children()}Revoke without cancelling{/snippet}
+        </Button>
+        <Button variant="danger" onclick={revokeWithStop}>
+          {#snippet children()}Cancel orders + revoke{/snippet}
+        </Button>
+      {:else if revokeModal.phase === 'done'}
+        <Button variant="ok" onclick={closeRevokeModal}>
+          {#snippet children()}Close{/snippet}
+        </Button>
+      {/if}
+    {/if}
+  {/snippet}
+</Modal>
 
-{#if preApproveOpen}
-  <div
-    class="modal-backdrop"
-    role="button"
-    tabindex="-1"
-    aria-label="Close modal"
-    onclick={closePreApprove}
-    onkeydown={(e) => { if (e.key === 'Escape') closePreApprove() }}
-  >
-    <div
-      class="preapprove-card"
-      role="dialog"
-      aria-modal="true"
-      aria-label="Pre-approve fingerprint"
-      tabindex="-1"
-      onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => e.stopPropagation()}
-    >
-      <div class="preapprove-title">Pre-approve fingerprint</div>
-      <div class="preapprove-body">
-        <p class="preapprove-lead">
-          Paste the fingerprint the agent logged on its first boot
-          — you'll see it in the agent's stdout / systemd journal:
-          <code class="mono">mm-agent starting … fingerprint=d5d0bf4df0ad14f5</code>.
-          When the agent connects, it'll be auto-accepted without a
-          Pending step.
-        </p>
-        <label class="field">
-          <span>Fingerprint</span>
-          <input
-            type="text"
-            bind:value={preApproveForm.fingerprint}
-            placeholder="d5d0bf4df0ad14f5"
-            disabled={preApproveBusy}
-          />
-        </label>
-        <label class="field">
-          <span>Notes (optional)</span>
-          <input
-            type="text"
-            bind:value={preApproveForm.notes}
-            placeholder="e.g. eu-01 trading box, ACME tenant"
-            disabled={preApproveBusy}
-          />
-        </label>
-        {#if preApproveError}
-          <div class="preapprove-err">{preApproveError}</div>
-        {/if}
-      </div>
-      <div class="preapprove-actions">
-        <button type="button" class="btn ghost" onclick={closePreApprove} disabled={preApproveBusy}>Cancel</button>
-        <button type="button" class="btn ok" onclick={submitPreApprove} disabled={preApproveBusy}>
-          {preApproveBusy ? 'Creating…' : 'Pre-approve'}
-        </button>
-      </div>
+<Modal
+  open={preApproveOpen}
+  ariaLabel="Pre-approve fingerprint"
+  maxWidth="520px"
+  onClose={closePreApprove}
+>
+  {#snippet children()}
+    <div class="preapprove-title">Pre-approve fingerprint</div>
+    <div class="preapprove-body">
+      <p class="preapprove-lead">
+        Paste the fingerprint the agent logged on its first boot
+        — you'll see it in the agent's stdout / systemd journal:
+        <code class="mono">mm-agent starting … fingerprint=d5d0bf4df0ad14f5</code>.
+        When the agent connects, it'll be auto-accepted without a
+        Pending step.
+      </p>
+      <label class="field">
+        <span>Fingerprint</span>
+        <input
+          type="text"
+          bind:value={preApproveForm.fingerprint}
+          placeholder="d5d0bf4df0ad14f5"
+          disabled={preApproveBusy}
+        />
+      </label>
+      <label class="field">
+        <span>Notes (optional)</span>
+        <input
+          type="text"
+          bind:value={preApproveForm.notes}
+          placeholder="e.g. eu-01 trading box, ACME tenant"
+          disabled={preApproveBusy}
+        />
+      </label>
+      {#if preApproveError}
+        <div class="preapprove-err">{preApproveError}</div>
+      {/if}
     </div>
-  </div>
-{/if}
+  {/snippet}
+  {#snippet actions()}
+    <Button variant="ghost" onclick={closePreApprove} disabled={preApproveBusy}>
+      {#snippet children()}Cancel{/snippet}
+    </Button>
+    <Button variant="ok" onclick={submitPreApprove} disabled={preApproveBusy}>
+      {#snippet children()}{preApproveBusy ? 'Creating…' : 'Pre-approve'}{/snippet}
+    </Button>
+  {/snippet}
+</Modal>
 
 <style>
   .page { padding: var(--s-6); height: calc(100vh - 57px); overflow-y: auto; }
@@ -1126,16 +1090,10 @@
   .fleet-op-status.warn    { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
   .fleet-op-status.err     { background: color-mix(in srgb, var(--danger) 18%, transparent); color: var(--danger); }
 
-  .modal-backdrop {
-    position: fixed; inset: 0; z-index: 1000;
-    background: rgba(0, 0, 0, 0.55); backdrop-filter: blur(2px);
-    display: flex; align-items: center; justify-content: center;
-    padding: var(--s-6);
-  }
+  /* `.modal-backdrop` moved to primitives/Modal.svelte — design system v1. */
+
   .revoke-card {
-    width: 560px; max-width: 100%;
-    background: var(--bg-raised); border: 1px solid var(--border-subtle);
-    border-radius: var(--r-lg); padding: var(--s-4);
+    max-width: 100%;
     display: flex; flex-direction: column; gap: var(--s-3);
   }
   .revoke-title { font-size: var(--fs-lg); color: var(--fg-primary); font-weight: 600; }
@@ -1311,20 +1269,7 @@
   .tone-danger { color: var(--danger); }
   .tone-muted { color: var(--fg-muted); }
 
-  .btn {
-    padding: 4px 10px; border-radius: var(--r-sm); border: 1px solid;
-    font-size: var(--fs-xs); font-weight: 600; cursor: pointer;
-    background: transparent; font-family: var(--font-sans);
-    transition: background var(--dur-fast) var(--ease-out);
-  }
-  .btn.small { padding: 2px 8px; font-size: 10px; }
-  .btn.ok { color: var(--accent); border-color: var(--accent); }
-  .btn.ok:hover:not(:disabled) { background: var(--accent-dim); }
-  .btn.danger { color: var(--danger); border-color: var(--danger); }
-  .btn.danger:hover:not(:disabled) { background: rgba(239,68,68,0.1); }
-  .btn.ghost { color: var(--fg-muted); border-color: var(--border-subtle); }
-  .btn.ghost:hover:not(:disabled) { background: var(--bg-raised); color: var(--fg-primary); }
-  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  /* `.btn*` CSS moved to primitives/Button.svelte — design system v1. */
 
   .cred-list {
     display: flex; flex-direction: column; gap: 6px;
@@ -1423,7 +1368,6 @@
   .chev { color: var(--fg-muted); text-align: right; font-size: var(--fs-md); width: 16px; }
   .dep-row:hover .chev { color: var(--accent); }
   .dep-actions { text-align: right; width: 1%; white-space: nowrap; }
-  .btn.xsmall { padding: 2px 8px; font-size: 10px; }
   .denial {
     font-size: var(--fs-xs); color: var(--fg-muted);
     border-top: 1px solid var(--border-subtle); padding-top: var(--s-2);

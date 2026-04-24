@@ -25,6 +25,7 @@
   import ConfigViewer from './ConfigViewer.svelte'
   import ParamTuner from './ParamTuner.svelte'
   import Icon from './Icon.svelte'
+  import { Button } from '../primitives/index.js'
 
   let {
     auth,
@@ -314,27 +315,19 @@
     </div>
     <div class="head-actions">
       {#if onOpenGraphLive && row?.active_graph?.name}
-        <button
-          type="button"
-          class="btn ghost small"
-          onclick={() => onOpenGraphLive(agent.agent_id, deployment.deployment_id)}
-          title="Open this deployment's strategy graph in Live mode"
-        >
-          <Icon name="pulse" size={12} />
-          <span>Open graph (live)</span>
-        </button>
+        <Button variant="ghost" size="sm" onclick={() => onOpenGraphLive(agent.agent_id, deployment.deployment_id)}
+ title="Open this deployment's strategy graph in Live mode">
+          {#snippet children()}<Icon name="pulse" size={12} />
+          <span>Open graph (live)</span>{/snippet}
+        </Button>
       {/if}
       {#if row?.active_graph?.name}
-        <button
-          type="button"
-          class="btn ghost small"
-          onclick={fileIncident}
-          disabled={incidentBusy}
-          title="File an incident stamped with this deployment's latest tick so a post-mortem can jump straight to the live graph at that frame"
-        >
-          <Icon name="alert" size={12} />
-          <span>{incidentBusy ? 'Filing…' : 'File incident'}</span>
-        </button>
+        <Button variant="ghost" size="sm" onclick={fileIncident}
+ disabled={incidentBusy}
+ title="File an incident stamped with this deployment's latest tick so a post-mortem can jump straight to the live graph at that frame">
+          {#snippet children()}<Icon name="alert" size={12} />
+          <span>{incidentBusy ? 'Filing…' : 'File incident'}</span>{/snippet}
+        </Button>
       {/if}
       <button type="button" class="close" onclick={onClose} aria-label="Close drilldown">
         <Icon name="close" size={16} />
@@ -725,11 +718,13 @@
         </div>
       {/if}
       <div class="flatten-actions">
-        <button type="button" class="btn ghost" onclick={closeFlattenPreview}>Cancel</button>
+        <Button variant="ghost" onclick={closeFlattenPreview}>
+          {#snippet children()}Cancel{/snippet}
+        </Button>
         {#if flattenPreview.phase === 'confirm' && flattenPreview.data?.side !== 'flat'}
-          <button type="button" class="btn danger" onclick={confirmFlatten}>
-            Confirm flatten
-          </button>
+          <Button variant="danger" onclick={confirmFlatten}>
+          {#snippet children()}Confirm flatten{/snippet}
+        </Button>
         {/if}
       </div>
     </div>
@@ -803,7 +798,7 @@
   }
   .close:hover { color: var(--fg-primary); background: var(--bg-chip); }
   .head-actions { display: inline-flex; align-items: center; gap: var(--s-2); }
-  .btn.small { padding: 4px 10px; font-size: 11px; }
+  /* `.btn.small` moved to primitives/Button.svelte — design system v1. */
 
   .meta {
     display: flex; flex-wrap: wrap; gap: var(--s-3);
