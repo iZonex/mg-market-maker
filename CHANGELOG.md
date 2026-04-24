@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-04-24
+
+Security patch. Closes the Dependabot findings flagged against 0.6.0.
+
+### Fixed
+
+- **Rust (`crates/dashboard/Cargo.toml`)** — swap `aws-sdk-s3` and
+  `aws-config` from the deprecated `"rustls"` feature to
+  `"default-https-client"`. The `"rustls"` alias resolves to
+  `aws-smithy-runtime/tls-rustls` → `aws-smithy-http-client/legacy-
+  rustls-ring` → `rustls 0.21.12` + `rustls-webpki 0.101.7`, which
+  triggered three security advisories:
+  - RUSTSEC-2026-0098 — URI name constraints incorrectly accepted.
+  - RUSTSEC-2026-0099 — name constraints accepted for wildcard names.
+  - RUSTSEC-2026-0104 — reachable panic in CRL parsing.
+  `default-https-client` uses the modern `rustls-aws-lc` backend
+  (`rustls 0.23` + `rustls-webpki 0.103.13`). Same API, no code
+  changes — build stays OpenSSL-free.
+- **`cargo update`** picked up the in-band patch for the one
+  remaining webpki hit: `rustls-webpki 0.103.12 → 0.103.13` plus
+  sibling bumps (`rustls 0.23.37 → 0.23.39`, `hyper-rustls 0.27.7
+  → 0.27.9`).
+- **Frontend (`frontend/package-lock.json`)** — `npm audit fix`
+  bumped `postcss` past 8.5.10 (GHSA-qx2v-qp2m-jg93 — XSS via
+  unescaped `</style>` in CSS stringify).
+
+### Verified
+
+- `cargo audit` — 0 vulnerabilities (was 4 in 0.6.0).
+- `npm audit` — 0 vulnerabilities (was 1 moderate in 0.6.0).
+- `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D
+  warnings`, `cargo test --all` (2241/2241), frontend build, design-
+  system linter (8/8) — all green.
+
+### Not in scope
+
+Five transitive "unmaintained" advisories remain (not security
+vulns, just deprecation flags):
+
+- `fxhash`, `kuchiki`, `proc-macro-error`, `rand 0.7` — all
+  pulled via the `printpdf 0.8` chain used by the monthly MiCA
+  report renderer. Replacing `printpdf` is a bigger surgery.
+- `rustls-pemfile 2.2` — maintainer recommends `rustls-pki-types`;
+  we still use the old shape for TLS key loading, deferred.
+
 ## [0.6.0] - 2026-04-24
 
 Design-system + CI-drift release. No runtime behaviour changes — every
