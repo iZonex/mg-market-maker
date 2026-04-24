@@ -1,5 +1,6 @@
 <script>
   import { onMount } from 'svelte'
+  import { baseChartOptions, readChartTheme } from '../chart-theme.js'
 
   let { data } = $props()
   let container
@@ -10,24 +11,21 @@
 
   onMount(async () => {
     const { createChart, LineSeries } = await import('lightweight-charts')
+    const theme = readChartTheme()
 
     chart = createChart(container, {
-      layout: { background: { color: 'transparent' }, textColor: '#a8acb5', fontFamily: 'JetBrains Mono, monospace', fontSize: 11 },
-      grid: { vertLines: { color: 'rgba(255,255,255,0.04)' }, horzLines: { color: 'rgba(255,255,255,0.04)' } },
+      ...baseChartOptions(),
       width: container.clientWidth,
       height: 200,
-      timeScale: { timeVisible: true, secondsVisible: false, borderColor: 'rgba(255,255,255,0.06)' },
-      rightPriceScale: { borderColor: 'rgba(255,255,255,0.06)' },
-      crosshair: { vertLine: { color: 'rgba(0,208,156,0.4)', labelBackgroundColor: '#00d09c' }, horzLine: { color: 'rgba(0,208,156,0.4)', labelBackgroundColor: '#00d09c' } },
     })
 
     series = chart.addSeries(LineSeries, {
-      color: '#00d09c',
+      color: theme.accent,
       lineWidth: 2,
       lineType: 0,
       crosshairMarkerRadius: 4,
       crosshairMarkerBorderWidth: 2,
-      crosshairMarkerBackgroundColor: '#00d09c',
+      crosshairMarkerBackgroundColor: theme.accent,
     })
 
     const ro = new ResizeObserver(() => {

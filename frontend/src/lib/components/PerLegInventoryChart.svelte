@@ -15,6 +15,7 @@
    */
   import { onMount } from 'svelte'
   import { createApiClient } from '../api.svelte.js'
+  import { baseChartOptions, seriesColor } from '../chart-theme.js'
 
   let { auth, base = null } = $props()
   const api = $derived(createApiClient(auth))
@@ -39,20 +40,16 @@
   }
 
   /**
-   * Hash a leg key into one of a fixed colour palette. Same leg
-   * always gets the same colour across page reloads — stable
+   * Hash a leg key into one of the chart-series palette slots. Same
+   * leg always gets the same colour across page reloads — stable
    * comparison.
    */
-  const PALETTE = [
-    '#8b5cf6', '#10b981', '#f59e0b', '#ef4444', '#3b82f6',
-    '#ec4899', '#14b8a6', '#eab308', '#f97316', '#6366f1',
-  ]
   function legColor(key) {
     let h = 0
     for (let i = 0; i < key.length; i++) {
       h = ((h << 5) - h + key.charCodeAt(i)) | 0
     }
-    return PALETTE[Math.abs(h) % PALETTE.length]
+    return seriesColor(Math.abs(h))
   }
 
   function applyLegs() {
@@ -93,12 +90,9 @@
     const { createChart, LineSeries } = await import('lightweight-charts')
     window.__mmLineSeries = LineSeries
     chart = createChart(container, {
-      layout: { background: { color: 'transparent' }, textColor: '#a8acb5', fontFamily: 'JetBrains Mono, monospace', fontSize: 11 },
-      grid: { vertLines: { color: 'rgba(255,255,255,0.04)' }, horzLines: { color: 'rgba(255,255,255,0.04)' } },
+      ...baseChartOptions(),
       width: container.clientWidth,
       height: 220,
-      timeScale: { timeVisible: true, secondsVisible: false, borderColor: 'rgba(255,255,255,0.06)' },
-      rightPriceScale: { borderColor: 'rgba(255,255,255,0.06)' },
     })
     const ro = new ResizeObserver(() => {
       if (chart) chart.applyOptions({ width: container.clientWidth })

@@ -223,7 +223,7 @@
   }
   .regime.muted       { color: var(--fg-muted); }
   .regime.regime-quiet    { background: var(--pos-bg, rgba(16, 185, 129, 0.10)); color: var(--pos); }
-  .regime.regime-trending { background: var(--info-bg, rgba(59, 130, 246, 0.14)); color: var(--info, #60a5fa); }
+  .regime.regime-trending { background: var(--info-bg); color: var(--info); }
   .regime.regime-volatile { background: var(--danger-bg, rgba(239, 68, 68, 0.12)); color: var(--danger); font-weight: 600; }
   .regime.regime-mr       { background: var(--warn-bg); color: var(--warn); }
   .regime.stale { opacity: 0.55; }

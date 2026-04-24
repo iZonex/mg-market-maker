@@ -198,27 +198,27 @@
   }
 
   /* Category colour band (left edge). */
-  .node[data-category="Source"]     { border-left-color: #7dd3fc; }
-  .node[data-category="Book"]       { border-left-color: #7dd3fc; }
-  .node[data-category="Sentiment"]  { border-left-color: #c4b5fd; }
-  .node[data-category="News"]       { border-left-color: #c4b5fd; }
-  .node[data-category="Volatility"] { border-left-color: #fde68a; }
-  .node[data-category="Inventory"]  { border-left-color: #fda4af; }
-  .node[data-category="Toxicity"]   { border-left-color: #fda4af; }
-  .node[data-category="Momentum"]   { border-left-color: #fda4af; }
-  .node[data-category="Signal"]     { border-left-color: #fda4af; }
-  .node[data-category="Regime"]     { border-left-color: #fda4af; }
-  .node[data-category="Indicator"]  { border-left-color: #fde68a; }
-  .node[data-category="Indicators"] { border-left-color: #fde68a; }
-  .node[data-category="Stats"]      { border-left-color: #fde68a; }
-  .node[data-category="Math"]       { border-left-color: #d4d4d8; }
-  .node[data-category="Logic"]      { border-left-color: #d4d4d8; }
-  .node[data-category="Cast"]       { border-left-color: #d4d4d8; }
-  .node[data-category="PairClass"]  { border-left-color: #c4b5fd; }
-  .node[data-category="Strategy"]   { border-left-color: #86efac; }
-  .node[data-category="Risk"]       { border-left-color: #fb923c; }
-  .node[data-category="Exec"]       { border-left-color: #86efac; }
-  .node[data-category="Out"]        { border-left-color: #ef4444; }
+  .node[data-category="Source"]     { border-left-color: var(--node-source); }
+  .node[data-category="Book"]       { border-left-color: var(--node-source); }
+  .node[data-category="Sentiment"]  { border-left-color: var(--node-sentiment); }
+  .node[data-category="News"]       { border-left-color: var(--node-sentiment); }
+  .node[data-category="Volatility"] { border-left-color: var(--node-metric); }
+  .node[data-category="Inventory"]  { border-left-color: var(--node-signal); }
+  .node[data-category="Toxicity"]   { border-left-color: var(--node-signal); }
+  .node[data-category="Momentum"]   { border-left-color: var(--node-signal); }
+  .node[data-category="Signal"]     { border-left-color: var(--node-signal); }
+  .node[data-category="Regime"]     { border-left-color: var(--node-signal); }
+  .node[data-category="Indicator"]  { border-left-color: var(--node-metric); }
+  .node[data-category="Indicators"] { border-left-color: var(--node-metric); }
+  .node[data-category="Stats"]      { border-left-color: var(--node-metric); }
+  .node[data-category="Math"]       { border-left-color: var(--node-logic); }
+  .node[data-category="Logic"]      { border-left-color: var(--node-logic); }
+  .node[data-category="Cast"]       { border-left-color: var(--node-logic); }
+  .node[data-category="PairClass"]  { border-left-color: var(--node-sentiment); }
+  .node[data-category="Strategy"]   { border-left-color: var(--node-strategy); }
+  .node[data-category="Risk"]       { border-left-color: var(--node-risk); }
+  .node[data-category="Exec"]       { border-left-color: var(--node-strategy); }
+  .node[data-category="Out"]        { border-left-color: var(--node-sink); }
 
   header {
     display: grid;
@@ -273,13 +273,13 @@
   }
 
   /* Port-type palette — echoes the typeClass() output. */
-  .t-number { --pt: #60a5fa; }  /* blue */
-  .t-bool   { --pt: #34d399; }  /* emerald */
-  .t-unit   { --pt: #9ca3af; }  /* gray */
-  .t-string { --pt: #c084fc; }  /* purple */
-  .t-killlevel   { --pt: #f87171; }  /* red */
-  .t-strategykind{ --pt: #fbbf24; }  /* amber */
-  .t-pairclass   { --pt: #fb7185; }  /* rose */
+  .t-number { --pt: var(--port-number); }
+  .t-bool   { --pt: var(--port-bool); }
+  .t-unit   { --pt: var(--port-unit); }
+  .t-string { --pt: var(--port-string); }
+  .t-killlevel   { --pt: var(--port-killlevel); }
+  .t-strategykind{ --pt: var(--port-strategykind); }
+  .t-pairclass   { --pt: var(--port-pairclass); }
 
   .port-glyph.t-number,
   .port-glyph.t-bool,
@@ -302,13 +302,13 @@
     border-radius: 50%;
     transition: transform 0.1s, box-shadow 0.1s;
   }
-  .node :global(.svelte-flow__handle.t-number)       { border-color: #60a5fa; }
-  .node :global(.svelte-flow__handle.t-bool)         { border-color: #34d399; }
-  .node :global(.svelte-flow__handle.t-unit)         { border-color: #9ca3af; }
-  .node :global(.svelte-flow__handle.t-string)       { border-color: #c084fc; }
-  .node :global(.svelte-flow__handle.t-killlevel)    { border-color: #f87171; }
-  .node :global(.svelte-flow__handle.t-strategykind) { border-color: #fbbf24; }
-  .node :global(.svelte-flow__handle.t-pairclass)    { border-color: #fb7185; }
+  .node :global(.svelte-flow__handle.t-number)       { border-color: var(--port-number); }
+  .node :global(.svelte-flow__handle.t-bool)         { border-color: var(--port-bool); }
+  .node :global(.svelte-flow__handle.t-unit)         { border-color: var(--port-unit); }
+  .node :global(.svelte-flow__handle.t-string)       { border-color: var(--port-string); }
+  .node :global(.svelte-flow__handle.t-killlevel)    { border-color: var(--port-killlevel); }
+  .node :global(.svelte-flow__handle.t-strategykind) { border-color: var(--port-strategykind); }
+  .node :global(.svelte-flow__handle.t-pairclass)    { border-color: var(--port-pairclass); }
 
   .node :global(.svelte-flow__handle:hover) {
     transform: scale(1.35);

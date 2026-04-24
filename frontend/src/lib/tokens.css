@@ -31,6 +31,7 @@
   --fg-secondary: #a8acb5;
   --fg-muted:     #6c6f7a;
   --fg-faint:     #44474e;
+  --fg-on-accent: #001510;    /* text on top of --accent fill */
 
   /* ── Semantic ─────────────────────────────────────────── */
   --accent:      #00d1b2;                 /* MG brand mint */
@@ -70,6 +71,52 @@
   --pc-alt-perp:      #fbbf24;
   --pc-meme-spot:     #ec4899;
   --pc-stable-stable: #10b981;
+
+  /* ── Strategy-graph port types (StrategyNode.svelte) ─── */
+  /* Colours consumers expect — don't rename without also editing
+     `docs/guides/graph-authoring.md`. Number / Bool / etc. */
+  --port-number:       #60a5fa;
+  --port-bool:         #34d399;
+  --port-unit:         #9ca3af;
+  --port-string:       #c084fc;
+  --port-killlevel:    #f87171;
+  --port-strategykind: #fbbf24;
+  --port-pairclass:    #fb7185;
+
+  /* ── Strategy-graph node category hues ───────────────── */
+  /* Left-border stripe on StrategyNode.svelte. Forks can re-skin
+     categories by editing these without touching the node component. */
+  --node-source:   #7dd3fc;   /* sky — Source, Book */
+  --node-sentiment: #c4b5fd;  /* lilac — Sentiment, News, PairClass */
+  --node-metric:   #fde68a;   /* sand — Volatility, Indicator(s), Stats */
+  --node-signal:   #fda4af;   /* rose — Inventory, Toxicity, Momentum, Signal, Regime */
+  --node-logic:    #d4d4d8;   /* grey — Math, Logic, Cast */
+  --node-strategy: #86efac;   /* mint — Strategy, Exec */
+  --node-risk:     #fb923c;   /* orange — Risk */
+  --node-sink:     #ef4444;   /* red — Out */
+
+  /* ── Kill-switch level hues (tags + alert pills) ─────── */
+  --kl-L1: var(--warn);       /* WidenSpreads */
+  --kl-L2: var(--warn);       /* StopNewOrders */
+  --kl-L3: var(--danger);     /* CancelAll */
+  --kl-L4: var(--danger);     /* FlattenAll */
+  --kl-L5: var(--critical);   /* Disconnect */
+
+  /* ── Chart palette — rotated series colours ──────────── */
+  /* Consumed from JS via `getComputedStyle(...).getPropertyValue`.
+     See frontend/src/lib/chart-theme.js. */
+  --chart-accent:    #00d09c;
+  --chart-series-1:  #8b5cf6;
+  --chart-series-2:  #10b981;
+  --chart-series-3:  #f59e0b;
+  --chart-series-4:  #ef4444;
+  --chart-series-5:  #3b82f6;
+  --chart-series-6:  #ec4899;
+  --chart-series-7:  #14b8a6;
+  --chart-series-8:  #eab308;
+  --chart-series-9:  #f97316;
+  --chart-series-10: #6366f1;
+  --chart-grid:      #a8acb5;   /* text + subtle axis colour */
 
   /* ── Gradients ────────────────────────────────────────── */
   --grad-accent:   linear-gradient(135deg, #00d1b2 0%, #00b897 100%);

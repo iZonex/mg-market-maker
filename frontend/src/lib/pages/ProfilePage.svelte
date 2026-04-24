@@ -92,6 +92,9 @@
         margin: 1,
         width: 220,
         errorCorrectionLevel: 'M',
+        // High-contrast dark-on-white — required for reliable phone-
+        // camera scanning. Not themed via `tokens.css` because a
+        // low-contrast brand would break the QR for users.
         color: { dark: '#0a0e14', light: '#ffffff' },
       })
       enrollment = { ...data, qrSvg }
@@ -633,6 +636,9 @@
   }
   .qr-frame {
     padding: var(--s-2);
+    /* White background is REQUIRED for QR contrast (the SVG inside
+       renders dark-on-white). Not themed — low-contrast brand would
+       break phone-camera scanning. */
     background: #ffffff;
     border-radius: var(--r-md);
     border: 1px solid var(--border-subtle);

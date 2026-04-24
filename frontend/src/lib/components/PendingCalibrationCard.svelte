@@ -530,8 +530,8 @@
 
   .spinner {
     width: 12px; height: 12px;
-    border: 2px solid rgba(0, 0, 0, 0.25);
-    border-top-color: #001510;
+    border: 2px solid color-mix(in srgb, var(--fg-on-accent) 25%, transparent);
+    border-top-color: var(--fg-on-accent);
     border-radius: 50%;
     animation: spin 0.75s linear infinite;
   }

@@ -209,13 +209,13 @@ ${e.kind} · ${e.inputs.length} in · ${e.outputs.length} out${e.restricted ? ' 
     color: var(--fg-muted); text-transform: none; letter-spacing: 0;
   }
   /* Category accent strip on the group header's left edge. */
-  .group[data-group="Sources"]     .group-head { box-shadow: inset 2px 0 0 #7dd3fc; }
-  .group[data-group="Indicators"]  .group-head { box-shadow: inset 2px 0 0 #fde68a; }
-  .group[data-group="Math"]        .group-head { box-shadow: inset 2px 0 0 #d4d4d8; }
-  .group[data-group="Logic"]       .group-head { box-shadow: inset 2px 0 0 #d4d4d8; }
-  .group[data-group="Risk"]        .group-head { box-shadow: inset 2px 0 0 #fb923c; }
-  .group[data-group="Exec"]        .group-head { box-shadow: inset 2px 0 0 #86efac; }
-  .group[data-group="Sinks"]       .group-head { box-shadow: inset 2px 0 0 #ef4444; }
+  .group[data-group="Sources"]     .group-head { box-shadow: inset 2px 0 0 var(--node-source); }
+  .group[data-group="Indicators"]  .group-head { box-shadow: inset 2px 0 0 var(--node-metric); }
+  .group[data-group="Math"]        .group-head { box-shadow: inset 2px 0 0 var(--node-logic); }
+  .group[data-group="Logic"]       .group-head { box-shadow: inset 2px 0 0 var(--node-logic); }
+  .group[data-group="Risk"]        .group-head { box-shadow: inset 2px 0 0 var(--node-risk); }
+  .group[data-group="Exec"]        .group-head { box-shadow: inset 2px 0 0 var(--node-strategy); }
+  .group[data-group="Sinks"]       .group-head { box-shadow: inset 2px 0 0 var(--node-sink); }
 
   .group-body {
     display: flex; flex-direction: column; gap: 2px;

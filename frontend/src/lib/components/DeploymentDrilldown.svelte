@@ -950,16 +950,16 @@
     border-radius: var(--r-sm);
     font-weight: 700;
   }
-  .op-btn.kl-L1 .kl-tag { background: rgba(245, 158, 11, 0.22); color: var(--warn); }
-  .op-btn.kl-L1:hover:not(:disabled) { border-color: rgba(245, 158, 11, 0.45); }
-  .op-btn.kl-L2 .kl-tag { background: rgba(245, 158, 11, 0.28); color: #fbbf24; }
-  .op-btn.kl-L2:hover:not(:disabled) { border-color: rgba(245, 158, 11, 0.55); }
-  .op-btn.kl-L3 .kl-tag { background: rgba(239, 68, 68, 0.2);  color: var(--neg); }
-  .op-btn.kl-L3:hover:not(:disabled) { border-color: rgba(239, 68, 68, 0.5); }
-  .op-btn.kl-L4 .kl-tag { background: rgba(239, 68, 68, 0.4);  color: #fff; }
-  .op-btn.kl-L4:hover:not(:disabled) { border-color: rgba(239, 68, 68, 0.75); color: var(--neg); }
-  .op-btn.kl-L5 .kl-tag { background: rgba(127, 29, 29, 0.85); color: #fff; }
-  .op-btn.kl-L5:hover:not(:disabled) { border-color: rgba(127, 29, 29, 0.9); color: var(--neg); }
+  .op-btn.kl-L1 .kl-tag { background: color-mix(in srgb, var(--kl-L1) 22%, transparent); color: var(--kl-L1); }
+  .op-btn.kl-L1:hover:not(:disabled) { border-color: color-mix(in srgb, var(--kl-L1) 45%, transparent); }
+  .op-btn.kl-L2 .kl-tag { background: color-mix(in srgb, var(--kl-L2) 28%, transparent); color: var(--kl-L2); }
+  .op-btn.kl-L2:hover:not(:disabled) { border-color: color-mix(in srgb, var(--kl-L2) 55%, transparent); }
+  .op-btn.kl-L3 .kl-tag { background: color-mix(in srgb, var(--kl-L3) 20%, transparent); color: var(--kl-L3); }
+  .op-btn.kl-L3:hover:not(:disabled) { border-color: color-mix(in srgb, var(--kl-L3) 50%, transparent); }
+  .op-btn.kl-L4 .kl-tag { background: color-mix(in srgb, var(--kl-L4) 40%, transparent); color: var(--fg-primary); }
+  .op-btn.kl-L4:hover:not(:disabled) { border-color: color-mix(in srgb, var(--kl-L4) 75%, transparent); color: var(--kl-L4); }
+  .op-btn.kl-L5 .kl-tag { background: color-mix(in srgb, var(--kl-L5) 85%, transparent); color: var(--fg-primary); }
+  .op-btn.kl-L5:hover:not(:disabled) { border-color: color-mix(in srgb, var(--kl-L5) 90%, transparent); color: var(--kl-L5); }
   .op-btn.aux { font-size: var(--fs-2xs); }
   .ops-hint {
     margin: var(--s-2) 0 0;

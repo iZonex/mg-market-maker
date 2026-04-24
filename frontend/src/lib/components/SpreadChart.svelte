@@ -1,5 +1,6 @@
 <script>
   import { onMount } from 'svelte'
+  import { baseChartOptions, seriesColor } from '../chart-theme.js'
 
   let { data } = $props()
   let container
@@ -10,24 +11,22 @@
 
   onMount(async () => {
     const { createChart, AreaSeries } = await import('lightweight-charts')
+    const hue = seriesColor(0)  // series-1 purple
 
     chart = createChart(container, {
-      layout: { background: { color: 'transparent' }, textColor: '#a8acb5', fontFamily: 'JetBrains Mono, monospace', fontSize: 11 },
-      grid: { vertLines: { color: 'rgba(255,255,255,0.04)' }, horzLines: { color: 'rgba(255,255,255,0.04)' } },
+      ...baseChartOptions(),
       width: container.clientWidth,
       height: 200,
-      timeScale: { timeVisible: true, secondsVisible: false, borderColor: 'rgba(255,255,255,0.06)' },
-      rightPriceScale: { borderColor: 'rgba(255,255,255,0.06)' },
       crosshair: {
-        vertLine: { color: 'rgba(139,92,246,0.45)', labelBackgroundColor: '#8b5cf6' },
-        horzLine: { color: 'rgba(139,92,246,0.45)', labelBackgroundColor: '#8b5cf6' },
+        vertLine: { color: `${hue}73`, labelBackgroundColor: hue },
+        horzLine: { color: `${hue}73`, labelBackgroundColor: hue },
       },
     })
 
     series = chart.addSeries(AreaSeries, {
-      lineColor: '#8b5cf6',
-      topColor: 'rgba(139,92,246,0.28)',
-      bottomColor: 'rgba(139,92,246,0.00)',
+      lineColor: hue,
+      topColor: `${hue}47`,
+      bottomColor: `${hue}00`,
       lineWidth: 2,
     })
 

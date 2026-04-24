@@ -216,18 +216,18 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: #05110e;
+    background: var(--bg-base);
     overflow: hidden;
   }
   .bg-grid {
     position: absolute;
     inset: 0;
     background-image:
-      linear-gradient(rgba(0, 209, 178, 0.06) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(0, 209, 178, 0.06) 1px, transparent 1px);
+      linear-gradient(color-mix(in srgb, var(--accent) 6%, transparent) 1px, transparent 1px),
+      linear-gradient(90deg, color-mix(in srgb, var(--accent) 6%, transparent) 1px, transparent 1px);
     background-size: 42px 42px;
-    mask-image: radial-gradient(ellipse at center, #000 0%, transparent 70%);
-    -webkit-mask-image: radial-gradient(ellipse at center, #000 0%, transparent 70%);
+    mask-image: radial-gradient(ellipse at center, black 0%, transparent 70%);
+    -webkit-mask-image: radial-gradient(ellipse at center, black 0%, transparent 70%);
   }
   .bg-orb {
     position: absolute;
@@ -235,8 +235,8 @@
     filter: blur(120px);
     pointer-events: none;
   }
-  .orb-a { width: 560px; height: 560px; background: #00d1b2; opacity: 0.30; top: -15%; left: -10%; }
-  .orb-b { width: 420px; height: 420px; background: #3b82f6; opacity: 0.18; bottom: -12%; right: -8%; }
+  .orb-a { width: 560px; height: 560px; background: var(--accent); opacity: 0.30; top: -15%; left: -10%; }
+  .orb-b { width: 420px; height: 420px; background: var(--pc-major-spot); opacity: 0.18; bottom: -12%; right: -8%; }
 
   .login-card {
     position: relative;
@@ -311,8 +311,8 @@
 
   .spinner {
     width: 14px; height: 14px;
-    border: 2px solid rgba(0, 0, 0, 0.25);
-    border-top-color: #001510;
+    border: 2px solid color-mix(in srgb, var(--fg-on-accent) 25%, transparent);
+    border-top-color: var(--fg-on-accent);
     border-radius: 50%;
     animation: spin 0.75s linear infinite;
   }
