@@ -4,7 +4,7 @@ Operator walkthrough of the MG Market Maker dashboard. Covers every page in the 
 
 **Tech stack:** Svelte 5 frontend on `:3000` (dev) or served from the Rust backend on `:9090` (prod), WebSocket + REST to the same Axum server.
 
-**Auth:** JWT bearer, three roles — `viewer` (read-only), `operator` (deploy, pause, ack incidents), `admin` (users, vault, kill switch reset, platform config). Route visibility is role-gated; the sidebar hides what your token can't reach.
+**Auth:** JWT bearer, four roles — `viewer` (read-only fleet), `operator` (deploy, pause, ack incidents), `admin` (users, vault, kill switch reset, platform config), `client-reader` (tenant-scoped, sees only their own client's data). Route visibility is role-gated; the sidebar hides what your token can't reach.
 
 ---
 
@@ -29,7 +29,7 @@ Operator walkthrough of the MG Market Maker dashboard. Covers every page in the 
 | Platform | admin | Cluster-wide config — feature flags, loans, sentiment headlines |
 | Users | admin | User CRUD, role assignment |
 | Login Audit | admin | Login attempt log for compliance audit |
-| Client Portal | client | Per-client read-only: PnL, positions, fills, reports |
+| Client Portal | client-reader | Per-client read-only: PnL, positions, fills, reports |
 | Profile | any | Password rotation, 2FA setup |
 
 ---
