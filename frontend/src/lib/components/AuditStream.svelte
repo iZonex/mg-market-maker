@@ -1,7 +1,23 @@
 <script>
+  /*
+   * Unified audit feed across the fleet.
+   *
+   * Audit lives on each agent's disk (engine writes to
+   * `data/audit/{symbol}.jsonl` in the agent's CWD). We fan out
+   * across the fleet, fetch each deployment's audit tail via the
+   * per-deployment details endpoint, and merge by `seq` (audit
+   * entries are monotonic, but seqs can collide across agents so
+   * the key includes the source).
+   *
+   * Chain inspection + severity mapping live in
+   * ./audit/audit-chain-analyzer.js; the verify-report panel
+   * lives in ./audit/VerifyReportBanner.svelte.
+   */
   import { createApiClient } from '../api.svelte.js'
   import Icon from './Icon.svelte'
   import { Button } from '../primitives/index.js'
+  import VerifyReportBanner from './audit/VerifyReportBanner.svelte'
+  import { analyzeChain, severityFor } from './audit/audit-chain-analyzer.js'
 
   let { auth } = $props()
   const api = $derived(createApiClient(auth))
@@ -11,16 +27,7 @@
   let error = $state('')
   let filter = $state('')
   let pausePoll = $state(false)
-  let lastSeq = 0
 
-  // Audit lives on each agent's disk (engine writes to
-  // `data/audit/{symbol}.jsonl` in the agent's CWD). To show a
-  // unified feed we fan out across the fleet, fetch each
-  // deployment's audit tail via the per-deployment details
-  // endpoint, and merge by `seq` (audit entries are
-  // monotonic). Controller serves the per-deployment fetch
-  // over its existing request/reply protocol with a 5s
-  // per-call timeout.
   async function refresh() {
     if (pausePoll) return
     try {
@@ -33,7 +40,7 @@
             + `/deployments/${encodeURIComponent(d.deployment_id)}/details/audit_tail`
           tailFetches.push(
             api.getJson(path)
-              .then(resp => (resp.payload?.events || []).map(ev => ({
+              .then((resp) => (resp.payload?.events || []).map((ev) => ({
                 ...ev,
                 _source_agent: a.agent_id,
                 _source_deployment: d.deployment_id,
@@ -44,12 +51,9 @@
       }
       const perDeployment = await Promise.all(tailFetches)
       const merged = perDeployment.flat()
-      // Dedup by seq within each source (seq is engine-scoped;
-      // across agents seqs can collide so include source in key).
-      const byId = new Map(events.map(e => [`${e._source_agent}#${e.seq}`, e]))
+      const byId = new Map(events.map((e) => [`${e._source_agent}#${e.seq}`, e]))
       for (const ev of merged) {
         byId.set(`${ev._source_agent}#${ev.seq}`, ev)
-        if (ev.seq > lastSeq) lastSeq = ev.seq
       }
       // Sort newest-first by timestamp since seq isn't globally
       // comparable across agents.
@@ -71,10 +75,9 @@
     return () => clearInterval(id)
   })
 
-  // Fix #2 — real SHA-256 chain verify (backend). Button
-  // triggers POST /api/v1/audit/verify; controller fan-outs to
-  // every running deployment so each agent verifies its own
-  // file. We render the aggregate result inline.
+  // Fix #2 — real SHA-256 chain verify (backend). Button triggers
+  // POST /api/v1/audit/verify; controller fan-outs to every
+  // running deployment so each agent verifies its own file.
   let verifyReport = $state(null)
   let verifyBusy = $state(false)
 
@@ -94,76 +97,20 @@
     }
   }
 
-  // Wave D1 — hash-chain verification. The audit JSONL carries
-  // `prev_hash` on every row (risk::audit::AuditEvent). For each
-  // (agent, deployment) source we walk the row sequence oldest-
-  // first: a break shows when two consecutive rows share the
-  // same prev_hash (missing row between), when a non-first row
-  // carries `prev_hash: null` (truncation), or when the seq
-  // jumps backwards. We annotate events with `_chain_broken`
-  // so the UI renders them in a distinct band.
-  const eventsWithChainStatus = $derived.by(() => {
-    const bySource = new Map()
-    for (const ev of events) {
-      const key = `${ev._source_agent}#${ev._source_deployment}`
-      if (!bySource.has(key)) bySource.set(key, [])
-      bySource.get(key).push(ev)
-    }
-    const brokenKeys = new Set()
-    let totalSources = 0
-    let brokenSources = 0
-    for (const [, list] of bySource) {
-      totalSources += 1
-      // sort oldest-first
-      list.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
-      let thisBroken = false
-      let prevPrev = undefined
-      for (let i = 0; i < list.length; i++) {
-        const curr = list[i]
-        const k = `${curr._source_agent}#${curr._source_deployment}#${curr.seq}`
-        // Non-first row with null prev_hash — truncation point.
-        if (i > 0 && (curr.prev_hash === null || curr.prev_hash === undefined)) {
-          brokenKeys.add(k); thisBroken = true
-        }
-        // Two consecutive rows sharing the same prev_hash —
-        // implies a row was deleted between them.
-        if (i > 0 && prevPrev === curr.prev_hash) {
-          brokenKeys.add(k); thisBroken = true
-        }
-        prevPrev = curr.prev_hash
-      }
-      if (thisBroken) brokenSources += 1
-    }
-    return {
-      events: events.map(ev => ({
-        ...ev,
-        _chain_broken: brokenKeys.has(`${ev._source_agent}#${ev._source_deployment}#${ev.seq}`),
-      })),
-      totalSources,
-      brokenSources,
-      brokenRowCount: brokenKeys.size,
-    }
-  })
+  const chainStatus = $derived(analyzeChain(events))
 
   const filtered = $derived.by(() => {
-    const src = eventsWithChainStatus.events
+    const src = chainStatus.events
     if (!filter) return src
     const q = filter.toLowerCase()
     return src.filter(
       (e) =>
         (e.event_type || '').toLowerCase().includes(q) ||
         (e.symbol || '').toLowerCase().includes(q) ||
-        (e.detail || '').toLowerCase().includes(q)
+        (e.detail || '').toLowerCase().includes(q),
     )
   })
 
-  function severity(evtType) {
-    const t = (evtType || '').toLowerCase()
-    if (t.includes('kill') || t.includes('breaker') || t.includes('halt') || t.includes('fail')) return 'neg'
-    if (t.includes('drift') || t.includes('resync') || t.includes('violation') || t.includes('delist') || t.includes('disconnect') || t.includes('shutdown')) return 'warn'
-    if (t.includes('login') || t.includes('logout') || t.includes('escalated') || t.includes('reset')) return 'info'
-    return 'muted'
-  }
   function fmtTime(t) {
     if (!t) return '—'
     try { return new Date(t).toLocaleTimeString() } catch { return '—' }
@@ -178,9 +125,9 @@
       </span>
       <span class="count num">{filtered.length}</span>
       <span class="label">events</span>
-      {#if eventsWithChainStatus.brokenRowCount > 0}
-        <span class="chain-chip chain-broken" title={`${eventsWithChainStatus.brokenSources} source(s) have a broken hash chain`}>
-          chain broken: {eventsWithChainStatus.brokenRowCount}
+      {#if chainStatus.brokenRowCount > 0}
+        <span class="chain-chip chain-broken" title={`${chainStatus.brokenSources} source(s) have a broken hash chain`}>
+          chain broken: {chainStatus.brokenRowCount}
         </span>
       {:else if events.length > 0}
         <span class="chain-chip chain-ok" title="Every audit source has a continuous hash chain">
@@ -189,51 +136,24 @@
       {/if}
     </div>
     <div class="head-actions">
-      <Button variant="primary" onclick={runVerify}
- disabled={verifyBusy}
- title="Run real SHA-256 hash-chain verify across every deployment's audit file">
-          {#snippet children()}<Icon name="shield" size={12} />
+      <Button variant="primary" onclick={runVerify} disabled={verifyBusy}
+        title="Run real SHA-256 hash-chain verify across every deployment's audit file">
+        {#snippet children()}<Icon name="shield" size={12} />
         <span>{verifyBusy ? 'Verifying…' : 'Verify chain'}</span>{/snippet}
-        </Button>
-      <Button variant="primary" onclick={() => (pausePoll = !pausePoll)}
- aria-label={pausePoll ? 'Resume' : 'Pause'}>
-          {#snippet children()}{#if pausePoll}
+      </Button>
+      <Button variant="ghost" onclick={() => (pausePoll = !pausePoll)} aria-label={pausePoll ? 'Resume' : 'Pause'}>
+        {#snippet children()}{#if pausePoll}
           <Icon name="pulse" size={12} />
           <span>Resume</span>
         {:else}
           <Icon name="clock" size={12} />
           <span>Pause</span>
         {/if}{/snippet}
-        </Button>
+      </Button>
     </div>
   </header>
 
-  {#if verifyReport}
-    <div class="verify-report" class:err={verifyReport.phase === 'err' || (verifyReport.broken ?? 0) > 0}>
-      {#if verifyReport.phase === 'pending'}
-        <span>Verifying…</span>
-      {:else if verifyReport.phase === 'err'}
-        <span>verify failed: {verifyReport.error}</span>
-      {:else}
-        <span>
-          ✓ {verifyReport.valid}/{verifyReport.total_deployments} valid
-          {#if verifyReport.broken > 0}· <strong>{verifyReport.broken} broken</strong>{/if}
-          {#if verifyReport.missing > 0}· {verifyReport.missing} missing{/if}
-        </span>
-        {#if verifyReport.broken > 0}
-          <div class="verify-broken-list">
-            {#each verifyReport.rows.filter(r => r.exists && !r.valid) as r (r.agent_id + '/' + r.deployment_id)}
-              <div class="verify-broken">
-                <span class="mono">{r.agent_id}/{r.symbol}</span>
-                <span class="err-kind">{r.error_kind}</span>
-                {#if r.break_row}<span class="mono">row #{r.break_row}</span>{/if}
-              </div>
-            {/each}
-          </div>
-        {/if}
-      {/if}
-    </div>
-  {/if}
+  <VerifyReportBanner report={verifyReport} />
 
   <div class="search">
     <span class="search-icon"><Icon name="search" size={13} /></span>
@@ -244,9 +164,9 @@
       bind:value={filter}
     />
     {#if filter}
-      <Button variant="primary" onclick={() => (filter = '')} aria-label="clear">
-          {#snippet children()}<Icon name="close" size={12} />{/snippet}
-        </Button>
+      <Button variant="ghost" size="sm" iconOnly onclick={() => (filter = '')} aria-label="clear">
+        {#snippet children()}<Icon name="close" size={12} />{/snippet}
+      </Button>
     {/if}
   </div>
 
@@ -271,7 +191,7 @@
   {:else}
     <div class="log scroll">
       {#each filtered as e (e._source_agent + '#' + e.seq)}
-        <div class="log-row" data-sev={severity(e.event_type)} class:chain-break={e._chain_broken}>
+        <div class="log-row" data-sev={severityFor(e.event_type)} class:chain-break={e._chain_broken}>
           <span class="dot"></span>
           <span class="ts num">{fmtTime(e.timestamp)}</span>
           {#if e._chain_broken}
@@ -306,6 +226,7 @@
     align-items: center;
     gap: var(--s-2);
   }
+  .head-actions { display: flex; gap: var(--s-2); }
   .count {
     font-size: var(--fs-md);
     font-weight: 600;
@@ -330,12 +251,6 @@
     padding-left: 34px;
     font-family: var(--font-sans);
   }
-  .search .btn {
-    position: absolute;
-    right: 4px;
-    top: 50%;
-    transform: translateY(-50%);
-  }
 
   .alert-bar {
     display: flex;
@@ -343,7 +258,7 @@
     gap: var(--s-2);
     padding: var(--s-2) var(--s-3);
     background: var(--neg-bg);
-    border: 1px solid rgba(239, 68, 68, 0.3);
+    border: 1px solid color-mix(in srgb, var(--neg) 30%, transparent);
     border-radius: var(--r-md);
     color: var(--neg);
     font-size: var(--fs-xs);
@@ -366,21 +281,6 @@
     background: color-mix(in srgb, var(--danger) 20%, transparent);
     color: var(--danger); font-weight: 600;
   }
-
-  .head-actions { display: flex; gap: var(--s-2); }
-  .verify-report {
-    padding: var(--s-2) var(--s-3);
-    background: color-mix(in srgb, var(--ok) 12%, transparent);
-    color: var(--ok); border-radius: var(--r-sm);
-    font-size: var(--fs-xs); font-family: var(--font-mono);
-  }
-  .verify-report.err {
-    background: color-mix(in srgb, var(--danger) 15%, transparent);
-    color: var(--danger);
-  }
-  .verify-broken-list { display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
-  .verify-broken { display: flex; gap: var(--s-2); font-size: 10px; }
-  .err-kind { color: var(--danger); font-weight: 600; text-transform: uppercase; }
 
   .log {
     display: flex;
