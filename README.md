@@ -17,7 +17,8 @@
   <img src="https://img.shields.io/badge/tests-2241_passing-brightgreen" alt="Tests">
   <img src="https://img.shields.io/badge/clippy-zero_warnings-brightgreen" alt="Clippy">
   <img src="https://img.shields.io/badge/crates-25-blue" alt="Crates">
-  <img src="https://img.shields.io/badge/lines-157K-blue" alt="LoC">
+  <img src="https://img.shields.io/badge/rust-159K-blue" alt="Rust LoC">
+  <img src="https://img.shields.io/badge/svelte-27K-orange" alt="Svelte LoC">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
 
@@ -27,7 +28,7 @@
 
 ---
 
-High-performance, multi-venue market making engine with institutional-grade risk management, toxicity detection, and MiCA compliance. `Decimal` arithmetic everywhere — never `f64` for money. 25 crates, 157K lines, 2241 tests.
+High-performance, multi-venue market making engine with institutional-grade risk management, toxicity detection, and MiCA compliance. `Decimal` arithmetic everywhere — never `f64` for money. **25 Rust crates (~159K lines) + Svelte 5 dashboard (~27K lines), 2241 tests.**
 
 Runs as a **server + agent split**: one `mm-server` (controller + dashboard + vault) central, one or more `mm-agent` processes (trading engine) per colo / venue region. Single-machine dev = both on one host. Agents connect over mTLS-capable WebSocket, lease-gated, admission-controlled by the controller.
 
@@ -36,17 +37,19 @@ Runs as a **server + agent split**: one `mm-server` (controller + dashboard + va
 | | MG Market Maker | Hummingbot | Freqtrade | NautilusTrader |
 |---|:---:|:---:|:---:|:---:|
 | **Language** | Rust | Python | Python | Rust+Python |
-| **Strategies** | 9+ (A-S, GLFT, Grid, Basis, XEMM, FundingArb, StatArb, PairedUnwind, ExecAlgos) | 5 | 3 | 4 |
-| **Venues** | 4 × dual-product (Binance spot+USDM futures, Bybit spot+linear+inverse, HyperLiquid spot+perps, Custom) | 20+ | 10+ | 5 |
-| **Latency** | ~2us/quote | ~1ms | ~10ms | ~50us |
-| **Kill Switch** | 5-level auto-escalation + typed-echo confirm | Manual | No | No |
+| **Strategies** | 15+ quote producers, async drivers, execution algos + 15 pentest detector/exploit pairs | 5 | 3 | 4 |
+| **Venues** | 5 (Binance spot+USDM, Bybit spot+linear+inverse, HyperLiquid spot+perps, Coinbase Prime FIX, Custom) | 20+ | 10+ | 5 |
+| **Visual strategy builder** | 100+ nodes, 14 templates, live overlay + replay + version diff | No | No | No |
+| **Kill Switch** | 5-level auto-escalation + typed-echo confirm + flatten preview | Manual | No | No |
 | **Toxicity (VPIN/Kyle/AS)** | Built-in | No | No | No |
 | **MiCA Audit Trail** | JSONL + SHA-256 hash chain + HMAC signed export | No | No | No |
 | **Portfolio Risk** | Factor VaR + correlation matrix + Markowitz hedge | No | No | Partial |
-| **Multi-Client** | Per-client isolation + SLA certificates | No | No | No |
-| **FIX 4.4** | Session engine + codec | No | No | Partial |
-| **Adaptive Calibration** | PairClass templates + hyperopt recalibrate flow | No | No | No |
-| **Auth Surface** | Role-gated (Admin/Operator/Viewer), HMAC tokens, audited login/logout | Basic | No | Basic |
+| **Multi-Client** | Per-client isolation + SLA certificates + ClientReader portal | No | No | No |
+| **FIX 4.4** | Session engine + codec (Coinbase Prime wired) | No | No | Partial |
+| **Adaptive Calibration** | PairClass templates + Autotune (regime) + Adaptive Tuner (online) + hyperopt | No | No | No |
+| **Distributed agent fleet** | mTLS-capable server+agent split, admission-gated, lease-refresh | No | No | No |
+| **Encrypted vault** | AES-256-GCM multi-kind secret store, tenant-scoped | No | No | No |
+| **Auth Surface** | 4 roles (Admin / Operator / Viewer / ClientReader), HMAC tokens, audited login/logout | Basic | No | Basic |
 
 ## Features
 
@@ -409,14 +412,28 @@ graph → wait 60s → assert 10+ endpoints populated → teardown).
 
 ### Docker
 
+The shipped `docker-compose.yml` runs `mm-server` + Prometheus +
+Grafana. For the split server+agent model you run one `mm-agent`
+per region on separate hosts (docker-compose spins only the control
+plane):
+
 ```bash
 docker compose up -d
-# Dashboard UI:     http://localhost:9090
-# Dashboard status: http://localhost:9090/api/v1/status
-# mm-agent WS:      ws://localhost:9091   (controller-facing only)
-# Prometheus:       http://localhost:9093
-# Grafana:          http://localhost:3000
+# Dashboard UI:    http://localhost:9090
+# Prometheus:      http://localhost:9091
+# Grafana:         http://localhost:3000
 ```
+
+`mm-agent` is not included in the compose — run it on the trading
+box directly (systemd unit, k8s DaemonSet, or bare `./mm-agent`).
+The in-container `mm-server` listens for agent WS on port 9091 of
+its own network namespace; external agents dial that via the
+controller's public address.
+
+Prometheus + Grafana dashboards pre-provisioned from
+`deploy/grafana/dashboards/`. A Helm chart for `mm-server` lives at
+`deploy/helm/mm/`; agent deployment is hand-rolled for now (one
+settings.toml per colo).
 
 ## API Surface
 
@@ -631,16 +648,18 @@ The dashboard is a **fork-to-rebrand Svelte 5 app**: `tokens.css` +
 
 ## Benchmarks
 
+`crates/strategy/benches/strategy_bench.rs` benches the three
+inner-loop quote producers (Avellaneda, GLFT, Grid) with a 25-level
+book against a fixed `ProductSpec`. Run on your hardware:
+
 ```bash
 cargo bench -p mm-strategy
 ```
 
-| Operation | Latency |
-|-----------|---------|
-| Avellaneda-Stoikov (5 levels) | ~2 us |
-| GLFT (5 levels) | ~5 us |
-| Grid (5 levels) | ~1 us |
-| Orderbook delta update | ~200 ns |
+Criterion writes HTML reports to `target/criterion/`. The legacy
+README numbers (~2us / ~5us / ~1us per quote on M-series Macs) were
+dropped until we commit to a reference target — CPU / compiler /
+decimal-precision all move the needle.
 
 ## Testing
 
