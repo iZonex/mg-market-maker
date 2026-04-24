@@ -12,6 +12,10 @@
    *   drag from palette → add node at drop position, fresh UUID
    *   deploy button   → POST /api/admin/strategy/graph with full
    *                     graph JSON; backend validates + broadcasts.
+   *
+   * Pure helpers + modal chrome live in strategy-graph-utils.js +
+   * components/strategy/*. This file is the coordinator (state,
+   * API calls, effects, unified layout).
    */
 
   import {
@@ -19,7 +23,6 @@
     Background,
     Controls,
     MiniMap,
-    useSvelteFlow,
   } from '@xyflow/svelte'
   import '@xyflow/svelte/dist/style.css'
   import { createApiClient } from '../api.svelte.js'
@@ -39,8 +42,19 @@
   import GraphInspector from '../components/GraphInspector.svelte'
   import GraphTimeline from '../components/GraphTimeline.svelte'
   import ReplayModal from '../components/ReplayModal.svelte'
-  import { Button, Modal } from '../primitives/index.js'
+  import VersionsModal from '../components/strategy/VersionsModal.svelte'
+  import SaveTemplateDialog from '../components/strategy/SaveTemplateDialog.svelte'
+  import DeployTargetModal from '../components/strategy/DeployTargetModal.svelte'
+  import RestrictedDeployModal from '../components/strategy/RestrictedDeployModal.svelte'
+  import { Button } from '../primitives/index.js'
   import { computeGraphDiff } from '../graphDiff.js'
+  import {
+    uuid,
+    nodeData as buildNodeData,
+    defaultConfigFor,
+    toBackendGraph as serializeGraph,
+    fromBackendGraph,
+  } from '../strategy-graph-utils.js'
 
   // `liveAgent` / `liveDeployment` come from App.svelte when the URL
   // carries `?live=<agentId>/<deploymentId>` — operator opened this
@@ -50,18 +64,11 @@
     liveAgent = null,
     liveDeployment = null,
     // M4-GOBS — `?tick=<tick_num>` deep link from Incidents.
-    // When set on mount we pre-pin that tick as soon as the
-    // live store catches up with a matching trace.
     liveTick = null,
   } = $props()
   const api = $derived(createApiClient(auth))
 
-  // M2-GOBS — authoring vs live mode. Authoring preserves the
-  // original behaviour (palette, drag, validate, preview, deploy).
-  // Live mode polls graph_trace_recent, overlays per-tick values on
-  // edges + nodes, shows the GraphInspector sidebar instead of the
-  // node-config panel. No deploy from Live mode — operator flips
-  // back to authoring first.
+  // M2-GOBS — authoring vs live mode.
   let mode = $state(
     untrack(() => (liveAgent && liveDeployment ? 'live' : 'authoring')),
   )
@@ -73,12 +80,11 @@
         : null,
     ),
   )
-  // M4-GOBS — time-travel. When `pinnedTickNum` is non-null
-  // the page renders THAT tick's values on the canvas instead
-  // of the latest live frame. Operator picks via the Timeline
-  // scrubber; deep link `?tick=N` pre-pins on mount.
+  // M4-GOBS — time-travel. When `pinnedTickNum` is non-null the
+  // page renders THAT tick's values on the canvas instead of the
+  // latest live frame.
   let pinnedTickNum = $state(liveTick != null ? Number(liveTick) : null)
-  let pinWarning = $state(null) // user-facing message when a pin stales off the ring
+  let pinWarning = $state(null)
   const liveTraces = $derived(liveStore?.state?.traces ?? [])
   const liveTickTrace = $derived(
     pinnedTickNum != null
@@ -87,11 +93,7 @@
   )
   // M4-long-session guard — when the pinned tick rolls off the
   // ring (operator held a pin longer than 256 ticks at ~2 Hz ≈
-  // 2 min), auto-unpin and tell them. Without this the canvas
-  // silently falls back to "newest tick" but the chrome still
-  // claimed pinned mode — worst-of-both UX. Fire only when
-  // the ring has settled (non-empty) so the bootstrap window
-  // before the first poll lands doesn't spuriously fire.
+  // 2 min), auto-unpin and tell them.
   $effect(() => {
     if (pinnedTickNum == null) return
     if (liveTraces.length === 0) return
@@ -104,9 +106,6 @@
   })
   let liveEdgeValues = $derived(edgeValuesFromTrace(liveTickTrace))
   let liveNodeStats = $derived(nodeStatsFromTraces(liveTraces))
-  // Per-node output lookup for the currently displayed tick
-  // (pinned or latest). Used so node badges reflect the exact
-  // frame the operator selected, not the rolling window tail.
   const liveTickOutputs = $derived.by(() => {
     const m = new Map()
     if (!liveTickTrace) return m
@@ -118,6 +117,52 @@
   })
   let liveGraphAnalysis = $derived(liveStore?.state?.graphAnalysis ?? null)
   let deadNodeIds = $derived(new Set(liveGraphAnalysis?.dead_nodes ?? []))
+
+  // Canvas state.
+  let nodes = $state.raw([])
+  let edges = $state.raw([])
+  let catalog = $state([])
+  let templates = $state([])
+  let graphName = $state('untitled')
+  let scopeKind = $state('symbol')
+  let scopeValue = $state('BTCUSDT')
+  let selected = $state(null)
+  let deployStatus = $state('')
+  let deployBusy = $state(false)
+  let previewResult = $state(null)
+  // Epic H Phase 3 — set when the operator loads a historical
+  // hash from the deploy-history panel. Passed as
+  // `?rollback_from=` on the next deploy so the audit row records
+  // intent. Cleared after a successful deploy.
+  let rollbackFrom = $state(null)
+  let previewBusy = $state(false)
+  // UI-6 — set when the backend returns 412 with a
+  // restricted-nodes list. Operator acks + we re-issue with
+  // restricted_ack=yes-pentest-mode.
+  let restrictedAck = $state(null)
+  let customTemplates = $state([])
+  let validation = $state({
+    valid: false, issues: [],
+    node_count: 0, edge_count: 0, sink_count: 0,
+    required_sources: [], dead_nodes: [], unconsumed_outputs: [],
+  })
+  let fileInput = $state(null)
+
+  // Wrappers so call sites don't have to thread `catalog`/local
+  // state through every helper — keeps the backend<->canvas
+  // transforms single-line.
+  const nodeData = (kind, config) => buildNodeData(catalog, kind, config)
+  const toBackendGraph = () => serializeGraph({
+    nodes, edges, name: graphName, scopeKind, scopeValue,
+  })
+  function applyLoadedGraph(g) {
+    const r = fromBackendGraph(g, catalog)
+    graphName = r.name
+    scopeKind = r.scopeKind
+    scopeValue = r.scopeValue
+    nodes = r.nodes
+    edges = r.edges
+  }
 
   // Spin up / tear down the live-poll store as mode flips.
   $effect(() => {
@@ -132,16 +177,12 @@
   // In Live mode, re-decorate edges whenever a new trace lands.
   $effect(() => {
     if (mode !== 'live') return
-    // Subscribe to trace updates (reading state.lastFetch forces
-    // reactivity). The heavy lifting is in decorateEdgesLive below.
     liveStore?.state?.lastFetch
     decorateEdgesLive()
   })
 
   // When entering Live mode with a known deployment, pull the
-  // deployment's graph onto the canvas so the overlay has edges
-  // to decorate. Fetches the fleet snapshot, finds the matching
-  // deployment, then reads its graph name + hash.
+  // deployment's graph onto the canvas.
   $effect(() => {
     if (mode !== 'live' || !liveTarget) return
     loadLiveGraph().catch((e) => { deployStatus = `live graph load failed: ${e}` })
@@ -160,9 +201,7 @@
     // In distributed mode `/strategy/graphs/:name` needs a graph
     // store which isn't wired; `/strategy/templates/:name` returns
     // the bundled graph JSON and works for every template the
-    // controller knows about. Fall back silently on 404 so
-    // operator-saved custom graphs still hit the regular path
-    // once a graph store is available.
+    // controller knows about.
     try {
       const g = await api.getJson(
         `/api/v1/strategy/templates/${encodeURIComponent(graphName)}`,
@@ -170,9 +209,7 @@
       applyLoadedGraph(g)
       // M5.2-GOBS — cache the deployed graph body so the
       // "Replay vs deployed" side-by-side canvas can render
-      // the LEFT pane even after the operator has edited the
-      // canvas into a candidate. We name the graph here so
-      // the replay modal can re-fetch it if the cache misses.
+      // the LEFT pane even after edits.
       deployedGraphSnapshot = g
       deployedGraphName = graphName
       deployStatus = `live: watching ${graphName}`
@@ -181,85 +218,21 @@
     }
   }
 
-  // Extracted helper — same transform the existing `loadGraph`
-  // applies, hoisted so `loadLiveGraph` can call it without
-  // re-fetching from a different endpoint.
-  function applyLoadedGraph(g) {
-    graphName = g.name
-    scopeKind = g.scope.kind
-    scopeValue = g.scope.value ?? ''
-    nodes = g.nodes.map((n) => ({
-      id: n.id,
-      type: 'graphNode',
-      position: { x: n.pos?.[0] ?? 0, y: n.pos?.[1] ?? 0 },
-      data: nodeData(n.kind, n.config),
-    }))
-    edges = g.edges.map((e, i) => ({
-      id: `e${i}`,
-      source: e.from.node,
-      sourceHandle: e.from.port,
-      target: e.to.node,
-      targetHandle: e.to.port,
-    }))
-  }
-
-  let nodes = $state.raw([])
-  let edges = $state.raw([])
-  let catalog = $state([])
-  let templates = $state([])
-  let graphName = $state('untitled')
-  let scopeKind = $state('symbol')
-  let scopeValue = $state('BTCUSDT')
-  let selected = $state(null)
-  let deployStatus = $state('')
-  let deployBusy = $state(false)
-  let previewResult = $state(null)
-  // Epic H Phase 3 — set when the operator loads a historical hash
-  // from the deploy-history panel. Passed as `?rollback_from=` on
-  // the next deploy so the audit row records intent (rollback vs.
-  // accidental hash match). Cleared after a successful deploy.
-  let rollbackFrom = $state(null)
-  let previewBusy = $state(false)
-  // UI-6 — set when the backend returns 412 with a
-  // restricted-nodes list. Frontend opens a confirmation
-  // modal; operator ticks the box + clicks Acknowledge &
-  // Deploy, which re-issues the request with
-  // restricted_ack=yes-pentest-mode.
-  let restrictedAck = $state(null)
-
-  // Custom / user-authored templates, loaded from disk via
-  // /api/v1/strategy/custom_templates. Shown in the same dropdown
-  // as bundled templates with a `custom:` prefix in the value.
-  let customTemplates = $state([])
-
-  // Live server-side validation snapshot. Debounced on any graph
-  // mutation. `valid` drives the Deploy button; `issues` render as
-  // red chips in the validation strip.
-  let validation = $state({
-    valid: false,
-    issues: [],
-    node_count: 0,
-    edge_count: 0,
-    sink_count: 0,
-    // M3-GOBS — topology fields, empty arrays when the graph
-    // doesn't compile (issues surface the reason instead).
-    required_sources: [],
-    dead_nodes: [],
-    unconsumed_outputs: [],
+  // Save dialog state.
+  let saveDialog = $state({
+    open: false,
+    name: '',
+    description: '',
+    diffPreview: null,
+    busy: false,
+    checkBusy: false,
+    error: '',
   })
 
-  let fileInput = $state(null)
-  let saveDialogOpen = $state(false)
-  let saveDialogName = $state('')
-  let saveDialogDesc = $state('')
-  let saveDialogBusy = $state(false)
-  let saveDialogError = $state('')
-
   // ─── Local draft persistence ──────────────────────────────
-  // Canvas work is checkpointed into localStorage on every change so
-  // F5 / tab crashes never lose the WIP. Deploy is still the single
-  // source of truth for "live" — draft only restores the *editor*
-  // state, never activates a graph.
+  // Canvas work is checkpointed into localStorage on every change
+  // so F5 / tab crashes never lose the WIP. Deploy is still the
+  // single source of truth; draft only restores editor state.
   const DRAFT_KEY = 'mm.strategy.draft.v1'
 
   function saveDraft() {
@@ -310,11 +283,8 @@
   }
 
   // Autosave: fires on any mutation of the observed state.
-  // Debounced via a micro-task so a 10-node load triggers one save
-  // at the end, not ten.
   let saveScheduled = false
   $effect(() => {
-    // Subscribe to the reactive state.
     nodes.length; edges.length; graphName; scopeKind; scopeValue
     if (saveScheduled) return
     saveScheduled = true
@@ -325,9 +295,7 @@
   //
   // Server-side is the single source of truth (same validator
   // Deploy uses) so client-side rules never silently drift.
-  // Debounced 300 ms — fast enough that operator feedback is
-  // immediate, slow enough that dragging a node doesn't spam
-  // the endpoint.
+  // Debounced 300 ms.
   let validateTimer = null
   function scheduleValidate() {
     if (validateTimer) clearTimeout(validateTimer)
@@ -335,20 +303,18 @@
   }
   async function runValidate() {
     if (nodes.length === 0) {
-      validation = { valid: false, issues: [], node_count: 0, edge_count: 0, sink_count: 0 }
+      validation = { valid: false, issues: [], node_count: 0, edge_count: 0, sink_count: 0,
+        required_sources: [], dead_nodes: [], unconsumed_outputs: [] }
       return
     }
     try {
       const body = { graph: toBackendGraph() }
       validation = await api.postJson('/api/v1/strategy/validate', body)
     } catch (e) {
-      // Non-fatal — keep last state, surface as a single issue so
-      // the operator at least sees something.
       validation = { ...validation, valid: false, issues: [`validator unreachable: ${e}`] }
     }
   }
   $effect(() => {
-    // Re-validate on any canvas mutation.
     nodes.length; edges.length; graphName; scopeKind; scopeValue
     scheduleValidate()
   })
@@ -365,10 +331,7 @@
 
   function exportGraph() {
     // M-SAVE GOBS — stamp the filename with an ISO date so the
-    // operator can tell exports apart when cross-referencing
-    // against the template's version history on disk. Hash
-    // would be more precise but needs a validator roundtrip;
-    // date is good enough at human-scale.
+    // operator can tell exports apart.
     const date = new Date().toISOString().slice(0, 10)
     const stem = graphName || 'strategy-graph'
     const blob = new Blob(
@@ -389,26 +352,11 @@
     try {
       const text = await file.text()
       const g = JSON.parse(text)
-      graphName = g.name ?? 'untitled'
-      scopeKind = g.scope?.kind ?? 'symbol'
-      scopeValue = g.scope?.value ?? ''
-      nodes = (g.nodes ?? []).map((n) => ({
-        id: n.id,
-        type: 'graphNode',
-        position: { x: n.pos?.[0] ?? 0, y: n.pos?.[1] ?? 0 },
-        data: nodeData(n.kind, n.config),
-      }))
-      edges = (g.edges ?? []).map((e, i) => ({
-        id: `e${i}`,
-        source: e.from.node, sourceHandle: e.from.port,
-        target: e.to.node, targetHandle: e.to.port,
-      }))
+      applyLoadedGraph(g)
       deployStatus = `imported ${nodes.length} nodes from ${file.name}`
-      // M-SAVE GOBS — if the imported name matches a known
-      // custom template, hint that saving will create a new
-      // version. The save dialog's diff preview does the actual
-      // version check at commit time; this is just a nudge so
-      // the operator doesn't assume a fresh template.
+      // M-SAVE GOBS — nudge if the imported name matches a known
+      // custom template; the save dialog's diff preview runs the
+      // actual version check at commit time.
       const existing = customTemplates.find((t) => t.name === graphName)
       if (existing) {
         deployStatus = `imported · matches existing '${graphName}' — save will create v${(existing.version_count ?? 0) + 2}`
@@ -421,42 +369,34 @@
   }
 
   // ─── Save as custom template ─────────────────────────────
-
-  // M-SAVE GOBS — the save flow now runs in two phases when
-  // the target name already has versions on disk:
+  //
+  // Two-phase when the target name already has versions on disk:
   //   phase 1: fetch existing latest graph + compute diff
   //   phase 2: operator confirms → actually POST
-  // When the name is brand new we go straight to phase 2.
-  let saveDiffPreview = $state(null) // {existing, diff} when target already saved
-  let saveCheckBusy = $state(false)
+  // Brand new name goes straight to phase 2.
 
   function openSaveDialog() {
-    saveDialogName = graphName && graphName !== 'untitled' ? graphName : ''
-    saveDialogDesc = ''
-    saveDialogError = ''
-    saveDiffPreview = null
-    saveDialogOpen = true
+    saveDialog = {
+      open: true,
+      name: graphName && graphName !== 'untitled' ? graphName : '',
+      description: '',
+      diffPreview: null,
+      busy: false,
+      checkBusy: false,
+      error: '',
+    }
   }
 
-  /**
-   * Click handler for the Save dialog's primary button. On first
-   * click, probe whether the name already exists — if it does,
-   * compute a diff and render it inline so the operator sees
-   * what's changing before the POST. On second click (with a
-   * diff already rendered), proceed to actually save.
-   */
   async function onSaveClick() {
-    if (saveDiffPreview) {
-      // Second click → commit.
+    if (saveDialog.diffPreview) {
       await commitSaveTemplate()
       return
     }
-    saveCheckBusy = true
-    saveDialogError = ''
+    saveDialog = { ...saveDialog, checkBusy: true, error: '' }
     try {
-      const name = saveDialogName.trim()
+      const name = saveDialog.name.trim()
       if (!name) {
-        saveDialogError = 'name is required'
+        saveDialog = { ...saveDialog, error: 'name is required' }
         return
       }
       let existing = null
@@ -465,56 +405,48 @@
           `/api/v1/strategy/custom_templates/${encodeURIComponent(name)}`,
         )
       } catch {
-        // 404 is expected for a brand-new name — fall through
-        // to direct-save without a diff preview.
+        // 404 is expected for a brand-new name.
       }
       if (!existing?.graph) {
-        // New template: save immediately.
         await commitSaveTemplate()
         return
       }
-      saveDiffPreview = {
-        existing,
-        diff: computeGraphDiff(existing.graph, toBackendGraph()),
+      saveDialog = {
+        ...saveDialog,
+        diffPreview: { existing, diff: computeGraphDiff(existing.graph, toBackendGraph()) },
       }
     } finally {
-      saveCheckBusy = false
+      saveDialog = { ...saveDialog, checkBusy: false }
     }
   }
 
   async function commitSaveTemplate() {
-    saveDialogBusy = true
-    saveDialogError = ''
+    saveDialog = { ...saveDialog, busy: true, error: '' }
     try {
       const resp = await api.postJson('/api/v1/strategy/custom_templates', {
-        name: saveDialogName.trim(),
-        description: saveDialogDesc.trim(),
+        name: saveDialog.name.trim(),
+        description: saveDialog.description.trim(),
         graph: toBackendGraph(),
       })
-      saveDialogOpen = false
-      saveDiffPreview = null
-      await loadCustomTemplates()
       const ver = resp?.version
       deployStatus = ver
-        ? `saved '${saveDialogName.trim()}' (v${ver})`
-        : `saved template '${saveDialogName.trim()}'`
+        ? `saved '${saveDialog.name.trim()}' (v${ver})`
+        : `saved template '${saveDialog.name.trim()}'`
+      saveDialog = { ...saveDialog, open: false, diffPreview: null }
+      await loadCustomTemplates()
     } catch (e) {
-      saveDialogError = String(e)
+      saveDialog = { ...saveDialog, error: String(e) }
     } finally {
-      saveDialogBusy = false
+      saveDialog = { ...saveDialog, busy: false }
     }
   }
 
   function closeSaveDialog() {
-    saveDialogOpen = false
-    saveDiffPreview = null
+    saveDialog = { ...saveDialog, open: false, diffPreview: null }
   }
 
-  // M-SAVE GOBS — version history UX for custom templates.
-  // Open via "Versions…" button in the toolbar. Lists every
-  // saved version newest-first; click any row to load that
-  // version's graph onto the canvas.
-  let versionsModal = $state(null) // {name, history}
+  // ─── Version history ─────────────────────────────────────
+  let versionsModal = $state(null)
   let versionsBusy = $state(false)
 
   const currentIsCustomTemplate = $derived.by(() =>
@@ -528,10 +460,7 @@
       const resp = await api.getJson(
         `/api/v1/strategy/custom_templates/${encodeURIComponent(graphName)}`,
       )
-      versionsModal = {
-        name: graphName,
-        history: resp?.history ?? [],
-      }
+      versionsModal = { name: graphName, history: resp?.history ?? [] }
     } catch (e) {
       deployStatus = `history fetch failed: ${e}`
     } finally {
@@ -553,10 +482,6 @@
     }
   }
 
-  function closeVersionsModal() {
-    versionsModal = null
-  }
-
   async function loadCatalog() {
     try {
       catalog = await api.getJson('/api/v1/strategy/catalog')
@@ -567,8 +492,7 @@
   async function loadTemplates() {
     try {
       templates = await api.getJson('/api/v1/strategy/templates')
-    } catch (e) {
-      // Non-fatal — operator can still compose from scratch.
+    } catch {
       templates = []
     }
   }
@@ -591,81 +515,27 @@
 
   async function loadTemplate(name) {
     if (!name) return
-    // `custom:<name>` → user-saved template on disk; hydrates from
-    // the full record (graph + metadata) rather than the bundled
-    // endpoint.
+    // `custom:<name>` → user-saved template on disk; hydrates
+    // from the full record (graph + metadata) rather than the
+    // bundled endpoint.
     const isCustom = name.startsWith('custom:')
     const realName = isCustom ? name.slice('custom:'.length) : name
     try {
       let g
       if (isCustom) {
         const rec = await api.getJson(
-          `/api/v1/strategy/custom_templates/${encodeURIComponent(realName)}`
+          `/api/v1/strategy/custom_templates/${encodeURIComponent(realName)}`,
         )
         g = rec.graph
       } else {
         g = await api.getJson(
-          `/api/v1/strategy/templates/${encodeURIComponent(realName)}`
+          `/api/v1/strategy/templates/${encodeURIComponent(realName)}`,
         )
       }
-      graphName = g.name
-      scopeKind = g.scope.kind
-      scopeValue = g.scope.value ?? ''
-      nodes = g.nodes.map((n) => ({
-        id: n.id,
-        type: 'graphNode',
-        position: { x: n.pos?.[0] ?? 0, y: n.pos?.[1] ?? 0 },
-        data: nodeData(n.kind, n.config),
-      }))
-      edges = g.edges.map((e, i) => ({
-        id: `e${i}`,
-        source: e.from.node,
-        sourceHandle: e.from.port,
-        target: e.to.node,
-        targetHandle: e.to.port,
-      }))
+      applyLoadedGraph(g)
       deployStatus = `loaded template '${realName}'`
     } catch (e) {
       deployStatus = `template load failed: ${e}`
-    }
-  }
-
-  function uuid() {
-    // Simple v4 UUID without adding a dep.
-    const h = 'abcdef0123456789'
-    let s = ''
-    for (let i = 0; i < 32; i++) {
-      if (i === 8 || i === 12 || i === 16 || i === 20) s += '-'
-      if (i === 12) s += '4'
-      else if (i === 16) s += h[(Math.random() * 4) | 0 | 8]
-      else s += h[(Math.random() * 16) | 0]
-    }
-    return s
-  }
-
-  // Build the `data` blob svelte-flow hands to StrategyNode.svelte.
-  // Centralised so every path that materialises a node (drag/click,
-  // template load, backend reload, rollback) attaches the same
-  // label/group/summary fields and doesn't drift.
-  function nodeData(kind, config) {
-    const entry = catalog.find((c) => c.kind === kind)
-    // Prefill the config with every schema default so the form is
-    // never empty — operators see what they can tweak even before
-    // they open the right-pane.
-    const defaults = {}
-    for (const f of entry?.config_schema ?? []) {
-      defaults[f.name] = f.default
-    }
-    return {
-      kind,
-      label: entry?.label ?? kind,
-      summary: entry?.summary ?? '',
-      group: entry?.group ?? kind.split('.')[0],
-      config: { ...defaults, ...(config ?? {}) },
-      configSchema: entry?.config_schema ?? [],
-      inputs: entry?.inputs ?? [],
-      outputs: entry?.outputs ?? [],
-      restricted: entry?.restricted ?? false,
     }
   }
 
@@ -683,24 +553,6 @@
     ]
   }
 
-  function defaultConfigFor(kind) {
-    if (kind === 'Stats.EWMA') return { alpha: '0.1' }
-    if (kind === 'Cast.ToBool') return { threshold: '0', cmp: 'ge' }
-    if (kind === 'Math.Const') return { value: '1.0' }
-    if (kind === 'Cast.StrategyEq') return { target: 'AvellanedaStoikov' }
-    if (kind === 'Cast.PairClassEq') return { target: 'MajorSpot' }
-    if (kind === 'Risk.ToxicityWiden') return { scale: '2' }
-    if (kind === 'Risk.InventoryUrgency') return { cap: '1', exponent: '2' }
-    if (kind === 'Risk.CircuitBreaker') return { wide_bps: '100' }
-    if (kind === 'Indicator.SMA' || kind === 'Indicator.EMA' || kind === 'Indicator.HMA' || kind === 'Indicator.RSI' || kind === 'Indicator.ATR') return { period: 14 }
-    if (kind === 'Indicator.Bollinger') return { period: 20, k_stddev: '2' }
-    if (kind === 'Exec.TwapConfig') return { duration_secs: 120, slice_count: 5 }
-    if (kind === 'Exec.VwapConfig') return { duration_secs: 300 }
-    if (kind === 'Exec.PovConfig') return { target_pct: 10 }
-    if (kind === 'Exec.IcebergConfig') return { display_qty: '0.1' }
-    return {}
-  }
-
   function onDrop(e) {
     e.preventDefault()
     const kind = e.dataTransfer?.getData('mm/strategy-kind')
@@ -713,34 +565,7 @@
   }
   function onDragOver(e) { e.preventDefault() }
 
-  function toBackendGraph() {
-    const backendNodes = nodes.map(n => ({
-      id: n.id,
-      kind: n.data.kind,
-      config: n.data.config ?? null,
-      pos: [n.position.x, n.position.y],
-    }))
-    const backendEdges = edges.map(e => ({
-      from: { node: e.source, port: e.sourceHandle ?? '' },
-      to: { node: e.target, port: e.targetHandle ?? '' },
-    }))
-    return {
-      version: 1,
-      name: graphName,
-      scope: { kind: scopeKind, value: scopeKind === 'global' ? null : scopeValue },
-      nodes: backendNodes,
-      edges: backendEdges,
-      stale_hold_ms: 30000,
-    }
-  }
-
-  // Unified deploy modal (Wave A3). Operator clicks Deploy once:
-  // modal opens pre-filled with the fleet, multi-select targets,
-  // Confirm fires save + parallel graph-swap to every selected
-  // (agent, deployment). No implicit broadcast — operator always
-  // names what they're affecting. Two-step (save-first) flow
-  // removed so the dispatch phase can show a single progress
-  // bar instead of "saved … now pick" limbo.
+  // ─── Unified deploy flow (Wave A3) ───────────────────────
   let deployTargetModal = $state(null)
 
   async function saveGraph(ackToken = null) {
@@ -759,8 +584,7 @@
         body: JSON.stringify(body),
       })
       if (resp.status === 412) {
-        // UI-6 — restricted deploy awaiting operator ack. Open
-        // the modal; resubmit only if the operator confirms.
+        // UI-6 — restricted deploy awaiting operator ack.
         const payload = await resp.json().catch(() => ({}))
         restrictedAck = {
           nodes: payload?.restricted_nodes ?? [],
@@ -792,7 +616,7 @@
   // multi-select target list. "Confirm" saves the graph and
   // fan-outs graph-swap to every selected (agent, deployment)
   // in parallel. One confirmation = one deploy.
-  async function deploy(_ackToken = null) {
+  async function deploy() {
     try {
       const fleet = await api.getJson('/api/v1/fleet')
       const rows = []
@@ -812,12 +636,11 @@
       deployTargetModal = {
         rows,
         selected: {},
-        phase: 'select',  // 'select' | 'dispatching' | 'done'
-        results: [],       // [{ key, phase: 'ok' | 'err', detail }]
+        phase: 'select',
+        results: [],
         status: rows.length === 0
           ? 'No running deployments on any accepted agent. Launch one via Fleet → Deploy first.'
           : '',
-        ackToken: null,
       }
     } catch (e) {
       deployStatus = `fleet fetch failed: ${e.message || e}`
@@ -832,31 +655,21 @@
     deployTargetModal = { ...deployTargetModal, selected: next }
   }
 
-  function selectedRows() {
-    if (!deployTargetModal) return []
-    return deployTargetModal.rows.filter(r => deployTargetModal.selected[r.key])
-  }
-
-  // Confirm action — saves once, then fan-outs graph-swap per
-  // selected row. Each dispatch is independent; failures on one
-  // row don't block the rest. The results table shows status
-  // per target so the operator sees exactly what landed.
+  // Confirm — saves once, then fan-outs graph-swap per selected
+  // row. Failures on one row don't block the rest.
   async function confirmDeploy(ackToken = null) {
-    const targets = selectedRows()
-    if (!deployTargetModal || targets.length === 0) return
+    if (!deployTargetModal) return
+    const targets = deployTargetModal.rows.filter((r) => deployTargetModal.selected[r.key])
+    if (targets.length === 0) return
     deployTargetModal = {
       ...deployTargetModal,
       phase: 'dispatching',
-      results: targets.map(r => ({ key: r.key, phase: 'pending', detail: '' })),
+      results: targets.map((r) => ({ key: r.key, phase: 'pending', detail: '' })),
       status: 'saving graph…',
     }
     const saved = await saveGraph(ackToken)
     if (!saved) {
-      deployTargetModal = {
-        ...deployTargetModal,
-        phase: 'select',
-        status: deployStatus || 'save failed',
-      }
+      deployTargetModal = { ...deployTargetModal, phase: 'select', status: deployStatus || 'save failed' }
       return
     }
     const hash = saved.hash
@@ -881,24 +694,14 @@
         return { key: row.key, phase: 'err', detail: e?.message || String(e) }
       }
     }))
-    const okCount = settled.filter(s => s.phase === 'ok').length
+    const okCount = settled.filter((s) => s.phase === 'ok').length
     deployStatus = `graph ${hash?.slice(0, 12)}… · ${okCount}/${targets.length} target(s) applied`
-    deployTargetModal = {
-      ...deployTargetModal,
-      phase: 'done',
-      results: settled,
-      status: deployStatus,
-    }
+    deployTargetModal = { ...deployTargetModal, phase: 'done', results: settled, status: deployStatus }
   }
 
-  function closeDeployTargetModal() {
-    deployTargetModal = null
-  }
-
-  // Restricted-graph ack path: saveGraph returned 412 inside
-  // confirmDeploy, flipped `restrictedAck`. Operator ticks the
-  // checkbox + confirms, we re-run confirmDeploy with the
-  // pentest-mode token on the same already-selected targets.
+  // Restricted-graph ack path: saveGraph returned 412, flipped
+  // `restrictedAck`. Operator confirms → re-run confirmDeploy
+  // with the pentest-mode token on the same selected targets.
   async function confirmRestrictedDeploy() {
     if (!restrictedAck?.acknowledged) return
     restrictedAck = { ...restrictedAck, busy: true, error: '' }
@@ -912,10 +715,7 @@
     previewBusy = true
     previewResult = null
     try {
-      const body = {
-        graph: toBackendGraph(),
-        source_inputs: {},
-      }
+      const body = { graph: toBackendGraph(), source_inputs: {} }
       previewResult = await api.postJson('/api/v1/strategy/preview', body)
       decorateEdges()
     } catch (e) {
@@ -925,10 +725,6 @@
     }
   }
 
-  // Decorate canvas edges with live values from the preview trace.
-  // svelte-flow supports `label` + `labelStyle` per edge, so we
-  // materialise the value the upstream node produced on the edge's
-  // `sourceHandle`. Edges without a trace hit stay unlabelled.
   function decorateEdges() {
     const lookup = previewResult?.edges ?? null
     edges = edges.map((e) => {
@@ -949,11 +745,9 @@
   }
 
   // M2-GOBS — Live-mode edge decoration. Same svelte-flow label
-  // path as preview, but values come from the `TickTrace` the
-  // agent returned over `graph_trace_recent`. Called from the
-  // `$effect` that watches `liveStore.state.lastFetch`. Reads
-  // `edges` for the rebuild but wraps the read in `untrack` so
-  // the self-write doesn't re-enter the effect.
+  // path as preview, but values come from the `TickTrace`
+  // returned over `graph_trace_recent`. Wrap `edges` read in
+  // `untrack` so the self-write doesn't re-enter the effect.
   function decorateEdgesLive() {
     const lookup = liveEdgeValues
     const deadIds = deadNodeIds
@@ -962,30 +756,21 @@
       const key = `${e.source}:${e.sourceHandle}`
       const label = lookup[key]
       const isDead = deadIds.has(e.source) || deadIds.has(e.target)
-      const base = isDead
-        ? { stroke: 'var(--danger)', 'stroke-dasharray': '4 3' }
-        : {}
       if (label !== undefined) {
         return {
           ...e,
           label,
-          labelStyle:
-            'font-family: var(--font-mono); font-size: 10px; fill: var(--fg-primary);',
-          labelBgStyle:
-            'fill: var(--bg-raised); stroke: var(--accent); stroke-width: 1;',
+          labelStyle: 'font-family: var(--font-mono); font-size: 10px; fill: var(--fg-primary);',
+          labelBgStyle: 'fill: var(--bg-raised); stroke: var(--accent); stroke-width: 1;',
           labelBgPadding: [4, 2],
           labelBgBorderRadius: 4,
-          style: isDead
-            ? 'stroke: var(--danger); stroke-dasharray: 4 3;'
-            : undefined,
+          style: isDead ? 'stroke: var(--danger); stroke-dasharray: 4 3;' : undefined,
         }
       }
       return {
         ...e,
         label: undefined,
-        style: isDead
-          ? 'stroke: var(--danger); stroke-dasharray: 4 3;'
-          : undefined,
+        style: isDead ? 'stroke: var(--danger); stroke-dasharray: 4 3;' : undefined,
       }
     })
   }
@@ -994,19 +779,10 @@
   // StrategyNode can render the badge / pulse / status chip /
   // dead border without plumbing a separate store through
   // svelte-flow's custom node slot.
-  //
-  // The effect reads `nodes` to write back onto it. Svelte 5
-  // would re-trigger the effect infinitely if we read `nodes`
-  // reactively here — wrap the read in `untrack` so the effect
-  // only re-runs when the live data actually changes.
   $effect(() => {
-    // Declared dependencies: re-run when mode flips, traces tick,
-    // or graph analysis swaps.
     const activeMode = mode
     const stats = liveNodeStats
     const analysis = liveGraphAnalysis
-    // M4 — re-run on pin/unpin so node badges snap to the
-    // selected tick's output (read outside untrack).
     const tickOutputs = liveTickOutputs
     untrack(() => {
       if (activeMode !== 'live') {
@@ -1026,14 +802,10 @@
       const required = new Set(analysis?.required_sources ?? [])
       nodes = nodes.map((n) => {
         const row = stats.get(n.id)
-        // Prefer the pinned/selected tick's actual output; fall
-        // back to the rolling-window last-value for nodes that
-        // happened not to fire on the selected tick.
         const pinnedOut = tickOutputs.get(n.id) ?? null
-        const fallbackOut =
-          row && row.history.length > 0
-            ? row.history[row.history.length - 1]
-            : null
+        const fallbackOut = row && row.history.length > 0
+          ? row.history[row.history.length - 1]
+          : null
         const display = pinnedOut ?? fallbackOut
         const live = {
           latest: formatValue(display),
@@ -1054,26 +826,23 @@
   async function loadGraph(name) {
     try {
       const g = await api.getJson(`/api/v1/strategy/graphs/${encodeURIComponent(name)}`)
-      graphName = g.name
-      scopeKind = g.scope.kind
-      scopeValue = g.scope.value ?? ''
-      nodes = g.nodes.map((n) => ({
-        id: n.id,
-        type: 'graphNode',
-        position: { x: n.pos?.[0] ?? 0, y: n.pos?.[1] ?? 0 },
-        data: nodeData(n.kind, n.config),
-      }))
-      edges = g.edges.map((e, i) => ({
-        id: `e${i}`,
-        source: e.from.node,
-        sourceHandle: e.from.port,
-        target: e.to.node,
-        targetHandle: e.to.port,
-      }))
+      applyLoadedGraph(g)
       deployStatus = `loaded '${name}'`
     } catch (e) {
       deployStatus = `load failed: ${e}`
     }
+  }
+
+  // Load an older deployed hash onto the canvas. Used by the
+  // deploy-history panel for both straight rollback (operator
+  // clicks Deploy to apply) and rollback-to-deployment (fires
+  // deploy() immediately).
+  async function loadHistoricalHash(name, hash) {
+    const g = await api.getJson(
+      `/api/v1/strategy/graphs/${encodeURIComponent(name)}/history/${encodeURIComponent(hash)}`,
+    )
+    applyLoadedGraph(g)
+    rollbackFrom = hash
   }
 
   function onSelectionChange(evt) {
@@ -1082,28 +851,21 @@
   function updateSelectedConfig(cfg) {
     if (!selected) return
     const id = selected.id
-    nodes = nodes.map(n =>
-      n.id === id ? { ...n, data: { ...n.data, config: cfg } } : n
+    nodes = nodes.map((n) =>
+      n.id === id ? { ...n, data: { ...n.data, config: cfg } } : n,
     )
-    // Keep the local reference in sync so the panel re-renders.
-    selected = nodes.find(n => n.id === id) ?? null
+    selected = nodes.find((n) => n.id === id) ?? null
   }
 
   function deleteSelected() {
     if (!selected) return
     const id = selected.id
-    nodes = nodes.filter(n => n.id !== id)
-    edges = edges.filter(e => e.source !== id && e.target !== id)
+    nodes = nodes.filter((n) => n.id !== id)
+    edges = edges.filter((e) => e.source !== id && e.target !== id)
     selected = null
   }
 
-  // M5-GOBS — replay current canvas against the deployment's
-  // recent trace ring. Button shows only when we know which
-  // deployment to compare against (i.e. operator arrived here
-  // from the Live view of that deployment). The modal chrome
-  // + side-by-side canvas + divergence scrubber live in
-  // `ReplayModal.svelte`; we only own the fetch + the two
-  // graph snapshots that feed it.
+  // ─── Replay vs deployed (M5-GOBS) ────────────────────────
   let replayBusy = $state(false)
   let replayResult = $state(null)
   let deployedGraphSnapshot = $state(null)
@@ -1116,8 +878,6 @@
     candidateGraphForReplay = toBackendGraph()
     // Safety-net re-fetch — if the operator never flipped into
     // Live mode, `loadLiveGraph` never ran so the cache is empty.
-    // Best-effort: failure here leaves `deployedGraphSnapshot`
-    // null and the modal falls back to a one-canvas layout.
     if (!deployedGraphSnapshot) {
       try {
         const fleet = await api.getJson('/api/v1/fleet')
@@ -1135,34 +895,27 @@
           }
         }
       } catch (_e) {
-        // Swallow — side-by-side pane just hides its left half.
+        // Swallow — side-by-side pane hides its left half.
       }
     }
     try {
       const url =
         `/api/v1/agents/${encodeURIComponent(liveTarget.agentId)}` +
         `/deployments/${encodeURIComponent(liveTarget.deploymentId)}/replay`
-      // Controller fans out to the agent via the
-      // `graph_replay` details topic; response wraps the
-      // ReplayResponse under `payload`.
       const resp = await api.postJson(url, {
         candidate_graph: candidateGraphForReplay,
         ticks: 20,
       })
       replayResult = resp?.payload ?? {
         summary: 'empty replay response',
-        ticks_replayed: 0,
-        divergence_count: 0,
-        divergences: [],
-        candidate_issues: [],
+        ticks_replayed: 0, divergence_count: 0,
+        divergences: [], candidate_issues: [],
       }
     } catch (e) {
       replayResult = {
         summary: `replay failed: ${e}`,
-        ticks_replayed: 0,
-        divergence_count: 0,
-        divergences: [],
-        candidate_issues: [String(e)],
+        ticks_replayed: 0, divergence_count: 0,
+        divergences: [], candidate_issues: [String(e)],
       }
     } finally {
       replayBusy = false
@@ -1231,21 +984,12 @@
       <Button variant="ghost" size="sm" iconOnly onclick={() => fileInput?.click()} title="Import graph from JSON file">
         {#snippet children()}<Icon name="upload" size={14} />{/snippet}
       </Button>
-      <input
-        type="file" accept="application/json" bind:this={fileInput}
-        onchange={importGraph} style="display: none"
-      />
+      <input type="file" accept="application/json" bind:this={fileInput} onchange={importGraph} style="display: none" />
       <Button variant="ghost" size="sm" iconOnly onclick={openSaveDialog} disabled={nodes.length === 0} title="Save as reusable template">
         {#snippet children()}<Icon name="save" size={14} />{/snippet}
       </Button>
       {#if currentIsCustomTemplate}
-        <Button
-          variant="ghost"
-          size="sm"
-          onclick={openVersionsModal}
-          disabled={versionsBusy}
-          title={`Browse saved versions of '${graphName}' and load any older revision.`}
-        >
+        <Button variant="ghost" size="sm" onclick={openVersionsModal} disabled={versionsBusy} title={`Browse saved versions of '${graphName}' and load any older revision.`}>
           {#snippet children()}<Icon name="history" size={14} /><span>{versionsBusy ? '…' : 'Versions'}</span>{/snippet}
         </Button>
       {/if}
@@ -1253,13 +997,7 @@
         {#snippet children()}<Icon name="pulse" size={14} /><span>{previewBusy ? 'Simulating…' : 'Simulate'}</span>{/snippet}
       </Button>
       {#if liveTarget && mode === 'authoring'}
-        <Button
-          variant="ghost"
-          size="sm"
-          onclick={runReplay}
-          disabled={replayBusy || nodes.length === 0}
-          title={`Replay this canvas against the last 20 ticks of ${liveTarget.agentId}/${liveTarget.deploymentId} and count where the sink actions diverge.`}
-        >
+        <Button variant="ghost" size="sm" onclick={runReplay} disabled={replayBusy || nodes.length === 0} title={`Replay this canvas against the last 20 ticks of ${liveTarget.agentId}/${liveTarget.deploymentId} and count where the sink actions diverge.`}>
           {#snippet children()}<Icon name="history" size={14} /><span>{replayBusy ? 'Replaying…' : 'Replay vs deployed'}</span>{/snippet}
         </Button>
       {/if}
@@ -1267,26 +1005,10 @@
         {#snippet children()}<Icon name="bolt" size={14} /><span>{deployBusy ? 'Deploying…' : 'Deploy'}</span>{/snippet}
       </Button>
       <div class="mode-toggle" role="tablist" aria-label="Editor mode">
-        <button
-          type="button"
-          class="mode-btn"
-          class:active={mode === 'authoring'}
-          role="tab"
-          aria-selected={mode === 'authoring'}
-          onclick={() => (mode = 'authoring')}
-        >
+        <button type="button" class="mode-btn" class:active={mode === 'authoring'} role="tab" aria-selected={mode === 'authoring'} onclick={() => (mode = 'authoring')}>
           Authoring
         </button>
-        <button
-          type="button"
-          class="mode-btn"
-          class:active={mode === 'live'}
-          role="tab"
-          aria-selected={mode === 'live'}
-          disabled={!liveTarget}
-          title={liveTarget ? 'Watch deployed graph live' : 'Open from Fleet → deployment → Open graph (live)'}
-          onclick={() => (mode = 'live')}
-        >
+        <button type="button" class="mode-btn" class:active={mode === 'live'} role="tab" aria-selected={mode === 'live'} disabled={!liveTarget} title={liveTarget ? 'Watch deployed graph live' : 'Open from Fleet → deployment → Open graph (live)'} onclick={() => (mode = 'live')}>
           <span class={mode === 'live' ? 'live-pulse' : ''}></span>
           Live
         </button>
@@ -1303,8 +1025,8 @@
   {/if}
 
   <!-- Validation strip: live counters + issue list, server-side
-       authoritative. Green pill = Evaluator::build succeeded +
-       no dangling edges; red pill lists every blocker so the
+       authoritative. Green pill = Evaluator::build succeeded + no
+       dangling edges; red pill lists every blocker so the
        operator fixes them before noticing the disabled Deploy. -->
   <div class="validate-bar" class:valid={validation.valid} class:invalid={!validation.valid && nodes.length > 0}>
     {#if nodes.length === 0}
@@ -1345,39 +1067,11 @@
     {/if}
   </div>
 
-  <Modal
-    open={!!versionsModal}
-    ariaLabel="Version history"
-    maxWidth="720px"
-    onClose={closeVersionsModal}
-  >
-    {#snippet children()}
-      <h3>{versionsModal?.name} — version history</h3>
-      {#if versionsModal?.history?.length === 0}
-        <div class="muted">no saved versions yet</div>
-      {:else if versionsModal}
-        <div class="versions-list">
-          {#each versionsModal.history as v, i (v.hash)}
-            <button
-              type="button"
-              class="version-row"
-              onclick={() => loadVersion(v.hash)}
-            >
-              <span class="v-ix">v{versionsModal.history.length - i}</span>
-              <code class="v-hash mono">{v.hash.slice(0, 12)}</code>
-              <span class="v-when mono">{new Date(v.saved_at).toLocaleString()}</span>
-              {#if v.saved_by}<span class="v-by">by <code>{v.saved_by}</code></span>{/if}
-              {#if v.description}<span class="v-desc">· {v.description}</span>{/if}
-              <span class="v-chev">›</span>
-            </button>
-          {/each}
-        </div>
-      {/if}
-    {/snippet}
-    {#snippet actions()}
-      <Button variant="ghost" onclick={closeVersionsModal}>{#snippet children()}Close{/snippet}</Button>
-    {/snippet}
-  </Modal>
+  <VersionsModal
+    state={versionsModal}
+    onLoadVersion={loadVersion}
+    onClose={() => (versionsModal = null)}
+  />
 
   <ReplayModal
     result={replayResult}
@@ -1386,108 +1080,15 @@
     candidateGraph={candidateGraphForReplay}
     onClose={closeReplay}
   />
-  <Modal
-    open={saveDialogOpen}
-    ariaLabel="Save as template"
-    maxWidth="640px"
+
+  <SaveTemplateDialog
+    open={saveDialog.open}
+    state={saveDialog}
+    onNameChange={(v) => (saveDialog = { ...saveDialog, name: v })}
+    onDescriptionChange={(v) => (saveDialog = { ...saveDialog, description: v })}
+    onSave={onSaveClick}
     onClose={closeSaveDialog}
-  >
-    {#snippet children()}
-      <h3>Save as template</h3>
-      <label class="field stacked">
-        <span class="field-label">Name</span>
-        <input type="text" bind:value={saveDialogName} placeholder="my-cool-setup" disabled={saveDiffPreview !== null} />
-      </label>
-      <label class="field stacked">
-        <span class="field-label">Description</span>
-        <input type="text" bind:value={saveDialogDesc} placeholder="What does this do?" />
-      </label>
-        {#if saveDiffPreview}
-          {@const d = saveDiffPreview.diff}
-          {@const unchanged = d.totalChanges === 0}
-          <div class="save-diff" class:clean={unchanged}>
-            <div class="save-diff-head">
-              {#if unchanged}
-                No graph changes — will save a new version with
-                just the updated description + timestamp.
-              {:else}
-                This name already has
-                {saveDiffPreview.existing.history?.length ?? 1} version(s).
-                Saving will append version #{(saveDiffPreview.existing.history?.length ?? 1) + 1}:
-              {/if}
-            </div>
-            {#if !unchanged}
-              <div class="save-diff-counts">
-                <span class="diff-chip add">+{d.addedNodes.length} nodes</span>
-                <span class="diff-chip rm">−{d.removedNodes.length} nodes</span>
-                <span class="diff-chip mod">~{d.modifiedNodes.length} nodes</span>
-                <span class="diff-chip add">+{d.addedEdges.length} edges</span>
-                <span class="diff-chip rm">−{d.removedEdges.length} edges</span>
-              </div>
-              <details class="save-diff-detail">
-                <summary>details</summary>
-                {#if d.addedNodes.length > 0}
-                  <div class="diff-section">
-                    <div class="diff-label">added nodes</div>
-                    {#each d.addedNodes as n}
-                      <code class="diff-line add">+ {n.kind} · {n.id.slice(0, 8)}</code>
-                    {/each}
-                  </div>
-                {/if}
-                {#if d.removedNodes.length > 0}
-                  <div class="diff-section">
-                    <div class="diff-label">removed nodes</div>
-                    {#each d.removedNodes as n}
-                      <code class="diff-line rm">− {n.kind} · {n.id.slice(0, 8)}</code>
-                    {/each}
-                  </div>
-                {/if}
-                {#if d.modifiedNodes.length > 0}
-                  <div class="diff-section">
-                    <div class="diff-label">modified nodes</div>
-                    {#each d.modifiedNodes as n}
-                      <code class="diff-line mod">
-                        ~ {n.kind} · {n.id.slice(0, 8)}
-                        {#if n.kindChanged}· kind {n.oldKind} → {n.kind}{/if}
-                        {#if n.configChanged}· config updated{/if}
-                      </code>
-                    {/each}
-                  </div>
-                {/if}
-                {#if d.addedEdges.length > 0}
-                  <div class="diff-section">
-                    <div class="diff-label">added edges</div>
-                    {#each d.addedEdges as e}
-                      <code class="diff-line add">+ {e.from.node.slice(0, 6)}:{e.from.port} → {e.to.node.slice(0, 6)}:{e.to.port}</code>
-                    {/each}
-                  </div>
-                {/if}
-                {#if d.removedEdges.length > 0}
-                  <div class="diff-section">
-                    <div class="diff-label">removed edges</div>
-                    {#each d.removedEdges as e}
-                      <code class="diff-line rm">− {e.from.node.slice(0, 6)}:{e.from.port} → {e.to.node.slice(0, 6)}:{e.to.port}</code>
-                    {/each}
-                  </div>
-                {/if}
-              </details>
-            {/if}
-          </div>
-        {/if}
-      {#if saveDialogError}
-        <div class="modal-err">{saveDialogError}</div>
-      {/if}
-    {/snippet}
-    {#snippet actions()}
-      <Button variant="ghost" onclick={closeSaveDialog}>{#snippet children()}Cancel{/snippet}</Button>
-      <Button
-        variant="primary"
-        onclick={onSaveClick}
-        loading={saveDialogBusy || saveCheckBusy}
-        disabled={!saveDialogName.trim()}
-      >{#snippet children()}{#if saveDialogBusy}Saving…{:else if saveCheckBusy}Checking…{:else if saveDiffPreview}Save new version{:else}Save{/if}{/snippet}</Button>
-    {/snippet}
-  </Modal>
+  />
 
   {#if previewResult}
     <div class="preview-bar" class:has-error={previewResult.errors?.length > 0}>
@@ -1518,12 +1119,7 @@
       />
     </aside>
 
-    <section
-      class="canvas"
-      ondrop={onDrop}
-      ondragover={onDragOver}
-      aria-label="Strategy graph canvas"
-    >
+    <section class="canvas" ondrop={onDrop} ondragover={onDragOver} aria-label="Strategy graph canvas">
       {#if nodes.length === 0}
         <div class="empty">
           Drag a node from the palette to start. Every graph needs exactly one
@@ -1582,32 +1178,8 @@
     {auth}
     onReload={(n) => loadGraph(n)}
     onRollbackToDeployment={async (name, hash) => {
-      // Load the historical graph onto the canvas and open the
-      // deploy modal scoped to the deployments that are currently
-      // NOT on this hash — letting operator pick which specific
-      // ones to roll back without cluttering the list with rows
-      // that are already on the target version.
       try {
-        const g = await api.getJson(
-          `/api/v1/strategy/graphs/${encodeURIComponent(name)}/history/${encodeURIComponent(hash)}`
-        )
-        graphName = g.name
-        scopeKind = g.scope.kind
-        scopeValue = g.scope.value ?? ''
-        nodes = g.nodes.map((n) => ({
-          id: n.id,
-          type: 'graphNode',
-          position: { x: n.pos?.[0] ?? 0, y: n.pos?.[1] ?? 0 },
-          data: nodeData(n.kind, n.config),
-        }))
-        edges = g.edges.map((e, i) => ({
-          id: `e${i}`,
-          source: e.from.node,
-          sourceHandle: e.from.port,
-          target: e.to.node,
-          targetHandle: e.to.port,
-        }))
-        rollbackFrom = hash
+        await loadHistoricalHash(name, hash)
         await deploy()
       } catch (e) {
         deployStatus = `rollback-to-deployment failed: ${e}`
@@ -1615,26 +1187,7 @@
     }}
     onRollback={async (name, hash) => {
       try {
-        const g = await api.getJson(
-          `/api/v1/strategy/graphs/${encodeURIComponent(name)}/history/${encodeURIComponent(hash)}`
-        )
-        graphName = g.name
-        scopeKind = g.scope.kind
-        scopeValue = g.scope.value ?? ''
-        nodes = g.nodes.map((n) => ({
-          id: n.id,
-          type: 'graphNode',
-          position: { x: n.pos?.[0] ?? 0, y: n.pos?.[1] ?? 0 },
-          data: nodeData(n.kind, n.config),
-        }))
-        edges = g.edges.map((e, i) => ({
-          id: `e${i}`,
-          source: e.from.node,
-          sourceHandle: e.from.port,
-          target: e.to.node,
-          targetHandle: e.to.port,
-        }))
-        rollbackFrom = hash
+        await loadHistoricalHash(name, hash)
         deployStatus = `loaded hash ${hash.slice(0, 8)}… — click Deploy to roll back`
       } catch (e) {
         deployStatus = `rollback fetch failed: ${e}`
@@ -1646,547 +1199,191 @@
     <ActivePlans {auth} />
   </div>
 
-  <Modal
-    open={!!deployTargetModal}
-    ariaLabel="Deploy graph — pick targets"
-    maxWidth="720px"
-    onClose={closeDeployTargetModal}
-  >
-    {#snippet children()}
-      {#if deployTargetModal}
-        {@const phase = deployTargetModal.phase}
-        <div class="ack-title">
-          {#if phase === 'select'}Deploy graph — pick target(s)
-          {:else if phase === 'dispatching'}Dispatching graph…
-          {:else}Deploy result
-          {/if}
-        </div>
-        <div class="ack-body">
-          {#if phase === 'select'}
-            <p class="ack-lead">
-              Check every (agent · deployment) that should run this graph.
-              Save + swap fire in a single action; each target is dispatched
-              in parallel. Already-running graph hashes are shown for comparison.
-            </p>
-          {:else}
-            <p class="ack-lead">
-              {deployTargetModal.status}
-            </p>
-          {/if}
-          {#if deployTargetModal.rows.length === 0}
-            <div class="ack-error">No running deployments on any accepted agent. Launch one via Fleet → Deploy strategy first.</div>
-          {:else}
-            <div class="deploy-rows">
-              {#each deployTargetModal.rows as row (row.key)}
-                {@const res = deployTargetModal.results.find(x => x.key === row.key)}
-                <label class="deploy-row-label" class:disabled={phase !== 'select'}>
-                  <input
-                    type="checkbox"
-                    checked={!!deployTargetModal.selected[row.key]}
-                    onchange={() => toggleTarget(row.key)}
-                    disabled={phase !== 'select'}
-                  />
-                  <span class="deploy-row-inner">
-                    <span class="deploy-title mono">{row.deployment.template || 'deployment'} · {row.deployment.symbol}</span>
-                    <span class="deploy-sub mono">
-                      {row.agent.agent_id}
-                      {#if row.deployment.venue}· {row.deployment.venue}{/if}
-                      {#if row.deployment.product}· {row.deployment.product}{/if}
-                      {#if row.current_hash}· current @{row.current_hash.slice(0, 8)}{/if}
-                      · <span class="faint">{row.deployment.deployment_id}</span>
-                    </span>
-                    {#if res}
-                      <span class="deploy-res res-{res.phase}">
-                        {#if res.phase === 'pending'}dispatching…
-                        {:else if res.phase === 'ok'}✓ applied
-                        {:else}✗ {res.detail}
-                        {/if}
-                      </span>
-                    {/if}
-                  </span>
-                </label>
-              {/each}
-            </div>
-          {/if}
-          {#if deployTargetModal.status && phase === 'select' && deployTargetModal.rows.length > 0}
-            <div class="ack-hint">{deployTargetModal.status}</div>
-          {/if}
-        </div>
-      {/if}
-    {/snippet}
-    {#snippet actions()}
-      {#if deployTargetModal}
-        {@const targets = deployTargetModal.rows.filter(r => deployTargetModal.selected[r.key])}
-        {@const phase = deployTargetModal.phase}
-        <Button variant="ghost" onclick={closeDeployTargetModal}>
-          {#snippet children()}{phase === 'done' ? 'Close' : 'Cancel'}{/snippet}
-        </Button>
-        {#if phase === 'select'}
-          <Button
-            variant="ok"
-            disabled={targets.length === 0 || deployBusy}
-            onclick={() => confirmDeploy()}
-          >
-            {#snippet children()}Deploy to {targets.length} target{targets.length === 1 ? '' : 's'}{/snippet}
-          </Button>
-        {/if}
-      {/if}
-    {/snippet}
-  </Modal>
+  <DeployTargetModal
+    state={deployTargetModal}
+    {deployBusy}
+    onToggleTarget={toggleTarget}
+    onConfirm={() => confirmDeploy()}
+    onClose={() => (deployTargetModal = null)}
+  />
 
-  <Modal
-    open={!!restrictedAck}
-    ariaLabel="Restricted deploy acknowledgement"
-    maxWidth="560px"
-    onClose={() => { if (!restrictedAck?.busy) restrictedAck = null }}
-  >
-    {#snippet children()}
-      {#if restrictedAck}
-        <div class="ack-title">⚠ Restricted deploy</div>
-        <div class="ack-body">
-          <p class="ack-lead">
-            This graph references {restrictedAck.nodes.length} pentest-only
-            node{restrictedAck.nodes.length === 1 ? '' : 's'}. Deployment
-            places market-manipulating patterns on the engine pool; make
-            sure the run is authorised before continuing.
-          </p>
-          <ul class="ack-nodes">
-            {#each restrictedAck.nodes as n (n)}
-              <li><code>{n}</code></li>
-            {/each}
-          </ul>
-          <label class="ack-check">
-            <input
-              type="checkbox"
-              bind:checked={restrictedAck.acknowledged}
-              disabled={restrictedAck.busy}
-            />
-            <span>I acknowledge the restricted node list above and authorise this deploy.</span>
-          </label>
-          {#if restrictedAck.error}
-            <div class="ack-error">{restrictedAck.error}</div>
-          {/if}
-        </div>
-      {/if}
-    {/snippet}
-    {#snippet actions()}
-      {#if restrictedAck}
-        <Button
-          variant="ghost"
-          onclick={() => { restrictedAck = null }}
-          disabled={restrictedAck.busy}
-        >{#snippet children()}Cancel{/snippet}</Button>
-        <Button
-          variant="danger"
-          onclick={confirmRestrictedDeploy}
-          loading={restrictedAck.busy}
-          disabled={!restrictedAck.acknowledged}
-        >{#snippet children()}Acknowledge & Deploy{/snippet}</Button>
-      {/if}
-    {/snippet}
-  </Modal>
+  <RestrictedDeployModal
+    state={restrictedAck}
+    onAckChange={(v) => { if (restrictedAck) restrictedAck = { ...restrictedAck, acknowledged: v } }}
+    onConfirm={confirmRestrictedDeploy}
+    onClose={() => (restrictedAck = null)}
+  />
 </div>
 
 <style>
   .page {
-    display: flex;
-    flex-direction: column;
+    display: flex; flex-direction: column;
     height: calc(100vh - 57px);
-  }
-  .plans-footer {
-    padding: var(--s-3) var(--s-4);
-    border-top: 1px solid var(--border-subtle);
-    background: var(--bg-raised);
+    background: var(--bg-base);
   }
 
-  /* ─── Top bar: one row, one height, one typography scale.
-   *    Every control (input/select/button) is exactly 30px tall,
-   *    every label is 10px monospace uppercase, every gap is s-2.
-   *    That's why nothing "jumps" between fields anymore. ────── */
   .top {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: var(--s-2) var(--s-4);
-    border-bottom: 1px solid var(--border-subtle);
+    display: flex; align-items: center; justify-content: space-between;
+    padding: var(--s-3) var(--s-4);
     background: var(--bg-raised);
+    border-bottom: 1px solid var(--border-subtle);
     gap: var(--s-3);
-    height: 48px;
-    flex-shrink: 0;
+    flex-wrap: wrap;
   }
   .left-chunk, .right-chunk {
-    display: flex; gap: var(--s-2); align-items: center; flex: 0 0 auto;
+    display: flex; align-items: center; gap: var(--s-3);
+    flex-wrap: wrap;
   }
-
-  /* M2-GOBS — mode toggle lives flush against the right-chunk
-     actions. Small, uses a pill container so the active state
-     reads at a glance. */
-  .mode-toggle {
-    display: inline-flex;
+  .field { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .field.stacked { width: 100%; }
+  .field-label {
+    font-size: 10px; color: var(--fg-muted);
+    letter-spacing: var(--tracking-label); text-transform: uppercase;
+  }
+  .field input,
+  .field select {
+    padding: 4px 8px;
+    background: var(--bg-chip);
     border: 1px solid var(--border-subtle);
-    border-radius: var(--r-pill);
-    overflow: hidden;
+    border-radius: var(--r-sm);
+    color: var(--fg-primary);
+    font-family: var(--font-mono); font-size: var(--fs-xs);
+    outline: none;
+    max-width: 180px;
+  }
+  .field input:focus, .field select:focus { border-color: var(--accent); }
+  .field-hidden { visibility: hidden; }
+
+  .mode-toggle {
+    display: inline-flex; gap: 0;
+    background: var(--bg-chip);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--r-sm);
+    padding: 2px;
     margin-left: var(--s-2);
   }
   .mode-btn {
-    padding: 4px var(--s-3);
-    background: transparent;
-    border: none;
+    padding: 4px 10px;
+    font-size: var(--fs-xs);
+    background: transparent; border: 0;
     color: var(--fg-muted);
-    font-family: var(--font-sans);
-    font-size: 11px;
-    font-weight: 500;
     cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    transition: color var(--dur-fast), background var(--dur-fast);
-  }
-  .mode-btn:hover:not(:disabled) { color: var(--fg-primary); background: var(--bg-raised); }
-  .mode-btn:disabled { opacity: 0.45; cursor: not-allowed; }
-  .mode-btn.active { background: var(--accent-dim); color: var(--accent); }
-  .mode-btn.active .live-pulse {
-    width: 8px; height: 8px;
-    background: var(--accent);
-    border-radius: 50%;
-    box-shadow: 0 0 0 0 var(--accent);
-    animation: live-pulse 1.5s infinite;
-  }
-  @keyframes live-pulse {
-    0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent); }
-    70%  { box-shadow: 0 0 0 6px transparent; }
-    100% { box-shadow: 0 0 0 0 transparent; }
-  }
-  .divider {
-    width: 1px; height: 22px;
-    background: var(--border-subtle); margin: 0 var(--s-2);
-  }
-  .field {
-    display: flex; align-items: center; gap: var(--s-2);
-    height: 30px;
-  }
-  .field-label {
-    font-family: var(--font-mono);
-    font-size: 10px; line-height: 1;
-    color: var(--fg-muted);
-    text-transform: uppercase;
-    letter-spacing: var(--tracking-label);
-  }
-  .field input, .field select {
-    height: 30px;
-    padding: 0 var(--s-3);
-    background: var(--bg-base); border: 1px solid var(--border-subtle);
-    border-radius: var(--r-sm); color: var(--fg-primary);
-    font-family: var(--font-mono); font-size: 12px; line-height: 30px;
-  }
-  .field input { width: 140px; }
-  .field select { min-width: 120px; }
-  .field input:focus, .field select:focus {
-    outline: none; border-color: var(--accent);
-  }
-  .status {
-    height: 30px; display: flex; align-items: center;
-    padding: 0 var(--s-3);
-    font-family: var(--font-mono); font-size: 11px;
-    color: var(--fg-muted);
-    max-width: 260px;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  /* `.btn` CSS moved to primitives/Button.svelte — design system v1. */
-
-  /* Hide a top-bar field without removing it from the flex layout
-   * so the bar keeps its width on scope toggles. */
-  .field-hidden { visibility: hidden; pointer-events: none; }
-
-  /* UI-6 — restricted-deploy ack modal. Full-screen backdrop +
-   * centred card over the editor. Checkbox-gated Deploy button
-   * so the operator can't tab-enter their way into a pentest
-   * deploy. */
-  .ack-backdrop {
-    position: fixed; inset: 0;
-    background: rgba(0, 0, 0, 0.65);
-    display: flex; align-items: center; justify-content: center;
-    z-index: 20;
-  }
-  .ack-card {
-    width: min(520px, 92vw);
-    background: var(--bg-raised);
-    border: 1px solid var(--danger);
-    border-radius: var(--r-md);
-    display: flex; flex-direction: column;
-    gap: var(--s-3);
-    padding: var(--s-4);
-  }
-  .ack-title {
-    font-size: var(--fs-md);
-    font-weight: 600;
-    color: var(--danger);
-    letter-spacing: var(--tracking-tight);
-  }
-  .ack-body { display: flex; flex-direction: column; gap: var(--s-3); font-size: var(--fs-sm); }
-  .ack-lead { color: var(--fg-primary); }
-  .ack-nodes {
-    list-style: disc;
-    padding-left: var(--s-4);
-    color: var(--fg-secondary);
-    font-family: var(--font-mono); font-size: var(--fs-xs);
-  }
-  .ack-check {
-    display: flex; align-items: center; gap: var(--s-2);
-    color: var(--fg-primary); font-size: var(--fs-xs);
-  }
-  .ack-error { color: var(--danger); font-size: var(--fs-xs); }
-  .ack-actions {
-    display: flex; justify-content: flex-end; gap: var(--s-2);
-  }
-
-  .deploy-rows {
-    display: flex; flex-direction: column; gap: 4px;
-    max-height: 320px; overflow-y: auto;
-  }
-  .deploy-row-label {
-    display: flex; align-items: flex-start; gap: var(--s-2);
-    padding: var(--s-2) var(--s-3);
-    background: var(--bg-chip);
-    border: 1px solid var(--border-subtle);
     border-radius: var(--r-sm);
-    cursor: pointer;
-    font-family: var(--font-sans);
-  }
-  .deploy-row-label:hover { border-color: var(--accent); }
-  .deploy-row-label.disabled { cursor: default; opacity: 0.85; }
-  .deploy-row-label input[type="checkbox"] { margin-top: 4px; }
-  .deploy-row-inner { display: flex; flex-direction: column; gap: 2px; flex: 1; }
-  .deploy-title { font-size: var(--fs-sm); color: var(--fg-primary); font-weight: 500; }
-  .deploy-sub { font-size: 10px; color: var(--fg-muted); }
-  .deploy-sub .faint { color: var(--fg-faint); }
-  .deploy-row-label .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-  .deploy-res {
-    font-size: 10px; font-family: var(--font-mono);
-    padding: 2px 6px; border-radius: var(--r-sm);
-    margin-top: 2px; align-self: flex-start;
-  }
-  .deploy-res.res-pending { background: var(--bg-raised); color: var(--fg-muted); }
-  .deploy-res.res-ok { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
-  .deploy-res.res-err { background: color-mix(in srgb, var(--danger) 18%, transparent); color: var(--danger); }
-  .ack-hint { font-size: 11px; color: var(--fg-muted); margin-top: var(--s-2); }
-
-  /* Validation strip — sits between the top bar and the canvas,
-   * always present (even when empty) so the bar's height doesn't
-   * jitter when issues come or go. */
-  .validate-bar {
-    display: flex; align-items: center; gap: var(--s-3);
-    padding: 4px var(--s-4);
-    background: var(--bg-raised);
-    border-bottom: 1px solid var(--border-subtle);
-    font-size: 11px;
-    min-height: 26px; flex-shrink: 0;
-  }
-  .validate-bar.valid   { border-bottom-color: color-mix(in srgb, var(--pos) 40%, var(--border-subtle)); }
-  .validate-bar.invalid { border-bottom-color: color-mix(in srgb, var(--neg) 40%, var(--border-subtle)); }
-
-  .v-pill {
     display: inline-flex; align-items: center; gap: 6px;
-    padding: 2px 8px;
-    border: 1px solid var(--border-subtle); border-radius: var(--r-pill);
-    font-family: var(--font-mono); font-size: 10px;
-    text-transform: uppercase; letter-spacing: var(--tracking-label);
   }
-  .v-pill .dot {
-    width: 6px; height: 6px; border-radius: 50%;
-    background: currentColor;
+  .mode-btn.active {
+    background: var(--bg-raised);
+    color: var(--fg-primary);
+    box-shadow: 0 0 0 1px var(--border-subtle);
   }
-  .v-pill.ok    { color: var(--pos); border-color: color-mix(in srgb, var(--pos) 60%, transparent); }
-  .v-pill.bad   { color: var(--neg); border-color: color-mix(in srgb, var(--neg) 60%, transparent); }
-  .v-pill.warn  { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 60%, transparent); }
+  .mode-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .mode-btn .live-pulse {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--ok);
+    animation: livePulse 1.6s ease-in-out infinite;
+  }
+  @keyframes livePulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50%      { opacity: 0.4; transform: scale(0.6); }
+  }
+
   .pin-warning {
-    display: flex; align-items: center; gap: var(--s-2);
-    padding: 4px var(--s-3);
-    background: color-mix(in srgb, var(--warn) 14%, transparent);
+    display: flex; gap: var(--s-2); align-items: center;
+    padding: var(--s-2) var(--s-3);
+    background: color-mix(in srgb, var(--warn) 10%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, var(--warn) 25%, transparent);
     color: var(--warn);
-    font-size: 11px;
-    border-bottom: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
+    font-size: var(--fs-xs);
   }
   .pin-warning-close {
-    margin-left: auto;
-    background: none; border: 0; padding: 0 4px;
-    color: var(--warn); cursor: pointer; font-size: 14px;
-  }
-  .v-pill.muted { color: var(--fg-muted); }
-  .v-pill.rollback {
-    color: var(--warn);
-    border-color: color-mix(in srgb, var(--warn) 60%, transparent);
-    background: color-mix(in srgb, var(--warn) 12%, transparent);
-  }
-  .v-pill-clear {
-    margin-left: 4px; padding: 0 4px; background: transparent; border: 0;
-    color: inherit; cursor: pointer; font-size: var(--fs-sm); line-height: 1;
-  }
-  .v-pill-clear:hover { color: var(--fg-primary); }
-  .v-stats { font-family: var(--font-mono); font-size: 11px; color: var(--fg-muted); }
-  .v-status { font-family: var(--font-mono); font-size: 11px; color: var(--fg-muted); margin-left: auto; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .v-hint { color: var(--fg-muted); font-size: 11px; }
-  .v-issues { display: flex; gap: 4px; flex-wrap: wrap; flex: 1; min-width: 0; }
-  .v-issue {
-    padding: 2px 6px;
-    background: color-mix(in srgb, var(--neg) 10%, var(--bg-chip));
-    border: 1px solid color-mix(in srgb, var(--neg) 40%, var(--border-subtle));
-    border-radius: var(--r-sm);
-    color: color-mix(in srgb, var(--neg) 80%, var(--fg-primary));
-    font-family: var(--font-mono); font-size: 10px;
-    max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    margin-left: auto; background: transparent; border: 0;
+    color: inherit; cursor: pointer; font-size: var(--fs-md);
   }
 
-  /* `.modal-*`, `.modal-actions`, `.modal-backdrop` CSS moved to
-     primitives/Modal.svelte — design system v1. */
-  h3 { margin: 0; font-size: 14px; font-weight: 600; color: var(--fg-primary); }
-  .field.stacked {
-    display: flex; flex-direction: column; gap: 4px; height: auto;
-  }
-  .modal-err {
-    padding: var(--s-2) var(--s-3);
-    background: color-mix(in srgb, var(--neg) 15%, var(--bg-base));
-    border: 1px solid var(--neg); border-radius: var(--r-sm);
-    color: var(--neg); font-family: var(--font-mono); font-size: 11px;
-  }
-
-  /* M-SAVE GOBS — save-diff preview inside the save modal.
-     Sits between the input fields and the action buttons. */
-  .save-diff {
-    margin: var(--s-2) 0;
-    padding: var(--s-3);
-    background: color-mix(in srgb, var(--warn) 8%, transparent);
-    border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent);
-    border-radius: var(--r-sm);
-    font-size: var(--fs-xs);
-  }
-  .save-diff.clean {
-    background: color-mix(in srgb, var(--ok) 8%, transparent);
-    border-color: color-mix(in srgb, var(--ok) 30%, transparent);
-  }
-  .save-diff-head { color: var(--fg-primary); margin-bottom: var(--s-2); }
-  .save-diff-counts {
-    display: flex; gap: 4px; flex-wrap: wrap;
-    margin-bottom: var(--s-2);
-  }
-  .diff-chip {
-    padding: 2px 6px;
-    border-radius: var(--r-sm);
-    font-family: var(--font-mono);
-    font-size: 10px;
-    background: var(--bg-chip);
-    color: var(--fg-muted);
-  }
-  .diff-chip.add { color: var(--pos); background: color-mix(in srgb, var(--pos) 14%, transparent); }
-  .diff-chip.rm  { color: var(--neg); background: color-mix(in srgb, var(--neg) 14%, transparent); }
-  .diff-chip.mod { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
-  .save-diff-detail { margin-top: var(--s-2); }
-  .save-diff-detail summary {
-    cursor: pointer; font-size: 10px; color: var(--fg-muted);
-    letter-spacing: var(--tracking-label); text-transform: uppercase;
-  }
-  .diff-section { margin-top: 6px; }
-  .diff-label {
-    font-size: 9px; letter-spacing: var(--tracking-label);
-    text-transform: uppercase; color: var(--fg-muted); margin-bottom: 2px;
-  }
-  .diff-line {
-    display: block; padding: 1px 6px;
-    font-family: var(--font-mono); font-size: 10px;
-    border-radius: 2px; background: var(--bg-raised);
-    margin-bottom: 1px;
-  }
-  .diff-line.add { color: var(--pos); }
-  .diff-line.rm  { color: var(--neg); }
-  .diff-line.mod { color: var(--warn); }
-
-  /* M-SAVE GOBS — versions modal */
-  .versions-card { min-width: 520px; max-width: 720px; }
-  .versions-list {
-    display: flex; flex-direction: column; gap: 4px;
-    max-height: 60vh; overflow-y: auto;
-    margin: var(--s-2) 0;
-  }
-  .version-row {
-    display: flex; align-items: center; gap: var(--s-2);
-    padding: var(--s-2) var(--s-3);
-    background: var(--bg-raised);
-    border: 1px solid var(--border-subtle);
-    border-radius: var(--r-sm);
-    cursor: pointer; color: inherit; text-align: left;
-    font-size: var(--fs-xs);
-    transition: border-color var(--dur-fast), background var(--dur-fast);
-  }
-  .version-row:hover { border-color: var(--accent); background: var(--bg-chip); }
-  .v-ix {
-    display: inline-block; min-width: 38px;
-    padding: 1px 6px;
-    background: var(--bg-chip); color: var(--accent);
-    border-radius: var(--r-sm);
-    font-family: var(--font-mono); font-weight: 600; font-size: 10px;
-    text-align: center;
-  }
-  .v-hash { color: var(--fg-secondary); }
-  .v-when { color: var(--fg-muted); }
-  .v-by { color: var(--fg-muted); }
-  .v-desc { color: var(--fg-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .v-chev { margin-left: auto; color: var(--fg-muted); font-size: var(--fs-md); }
-
-  .preview-bar {
-    display: flex; align-items: center; flex-wrap: wrap; gap: var(--s-2);
+  .validate-bar {
+    display: flex; flex-wrap: wrap; gap: var(--s-2); align-items: center;
     padding: var(--s-2) var(--s-4);
     background: var(--bg-raised);
-    border-bottom: 1px solid var(--accent);
+    border-bottom: 1px solid var(--border-subtle);
     font-size: var(--fs-xs);
   }
-  .preview-bar.has-error { border-bottom-color: var(--neg); }
+  .v-pill {
+    display: inline-flex; gap: 4px; align-items: center;
+    padding: 2px 8px;
+    border-radius: var(--r-pill);
+    font-family: var(--font-mono); font-size: 10px; font-weight: 600;
+    letter-spacing: var(--tracking-label); text-transform: uppercase;
+  }
+  .v-pill .dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+  .v-pill.ok  { color: var(--ok);    background: color-mix(in srgb, var(--ok) 12%, transparent); }
+  .v-pill.bad { color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, transparent); }
+  .v-pill.warn { color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); }
+  .v-pill.rollback { color: var(--warn); background: color-mix(in srgb, var(--warn) 15%, transparent); border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent); }
+  .v-pill-clear {
+    background: transparent; border: 0; color: inherit;
+    cursor: pointer; padding: 0 0 0 4px;
+  }
+  .v-pill.muted { color: var(--fg-muted); }
+  .v-hint, .v-stats, .v-status { color: var(--fg-muted); }
+  .v-status { margin-left: auto; font-family: var(--font-mono); }
+  .v-issues { display: flex; flex-wrap: wrap; gap: 4px; }
+  .v-issue {
+    font-family: var(--font-mono); font-size: 10px;
+    padding: 1px 6px;
+    background: color-mix(in srgb, var(--danger) 10%, transparent);
+    color: var(--danger); border-radius: var(--r-sm);
+  }
+
+  .preview-bar {
+    display: flex; flex-wrap: wrap; gap: var(--s-2); align-items: center;
+    padding: var(--s-2) var(--s-4);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
+    font-size: var(--fs-xs);
+  }
+  .preview-bar.has-error {
+    background: color-mix(in srgb, var(--danger) 10%, transparent);
+    border-bottom-color: color-mix(in srgb, var(--danger) 25%, transparent);
+  }
   .preview-label {
-    font-family: var(--font-mono); font-size: var(--fs-2xs);
-    color: var(--accent); text-transform: uppercase; letter-spacing: var(--tracking-label);
+    font-family: var(--font-mono); color: var(--fg-primary);
+    text-transform: uppercase; font-size: 10px; letter-spacing: var(--tracking-label); font-weight: 600;
   }
-  .preview-bar.has-error .preview-label { color: var(--neg); }
   .preview-sink, .preview-err {
-    padding: 2px var(--s-2);
-    background: var(--bg-chip); border: 1px solid var(--border-subtle);
-    border-radius: var(--r-sm); font-family: var(--font-mono); font-size: var(--fs-2xs);
-    color: var(--fg-primary);
+    font-family: var(--font-mono); font-size: 10px;
+    padding: 1px 6px; border-radius: var(--r-sm);
+    background: var(--bg-chip);
   }
-  .preview-err { color: var(--neg); border-color: var(--neg); }
+  .preview-err { color: var(--danger); }
   .preview-close {
-    margin-left: auto;
-    background: transparent; border: none; color: var(--fg-muted);
-    font-size: var(--fs-md); cursor: pointer; padding: 0 var(--s-2);
+    margin-left: auto; background: transparent; border: 0;
+    color: inherit; cursor: pointer; font-size: var(--fs-md);
   }
-  .preview-close:hover { color: var(--fg-primary); }
 
   .body {
+    flex: 1; min-height: 0;
     display: grid;
-    grid-template-columns: 220px 1fr 280px;
-    flex: 1;
-    min-height: 0;
+    grid-template-columns: 260px 1fr 300px;
+    gap: 0;
   }
-  .palette {
-    border-right: 1px solid var(--border-subtle);
+  .palette { border-right: 1px solid var(--border-subtle); overflow-y: auto; }
+  .canvas { position: relative; background: var(--bg-base); }
+  .canvas .empty {
+    position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    color: var(--fg-muted); font-size: var(--fs-sm);
+    text-align: center; pointer-events: none; z-index: 1;
+  }
+  .canvas .empty code {
+    font-family: var(--font-mono);
+    background: var(--bg-chip);
+    padding: 0 4px; border-radius: 3px; color: var(--fg-primary);
+  }
+  .config { border-left: 1px solid var(--border-subtle); overflow-y: auto; }
+
+  .plans-footer {
+    border-top: 1px solid var(--border-subtle);
     background: var(--bg-raised);
-    overflow-y: auto;
-  }
-  .canvas {
-    position: relative;
-    background: var(--bg-base);
-    min-height: 0;
-    overflow: hidden;
-  }
-  .canvas :global(.svelte-flow) { width: 100%; height: 100%; }
-  .empty {
-    position: absolute; inset: var(--s-6);
-    color: var(--fg-muted); font-size: var(--fs-sm); line-height: 1.6;
-    pointer-events: none;
-    z-index: 10;
-  }
-  .empty code { font-family: var(--font-mono); background: var(--bg-chip); padding: 2px 6px; border-radius: var(--r-sm); }
-  .config {
-    border-left: 1px solid var(--border-subtle);
-    background: var(--bg-raised);
-    overflow-y: auto;
   }
 </style>
