@@ -57,11 +57,11 @@ ambiguous_glob_imported_traits = "allow"
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls-pemfile = "2"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-rand = "0.8"
+rand = "0.9"
 semver = "1"
 futures-util = "0.3"
 
@@ -83,10 +83,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Metrics
-prometheus = { version = "0.13", default-features = false }
+prometheus = { version = "0.14", default-features = false }
 
 # Config
-toml = "0.8"
+toml = "1.1"
 regex = "1"
 
 # Time
@@ -107,15 +107,15 @@ uuid = { version = "1", features = ["v4", "serde"] }
 async-trait = "0.1"
 
 # Crypto auth
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 hex = "0.4"
-getrandom = "0.2"
+getrandom = "0.4"
 subtle = "2"
 
 # HyperLiquid signing (EIP-712 over secp256k1)
 k256 = { version = "0.13", features = ["ecdsa"] }
-sha3 = "0.10"
+sha3 = "0.11"
 rmp-serde = "1"
 
 # Internal crates
