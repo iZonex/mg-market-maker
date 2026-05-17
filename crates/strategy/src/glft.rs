@@ -1,10 +1,12 @@
 use mm_common::types::{Quote, QuotePair, Side};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use tracing::debug;
 
+use crate::cartea_spread::decimal_ln;
 use crate::r#trait::{bps_to_frac, CalibrationState, FillObservation, Strategy, StrategyContext};
 use crate::volatility::decimal_sqrt;
 
@@ -86,27 +88,46 @@ impl IntensityCalibration {
 
     /// Recalibrate A and k from observed fill depths.
     ///
-    /// Method: bin depths, count fills per bin, fit ln(λ) = ln(A) - k·δ.
+    /// Fits the GLFT arrival model `λ(δ) = A·exp(-k·δ)` by binning
+    /// the recorded fill depths, taking each bin's fill frequency as
+    /// a proxy for `λ` at the bin midpoint, and running an ordinary
+    /// least-squares regression of `ln(frequency)` on the midpoint —
+    /// `slope = −k`, `intercept = ln(A)`. See [`fit_intensity`].
+    ///
+    /// Both fitted parameters are folded in with a 0.9/0.1 EWMA so a
+    /// single noisy retune cannot whipsaw the quoter, then clamped to
+    /// a sane range. A degenerate window (see [`fit_intensity`])
+    /// leaves `(A, k)` untouched — the cooldown timestamp still
+    /// advances so the retune cadence is unaffected.
     fn recalibrate(&mut self, now_ms: Option<i64>) {
         if self.fill_depths.len() < 50 {
             return;
         }
-
-        // Simple: compute mean depth and use it to estimate k.
-        // k ≈ 1 / mean_depth (the higher the mean depth, the lower the sensitivity).
-        let n = Decimal::from(self.fill_depths.len() as u64);
-        let mean_depth: Decimal = self.fill_depths.iter().sum::<Decimal>() / n;
-
-        if mean_depth > dec!(0.000001) {
-            let new_k = dec!(1) / mean_depth;
-            // Smooth update.
-            self.k = self.k * dec!(0.9) + new_k * dec!(0.1);
-        }
-
-        // A ≈ fill_rate (fills per second).
-        // Simplified: we'll keep A at 1.0 since it cancels in the spread formula.
-        debug!(k = %self.k, a = %self.a, samples = self.fill_depths.len(), "GLFT recalibrated");
+        // Advance the cooldown stamp even when the fit is skipped, so
+        // a degenerate window still counts as a retune for the
+        // `recalibrate_if_due` cadence gate.
         self.last_recalibrated_ms = now_ms.or(self.last_recalibrated_ms);
+
+        let Some((fitted_k, fitted_a)) = fit_intensity(&self.fill_depths) else {
+            debug!(
+                samples = self.fill_depths.len(),
+                "GLFT recalibration skipped — degenerate fill-depth sample"
+            );
+            return;
+        };
+
+        // Smooth update — same 0.9/0.1 blend for both parameters.
+        self.k = (self.k * dec!(0.9) + fitted_k * dec!(0.1)).clamp(dec!(0.01), dec!(100));
+        self.a = (self.a * dec!(0.9) + fitted_a * dec!(0.1)).clamp(dec!(0.01), dec!(100));
+
+        debug!(
+            k = %self.k,
+            a = %self.a,
+            fitted_k = %fitted_k,
+            fitted_a = %fitted_a,
+            samples = self.fill_depths.len(),
+            "GLFT recalibrated"
+        );
     }
 }
 
@@ -161,7 +182,7 @@ impl Strategy for GlftStrategy {
             bps_to_frac(ctx.config.min_spread_bps) * ctx.mid_price / dec!(2)
         } else {
             let ln_arg = dec!(1) + xi_delta / k;
-            let ln_val = decimal_ln_positive(ln_arg);
+            let ln_val = decimal_ln(ln_arg);
             ln_val / xi_delta
         };
 
@@ -172,7 +193,7 @@ impl Strategy for GlftStrategy {
             let base = dec!(1) + xi_delta / k;
             let exponent = k / xi_delta + dec!(1);
             // Approximate base^exponent via exp(exponent * ln(base)).
-            let ln_base = decimal_ln_positive(base);
+            let ln_base = decimal_ln(base);
             let power = decimal_exp(exponent * ln_base);
             let inner = gamma / (dec!(2) * a * delta * k) * power;
             decimal_sqrt(inner.max(dec!(0)))
@@ -412,25 +433,6 @@ impl Strategy for GlftStrategy {
     }
 }
 
-/// Natural log for positive Decimal values.
-fn decimal_ln_positive(x: Decimal) -> Decimal {
-    if x <= dec!(0) {
-        return dec!(0);
-    }
-    if x == dec!(1) {
-        return dec!(0);
-    }
-    let u = (x - dec!(1)) / (x + dec!(1));
-    let u2 = u * u;
-    let mut term = u;
-    let mut sum = u;
-    for k in 1..20 {
-        term *= u2;
-        sum += term / Decimal::from(2 * k + 1);
-    }
-    dec!(2) * sum
-}
-
 /// Exponential function for Decimal via Taylor series.
 fn decimal_exp(x: Decimal) -> Decimal {
     // Clamp to avoid overflow.
@@ -445,6 +447,92 @@ fn decimal_exp(x: Decimal) -> Decimal {
         }
     }
     sum
+}
+
+/// Fit the GLFT arrival model `λ(δ) = A·exp(-k·δ)` to a window of
+/// observed fill depths.
+///
+/// Bins the depths into `BIN_COUNT` equal-width buckets over
+/// `[0, max_depth]`, takes each bucket's fill *frequency* as a proxy
+/// for `λ` at the bucket midpoint, and runs an ordinary least-squares
+/// fit of `ln(frequency)` against the midpoint:
+///
+/// ```text
+///   ln(λ) = ln(A) − k·δ    ⇒    slope = −k,   intercept = ln(A)
+/// ```
+///
+/// Frequencies — rather than raw counts — keep the fitted `A`
+/// dimensionless and `O(1)`, so it stays comparable to the
+/// constructor default and cannot blow up the GLFT skew term `C2`.
+///
+/// Returns `None` for a degenerate window: fewer than three populated
+/// bins, no spread in the bin midpoints, or a non-negative slope. The
+/// last case means intensity does not decay with depth — the sample
+/// carries no usable signal (e.g. every fill landed at the same
+/// depth), so the caller keeps the previous `(A, k)`.
+fn fit_intensity(depths: &VecDeque<Decimal>) -> Option<(Decimal, Decimal)> {
+    /// Equal-width buckets spanning `[0, max_depth]`.
+    const BIN_COUNT: usize = 10;
+
+    let total = depths.len();
+    if total < 50 {
+        return None;
+    }
+
+    let max_depth = depths.iter().copied().max()?;
+    let bin_width = max_depth / Decimal::from(BIN_COUNT as u64);
+    if bin_width <= dec!(0) {
+        return None;
+    }
+
+    // Histogram the depths into equal-width buckets.
+    let mut counts = [0u64; BIN_COUNT];
+    for &d in depths {
+        let bin = (d / bin_width)
+            .floor()
+            .to_usize()
+            .unwrap_or(0)
+            .min(BIN_COUNT - 1);
+        counts[bin] += 1;
+    }
+
+    // Collect (midpoint, ln frequency) for every populated bin.
+    let total_dec = Decimal::from(total as u64);
+    let mut points: Vec<(Decimal, Decimal)> = Vec::with_capacity(BIN_COUNT);
+    for (i, &count) in counts.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let midpoint = bin_width * (Decimal::from(i as u64) + dec!(0.5));
+        let freq = Decimal::from(count) / total_dec;
+        points.push((midpoint, decimal_ln(freq)));
+    }
+    if points.len() < 3 {
+        return None;
+    }
+
+    // Ordinary least squares: slope = Σ(x−x̄)(y−ȳ) / Σ(x−x̄)².
+    let n = Decimal::from(points.len() as u64);
+    let x_mean = points.iter().map(|(x, _)| *x).sum::<Decimal>() / n;
+    let y_mean = points.iter().map(|(_, y)| *y).sum::<Decimal>() / n;
+    let mut sxx = dec!(0);
+    let mut sxy = dec!(0);
+    for (x, y) in &points {
+        let dx = *x - x_mean;
+        sxx += dx * dx;
+        sxy += dx * (*y - y_mean);
+    }
+    if sxx <= dec!(0) {
+        return None;
+    }
+    let slope = sxy / sxx;
+    if slope >= dec!(0) {
+        return None;
+    }
+
+    let k = -slope;
+    let a = decimal_exp(y_mean - slope * x_mean);
+    Some((k, a))
 }
 
 #[cfg(test)]
