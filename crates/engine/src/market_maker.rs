@@ -424,6 +424,11 @@ pub struct MarketMakerEngine {
     exposure_manager: ExposureManager,
     circuit_breaker: CircuitBreaker,
     volatility_estimator: VolatilityEstimator,
+    /// Graph-authored σ from an `Out.Volatility` sink, refreshed
+    /// each graph tick. `Some` overrides `volatility_estimator` for
+    /// the strategy reservation price; `None` (no graph deployed, or
+    /// no `Out.Volatility` wired) falls back to the built-in estimator.
+    graph_volatility_override: Option<Decimal>,
 
     // Risk.
     kill_switch: KillSwitch,
@@ -1074,6 +1079,7 @@ impl MarketMakerEngine {
             exposure_manager: ExposureManager::new(dec!(0)),
             circuit_breaker: CircuitBreaker::new(),
             volatility_estimator: vol_est,
+            graph_volatility_override: None,
             kill_switch: KillSwitch::new(ks_config),
             protections: config.protections.as_ref().map(|cfg| {
                 Protections::new(ProtectionsConfig {
@@ -5227,6 +5233,10 @@ impl MarketMakerEngine {
             trace.graph_hash = h.to_string();
         }
         mm_dashboard::details_store::global().push_graph_trace(&self.symbol, trace);
+        // Each graph tick fully re-derives the σ override — a tick
+        // with no `Out.Volatility` sink (or a Missing input) clears
+        // it, so the engine cleanly reverts to its own estimator.
+        self.graph_volatility_override = None;
         for a in actions {
             match a {
                 SinkAction::SpreadMult(m) => {
@@ -5234,6 +5244,13 @@ impl MarketMakerEngine {
                 }
                 SinkAction::SizeMult(m) => {
                     self.auto_tuner.set_graph_size_mult(m);
+                }
+                SinkAction::Volatility(sigma) => {
+                    // A non-positive σ is meaningless — ignore it and
+                    // let the built-in estimator stand in.
+                    if sigma > dec!(0) {
+                        self.graph_volatility_override = Some(sigma);
+                    }
                 }
                 SinkAction::KillEscalate {
                     level,
@@ -9020,10 +9037,12 @@ impl MarketMakerEngine {
             (Decimal::from(horizon - elapsed_secs) / Decimal::from(horizon)).max(dec!(0.01))
         };
 
-        // Volatility.
+        // Volatility — a graph `Out.Volatility` sink overrides the
+        // built-in estimator when wired (e.g. from a `Stats.Garch`
+        // node); otherwise fall back to the engine's own estimator.
         let sigma = self
-            .volatility_estimator
-            .volatility()
+            .graph_volatility_override
+            .or_else(|| self.volatility_estimator.volatility())
             .unwrap_or(self.config.market_maker.sigma);
 
         // Kill switch multipliers.

@@ -8,6 +8,7 @@
 //! is visible, not implicit.
 
 use crate::node::{EvalCtx, NodeKind, NodeState};
+use crate::nodes::decimal_field;
 use crate::types::{Port, PortType, Value};
 use anyhow::Result;
 use once_cell::sync::Lazy;
@@ -15,7 +16,6 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::Deserialize;
 use serde_json::Value as Json;
-use std::str::FromStr;
 
 // ── Risk.ToxicityWiden ─────────────────────────────────────
 
@@ -47,16 +47,7 @@ impl ToxicityWiden {
             return Some(Self::default());
         }
         let parsed: ToxicityWidenCfg = serde_json::from_value(cfg.clone()).ok()?;
-        let scale = match parsed.scale {
-            None => dec!(2),
-            Some(s) => {
-                let v = Decimal::from_str(&s).ok()?;
-                if v < dec!(0) {
-                    return None;
-                }
-                v
-            }
-        };
+        let scale = decimal_field(parsed.scale, dec!(2), |v| v >= dec!(0))?;
         Some(Self { scale })
     }
 }
@@ -145,26 +136,8 @@ impl InventoryUrgency {
             return Some(Self::default());
         }
         let parsed: InventoryUrgencyCfg = serde_json::from_value(cfg.clone()).ok()?;
-        let cap = match parsed.cap {
-            None => dec!(1),
-            Some(s) => {
-                let v = Decimal::from_str(&s).ok()?;
-                if v <= dec!(0) {
-                    return None;
-                }
-                v
-            }
-        };
-        let exponent = match parsed.exponent {
-            None => dec!(2),
-            Some(s) => {
-                let v = Decimal::from_str(&s).ok()?;
-                if v <= dec!(0) {
-                    return None;
-                }
-                v
-            }
-        };
+        let cap = decimal_field(parsed.cap, dec!(1), |v| v > dec!(0))?;
+        let exponent = decimal_field(parsed.exponent, dec!(2), |v| v > dec!(0))?;
         Some(Self { cap, exponent })
     }
 }
@@ -279,16 +252,7 @@ impl CircuitBreaker {
             return Some(Self::default());
         }
         let parsed: CircuitBreakerCfg = serde_json::from_value(cfg.clone()).ok()?;
-        let wide_bps = match parsed.wide_bps {
-            None => dec!(100),
-            Some(s) => {
-                let v = Decimal::from_str(&s).ok()?;
-                if v <= dec!(0) {
-                    return None;
-                }
-                v
-            }
-        };
+        let wide_bps = decimal_field(parsed.wide_bps, dec!(100), |v| v > dec!(0))?;
         Some(Self { wide_bps })
     }
 }

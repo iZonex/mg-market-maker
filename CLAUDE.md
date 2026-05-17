@@ -53,7 +53,7 @@ strategy/              Strategies + signals + execution:
   ├── autotune         Regime detection + toxicity-based parameter adjustment
   ├── market_resilience Event-driven shock detector + recovery score (MR)
   ├── inventory_skew   Quadratic skew, dynamic sizing, urgency unwinding
-  └── volatility       EWMA realized vol estimator
+  └── volatility       EWMA + GARCH(1,1) realized vol estimators
 risk/                  Risk management:
   ├── portfolio_risk   Portfolio-level factor limits + global delta guard
   ├── portfolio_var    Portfolio-level parametric Gaussian VaR guard

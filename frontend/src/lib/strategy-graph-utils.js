@@ -47,6 +47,7 @@ export function nodeData(catalog, kind, config) {
 // can't be expressed as a schema default alone.
 export function defaultConfigFor(kind) {
   if (kind === 'Stats.EWMA') return { alpha: '0.1' }
+  if (kind === 'Stats.Garch') return { tick_secs: '0.5' }
   if (kind === 'Cast.ToBool') return { threshold: '0', cmp: 'ge' }
   if (kind === 'Math.Const') return { value: '1.0' }
   if (kind === 'Cast.StrategyEq') return { target: 'AvellanedaStoikov' }

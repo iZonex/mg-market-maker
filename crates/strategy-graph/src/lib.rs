@@ -84,6 +84,56 @@ mod integration_tests {
         assert_eq!(actions, vec![SinkAction::SpreadMult(dec!(7))]);
     }
 
+    /// `Out.Volatility` harvests its wired input into a
+    /// `SinkAction::Volatility` the engine uses as the strategy σ.
+    /// An unwired `Out.SpreadMult` is present only to satisfy the
+    /// fail-closed validation rule.
+    #[test]
+    fn out_volatility_harvests_sigma() {
+        let add_id = NodeId::new();
+        let vol_sink = NodeId::new();
+        let spread_sink = NodeId::new();
+
+        let mut g = Graph::empty("tv", GScope::Symbol("BTCUSDT".into()));
+        g.nodes.push(graph::Node {
+            id: add_id,
+            kind: "Math.Add".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        g.nodes.push(graph::Node {
+            id: vol_sink,
+            kind: "Out.Volatility".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        // Validation requires an Out.SpreadMult sink — left unwired,
+        // so it harvests nothing.
+        g.nodes.push(graph::Node {
+            id: spread_sink,
+            kind: "Out.SpreadMult".into(),
+            config: serde_json::Value::Null,
+            pos: (0.0, 0.0),
+        });
+        g.edges.push(Edge {
+            from: PortRef {
+                node: add_id,
+                port: "out".into(),
+            },
+            to: PortRef {
+                node: vol_sink,
+                port: "sigma".into(),
+            },
+        });
+
+        let mut ev = Evaluator::build(&g).expect("valid graph");
+        let mut src: HashMap<(NodeId, String), Value> = HashMap::new();
+        src.insert((add_id, "a".into()), Value::Number(dec!(0.3)));
+        src.insert((add_id, "b".into()), Value::Number(dec!(0.1)));
+        let actions = ev.tick(&EvalCtx::default(), &src).expect("eval ok");
+        assert_eq!(actions, vec![SinkAction::Volatility(dec!(0.4))]);
+    }
+
     /// Graph with no SpreadMult must fail validation — fail-closed
     /// default: operator can't silently delete the widening.
     #[test]

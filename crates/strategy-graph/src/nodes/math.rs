@@ -5,13 +5,13 @@
 //! file grows is trivial.
 
 use crate::node::{EvalCtx, NodeKind, NodeState};
+use crate::nodes::decimal_field;
 use crate::types::{Port, PortType, Value};
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::Value as Json;
-use std::str::FromStr;
 
 /// `Math.Add` — two-input numeric sum. `Missing` on either input
 /// propagates as `Missing` on the output (additive identity of the
@@ -179,10 +179,7 @@ impl Const {
             return Some(Self::default());
         }
         let parsed: ConstCfg = serde_json::from_value(cfg.clone()).ok()?;
-        let value = match parsed.value {
-            None => Decimal::ZERO,
-            Some(s) => Decimal::from_str(&s).ok()?,
-        };
+        let value = decimal_field(parsed.value, Decimal::ZERO, |_| true)?;
         Some(Self { value })
     }
 }
@@ -313,10 +310,7 @@ impl ToBool {
             return Some(Self::default());
         }
         let parsed: ToBoolCfg = serde_json::from_value(cfg.clone()).ok()?;
-        let threshold = match parsed.threshold {
-            None => Decimal::ZERO,
-            Some(s) => Decimal::from_str(&s).ok()?,
-        };
+        let threshold = decimal_field(parsed.threshold, Decimal::ZERO, |_| true)?;
         Some(Self {
             threshold,
             cmp: parsed.cmp.unwrap_or_default(),
@@ -443,26 +437,8 @@ impl InventorySkew {
             return Some(Self::default());
         }
         let parsed: InventorySkewCfg = serde_json::from_value(cfg.clone()).ok()?;
-        let cap = match parsed.cap {
-            None => Decimal::ONE,
-            Some(s) => {
-                let v = Decimal::from_str(&s).ok()?;
-                if v <= Decimal::ZERO {
-                    return None;
-                }
-                v
-            }
-        };
-        let exponent = match parsed.exponent {
-            None => Decimal::from(2u8),
-            Some(s) => {
-                let v = Decimal::from_str(&s).ok()?;
-                if v <= Decimal::ZERO {
-                    return None;
-                }
-                v
-            }
-        };
+        let cap = decimal_field(parsed.cap, Decimal::ONE, |v| v > Decimal::ZERO)?;
+        let exponent = decimal_field(parsed.exponent, Decimal::from(2u8), |v| v > Decimal::ZERO)?;
         Some(Self { cap, exponent })
     }
 }

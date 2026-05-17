@@ -38,6 +38,14 @@ pub type EvalTrace = HashMap<(NodeId, String), Value>;
 pub enum SinkAction {
     SpreadMult(Decimal),
     SizeMult(Decimal),
+    /// Graph-authored volatility σ — overrides the engine's
+    /// built-in `VolatilityEstimator` for the strategy's
+    /// reservation-price input. Lets a `Stats.Garch` node (or
+    /// any number source) drive the Avellaneda-Stoikov / GLFT σ
+    /// entirely from the visual graph. When the sink is absent
+    /// or its input is `Missing`, the engine falls back to its
+    /// own estimator.
+    Volatility(Decimal),
     KillEscalate {
         level: u8,
         reason: String,
@@ -567,6 +575,11 @@ impl Evaluator {
                 "Out.SizeMult" => {
                     if let Some(mult) = input_vec.first().and_then(Value::as_number) {
                         sinks.push(SinkAction::SizeMult(mult));
+                    }
+                }
+                "Out.Volatility" => {
+                    if let Some(sigma) = input_vec.first().and_then(Value::as_number) {
+                        sinks.push(SinkAction::Volatility(sigma));
                     }
                 }
                 "Out.KillEscalate" => {
