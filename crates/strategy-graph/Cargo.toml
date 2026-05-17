@@ -8,10 +8,11 @@ version.workspace = true
 # Typed DAG of nodes (closed catalog) the engine evaluates on every tick.
 # See `docs/research/visual-strategy-builder.md` for the architecture.
 #
-# This crate stays dependency-light on purpose: it owns the graph +
-# evaluator + node catalog, nothing else. Engine integration happens
-# in `mm-engine`, not here. That keeps the crate unit-testable without
-# needing to mock orderbooks + connectors.
+# This crate owns the graph + evaluator + node catalog. It pulls in
+# computation crates (`mm-indicators`, `mm-strategy`) that node kinds
+# delegate to, but deliberately avoids orderbook / connector deps —
+# engine integration happens in `mm-engine`, not here, so the crate
+# stays unit-testable without mocking orderbooks + connectors.
 
 [dependencies]
 serde = { workspace = true }
@@ -20,6 +21,7 @@ rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 anyhow = { workspace = true }
 mm-indicators = { workspace = true }
+mm-strategy = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }

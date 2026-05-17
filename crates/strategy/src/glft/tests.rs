@@ -236,7 +236,7 @@ fn test_exp_and_ln() {
     assert!((e - dec!(2.718)).abs() < dec!(0.01));
 
     // ln(e) ≈ 1
-    let ln_e = decimal_ln_positive(e);
+    let ln_e = decimal_ln(e);
     assert!((ln_e - dec!(1)).abs() < dec!(0.01));
 }
 
@@ -763,10 +763,12 @@ proptest! {
     }
 }
 
-/// MM-2 — 50+ `on_fill` notifications drive the calibration
-/// into its recalibration branch; k moves off the constructor
-/// default. Confirms the `&self` hook actually mutates state
-/// through the `Mutex`.
+/// MM-2 — `on_fill` notifications drive the regression-based
+/// calibration: a stream of fill depths whose histogram decays
+/// with depth (the signature of `λ(δ) = A·exp(-k·δ)`) pulls `k`
+/// up off the constructor default. Confirms the `&self` hook
+/// mutates state through the `Mutex` *and* that the log-linear
+/// fit recovers a positive decay rate.
 #[test]
 fn on_fill_drives_k_recalibration() {
     use crate::r#trait::{FillObservation, Strategy as _};
@@ -774,27 +776,85 @@ fn on_fill_drives_k_recalibration() {
 
     let strat = GlftStrategy::new();
     let k_before = strat.calibration.lock().unwrap().k;
-    // Simulate 60 fills at depth 0.3 from a mid of 100 — a
-    // stable stream should pull k toward 1/0.3 ≈ 3.33.
-    for _ in 0..60u64 {
-        let obs = FillObservation {
-            side: Side::Buy,
-            price: dec!(99.7),
-            qty: dec!(0.001),
-            depth_from_mid: dec!(0.3),
-            mid: dec!(100),
-            is_maker: true,
-            ts_ms: 0,
-        };
-        strat.on_fill(&obs);
+
+    // 60 fills whose depth histogram decays geometrically — far
+    // more fills land near the mid than deep in the book, which
+    // is exactly the exponential arrival shape the GLFT fit
+    // expects. A flat or single-depth stream carries no decay
+    // signal and (correctly) leaves `k` untouched.
+    let mid = dec!(100);
+    let bands: [(Decimal, u32); 6] = [
+        (dec!(0.1), 24),
+        (dec!(0.2), 16),
+        (dec!(0.3), 10),
+        (dec!(0.4), 6),
+        (dec!(0.5), 3),
+        (dec!(0.6), 1),
+    ];
+    for (depth, count) in bands {
+        for _ in 0..count {
+            strat.on_fill(&FillObservation {
+                side: Side::Buy,
+                price: mid - depth,
+                qty: dec!(0.001),
+                depth_from_mid: depth,
+                mid,
+                is_maker: true,
+                ts_ms: 0,
+            });
+        }
     }
+
     let k_after = strat.calibration.lock().unwrap().k;
-    assert_ne!(k_before, k_after, "k should move after 60 fills");
-    // Smoothed update (weight 0.1) pulls k a fraction of the
-    // way toward 1/0.3 ≈ 3.33 — should exceed the 1.5 default.
+    assert_ne!(k_before, k_after, "k should move after 60 decaying fills");
+    // The fitted decay rate is steep (~6); the 0.9/0.1 smoothing
+    // applied over the ≥50-sample retunes still lifts `k` well
+    // past the 1.5 default.
     assert!(
         k_after > dec!(1.5),
         "k_after = {k_after}; expected to move past default 1.5"
+    );
+    // `A` is now fit too — it must stay positive and finite.
+    let a_after = strat.calibration.lock().unwrap().a;
+    assert!(a_after > dec!(0), "a_after = {a_after}; must stay positive");
+}
+
+/// `fit_intensity` recovers a positive decay rate from a clean
+/// exponential-shaped depth histogram, and rejects degenerate
+/// windows (all depths equal → no slope to fit; sub-threshold
+/// sample → not enough data).
+#[test]
+fn fit_intensity_recovers_decay_and_rejects_degenerate() {
+    // Geometric histogram: 32 / 16 / 8 / 4 fills at increasing
+    // depths — a textbook λ(δ) = A·exp(-k·δ) shape.
+    let mut depths: VecDeque<Decimal> = VecDeque::new();
+    for (depth, count) in [
+        (dec!(0.10), 32),
+        (dec!(0.20), 16),
+        (dec!(0.30), 8),
+        (dec!(0.40), 4),
+    ] {
+        for _ in 0..count {
+            depths.push_back(depth);
+        }
+    }
+    let (k, a) = fit_intensity(&depths).expect("clean exponential must fit");
+    assert!(k > dec!(0), "decay rate must be positive, got {k}");
+    assert!(a > dec!(0), "intercept A must be positive, got {a}");
+
+    // Degenerate: 60 fills all at the same depth — one populated
+    // bin, no slope. Must return None so the caller keeps (A, k).
+    let flat: VecDeque<Decimal> = (0..60).map(|_| dec!(0.25)).collect();
+    assert!(
+        fit_intensity(&flat).is_none(),
+        "single-depth window must not produce a fit"
+    );
+
+    // Sub-threshold: below the 50-sample gate.
+    let sparse: VecDeque<Decimal> = (0..10).map(|_| dec!(0.1)).collect();
+    assert!(
+        fit_intensity(&sparse).is_none(),
+        "sub-threshold window must not fit"
     );
 }
 

@@ -72,6 +72,38 @@ impl NodeKind for SizeMult {
     }
 }
 
+static VOLATILITY_INPUTS: Lazy<Vec<Port>> =
+    Lazy::new(|| vec![Port::new("sigma", PortType::Number)]);
+
+/// `Out.Volatility` — graph-authored volatility σ. Overrides the
+/// engine's built-in `VolatilityEstimator` for the strategy's
+/// reservation-price input. Wire e.g. `Stats.Garch → Out.Volatility`
+/// to drive the Avellaneda-Stoikov / GLFT σ from the visual graph.
+/// A `Missing` input skips the sink, so the engine cleanly falls
+/// back to its own estimator.
+#[derive(Debug, Default)]
+pub struct Volatility;
+
+impl NodeKind for Volatility {
+    fn kind(&self) -> &'static str {
+        "Out.Volatility"
+    }
+    fn input_ports(&self) -> &[Port] {
+        &VOLATILITY_INPUTS
+    }
+    fn output_ports(&self) -> &[Port] {
+        &UNIT_OUT
+    }
+    fn evaluate(
+        &self,
+        _ctx: &EvalCtx,
+        _inputs: &[Value],
+        _state: &mut NodeState,
+    ) -> Result<Vec<Value>> {
+        Ok(vec![Value::Unit])
+    }
+}
+
 static KILL_INPUTS: Lazy<Vec<Port>> = Lazy::new(|| {
     vec![
         Port::new("trigger", PortType::Bool),

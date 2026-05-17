@@ -9,6 +9,7 @@
 //! family.
 
 use crate::node::{EvalCtx, NodeKind, NodeState};
+use crate::nodes::decimal_field;
 use crate::types::{Port, PortType, Value};
 use anyhow::Result;
 use once_cell::sync::Lazy;
@@ -16,7 +17,6 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::Deserialize;
 use serde_json::Value as Json;
-use std::str::FromStr;
 
 // Shared input/output port shapes — every single-series
 // indicator takes a Number on `x` and emits a Number on `out`.
@@ -424,16 +424,7 @@ impl BollingerNode {
         if period == 0 || period > 10_000 {
             return None;
         }
-        let k_stddev = match parsed.k_stddev {
-            None => dec!(2),
-            Some(s) => {
-                let v = Decimal::from_str(&s).ok()?;
-                if v <= dec!(0) {
-                    return None;
-                }
-                v
-            }
-        };
+        let k_stddev = decimal_field(parsed.k_stddev, dec!(2), |v| v > dec!(0))?;
         Some(Self { period, k_stddev })
     }
 }

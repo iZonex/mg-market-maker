@@ -33,6 +33,9 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         "Math.Const" => math::Const::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>),
         // Stats — configurable α
         "Stats.EWMA" => stats::Ewma::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>),
+        "Stats.Garch" => {
+            stats::Garch::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
+        }
         // Cast — configurable threshold + comparator
         "Cast.ToBool" => {
             math::ToBool::from_config(config).map(|n| Box::new(n) as Box<dyn NodeKind>)
@@ -220,6 +223,7 @@ pub fn build(kind: &str, config: &Json) -> Option<Box<dyn NodeKind>> {
         // Sinks
         "Out.SpreadMult" => Some(Box::new(sinks::SpreadMult)),
         "Out.SizeMult" => Some(Box::new(sinks::SizeMult)),
+        "Out.Volatility" => Some(Box::new(sinks::Volatility)),
         "Out.KillEscalate" => Some(Box::new(sinks::KillEscalate)),
         _ => None,
     }
@@ -286,6 +290,7 @@ pub fn meta(kind: &str) -> NodeMeta {
         "Math.Mul"             => NodeMeta { label: "Multiply",            summary: "a × b", group: "Math" },
         "Math.Const"           => NodeMeta { label: "Constant",            summary: "Literal number", group: "Math" },
         "Stats.EWMA"           => NodeMeta { label: "EWMA",                summary: "Exponential moving average (α)", group: "Math" },
+        "Stats.Garch"          => NodeMeta { label: "GARCH volatility",    summary: "GARCH(1,1) conditional volatility of a price stream — clustering + mean reversion", group: "Math" },
         "Logic.And"             => NodeMeta { label: "AND",                summary: "Boolean AND", group: "Logic" },
         "Logic.Mux"             => NodeMeta { label: "Mux (number)",       summary: "Pick a or b by a boolean selector", group: "Logic" },
         "Logic.StringMux"       => NodeMeta { label: "Mux (string)",       summary: "Pick a or b (string) by a boolean selector", group: "Logic" },
@@ -392,6 +397,7 @@ pub fn meta(kind: &str) -> NodeMeta {
         // Sinks — always fire on a trigger, consumed by the engine.
         "Out.SpreadMult"       => NodeMeta { label: "Spread multiplier",   summary: "Final spread scalar applied to quotes", group: "Sinks" },
         "Out.SizeMult"         => NodeMeta { label: "Size multiplier",     summary: "Final size scalar applied to quotes", group: "Sinks" },
+        "Out.Volatility"       => NodeMeta { label: "Volatility override", summary: "Graph-authored σ — overrides the engine's built-in estimator for the strategy reservation price", group: "Sinks" },
         "Out.KillEscalate"     => NodeMeta { label: "Kill-switch escalate",summary: "Raise kill level with a reason", group: "Sinks" },
         "Out.Flatten"          => NodeMeta { label: "Flatten position",    summary: "Fire L4 flatten with the given exec policy", group: "Sinks" },
         "Out.Quotes"           => NodeMeta { label: "Quotes",              summary: "Replace strategy output with a graph-authored quote bundle", group: "Sinks" },
@@ -436,6 +442,7 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Math.Mul",
         "Math.Const",
         "Stats.EWMA",
+        "Stats.Garch",
         "Cast.ToBool",
         "Logic.And",
         "Logic.Mux",
@@ -561,6 +568,7 @@ pub fn kinds() -> Vec<(&'static str, KindShape)> {
         "Surveillance.StrategicNonFillingScore",
         "Out.SpreadMult",
         "Out.SizeMult",
+        "Out.Volatility",
         "Out.KillEscalate",
     ];
     ks.iter()
@@ -634,11 +642,12 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_130_nodes_after_quote_hedge() {
+    fn catalog_has_132_nodes_after_volatility_sink() {
         // 127 after R13 + 3 (Trade.OwnFill source + Out.VenueQuotesIf
         // sink + Quote.Hedge transform — Phase IV graph-native
-        // reactive XEMM) = 130.
-        assert_eq!(kinds().len(), 130, "catalog drift");
+        // reactive XEMM) = 130, + 2 (Stats.Garch GARCH(1,1) transform
+        // + Out.Volatility σ-override sink) = 132.
+        assert_eq!(kinds().len(), 132, "catalog drift");
     }
 
     /// GR-1 — every indicator with a `period` config field must
