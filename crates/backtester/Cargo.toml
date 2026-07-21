@@ -19,7 +19,7 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 rand = "0.9"
-rand_chacha = "0.9"
+rand_chacha = "0.10"
 # Live data recorder — pulls Binance/Bybit public WS streams
 # and dumps them as RecordedEvent JSONL so operators can
 # calibrate strategy parameters on real venue flow.
