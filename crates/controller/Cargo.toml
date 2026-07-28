@@ -42,14 +42,14 @@ mm-dashboard = { workspace = true }
 # Credential encryption-at-rest. AES-256-GCM with a per-record
 # 96-bit nonce generated via `OsRng` — the industry standard for
 # authenticated symmetric encryption of short secrets.
-aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc", "getrandom"] }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "getrandom"] }
 # argon2id for deriving the master key from an operator passphrase
 # (no plaintext key on disk — only the salt, which is useless on
 # its own). OWASP-recommended params baked in.
 argon2 = "0.5"
 rand = { workspace = true }
 hex = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 
 [dev-dependencies]
 tokio = { workspace = true }
